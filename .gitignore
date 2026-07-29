@@ -1,0 +1,19 @@
+# Docker volumes (runtime)
+data/
+
+# Модели (тяжёлые)
+models_cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Env (секреты)
+.env
+!.env.example
+
+# IDE
+.vscode/
+.idea/
