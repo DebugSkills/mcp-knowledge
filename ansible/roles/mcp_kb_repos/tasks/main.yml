@@ -1,0 +1,27 @@
+---
+# Role: mcp_kb_repos
+# Назначение: клонирование двух git-репозиториев (mcp-knowledge + knowledge)
+
+- name: Клонировать репо кода (mcp-knowledge)
+  ansible.builtin.git:
+    repo: "{{ mcp_knowledge_repo_url }}"
+    dest: /opt/mcp-knowledge/mcp-knowledge
+    version: main
+    update: yes
+
+- name: Клонировать репо знаний (knowledge)
+  ansible.builtin.git:
+    repo: "{{ knowledge_repo_url }}"
+    dest: /opt/mcp-knowledge/knowledge
+    version: main
+    update: yes
+
+- name: Добавить backup remote в knowledge
+  ansible.builtin.command:
+    cmd: git remote add backup /opt/mcp-knowledge-bare/knowledge.git
+    chdir: /opt/mcp-knowledge/knowledge
+  register: remote_result
+  failed_when: 
+    - remote_result.rc != 0
+    - "'already exists' not in remote_result.stderr"
+  changed_when: remote_result.rc == 0

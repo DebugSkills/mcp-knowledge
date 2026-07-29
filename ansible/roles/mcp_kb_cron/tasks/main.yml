@@ -1,0 +1,32 @@
+---
+# Role: mcp_kb_cron
+# Назначение: cron-задачи для бэкапа и quality scan
+
+- name: Копировать backup.sh
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../scripts/backup.sh"
+    dest: /opt/mcp-knowledge/scripts/backup.sh
+    mode: '0755'
+
+- name: Копировать quality_scan.sh
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../scripts/quality_scan.sh"
+    dest: /opt/mcp-knowledge/scripts/quality_scan.sh
+    mode: '0755'
+
+- name: Настроить cron для ежедневного бэкапа
+  ansible.builtin.cron:
+    name: "MCP Knowledge — daily backup"
+    job: "/opt/mcp-knowledge/scripts/backup.sh >> /var/log/mcp-backup.log 2>&1"
+    hour: "3"
+    minute: "0"
+    user: root
+
+- name: Настроить cron для weekly quality scan
+  ansible.builtin.cron:
+    name: "MCP Knowledge — weekly quality scan"
+    job: "/opt/mcp-knowledge/scripts/quality_scan.sh >> /var/log/mcp-quality.log 2>&1"
+    weekday: "1"
+    hour: "4"
+    minute: "0"
+    user: root

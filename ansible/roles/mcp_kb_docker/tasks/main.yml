@@ -1,0 +1,34 @@
+---
+# Role: mcp_kb_docker
+# Назначение: docker compose up + health-check
+
+- name: Копировать .env из шаблона
+  ansible.builtin.template:
+    src: .env.j2
+    dest: /opt/mcp-knowledge/mcp-knowledge/.env
+    mode: '0600'
+
+- name: Запустить docker compose
+  ansible.builtin.command:
+    cmd: docker compose up -d --wait
+    chdir: /opt/mcp-knowledge/mcp-knowledge
+  register: compose_result
+  changed_when: "'Running' in compose_result.stdout or 'Starting' in compose_result.stdout"
+
+- name: Проверить health mcp-server
+  ansible.builtin.uri:
+    url: http://localhost:8000/health
+    return_content: yes
+  register: health_result
+  until: health_result.status == 200
+  retries: 10
+  delay: 5
+
+- name: Проверить health Qdrant
+  ansible.builtin.uri:
+    url: http://localhost:6333/healthz
+    return_content: yes
+  register: qdrant_health
+  until: qdrant_health.status == 200
+  retries: 10
+  delay: 5

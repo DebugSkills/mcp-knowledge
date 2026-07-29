@@ -1,0 +1,5 @@
+all:
+  hosts:
+    mcp-knowledge-server:
+      ansible_host: <server-ip>
+      ansible_user: root

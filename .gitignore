@@ -17,3 +17,12 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+# SSOT Knowledge Base (auto-gen, подключается через symlink)
+.knowledge/
+.roomodes
+.kilo/
+AGENTS.md
+.board.md
+.boardData.md
+.roo/

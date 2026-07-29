@@ -1,0 +1,10 @@
+---
+- name: Deploy MCP Knowledge Server
+  hosts: all
+  gather_facts: yes
+
+  roles:
+    - mcp_kb_dirs
+    - mcp_kb_repos
+    - mcp_kb_docker
+    - mcp_kb_cron

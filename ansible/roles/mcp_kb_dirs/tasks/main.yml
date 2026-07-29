@@ -1,0 +1,23 @@
+---
+# Role: mcp_kb_dirs
+# Назначение: создание структуры каталогов /opt/mcp-knowledge/ + bare-remote
+
+- name: Создать рабочую директорию
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "1000"
+    group: "1000"
+    mode: '0755'
+  loop:
+    - /opt/mcp-knowledge/data/qdrant/snapshots
+    - /opt/mcp-knowledge/data/dlq
+    - /opt/mcp-knowledge/data/quality
+    - /opt/mcp-knowledge/data/backups
+    - /opt/mcp-knowledge/models_cache
+    - /opt/mcp-knowledge/scripts
+
+- name: Создать bare-репозиторий для бэкапа SSOT
+  ansible.builtin.command:
+    cmd: git init --bare /opt/mcp-knowledge-bare/knowledge.git
+    creates: /opt/mcp-knowledge-bare/knowledge.git/HEAD
