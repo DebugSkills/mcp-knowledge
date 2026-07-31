@@ -12,6 +12,7 @@ dependencies = [
     "pydantic-settings>=2.0",
     "pyyaml>=6.0",
     "sentence-transformers>=3.0",
+    "transformers>=4.40",    # P1-4: явная зависимость (токенайзер XLM-R, BGE-M3)
     "onnxruntime>=1.18",
     "prometheus-client>=0.20",
     "gitpython>=3.1",

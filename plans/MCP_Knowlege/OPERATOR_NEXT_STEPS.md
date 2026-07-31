@@ -1,8 +1,8 @@
 # 🎯 ОПЕРАТОРУ: Пошаговые действия — MCP Knowledge Server
 
-> **Статус:** Анализ завершён ✅ | Critic Gate: **PASS (0.84)** ✅ | Реализация: готова к старту
+> **Статус:** Анализ завершён ✅ | Critic Gate v3.1: **PASS (0.84)** ✅ | Реализация: **Ф0 ✅ Ф1 ✅ (M1)** → Ф2 в работе
 > **План:** [`00-implementation-plan.md`](00-implementation-plan.md) (**v3.1** post-Critic Gate, 26 решений, 4 фазы, ~122 ч Ф0–Ф3; Hybrid Search Architecture)
-> **Дата:** 2026-07-29
+> **Дата:** 2026-07-29 · **Актуализация:** 2026-07-31 (статус реализации — [§0 плана](00-implementation-plan.md))
 >
 > **Critic Gate v3.0→v3.1:** 6 P1-замечаний интегрированы (cache-invalidation, bounded search, INDEX size enforcement, suggested_tags алгоритм, structural change recovery, 4 новых риска R14–R17). Покрытие: §13.7. **План готов к передаче Code Implementer.**
 
@@ -10,7 +10,16 @@
 
 ## 📍 Где мы сейчас
 
-Архитектура спроектирована, план утверждён, критика отработана (2 внешние рецензии + Critic Gate). Следующий шаг — **Фаза 0: Scaffolding** (создание скелета проекта).
+Архитектура спроектирована, план утверждён, критика отработана (2 внешние рецензии + Critic Gate).
+
+| Фаза | Статус | Что готово |
+|------|:------:|------------|
+| **Ф0 Scaffolding** | ✅ | docker-compose, Dockerfile, config (`WORKERS=1`), health, Makefile, ansible-структура |
+| **Ф1 Ядро (M1)** | ✅ | SSOT+git, Qdrant, BGE-M3 in-process GPU/CPU, chunker XLM-R, pipeline, INDEX.gen.yaml |
+| **Ф2 MCP-сервер** | ❌ | План готов → [`02-phase2-mcp-server.md`](02-phase2-mcp-server.md) |
+| **Ф3 Production** | 🟡 | Скрипты (`backup.sh`, `offline-deploy.sh`); hardening — после Ф2 |
+
+> 🎯 **Следующий шаг — Фаза 2: MCP-сервер.** Без неё сервер не отвечает на запросы агентов (нет JSON-RPC, auth, 9 tools). Детальный план: [`02-phase2-mcp-server.md`](02-phase2-mcp-server.md) (4 блока B→A→C→D, ~37 ч).
 
 ---
 
@@ -494,13 +503,13 @@ mount | grep data/qdrant
 
 ## 📋 ЧТО ДАЛЬШЕ
 
-| Шаг | Что | Где в плане | ~Время |
-|-----|-----|-------------|--------|
-| ✅ | Структура + docker-compose + health | §4 Фаза 0 (задачи 0.1–0.8) | 8 ч |
-| 🔜 | Ядро: Markdown SSOT + Qdrant + BGE-M3 + INDEX.gen.yaml (+cache, truncation, suggested_tags, structural change) | §5 Фаза 1 (задачи 1.1–1.11) | 31 ч |
-| 🔜 | MCP-сервер: 9 Tools + auth + reconcile (+read-after-write, bounded search) | §6 Фаза 2 (задачи 2.1–2.15) | 38 ч |
-| 🔜 | Production: backup + метрики + air-gap | §7 Фаза 3 (задачи 3.1–3.10) | 27 ч |
-| 🔜 | Ansible playbook (наполнение) | §4 задача 0.9 | 4 ч |
+| Шаг | Что | Где в плане | Статус |
+|-----|-----|-------------|:------:|
+| Структура + docker-compose + health | §4 Фаза 0 (задачи 0.1–0.8) | ✅ **готово** |
+| Ядро: Markdown SSOT + Qdrant + BGE-M3 + INDEX.gen.yaml (+cache, truncation, suggested_tags, structural change) | §5 Фаза 1 (задачи 1.1–1.11) | ✅ **готово (M1)** |
+| 🔜 **MCP-сервер: 9 Tools + auth + reconcile + metrics** (+read-after-write, bounded search) | [`02-phase2-mcp-server.md`](02-phase2-mcp-server.md) (задачи 2.1–2.15) | ❌ **СЛЕДУЮЩИЙ** |
+| Production: backup + метрики + air-gap + rate-limit | §7 Фаза 3 (задачи 3.1–3.10) | 🟡 частично (скрипты есть) |
+| Ansible playbook (наполнение) | §4 задача 0.9 | 🟡 структура есть |
 
 ---
 

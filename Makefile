@@ -1,8 +1,16 @@
 DOCKER_COMPOSE ?= docker compose
+DATA_DIR := ../data
+KNOWLEDGE_DIR := ../knowledge
+MODELS_DIR := ../models_cache
 
-.PHONY: dev down logs test lint clean
+.PHONY: dev down logs test lint clean dlq-replay reindex backup prereq-dirs
 
-dev:
+# Проверка и создание необходимых директорий перед запуском
+prereq-dirs:
+	@mkdir -p $(DATA_DIR)/{qdrant/snapshots,dlq,quality,backups} $(MODELS_DIR)
+	@test -d $(KNOWLEDGE_DIR)/.git || (echo "❌ knowledge/ должен быть git-репозиторием (git init)" && exit 1)
+
+dev: prereq-dirs
 	$(DOCKER_COMPOSE) up -d --wait
 
 down:
@@ -19,3 +27,15 @@ lint:
 
 clean:
 	$(DOCKER_COMPOSE) down -v
+
+# 🆕 v2.2: возврат задач из DLQ в очередь индексации
+dlq-replay:
+	$(DOCKER_COMPOSE) exec mcp-server python -m mcp_server.cli dlq-replay
+
+# Полный переиндекс из Markdown SSOT
+reindex:
+	$(DOCKER_COMPOSE) exec mcp-server python -m mcp_server.cli reindex
+
+# Бэкап Qdrant + SSOT
+backup:
+	bash scripts/backup.sh

@@ -20,9 +20,10 @@ class Settings(BaseSettings):
     MCP_READ_KEYS: List[str] = []
     MCP_WRITE_KEYS: List[str] = []
 
-    # Git audit (#21)
+    # Git audit (#21) + SSOT
     GIT_AUDIT: bool = True
     KNOWLEDGE_DIR: str = "/app/knowledge"
+    KNOWLEDGE_ROOT: str = "/app/knowledge"  # Псевдоним для MarkdownStore (тот же путь)
 
     # Chunking (#13, #20)
     CHUNK_MAX_TOKENS: int = 512

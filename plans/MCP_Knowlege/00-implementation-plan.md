@@ -19,6 +19,49 @@
 
 ---
 
+## 0. 🚦 Статус реализации (актуализация 2026-07-31)
+
+> **Метод:** сверка плана с фактическим кодом в [`mcp_server/src/mcp_server/`](mcp_server/src/mcp_server/). Критерий «готово» — модуль существует и покрывает задачи фазы (по докстрингам и контрактам). Легенда: ✅ реализовано · 🟡 частично · ❌ не начато (только план).
+
+### 0.1 Сводка по фазам
+
+| Фаза | Статус | Доказательство по коду | Milestone |
+|------|:------:|------------------------|:---------:|
+| **Ф0: Scaffolding + Docker** | ✅ | [`docker-compose.yml`](docker-compose.yml:1) (rw-mount после P0-фикса), [`Dockerfile`](mcp_server/Dockerfile:1), [`config.py`](mcp_server/src/mcp_server/config.py:42) (инвариант `WORKERS=1`), [`Makefile`](Makefile:1), `ansible/` — | ✅ |
+| **Ф1: Ядро + эмбеддинги + INDEX** | ✅ | [`markdown_store.py`](mcp_server/src/mcp_server/storage/markdown_store.py:1), [`qdrant_client.py`](mcp_server/src/mcp_server/storage/qdrant_client.py:1), [`manager.py`](mcp_server/src/mcp_server/embedding/manager.py:1) GPU/CPU, [`chunker.py`](mcp_server/src/mcp_server/indexing/chunker.py:1), [`pipeline.py`](mcp_server/src/mcp_server/indexing/pipeline.py:1), [`knowledge_index.py`](mcp_server/src/mcp_server/indexing/knowledge_index.py:1). Critic Gate REVISE→исправлено | ✅ **M1** |
+| **Ф2: MCP-сервер + устойчивость** | ❌ | Нет `auth.py`, пакета `tools/`, `resources.py`, `prompts.py`, `metrics.py`, `reconcile.py`. e2e-тест — пустой docstring. Готов план: [`02-phase2-mcp-server.md`](02-phase2-mcp-server.md) + [`.board.md`](.board.md:1) | ⏳ **M2** |
+| **Ф3: Production + Air-gap** | 🟡 | Скрипты есть: [`backup.sh`](scripts/backup.sh:1), [`offline-deploy.sh`](scripts/offline-deploy.sh:1), [`reindex.sh`](scripts/reindex.sh:1). НО: rate-limit, blue-green reindex, conflict resolution, runbook ротации — не сделаны (зависят от Ф2) | ⏳ **M3** |
+| **Ф4: Knowledge Quality** | ❌ | Нет пакета `quality/`; [`quality_scan.sh`](scripts/quality_scan.sh:13) — stub | — |
+| **Ф5: Content Import** | ❌ | Нет пакета `content/` | — |
+
+> **Тесты:** директории [`tests/unit`](mcp_server/tests/unit/__init__.py:1) · [`tests/integration`](mcp_server/tests/integration/__init__.py:1) · [`tests/e2e`](mcp_server/tests/e2e/test_russian_corpus.py:1) — пусты/только docstring. Покрытие E2E на русском корпусе — цель Фазы 2 (критерий #10).
+
+### 0.2 Детализация по задачам Ф0–Ф1 (реализованные)
+
+| Задача | Статус | Где |
+|--------|:------:|-----|
+| 0.1–0.8 Scaffolding | ✅ | `docker-compose.yml`, `Dockerfile`, `config.py`, `health.py`, `Makefile`, `.env.example` |
+| 0.4 Инвариант `WORKERS=1` | ✅ | [`config.py:42`](mcp_server/src/mcp_server/config.py:42) (валидация при старте) |
+| 0.6 `make dlq-replay` | ✅ | [`Makefile:32`](Makefile:32) + [`cli.py`](mcp_server/src/mcp_server/cli.py:54) |
+| 0.9 Ansible playbook | 🟡 | `ansible/` (структура ролей есть, наполнение — в ходе Ф3) |
+| 1.1 Markdown SSOT + git-аудит + `asyncio.Lock` | ✅ | [`markdown_store.py:49`](mcp_server/src/mcp_server/storage/markdown_store.py:49) |
+| 1.2 Гибридная иерархия | ✅ | `markdown_store.py` (CRUD `domain/subject/project`) |
+| 1.3 Qdrant-коллекция + payload | ✅ | [`qdrant_client.py`](mcp_server/src/mcp_server/storage/qdrant_client.py:1) + [`schema.py`](mcp_server/src/mcp_server/storage/schema.py:1) |
+| 1.4 Chunker XLM-RoBERTa (512 токенов) | ✅ | [`chunker.py`](mcp_server/src/mcp_server/indexing/chunker.py:1) + [`tokenizer.py`](mcp_server/src/mcp_server/embedding/tokenizer.py:1) |
+| 1.5/1.6 In-process embed GPU/CPU + `run_in_executor` | ✅ | [`manager.py`](mcp_server/src/mcp_server/embedding/manager.py:1), [`pipeline.py:247`](mcp_server/src/mcp_server/indexing/pipeline.py:247) |
+| 1.7 `/health` embedding-проверка | ✅ | [`health.py:34`](mcp_server/src/mcp_server/health.py:34) |
+| 1.8 Async pipeline (queue+batch+backpressure) | ✅ | [`pipeline.py:33`](mcp_server/src/mcp_server/indexing/pipeline.py:33) |
+| 1.9 Полный reindex | ✅ | [`pipeline.py:135`](mcp_server/src/mcp_server/indexing/pipeline.py:135) `reindex_all()` |
+| 1.11 INDEX.gen.yaml + gap + cache + size-enforcement | ✅ | [`knowledge_index.py:50`](mcp_server/src/mcp_server/indexing/knowledge_index.py:50) |
+
+> **⚠️ Носитель P0-фикса (pre-flight Ф2):** [`qdrant_client.py`](mcp_server/src/mcp_server/storage/qdrant_client.py:135) `search_by_tags` — логика AND (`match="all"`) требует N условий `MatchValue` вместо `MatchAny(any=tags)`. Зафиксировано в [`02-phase2-mcp-server.md`](02-phase2-mcp-server.md) §PRE-FLIGHT P0-1.
+
+### 0.3 Следующий шаг
+
+**Фаза 2 — единственный блокирующий пробел.** Без неё сервер не отвечает на запросы агентов (нет MCP JSON-RPC, auth, tools). Детальный план: [`02-phase2-mcp-server.md`](02-phase2-mcp-server.md) (4 блока B→A→C→D, 15 задач, ~37 ч). Ф3 завершается после Ф2 (rate-limit/ротация требуют `auth.py`).
+
+---
+
 ## 📑 Содержание
 
 1. [Обзор архитектуры](#1-обзор-архитектуры)
@@ -364,8 +407,9 @@ updated_at: "2026-07-21T10:00:00+03:00"       # ← ключ reconciliation (#19
 
 ---
 
-## 4. Фаза 0: Scaffolding и инфраструктура (Docker)
+## 4. Фаза 0: Scaffolding и инфраструктура (Docker) — ✅ РЕАЛИЗОВАНО
 
+> **Статус (2026-07-31):** ✅ Готово. См. [§0.2](#02-детализация-по-задачам-ф0ф1-реализованные). Ansible-роли (0.9) — структура есть, финальное наполнение в Ф3.
 **Цель:** Подготовить проектный скелет, **Docker**-окружение и базовые health-checks, чтобы последующие фазы велись в воспроизводимой среде.
 
 **Приоритет:** 🔴 BLOCKING (основа для всех остальных фаз)
@@ -405,8 +449,9 @@ updated_at: "2026-07-21T10:00:00+03:00"       # ← ключ reconciliation (#19
 
 ---
 
-## 5. Фаза 1: Ядро хранения и эмбеддингов (in-process)
+## 5. Фаза 1: Ядро хранения и эмбеддингов (in-process) — ✅ РЕАЛИЗОВАНО (M1)
 
+> **Статус (2026-07-31):** ✅ Готово (milestone M1). Все 11 задач выполнены: SSOT+git-aудит, Qdrant, BGE-M3 in-process, chunker XLM-R, async pipeline, INDEX.gen.yaml (#30/#32). Critic Gate §6-PHASE1 REVISE → P0/P1 исправлены.
 **Цель:** Реализовать SSOT-хранилище Markdown (с git-аудитом), Qdrant-коллекцию, **in-process** embedding (GPU + CPU fallback), async-пайплайн с корректным токенайзер-чанкингом.
 
 **Приоритет:** 🔴 HIGH (ядро всей системы)
@@ -481,8 +526,9 @@ updated_at: "2026-07-21T10:00:00+03:00"       # ← ключ reconciliation (#19
 
 ---
 
-## 6. Фаза 2: MCP-сервер, протокол и устойчивость
+## 6. Фаза 2: MCP-сервер, протокол и устойчивость — ❌ НЕ НАЧАТО (СЛЕДУЮЩАЯ)
 
+> **Статус (2026-07-31):** ❌ Не реализовано. Нет `auth.py`, пакета `tools/` (9 MCP Tools), `resources.py`, `prompts.py`, `metrics.py`, `reconcile.py`. **Детальный план:** [`02-phase2-mcp-server.md`](02-phase2-mcp-server.md) (4 блока B→A→C→D, 15 задач, ~37 ч) + [`.board.md`](.board.md:1) (Critic Gate REVISE 0.58 → 6 фиксов применены). e2e-тест на русском — пустой docstring.
 **Цель:** Реализовать полный MCP-интерфейс (**9 Tools** + Resources + Prompts), **мульти-ключевую** аутентификацию, sync-флаг (с CPU-ограничением), Dead Letter Queue, **reconciliation при старте**, базовый Prometheus-мониторинг и **🆕 v3.0: структурную навигацию** (`get_knowledge_map` + `search_by_tags`).
 
 **Приоритет:** 🔴 HIGH (пользовательский контракт)
@@ -589,8 +635,9 @@ updated_at: "2026-07-21T10:00:00+03:00"       # ← ключ reconciliation (#19
 
 ---
 
-## 7. Фаза 3: Production-готовность и Air-gap (Docker)
+## 7. Фаза 3: Production-готовность и Air-gap (Docker) — 🟡 ЧАСТИЧНО
 
+> **Статус (2026-07-31):** 🟡 Скрипты готовы: [`backup.sh`](scripts/backup.sh:1) (Qdrant+SSOT), [`offline-deploy.sh`](scripts/offline-deploy.sh:1) (prepare/deploy/verify), [`reindex.sh`](scripts/reindex.sh:1). Остаток (зависит от Ф2): rate limiting (3.5), сине-зелёный reindex (3.9), conflict resolution (3.10), runbook ротации мульти-ключей (3.4), валидация pre-download моделей (3.7).
 **Цель:** Довести систему до production-стандарта: резервное копирование, завершение ротации ключей, rate limiting, air-gap-развёртывание на Docker.
 
 **Приоритет:** 🟠 MEDIUM (после работающего MVP)
@@ -845,9 +892,9 @@ scripts/offline-deploy.sh
 
 | Веха | День | Критерий |
 |------|:----:|----------|
-| **M1: Ядро** | 5 | Markdown→Qdrant индексация; in-process GPU+CPU; chunker XLM-R; recovery из SSOT; git-аудит; **🆕 v3.0: INDEX.gen.yaml generation** |
-| **M2: MCP MVP** | 11 | **9 Tools** + мульти-ключи + sync-флаг (CPU-aware) + reconciliation + DLQ + Prometheus; **🆕 v3.0: get_knowledge_map + search_by_tags**; E2E на русском |
-| **M3: Production** | 15 (≤18) | `restart: unless-stopped`, backup (Qdrant + SSOT), метрики, air-gap (Docker); **1 uvicorn worker** задокументирован; Definition of Done выполнен |
+| **M1: Ядро** | 5 | ✅ **ДОСТИГНУТ (2026-07-31)**. Markdown→Qdrant индексация; in-process GPU+CPU; chunker XLM-R; recovery из SSOT; git-аудит; **🆕 v3.0: INDEX.gen.yaml generation** |
+| **M2: MCP MVP** | 11 | ⏳ **СЛЕДУЮЩИЙ.** План: [`02-phase2-mcp-server.md`](02-phase2-mcp-server.md). **9 Tools** + мульти-ключи + sync-флаг (CPU-aware) + reconciliation + DLQ + Prometheus; **🆕 v3.0: get_knowledge_map + search_by_tags**; E2E на русском |
+| **M3: Production** | 15 (≤18) | ⏳ Ф3 частично (скрипты есть, hardening после Ф2). `restart: unless-stopped`, backup (Qdrant + SSOT), метрики, air-gap (Docker); **1 uvicorn worker** задокументирован; Definition of Done выполнен |
 
 ---
 
