@@ -31,3 +31,4 @@ AGENTS.md
 .roo/
 .knowledge
 plans
+.venv/

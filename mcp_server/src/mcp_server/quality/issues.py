@@ -1,0 +1,294 @@
+"""Issue-store — append-only JSONL с атомарной записью (4.1).
+
+Хранилище quality-issues: data/quality/issues.jsonl.
+Формат: одна JSON-запись на строку (JSONL).
+Гарантии:
+- Атомарность: write → *.tmp → os.replace() (atomic на Linux)
+- Идемпотентность: issue_id = hash(type, knowledge_id, detail) → дубликаты пропускаются
+- Потокобезопасность: threading.Lock сериализует все операции
+
+Зависимости: только stdlib + Pydantic.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Literal, Optional
+
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger("mcp_knowledge.quality.issues")
+
+# ── Конфигурация пути хранилища ────────────────────────────
+
+_DEFAULT_STORE_DIR: str | None = None  # Ленивая инициализация из config
+
+
+def _get_default_store_dir() -> str:
+    global _DEFAULT_STORE_DIR
+    if _DEFAULT_STORE_DIR is None:
+        try:
+            from ..config import settings
+
+            _DEFAULT_STORE_DIR = settings.QUALITY_DIR
+        except Exception:
+            _DEFAULT_STORE_DIR = "/app/data/quality"
+    return _DEFAULT_STORE_DIR
+
+
+# Глобальное переопределение для тестов
+_store_dir_override: Optional[str] = None
+
+# Блокировка для атомарных read-modify-write
+_store_lock = threading.Lock()
+
+
+def _get_store_path() -> Path:
+    """Путь к issues.jsonl (с учётом оверрайда для тестов)."""
+    base = _store_dir_override or _get_default_store_dir()
+    return Path(base) / "issues.jsonl"
+
+
+def set_store_dir(path: str) -> None:
+    """Переопределить директорию хранилища (для тестов)."""
+    global _store_dir_override
+    _store_dir_override = path
+
+
+def get_issues_store_path() -> Path:
+    """Получить путь к файлу issues.jsonl."""
+    return _get_store_path()
+
+
+# ── Типы ────────────────────────────────────────────────────
+
+IssueType = Literal["duplicate", "missing_field", "edit_war", "broken_link", "conflicting"]
+IssueSeverity = Literal["info", "warn", "critical"]
+IssueStatus = Literal["open", "resolved", "ignored"]
+
+
+# ── Pydantic модель ─────────────────────────────────────────
+
+
+class Issue(BaseModel):
+    """Запись о проблеме качества в БЗ."""
+
+    issue_id: str = Field(..., description="Уникальный ID (детерминированный хеш)")
+    type: IssueType = Field(..., description="Тип проблемы")
+    knowledge_id: str = Field(..., description="ID записи знаний")
+    severity: IssueSeverity = Field(..., description="Серьёзность: info | warn | critical")
+    detail: str = Field(..., description="Детальное описание проблемы")
+    detected_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="Время обнаружения",
+    )
+    status: IssueStatus = Field(default="open", description="Статус: open | resolved | ignored")
+    resolved_at: Optional[datetime] = Field(default=None, description="Время разрешения")
+    resolution: Optional[str] = Field(default=None, description="Описание решения")
+
+
+# ── Helpers ─────────────────────────────────────────────────
+
+
+def _make_issue_id(issue_type: str, knowledge_id: str, detail: str) -> str:
+    """Детерминированный issue_id: SHA256 от (type, knowledge_id, detail)."""
+    seed = f"{issue_type}|{knowledge_id}|{detail}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return f"iss_{digest[:16]}"
+
+
+def _read_all_issues(store_path: Path) -> list[dict]:
+    """Прочитать все записи из JSONL файла."""
+    if not store_path.exists():
+        return []
+    issues = []
+    with open(store_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                issues.append(json.loads(line))
+            except json.JSONDecodeError:
+                logger.warning("Пропущена битая строка в %s: %s", store_path, line[:80])
+    return issues
+
+
+def _write_all_issues(store_path: Path, issues: list[dict]) -> None:
+    """Атомарно записать все записи: tmp → os.replace()."""
+    store_dir = store_path.parent
+    store_dir.mkdir(parents=True, exist_ok=True)
+
+    tmp_path = store_path.with_suffix(".jsonl.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for issue in issues:
+                # Сериализуем datetime в ISO строку
+                serialized = _serialize_issue(issue)
+                f.write(json.dumps(serialized, ensure_ascii=False) + "\n")
+        # Атомарная замена на Linux
+        os.replace(tmp_path, store_path)
+    except Exception:
+        # Подчищаем .tmp при ошибке
+        if tmp_path.exists():
+            os.unlink(tmp_path)
+        raise
+
+
+def _serialize_issue(issue: dict) -> dict:
+    """Сериализовать issue-словарь: datetime → ISO-строка."""
+    result = dict(issue)
+    for key in ("detected_at", "resolved_at"):
+        value = result.get(key)
+        if isinstance(value, datetime):
+            result[key] = value.isoformat()
+    return result
+
+
+def _issue_from_dict(data: dict) -> Issue:
+    """Создать Issue из словаря (с десериализацией ISO-дат)."""
+    return Issue(**data)
+
+
+# ── Public API ──────────────────────────────────────────────
+
+
+def create_issue(
+    issue_type: IssueType,
+    knowledge_id: str,
+    severity: IssueSeverity,
+    detail: str,
+) -> Issue:
+    """Создать issue (идемпотентно — дубликаты пропускаются).
+
+    Идемпотентность: issue_id = SHA256(type, knowledge_id, detail).
+    Если issue с таким ID уже существует, возвращается существующая запись.
+
+    Атомарность: read → append → write(tmp) → os.replace() под threading.Lock.
+
+    Args:
+        issue_type: Тип проблемы (duplicate, missing_field, edit_war, broken_link, conflicting)
+        knowledge_id: ID записи знаний
+        severity: Серьёзность (info, warn, critical)
+        detail: Детальное описание
+
+    Returns:
+        Issue: Созданная (или существующая) запись
+    """
+    issue_id = _make_issue_id(issue_type, knowledge_id, detail)
+    now = datetime.now(timezone.utc)
+
+    with _store_lock:
+        store_path = _get_store_path()
+        existing = _read_all_issues(store_path)
+
+        # Проверка на дубликат
+        for entry in existing:
+            if entry.get("issue_id") == issue_id:
+                logger.debug("Idempotent skip: issue %s already exists", issue_id)
+                return _issue_from_dict(entry)
+
+        # Новый issue
+        new_issue = Issue(
+            issue_id=issue_id,
+            type=issue_type,
+            knowledge_id=knowledge_id,
+            severity=severity,
+            detail=detail,
+            detected_at=now,
+            status="open",
+        )
+        existing.append(new_issue.model_dump(mode="json"))
+        _write_all_issues(store_path, existing)
+
+        logger.info(
+            "Created issue %s: type=%s knowledge_id=%s severity=%s",
+            issue_id, issue_type, knowledge_id, severity,
+        )
+        return new_issue
+
+
+def list_issues(
+    types: Optional[list[IssueType]] = None,
+    status: str = "open",
+    limit: int = 50,
+) -> list[Issue]:
+    """Получить список issues с фильтрацией.
+
+    Args:
+        types: Фильтр по типам (None = все типы)
+        status: Фильтр по статусу (open | resolved | ignored)
+        limit: Максимальное количество возвращаемых записей
+
+    Returns:
+        list[Issue]: Отфильтрованный список (новые первыми)
+    """
+    store_path = _get_store_path()
+    if not store_path.exists():
+        return []
+
+    with _store_lock:
+        all_issues = _read_all_issues(store_path)
+
+    result = []
+    for entry in reversed(all_issues):  # Новые первыми
+        if types is not None and entry.get("type") not in types:
+            continue
+        if entry.get("status") != status:
+            continue
+        result.append(_issue_from_dict(entry))
+        if len(result) >= limit:
+            break
+
+    return result
+
+
+def update_issue_status(
+    issue_id: str,
+    status: IssueStatus,
+    resolution: Optional[str] = None,
+) -> Optional[Issue]:
+    """Обновить статус issue (open → resolved | ignored).
+
+    При статусе resolved или ignored автоматически устанавливается resolved_at.
+
+    Args:
+        issue_id: ID проблемы
+        status: Новый статус (resolved | ignored)
+        resolution: Описание решения (опционально)
+
+    Returns:
+        Issue или None если issue_id не найден
+    """
+    if status not in ("resolved", "ignored"):
+        raise ValueError(f"Invalid target status: {status}. Expected 'resolved' or 'ignored'.")
+
+    now = datetime.now(timezone.utc)
+
+    with _store_lock:
+        store_path = _get_store_path()
+        all_issues = _read_all_issues(store_path)
+
+        updated = None
+        for entry in all_issues:
+            if entry.get("issue_id") == issue_id:
+                entry["status"] = status
+                entry["resolved_at"] = now.isoformat()
+                if resolution is not None:
+                    entry["resolution"] = resolution
+                updated = _issue_from_dict(entry)
+                break
+
+        if updated is None:
+            return None
+
+        _write_all_issues(store_path, all_issues)
+
+    logger.info("Updated issue %s: status=%s", issue_id, status)
+    return updated
