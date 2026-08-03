@@ -101,3 +101,61 @@
 - **Fix:** (1) `PROJECT_ROOT` now resolves from `$PWD` if `.board.md`/`.boardData.md` exist there, else falls back to script-relative for backwards compat. (2) `TMPL_DIR` searches project `.roo/tmpl/`, then script-adjacent `tmpl/`, then `SCRIPT_DIR/../../.roo/tmpl/` — canonical knowledge_base location, no template duplication across projects.
 - **Pattern:** Shared/canonical ops scripts must be **location-agnostic**: resolve target via current working directory, resolve shared assets via fallback chain relative to script. Never hardcode root from `SCRIPT_DIR`.
 - **Tags:** reusability, ops-script, script-path, project-root, template-fallback, anti-pattern
+
+### 6. [DOMAIN] Ollama embedder replaces sentence-transformers for air-gap quality
+
+**Теги:** `ollama`, `embeddings`, `air-gap`, `mxbai-embed-large`, `sentence-transformers`, `dependency-weight`
+
+**Инсайт:** Использование локального Ollama API (`mxbai-embed-large`, 669 MB) вместо `sentence-transformers` + `BGE-M3` (3 GB torch/transformers) для semantic duplicate detection. Преимущества: (1) ноль Python-зависимостей — только HTTP (httpx), (2) 4.5× меньше диска (669 MB vs 3 GB), (3) полная air-gap совместимость — Ollama работает офлайн, (4) hot-swap модели без перезапуска Python. Цена: +50-200ms latency на HTTP round-trip (приемлемо для pre-write gate).
+
+**Контекст:** Фаза 4, задача 4.3. `quality/embedder.py` — OllamaEmbedder с fallback-цепочкой: mxbai-embed-large (1024-dim) → nomic-embed-text (768-dim). `check_duplicates()` параметризован — любой эмбеддер с `.encode()` интерфейсом.
+
+**Когда применять:**
+- Air-gap/offline среды без PyPI доступа
+- Проекты где torch — неприемлемая зависимость (>3 GB)
+- Локальный Ollama уже используется для LLM — эмбеддинг «бесплатно»
+
+---
+
+### 7. [DOMAIN] 7-module quality package: separation of concerns for knowledge validation
+
+**Теги:** `quality`, `architecture`, `separation-of-concerns`, `modularization`, `ocp`
+
+**Инсайт:** Система качества знаний разбита на 7 независимых модулей по принципу «один модуль — одна отвественность»: `issues.py` (хранение), `gates.py` (валидация frontmatter), `dup_gate.py` (семантические дубли), `scoring.py` (чистая формула), `scanner.py` (оркестрация), `edit_war.py` (git-анализ), `lifecycle.py` (стейт-машина). Каждый модуль тестируется независимо (unit tests 116 шт.), интеграция — через `tools/quality.py` тонкие врапперы. OCP: новый механизм качества = новый модуль в `quality/` + handler в `tools/`.
+
+**Контекст:** Фаза 4, 10 задач. Архитектура выдержала 2 critic gate + brainstorm без переписывания — только дополнения.
+
+**Когда применять:**
+- Системы валидации/проверки с >3 независимыми правилами
+- Проекты где правила качества будут расширяться (OCP)
+- Требуется изоляция unit-тестов для каждого правила
+
+---
+
+### 8. [PROCEDURAL] Strategic: максимум кода без тяжёлых зависимостей, потом интеграция
+
+**Теги:** `strategy`, `dependencies`, `blocking`, `tdd`, `parallel-work`
+
+**Инсайт:** 80% кода Фазы 4 (issues, gates, scoring, scanner, edit-war, lifecycle, MCP tools) не требовали sentence-transformers/Qdrant/torch. Стратегия «пиши всё что можно на текущем venv, тяжёлые зависимости — параллельным фоном» дала: 4 задачи полностью завершены пока качался qdrant-client, 6 задач — пока разбирались конфликты версий sentence-transformers. Итог: 0 минут простоя в ожидании зависимостей.
+
+**Контекст:** Фаза 4, стратегическое решение при переходе от 4.2 к 4.5. `staleness_score()` — чистая функция (stdlib), `_are_dup_candidates()` — stdlib, `detect_edit_war()` — gitpython (лёгкий).
+
+**Когда применять:**
+- Проекты с тяжёлыми ML/GPU зависимостями
+- Когда установка deps может занять >10 минут
+- Чистые функции vs I/O-bound код разделены архитектурно
+
+---
+
+### 9. [PROCEDURAL] Brainstorm между Critic Gate и реализацией снимает архитектурные неопределённости
+
+**Теги:** `brainstorm`, `critic-gate`, `decision-making`, `architecture`, `ambiguity`
+
+**Инсайт:** После Critic Gate REVISE (0.83) с 2 P0-блокерами и 6 P1-рекомендациями — структурированный brainstorm (3 измерения по 2-4 варианта) занял 3 минуты Q&A и снял ВСЕ неопределённости до реализации. P0-фиксы применены к плану (merge-lock deadlock prevention, scan trigger архитектура), P1-рекомендации осознанно приняты/отклонены с обоснованием. Без брейншторма эти решения были бы приняты ad-hoc во время реализации с риском переделок.
+
+**Контекст:** Фаза 4, переход Critic v2 → реализация. 3 измерения: link_health HEAD-check (полноценно), Day 18 schedule (оставить), budget (из docs).
+
+**Когда применять:**
+- Critic вернул REVISE с ≥2 P0-блокерами
+- Есть ≥2 архитектурных альтернатив с разными tradeoffs
+- Решения влияют на несколько задач/дней реализации
