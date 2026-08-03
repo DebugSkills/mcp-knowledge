@@ -5,6 +5,7 @@
 - gates.py — pre-write frontmatter validation gate (4.2)
 - scoring.py — staleness_score чистая функция (4.5)
 - scanner.py — periodic quality scan оркестрация (4.5)
+- edit_war.py — git-based edit-war detection (4.4)
 """
 
 from __future__ import annotations
@@ -33,6 +34,12 @@ from .scoring import (
 from .scanner import (
     run_scan,
 )
+from .edit_war import (
+    detect_edit_war,
+    detect_all_edit_wars,
+    EDIT_WAR_WINDOW_H,
+    EDIT_WAR_THRESHOLD,
+)
 
 __all__ = [
     # issues (4.1)
@@ -55,4 +62,9 @@ __all__ = [
     "should_review",
     # scanner (4.5)
     "run_scan",
+    # edit_war (4.4)
+    "detect_edit_war",
+    "detect_all_edit_wars",
+    "EDIT_WAR_WINDOW_H",
+    "EDIT_WAR_THRESHOLD",
 ]
