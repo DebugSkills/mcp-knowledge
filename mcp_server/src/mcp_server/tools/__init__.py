@@ -14,7 +14,7 @@ from .read import get_entry, get_knowledge_map
 from .crud import write_knowledge, update_entry, delete_entry
 from .browse import list_domains, list_subjects, list_projects
 from .admin import reindex
-from .quality import review_queue, list_quality_issues, resolve_quality_issue
+from .quality import review_queue, list_quality_issues, resolve_quality_issue, run_quality_scan
 
 # ── JSON Schema fragments ──────────────────────────────────
 
@@ -146,6 +146,13 @@ _RESOLVE_QUALITY_ISSUE_SCHEMA: dict[str, Any] = {
     "required": ["issue_id", "action"],
 }
 
+_RUN_QUALITY_SCAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "domain": {"type": "string", "description": "Опционально: скан только одного домена"},
+    },
+}
+
 # ── Tool definitions ───────────────────────────────────────
 
 TOOLS: list[dict[str, Any]] = [
@@ -220,6 +227,11 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Разрешить проблему качества: merge (слить), deprecate (скрыть), restore (вернуть), resolve (исправлено), ignore (пропустить).",
         "inputSchema": _RESOLVE_QUALITY_ISSUE_SCHEMA,
     },
+    {
+        "name": "run_quality_scan",
+        "description": "Запустить периодический quality scan: обход всех .md → staleness_score → dup-pair detection → issues + review_queue. Для cron (4.8).",
+        "inputSchema": _RUN_QUALITY_SCAN_SCHEMA,
+    },
 ]
 
 # ── Handler dispatch table (реальные реализации) ───────────
@@ -240,4 +252,5 @@ TOOL_HANDLERS = {
     "review_queue": review_queue,
     "list_quality_issues": list_quality_issues,
     "resolve_quality_issue": resolve_quality_issue,
+    "run_quality_scan": run_quality_scan,
 }

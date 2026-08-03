@@ -1,4 +1,4 @@
-"""Quality MCP Tools — review_queue, list_quality_issues, resolve_quality_issue (4.6).
+"""Quality MCP Tools — review_queue, list_quality_issues, resolve_quality_issue, run_quality_scan (4.6+4.8).
 
 Thin wrappers: делегируют доменную логику в quality/ пакет.
 Регистрируются в tools/__init__.py → TOOLS + TOOL_HANDLERS.
@@ -10,7 +10,6 @@ import logging
 from typing import Any
 
 from mcp_server.quality.issues import list_issues, update_issue_status
-from mcp_server.quality.scoring import REVIEW_THRESHOLD, staleness_score, StalenessInput
 
 logger = logging.getLogger("mcp_knowledge.tools.quality")
 
@@ -196,3 +195,46 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
         return {"resolved": False, "error": str(exc)}
 
     return {"resolved": False, "error": f"Unknown action: {action}"}
+
+
+# ── 4.8: Cron-triggered scan ─────────────────────────────────
+
+async def run_quality_scan(params: dict, app_state) -> dict:
+    """Запускает периодический quality scan (для cron, 4.8).
+
+    Вызывает scanner.run_scan() — обход knowledge/**, вычисление
+    staleness_score, dup-pair detection, запись в Qdrant + issues.
+
+    Args:
+        params:
+            domain (optional): скан только одного домена
+    """
+    from mcp_server.quality.scanner import run_scan
+
+    domain = params.get("domain")
+
+    try:
+        knowledge_dir = app_state.settings.knowledge_dir if hasattr(app_state, 'settings') else None
+        qdrant_client = getattr(app_state, 'qdrant_client', None)
+
+        metrics = await run_scan(
+            knowledge_dir=knowledge_dir,
+            qdrant_client=qdrant_client,
+        )
+
+        logger.info(
+            "Quality scan: %d files, %d in review queue, %d dups, %d issues",
+            metrics["files_scanned"],
+            metrics["review_queue_size"],
+            metrics["duplicates_detected"],
+            metrics["issues_created"],
+        )
+
+        return {
+            "scanned": True,
+            "metrics": metrics,
+        }
+
+    except Exception as exc:
+        logger.error("run_quality_scan failed: %s", exc)
+        return {"scanned": False, "error": str(exc)}
