@@ -87,3 +87,10 @@
 
 ---
 **v1.0** | 2026-07-31 | Bootstrap: 5 записей из Фазы 2 MCP Server (2 доменных + 1 процедурный + 2 дополнительных доменных)
+
+## INSIGHT: critic-gate skill registration fix (2026-08-03)
+- **Problem:** Skill `critic-gate` exists on disk (`.kilo/skills/critic-gate/SKILL.md`, v1.6, 160 lines) but is NOT in system prompt `<available_skills>` (~40/61 skills registered). Critic role called `skill("critic-gate")` → "not found" → fallback to `critic-code-metrics` + `global-fpf`.
+- **Root cause:** System prompt token budget cutoff. 61 skills on disk, ~40 in available_skills. `critic-gate` excluded despite valid frontmatter with `modeSlugs: [critic, code-project-critic, media-critic, qa-critic]`.
+- **Fix:** Updated `roles/critic.yaml` v1.0→v1.1: replaced `skill("critic-gate")` with `skill("critic-code-metrics")` (code metrics) + `skill("global-fpf")` (FPF methodology). Inlined missing 60%: ecosystem criteria tables, confidence formula (5-axis A.19.ECS), verdict protocol (PASS/REVISE/PLATEAU), plateau rule, 7-step workflow. 
+- **Pattern:** When a skill is on disk but not in available_skills, workaround is: (a) inline essential protocol into role customInstructions, (b) load available complementary skills instead. Anti-pattern: keep referencing phantom skill.
+- **Tags:** critic-gate, skill-registration, ecosystem-error, role-architect, token-budget
