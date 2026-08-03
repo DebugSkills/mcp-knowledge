@@ -94,3 +94,10 @@
 - **Fix:** Updated `roles/critic.yaml` v1.0→v1.1: replaced `skill("critic-gate")` with `skill("critic-code-metrics")` (code metrics) + `skill("global-fpf")` (FPF methodology). Inlined missing 60%: ecosystem criteria tables, confidence formula (5-axis A.19.ECS), verdict protocol (PASS/REVISE/PLATEAU), plateau rule, 7-step workflow. 
 - **Pattern:** When a skill is on disk but not in available_skills, workaround is: (a) inline essential protocol into role customInstructions, (b) load available complementary skills instead. Anti-pattern: keep referencing phantom skill.
 - **Tags:** critic-gate, skill-registration, ecosystem-error, role-architect, token-budget
+
+## INSIGHT: Reusable ops scripts must resolve project root from $PWD (2026-08-03)
+- **Problem:** `clear_boards.sh` hardcoded `PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"` — rooted at the script's location (knowledge_base), not the current project. Running it from any other project silently cleared/wrote boards in knowledge_base instead of the target project.
+- **Root cause:** Two assumptions broke reusability: (1) project root computed from script path, (2) templates assumed in project-local `.roo/tmpl/` which most projects don't have.
+- **Fix:** (1) `PROJECT_ROOT` now resolves from `$PWD` if `.board.md`/`.boardData.md` exist there, else falls back to script-relative for backwards compat. (2) `TMPL_DIR` searches project `.roo/tmpl/`, then script-adjacent `tmpl/`, then `SCRIPT_DIR/../../.roo/tmpl/` — canonical knowledge_base location, no template duplication across projects.
+- **Pattern:** Shared/canonical ops scripts must be **location-agnostic**: resolve target via current working directory, resolve shared assets via fallback chain relative to script. Never hardcode root from `SCRIPT_DIR`.
+- **Tags:** reusability, ops-script, script-path, project-root, template-fallback, anti-pattern
