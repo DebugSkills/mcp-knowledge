@@ -6,6 +6,8 @@
 - scoring.py — staleness_score чистая функция (4.5)
 - scanner.py — periodic quality scan оркестрация (4.5)
 - edit_war.py — git-based edit-war detection (4.4)
+- dup_gate.py — semantic duplicate detection (4.3)
+- lifecycle.py — 2-state lifecycle published|deprecated (4.7)
 """
 
 from __future__ import annotations
@@ -40,6 +42,20 @@ from .edit_war import (
     EDIT_WAR_WINDOW_H,
     EDIT_WAR_THRESHOLD,
 )
+from .dup_gate import (
+    compute_cosine,
+    find_duplicates,
+    check_duplicates,
+    DUP_SIMILARITY_THRESHOLD,
+)
+from .lifecycle import (
+    get_status,
+    build_search_filter,
+    validate_transition,
+    make_deprecation_payload_update,
+    make_restore_payload_update,
+    make_published_payload_update,
+)
 
 __all__ = [
     # issues (4.1)
@@ -67,4 +83,16 @@ __all__ = [
     "detect_all_edit_wars",
     "EDIT_WAR_WINDOW_H",
     "EDIT_WAR_THRESHOLD",
+    # dup_gate (4.3)
+    "compute_cosine",
+    "find_duplicates",
+    "check_duplicates",
+    "DUP_SIMILARITY_THRESHOLD",
+    # lifecycle (4.7)
+    "get_status",
+    "build_search_filter",
+    "validate_transition",
+    "make_deprecation_payload_update",
+    "make_restore_payload_update",
+    "make_published_payload_update",
 ]
