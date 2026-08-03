@@ -1,12 +1,13 @@
 # 📊 ФАЗА 5: Content Preprocessor Pipeline — модульный импорт крупных текстов
 
-> **trace_id:** `code-2026-07-21-001` | **Автор:** analyst | **Дата:** 2026-07-29
-> **Версия:** 1.0 | **Статус:** готов к реализации (post-брейншторм, архитектура согласована)
+> **trace_id:** `code-2026-08-03-162` | **Автор:** analyst | **Дата:** 2026-08-03 (обновление v1.1)
+> **Версия:** 1.1 | **Статус:** готов к реализации (после Critic Gate v2 — PASS 0.85)
 > **Родительский план:** [`00-implementation-plan.md`](00-implementation-plan.md) **v3.1** (расширение, НЕ замена)
-> **Зависимости:** Фазы 0–3 (особенно #2 Markdown SSOT, #3/#17 in-process BGE-M3 embedder, #19 reconciliation, #20 XLM-RoBERTa токенайзер, #21 git-аудит, #22 quality gates из Фазы 4)
+> **Зависимости:** Фазы 0–4 (особенно #2 Markdown SSOT, #3/#17 in-process BGE-M3 embedder, #19 reconciliation, #20 XLM-RoBERTa токенайзер, #21 git-аудит, #22 quality gates из Фазы 4 — реализованы)
 >
 > **История версий:**
 > - **v1.0** (2026-07-29) — базовый план Фазы 5: 4 решения (#33–#36), 6 задач (5.1–5.6), ~30 ч. Модульная архитектура `ContentPreprocessor` (ABC) + registry; `BookPreprocessor` — первая реализация. Гибридное семантическое разбиение (structural → embedding clustering → recursive split). Parent-child коллекции. Best-effort batch + orphan cleanup (переиспользует reconciliation #19). Архитектурные решения приняты на брейншторме оператором.
+> - **v1.1** (2026-08-03) — **обновление по результатам codebase audit + Critic Gate v2** (trace_id `code-2026-08-03-162`). План написан до реализации Ф4 и содержал 22 расхождения с реальным кодом (5 critical, 9 medium, 8 low) + P0-блокер schema.py payload pathway. Исправлено: пути (`mcp/tools.py` → `tools/` пакет, tool #13 → **#16**), 4 parent-child поля модели, `"orphaned"` в IssueType, `orphaned_detected` в ReconcileResult, P0 schema.py payload wiring, зависимости (nltk/yake/sklearn), бюджет **30h → 34.5h**. A.19.ECS: 0.697 → 0.876 (консенсус Critic: 0.867). См. §13 «Лог правок v1.1».
 >
 > **Ключевой вопрос:** *как импортировать большие неструктурированные тексты (книги, будущие PDF, дампы документации) в SSOT, сохранив качество retrieval и не сломав single-record write-контракт?*
 > **Краткий ответ:** отдельный MCP Tool `import_content` + модульные препроцессоры (`content_type → preprocessor`) + гибридное разбиение на семантические секции + parent-child связывание (`collection` root) + best-effort batch с orphan cleanup через reconciliation. См. §1 FPF-обоснование.
@@ -27,6 +28,7 @@
 10. [Roadmap-слайс (4 дня)](#10-roadmap-слайс-4-дня)
 11. [Known limitations — что НЕ покрывается](#11-known-limitations--что-не-покрывается)
 12. [Интеграция с существующей архитектурой (не ломаем)](#12-интеграция-с-существующей-архитектурой-не-ломаем)
+13. [Лог правок v1.1 (codebase audit + Critic Gate v2)](#13-лог-правок-v11-codebase-audit--critic-gate-v2)
 
 ---
 
@@ -68,7 +70,7 @@
 
 ### 1.3 A.10 — Evidence Graph: почему выбран именно этот набор
 
-**Выбранный набор (≤30 ч):** отдельный `import_content` tool + модульные препроцессоры + гибридное разбиение (D) + parent-child коллекции + best-effort batch.
+**Выбранный набор (≤34.5 ч):** отдельный `import_content` tool + модульные препроцессоры + гибридное разбиение (D) + parent-child коллекции + best-effort batch.
 
 **Цепочка доказательств «за»:**
 
@@ -96,7 +98,7 @@
 **Цель:** Внедрить **модульную систему импорта крупных неструктурированных текстов** (книги, будущие PDF, дампы документации) в SSOT: декомпозиция на семантические секции, авто-gen frontmatter (вкл. теги через TF-IDF/YAKE), parent-child связывание в коллекции, и best-effort batch-загрузка с orphan cleanup. Всё — на базе существующих активов, **без** новой инфраструктуры хранения.
 
 **Приоритет:** 🟠 MEDIUM (после работающего MVP Фаз 0–3; **не блокирует** MVP). Зависит от #2, #3/#17, #7, #19, #20, #21, #22 (Ф4 — желательно, но orphan-issue можно логировать и без quality-gate).
-**Трудозатраты:** **~30 ч** (≈ 4 дня); **P0-ядро = 23 ч** (минимальный viable набор — рабочий `import_content` + `BookPreprocessor` + гибридное разбиение + тесты; без orphan-detection в reconciliation и без batch-recovery контракта).
+**Трудозатраты:** **~34.5 ч** (≈ 4.5 дня); **P0-ядро = 27 ч** (рабочий `import_content` + `BookPreprocessor` + гибридное разбиение + тесты; без orphan-detection в reconciliation и без batch-recovery контракта). *v1.0: 30h → v1.1: 34.5h (+4.5h на адаптацию к реальному коду: paths, model fields, schema.py payload, deps).*
 **Новые решения:** **#33** `import_content` MCP Tool · **#34** Hybrid Semantic Splitting · **#35** Parent-Child Collection Linking · **#36** Best-Effort Batch + Orphan Cleanup
 
 | # | Приоритет | Решение | Детали | Покрытие |
@@ -178,8 +180,9 @@ mcp_server/src/mcp_server/
 │   ├── splitting.py                     # Hybrid splitting: structural + clustering + recursive
 │   ├── keywords.py                      # TF-IDF / YAKE keyword extraction → tags
 │   └── linking.py                       # Parent-child collection model (root TOC + children)
-├── mcp/
-│   └── tools.py                         # + import_content tool (#13 в реестре)
+├── tools/
+│   ├── content.py                       # 🆕 import_content tool handler (#16 в реестре)
+│   └── __init__.py                      # TOOLS + TOOL_HANDLERS (реальный паттерн регистрации)
 └── indexing/
     └── reconcile.py                     # + orphan detection (augmented #19)
 ```
@@ -216,37 +219,37 @@ class ContentPreprocessor(ABC):
 
 | # | Задача | Решение | Детали | Файлы |
 |---|--------|:-------:|--------|-------|
-| **5.1** | Preprocessor interface + registry + `import_content` tool | #33 [P0] | `ContentPreprocessor` ABC (`validate()` + `decompose()` → `list[Section]`). `content/registry.py`: dict `content_type → preprocessor`, lookup с fallback на `ValueError("unknown content_type")` + список доступных типов в сообщении. MCP Tool `import_content` (§5): валидация → `registry.get(content_type).decompose()` → linking (#35) → batch write (reuse markdown_store + pipeline #7). Права: **write**. **Reuse:** markdown_store (#2), git (#21), pipeline (#7) — без дублей. | [`content/preprocessor.py`](mcp_server/src/mcp_server/content/preprocessor.py), [`content/registry.py`](mcp_server/src/mcp_server/content/registry.py), [`mcp/tools.py`](mcp_server/src/mcp_server/mcp/tools.py) |
+| **5.1** | Preprocessor interface + registry + `import_content` tool | #33 [P0] | `ContentPreprocessor` ABC (`validate()` + `decompose()` → `list[Section]`). `content/registry.py`: dict `content_type → preprocessor`, lookup с fallback на `ValueError("unknown content_type")` + список доступных типов в сообщении. MCP Tool `import_content` (§5): валидация → `registry.get(content_type).decompose()` → linking (#35) → batch write (reuse markdown_store + pipeline #7). Права: **write**. **Reuse:** markdown_store (#2), git (#21), pipeline (#7) — без дублей. **Регистрация:** `tools/content.py` + TOOLS/TOOL_HANDLERS в `tools/__init__.py` (tool **#16**). | [`content/preprocessor.py`](mcp_server/src/mcp_server/content/preprocessor.py), [`content/registry.py`](mcp_server/src/mcp_server/content/registry.py), [`tools/content.py`](mcp_server/src/mcp_server/tools/content.py), [`tools/__init__.py`](mcp_server/src/mcp_server/tools/__init__.py) |
 | **5.2** | `BookPreprocessor`: structural parsing + auto-frontmatter + keyword extraction | #33/#35 [P0] | Реализация для `content_type="book"`. **Structural parse** (stage 1): regex/MD-парсинг заголовков `#`/`##`/`###` → секции (заголовок + тело до след. заголовка). **Auto-frontmatter:** `knowledge_id` = `{domain}-{subject}-{slug(title)}-{seq}` (slug kebab-case, транслит кириллицы); `title` = ближайший заголовок (или авто «Раздел N»); `domain`/`subject`/`tags` унаследованы из import params; `created_at`/`updated_at` = now. **Keyword extraction** (`keywords.py`, §6.4): TF-IDF (корпус = все секции книги) **и/или** YAKE → top-N (default 5) ключевых слов → candidate tags (kebab-case, стоп-слова RU+EN, дедуп с inherited). | [`content/book_preprocessor.py`](mcp_server/src/mcp_server/content/book_preprocessor.py), [`content/keywords.py`](mcp_server/src/mcp_server/content/keywords.py) |
 | **5.3** | Hybrid semantic splitting: embedding clustering + recursive split | #34 [P0] | [`content/splitting.py`](mcp_server/src/mcp_server/content/splitting.py). **Stage 2 (fallback):** если structural-parse дал < `MIN_SECTIONS` ИЛИ есть oversized-секция → paragraph embedding (reuse in-process BGE-M3 #3/#17, через `run_in_executor` #1.6 — не блокировать event loop) → cosine similarity matrix相邻них абзацев → agglomerative clustering (порог `CLUSTER_COSINE`, default 0.75, калибруется в тестах) → группировка смежных похожих абзацев в чанки. **Stage 3 (recursive):** любой чанк > `max_chunk_tokens` (512 XLM-R #20) → recursive split по границам предложений (sent_tokenize, RU+EN) до ≤ лимита. **Гарантия:** после всех стадий **каждая секция ≤ max_chunk_tokens**. | [`content/splitting.py`](mcp_server/src/mcp_server/content/splitting.py) |
 | **5.4** | Parent-child linking + orphan detection в reconciliation | #35/#36 [P1] | [`content/linking.py`](mcp_server/src/mcp_server/content/linking.py): создание root-collection записи (`content_type: "collection"`, TOC `children[]`) + проставление `parent_knowledge_id`/`sequence_number` на детях. **Orphan detection** — augment [`indexing/reconcile.py`](mcp_server/src/mcp_server/indexing/reconcile.py) (#19): в существующем проходе `knowledge/**/*.md` доп. проверка — (а) запись с `parent_knowledge_id`, где parent-файл отсутствует → issue `orphaned`; (б) `content_type: collection` с incomplete children (child missing/deleted) → WARN. Issues → `data/quality/issues.jsonl` (Ф4, fcntl.flock §4.1). Лог reconcile дополняется: `{..., orphaned_detected}`. | [`content/linking.py`](mcp_server/src/mcp_server/content/linking.py), [`indexing/reconcile.py`](mcp_server/src/mcp_server/indexing/reconcile.py) |
-| **5.5** | Batch best-effort: partial_success контракт + orphan cleanup | #36 [P1] | `import_content` обрабатывает секции в цикле (batch write). **Partial failure:** секция падает (embed/store error) → catch → запись в `failed_sections[{sequence_number, title, error}]`, остальные продолжают. **Контракт возврата** (§5): `{collection_id, imported, failed, failed_sections[], partial_success, indexed}`. **Batch git-commit** (#21): 1 коммит на N секций (default `IMPORT_BATCH_COMMIT=10`), не 1 коммит/секция (производительность массового импорта). **Orphan cleanup action:** `?cleanup_orphans=true` (опц.) — при partial_success/interrupt удалить осиротевших детей через `delete_entry` (soft-delete + Qdrant + git). Default: только логировать (безопаснее). | [`mcp/tools.py`](mcp_server/src/mcp_server/mcp/tools.py), [`content/linking.py`](mcp_server/src/mcp_server/content/linking.py) |
+| **5.5** | Batch best-effort: partial_success контракт + orphan cleanup | #36 [P1] | `import_content` обрабатывает секции в цикле (batch write). **Partial failure:** секция падает (embed/store error) → catch → запись в `failed_sections[{sequence_number, title, error}]`, остальные продолжают. **Контракт возврата** (§5): `{collection_id, imported, failed, failed_sections[], partial_success, indexed}`. **Batch git-commit** (#21): 1 коммит на N секций (default `IMPORT_BATCH_COMMIT=10`), не 1 коммит/секция (производительность массового импорта). **Orphan cleanup action:** `?cleanup_orphans=true` (опц.) — при partial_success/interrupt удалить осиротевших детей через `delete_entry` (soft-delete + Qdrant + git). Default: только логировать (безопаснее). | [`tools/content.py`](mcp_server/src/mcp_server/tools/content.py), [`content/linking.py`](mcp_server/src/mcp_server/content/linking.py) |
 | **5.6** | Тесты: structural book, plain text без заголовков, oversized секции, batch interrupt recovery | — [P0] | Unit: `splitting` (structural → секции; clustering → группы; recursive → ≤512 токенов), `keywords` (TF-IDF/YAKE на русском, стоп-слова, top-N), `linking` (root TOC + children sequence), `registry` (lookup/fallback). Integration: `import_content(book)` end-to-end → N записей в SSOT + Qdrant + git-коммиты; `get_entry(collection_id)` → TOC с детьми; orphan: удалить root-файл вручную → reconcile → issue `orphaned`. E2E-кейсы: (1) **структурная книга** (ясные #/##) — чистая декомпозиция; (2) **plain text без заголовков** — fallback на clustering; (3) **oversized секции** (>512 токенов) — recursive split; (4) **batch interrupt** (симуляция падения 1 секции) — `partial_success:true`, остальные LIVE, orphan cleanup. | `tests/unit/test_content_*.py`, `tests/integration/test_import_flow.py`, `tests/e2e/test_import_content.py` |
 
 ### Бюджет по задачам
 
-| # | Задача | Приоритет | Ч/ч | Обоснование |
-|---|--------|:---------:|:--:|-------------|
-| 5.1 | Preprocessor interface + registry + `import_content` tool | P0 | **4** | ABC + registry + tool-клей; heavy-reuse write-path |
-| 5.2 | `BookPreprocessor`: structural parse + auto-frontmatter + keywords | P0 | **6** | regex-парсер + slug-ген + TF-IDF/YAKE интеграция |
-| 5.3 | Hybrid splitting: clustering + recursive | P0 | **8** | cosine matrix + agglomerative clustering + recursive split (самая ёмкая) |
-| 5.4 | Parent-child linking + orphan detection | P1 | **4** | TOC-модель + augment reconcile (#19) |
-| 5.5 | Batch best-effort + orphan cleanup | P1 | **3** | partial-failure loop + cleanup action |
-| 5.6 | Тесты (4 E2E-кейса + unit) | P0 | **5** | structural/plain/oversized/interrupt на русском |
-| | **ИТОГО** | | **30** | |
-| | **P0-ядро** (5.1, 5.2, 5.3, 5.6) | | **23** | минимальный viable: рабочий импорт + разбиение + тесты, без orphan-detection/batch-recovery |
+| # | Задача | Приоритет | Ч/ч (v1.1) | Ч/ч (v1.0) | Δ | Обоснование Δ |
+|---|--------|:---------:|:--:|:--:|:--:|-------------|
+| 5.1 | Preprocessor interface + registry + `import_content` tool | P0 | **4.5** | 4 | +0.5 | адаптация к `tools/` пакету + tool #16 регистрация |
+| 5.2 | `BookPreprocessor`: structural parse + auto-frontmatter + keywords | P0 | **7** | 6 | +1.0 | deps-check (nltk/yake fallback) + keywords TF-IDF |
+| 5.3 | Hybrid splitting: clustering + recursive | P0 | **8.5** | 8 | +0.5 | embed_sync API + Ollama fallback |
+| 5.4 | Parent-child linking + orphan detection | P1 | **5** | 4 | +1.0 | 4 поля модели + IssueType orphaned + orphaned_detected + schema.py payload |
+| 5.5 | Batch best-effort + orphan cleanup | P1 | **3** | 3 | 0 | без изменений |
+| 5.6 | Тесты (4 E2E-кейса + unit) | P0 | **6.5** | 5 | +1.5 | schema.py payload wiring + async fixtures + deps mocks |
+| | **ИТОГО** | | **34.5** | 30 | **+4.5** | адаптация к реальному коду Ф0–Ф4 |
+| | **P0-ядро** (5.1, 5.2, 5.3, 5.6) | | **27** | 23 | +4 | минимальный viable: рабочий импорт + разбиение + тесты, без orphan-detection/batch-recovery |
 
-> **Минимальный viable набор (P0, 23 ч)** уже даёт рабочий `import_content`: структурная книга → N записей с auto-frontmatter + тегами + гибридное разбиение (вкл. fallback для plain text). P1-задачи (5.4, 5.5) добавляют коллекции/навигацию и устойчивость к partial failure, но не блокируют базовую ценность.
+> **Минимальный viable набор (P0, 27 ч)** уже даёт рабочий `import_content`: структурная книга → N записей с auto-frontmatter + тегами + гибридное разбиение (вкл. fallback для plain text). P1-задачи (5.4, 5.5) добавляют коллекции/навигацию и устойчивость к partial failure, но не блокируют базовую ценность. *Бюджет пересчитан в v1.1 (+4.5h) на адаптацию к реальному коду Ф0–Ф4 (пути, model fields, schema.py payload, deps).*
 
 ---
 
 ## 5. Новый MCP Tool: `import_content`
 
-> В дополнение к 12 Tools (9 base v3.0 + 3 quality из [`04-phase4`](04-phase4-knowledge-quality.md) §5). Всего Tools после Ф5: **13**.
+> В дополнение к 15 Tools (11 base v3.0 + 4 quality из [`04-phase4`](04-phase4-knowledge-quality.md) §5). Всего Tools после Ф5: **16**. *v1.0: 12 → 13 (неверно — план считал 9 base tools; реально 11 base + 4 quality = 15).*
 
 | # | Tool | Сигнатура | Права | Решение |
 |---|------|-----------|:-----:|:-------:|
-| 13 | `import_content` | `(content: str, content_type: str, domain: str, subject: str, project?: str, title?: str, tags?: str[], cross_subjects?: str[], max_chunk_tokens?: int=512, wait_for_index?: bool=false, cleanup_orphans?: bool=false)` → `{collection_id, imported: int, failed: int, failed_sections: [{sequence_number, title, error}], partial_success: bool, indexed: bool, pending?: bool}` | **write** | #33–#36 |
+| 16 | `import_content` | `(content: str, content_type: str, domain: str, subject: str, project?: str, title?: str, tags?: str[], cross_subjects?: str[], max_chunk_tokens?: int=512, wait_for_index?: bool=false, cleanup_orphans?: bool=false)` → `{collection_id, imported: int, failed: int, failed_sections: [{sequence_number, title, error}], partial_success: bool, indexed: bool, pending?: bool, quality_report?: dict}` | **write** | #33–#36 |
 
 **Семантика параметров:**
 
@@ -446,16 +449,18 @@ IMPORT_BATCH_COMMIT = 10         # секций на 1 git-коммит (#21, п
 > При условии 1 backend-разработчика (8 ч/д). Фаза 5 идёт **после** M3 (Фазы 0–3) из [`00-implementation-plan.md`](00-implementation-plan.md) §12. **Не блокирует MVP.** Может идти параллельно с Фазой 4 при 2 разработчиках (нет общих файлов, кроме augment reconcile #19 — координировать задачу 5.4).
 
 ```
-Фаза 5 (дни 20-23, после Production M3) — v1.0   (~30 ч / ~4 дня при 8 ч/д)
-├─ День 20:  5.1 Preprocessor ABC + registry + import_content tool [4 ч]
-│            + 5.2 structural parse + auto-frontmatter (часть)     [4 ч] ✅ фундамент           [8 ч]
-├─ День 21:  5.2 keywords (TF-IDF/YAKE) + auto-tags (завершение)   [2 ч]
-│            + 5.3 hybrid splitting: clustering (часть)            [6 ч] ✅ M5a: рабочий импорт  [8 ч]
-├─ День 22:  5.3 recursive split (завершение)                      [2 ч]
-│            + 5.4 linking + orphan detection                      [4 ч]
-│            + 5.5 batch best-effort (часть)                       [2 ч] ✅ M5b: hybrid split    [8 ч]
-└─ День 23:  5.5 partial_success + cleanup (завершение)            [1 ч]
-             5.6 тесты (4 E2E-кейса на русском)                    [5 ч] ✅ M5: Content Import    [6 ч]
+Фаза 5 (дни 20-24, после Production M3) — v1.1   (~34.5 ч / ~4.5 дня при 8 ч/д)
+├─ День 20:  5.1 Preprocessor ABC + registry + import_content tool [4.5 ч]
+│            + 5.2 structural parse + auto-frontmatter (часть)     [3.5 ч] ✅ фундамент           [8 ч]
+├─ День 21:  5.2 keywords (TF-IDF) + auto-tags (завершение)        [3.5 ч]
+│            + 5.3 hybrid splitting: clustering (часть)            [4.5 ч] ✅ M5a: рабочий импорт  [8 ч]
+├─ День 22:  5.3 recursive split (завершение)                      [4 ч]
+│            + 5.4 linking + orphan detection (model+IssueType)    [4 ч] ✅ M5b: hybrid split    [8 ч]
+├─ День 23:  5.4 schema.py payload + reconcile augment (заверш.)   [1 ч]
+│            + 5.5 batch best-effort + cleanup                     [3 ч]
+│            + 5.6 тесты (часть)                                   [4 ч] ✅ M5: Content Import   [8 ч]
+└─ День 24:  5.6 тесты (завершение) + deps/fallback верификация    [2.5 ч]
+             + буфер (deps, air-gap, docs)                         [5.5 ч]                       [8 ч]
 ```
 
 ### Вехи
@@ -490,13 +495,15 @@ IMPORT_BATCH_COMMIT = 10         # секций на 1 git-коммит (#21, п
 | Где | Изменение | Совместимость |
 |-----|-----------|---------------|
 | `write_knowledge`/`update_entry` (#5) | **Без изменений.** `import_content` — отдельный tool; вызывает markdown_store/pipeline под капотом | ✅ single-record контракт не тронут |
-| Markdown SSOT (#2) | + 3 аддитивных frontmatter-поля (`parent_knowledge_id`, `sequence_number`, `content_type`); absent = обычная запись | ✅ backward-compatible |
+| Markdown SSOT (#2) | + 4 аддитивных frontmatter-поля (`parent_knowledge_id`, `sequence_number`, `content_type`, `children`); absent = обычная запись (Optional, default None) | ✅ backward-compatible |
+| `KnowledgeFrontmatter` (models.py) | + `parent_knowledge_id: Optional[str]`, `sequence_number: Optional[int]`, `content_type: Optional[str]`, `children: Optional[list[dict]]` (после поля `source`) | ✅ аддитивно; `exclude_none=True` в model_dump (markdown_store.py:233) — существующие записи не затрагиваются |
 | Qdrant payload-схема (задача 1.3) | + индексируемые поля `parent_knowledge_id(str)`, `content_type(str)` | ✅ аддитивно; `search_by_tags`/`get_knowledge_map` работают без изменений |
+| **`storage/schema.py` (P0-фикс v1.1)** | **`build_payload_point()` (schema.py:82-111) использует hardcoded payload — новые поля НЕ попадут в Qdrant автоматически.** Обновить: `PAYLOAD_SCHEMA` (26-37), `PAYLOAD_INDEXES` (40-47), `build_payload_point()` payload dict, callers (pipeline.py:359,434; cli.py:124) | ✅ без этого поля Ф5 будут в YAML, но не в Qdrant (SSOT-Qdrant inconsistency) |
 | Async indexing pipeline (#7) | **Без изменений.** Import готовит секции → та же очередь (chunk → embed → Qdrant) | ✅ reuse |
-| In-process embedder (#3/#17) | Reuse в splitting (clustering) через `run_in_executor` (#1.6) | ✅ synergy (E3) |
-| Reconciliation (#19) | + orphan detection (ещё одна проверка в существующем проходе) | ✅ augment, не rewrite |
-| Quality gates (#22, Ф4) | per-section advisory (дубли/missing) — работают на каждой секции импорта | ✅ reuse |
-| Issues.jsonl (Ф4 §4.1) | + тип `orphaned` для parent-child проблем | ✅ аддитивно (тип уже зарезервирован в Ф4 §6.2) |
+| In-process embedder (#3/#17) | Reuse в splitting (clustering) через `run_in_executor` (#1.6). API: `EmbeddingManager.embed_sync(texts) → list[list[float]]` (manager.py:75). Fallback air-gap: `OllamaEmbedder` (quality/embedder.py) | ✅ synergy (E3) |
+| Reconciliation (#19) | + orphan detection (ещё одна проверка в существующем проходе) + поле `orphaned_detected` в `ReconcileResult` (reconcile.py:28-45) | ✅ augment, не rewrite |
+| Quality gates (#22, Ф4) | per-section advisory (дубли/missing) — работают на каждой секции импорта. API: `evaluate_frontmatter()` (gates.py:118), `check_duplicates()` (dup_gate.py:77) | ✅ reuse |
+| Issues.jsonl (Ф4 §4.1) | + тип `orphaned` — **НЕ зарезервирован в Ф4 §6.2** (реальный IssueType: duplicate\|missing_field\|edit_war\|broken_link\|conflicting). Добавить в Literal (issues.py:72), schema enum (tools/__init__.py:126), docstring | ⚠️ v1.0 утверждал неверно; v1.1 фиксирует |
 | Git-аудит (#21) | Batch-commit (1 на N секций) под `asyncio.Lock` (задача 1.1) | ✅ consistency |
 | `/metrics` (#2.13) | + `import_content_*`, `orphans_detected_total` | ✅ аддитивно |
 | INDEX.gen.yaml (#30) | Коллекции/дети — обычные `.md`; INDEX их индексирует (теги `content_type` доступны) | ✅ без изменений |
@@ -504,4 +511,32 @@ IMPORT_BATCH_COMMIT = 10         # секций на 1 git-коммит (#21, п
 
 ---
 
-> **FPF-методология:** C.30 (Grounded Architecture — переиспользование BGE-M3/XLM-R/SSOT/#7/#19/#21/Ф4 вместо новой инфраструктуры), A.22 (Structure Views — декомпозиция «импорта» на validate/decompose/split/link/batch + явные границы non-coverage), A.19.ECS (оценка 4 стратегий разбиения по 6 критериям, §1.2), A.10 (Evidence Graph — E1–E6 «за», C1–C3 «против» транзакций/LLM/PDF, §1.3). Бюджет 30 ч выполнен; P0-ядро 23 ч даёт рабочий `import_content` даже без коллекций/orphan-detection. Фаза 5 идёт после MVP, не блокирует; может параллелиться с Ф4.
+## 13. Лог правок v1.1 (codebase audit + Critic Gate v2)
+
+> **trace_id:** `code-2026-08-03-162` | **Дата:** 2026-08-03 | **A.19.ECS:** 0.697 → 0.876 (консенсус Critic: 0.867, PASS 0.85)
+
+**22 расхождения план ↔ реальный код устранены (5 critical, 9 medium, 8 low):**
+
+| # | Правка | Severity |
+|---|--------|:--------:|
+| 1 | `mcp/tools.py` → `tools/content.py` + `tools/__init__.py` (TOOLS+TOOL_HANDLERS) | 🔴 |
+| 2 | Tool count: план 12→13, реально 15→16 | 🟠 |
+| 3 | 4 parent-child поля модели (`parent_knowledge_id`, `sequence_number`, `content_type`, `children`) | 🔴 |
+| 4 | `"orphaned"` в IssueType — НЕ был зарезервирован (v1.0 неверно утверждал) | 🔴 |
+| 5 | `orphaned_detected` в ReconcileResult (reconcile.py:28-45) | 🟠 |
+| 6 | **P0: `schema.py:build_payload_point()` hardcoded** — новые поля не попадут в Qdrant; обновить PAYLOAD_SCHEMA/INDEXES/fn/callers | 🔴 |
+| 7 | Embedder API: `EmbeddingManager.embed_sync()` (не `.encode()`) | 🟠 |
+| 8 | OllamaEmbedder (air-gap, quality/embedder.py) — не упомянут в v1.0 | 🟡 |
+| 9 | `status`/`evergreen`/`source` — уже есть в модели (Ф4), v1.0 предполагал отсутствие | 🟡 |
+| 10 | Токенайзер: `embedding/tokenizer.py` (не `indexing/chunker.py`) | 🟡 |
+| 11 | Prompts: 3 (не 2) — Ф4 добавил `periodic_quality_cleanup` | 🟡 |
+| 12 | `create_issue_async()` — orphan detection из async reconcile должен вызывать async-обёртку | 🟡 |
+| 13-22 | 10 остальных правок (пути, сигнатуры, docstrings, counts) | 🟡 |
+
+**Зависимости (проверены в pyproject.toml):** `scikit-learn` ✅ (transitive через sentence-transformers); `nltk` ❌, `yake` ❌ — **fallback**: свой simple cosine-clustering вместо sklearn (или vendor), simple split по ". " вместо nltk.sent_tokenize, TF-IDF через sklearn. Добавить в deps при реализации (или документировать fallback).
+
+**Бюджет:** 30h → **34.5h** (+4.5h: paths 0.5h, model fields 1h, schema.py payload 0.5h, deps/fallback 0.5h, async fixtures 0.5h, quality_report +1.5h в тестах).
+
+---
+
+> **FPF-методология:** C.30 (Grounded Architecture — переиспользование BGE-M3/XLM-R/SSOT/#7/#19/#21/Ф4 вместо новой инфраструктуры), A.22 (Structure Views — декомпозиция «импорта» на validate/decompose/split/link/batch + явные границы non-coverage), A.19.ECS (оценка 4 стратегий разбиения по 6 критериям, §1.2), A.10 (Evidence Graph — E1–E6 «за», C1–C3 «против» транзакций/LLM/PDF, §1.3). Бюджет v1.1: 34.5 ч; P0-ядро 27 ч даёт рабочий `import_content` даже без коллекций/orphan-detection. Фаза 5 идёт после MVP, не блокирует; может параллелиться с Ф4.

@@ -69,7 +69,7 @@ def get_issues_store_path() -> Path:
 
 # ── Типы ────────────────────────────────────────────────────
 
-IssueType = Literal["duplicate", "missing_field", "edit_war", "broken_link", "conflicting"]
+IssueType = Literal["duplicate", "missing_field", "edit_war", "broken_link", "conflicting", "orphaned"]
 IssueSeverity = Literal["info", "warn", "critical"]
 IssueStatus = Literal["open", "resolved", "ignored"]
 

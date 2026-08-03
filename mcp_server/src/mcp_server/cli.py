@@ -135,6 +135,8 @@ async def dlq_replay():
                             section_header=ch.section_header,
                             chunk_index=ch.chunk_index,
                             updated_at=fm.updated_at.isoformat(),
+                            parent_knowledge_id=getattr(fm, "parent_knowledge_id", None),
+                            content_type=getattr(fm, "content_type", None),
                         )
                         points.append(point)
                     qdrant.upsert_points(points)

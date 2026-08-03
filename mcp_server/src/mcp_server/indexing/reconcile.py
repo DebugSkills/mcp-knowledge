@@ -6,7 +6,8 @@ Flow:
 1. Обход knowledge/**/*.md → сравнение updated_at с Qdrant payload
 2. Расхождения → доиндексация (через pipeline.reindex_all)
 3. Обратная сверка: Qdrant-точки без .md → удаление сирот
-4. Лог: {checked, reindexed, skipped, deleted_orphans}
+4. Фаза 5: parent-child orphan detection (child без parent, collection incomplete)
+5. Лог: {checked, reindexed, skipped, deleted_orphans, orphaned_detected}
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ class ReconcileResult:
         self.reindexed: int = 0
         self.skipped: int = 0
         self.deleted_orphans: int = 0
+        self.orphaned_detected: int = 0  # Фаза 5: parent-child orphans
         self.errors: list[str] = []
 
     def to_dict(self) -> dict:
@@ -41,6 +43,7 @@ class ReconcileResult:
             "reindexed": self.reindexed,
             "skipped": self.skipped,
             "deleted_orphans": self.deleted_orphans,
+            "orphaned_detected": self.orphaned_detected,
             "errors": self.errors,
         }
 
@@ -125,10 +128,92 @@ async def reconcile(
         result.errors.append(msg)
         logger.warning("RECONCILE: %s", msg)
 
+    # ── Шаг 4: Parent-child orphan detection (Фаза 5) ────────────────
+    await _detect_parent_child_orphans(store, md_paths, result)
+
     summary = result.to_dict()
     logger.info(
-        "✅ RECONCILE complete: checked=%d, reindexed=%d, skipped=%d, orphans=%d, errors=%d",
+        "✅ RECONCILE complete: checked=%d, reindexed=%d, skipped=%d, "
+        "orphans=%d, orphaned_detected=%d, errors=%d",
         result.checked, result.reindexed, result.skipped,
-        result.deleted_orphans, len(result.errors),
+        result.deleted_orphans, result.orphaned_detected, len(result.errors),
     )
     return summary
+
+
+async def _detect_parent_child_orphans(
+    store: MarkdownStore,
+    md_paths: list[Path],
+    result: ReconcileResult,
+) -> None:
+    """Фаза 5 §6.5: обнаружение parent-child orphan-записей.
+
+    - Child с parent_knowledge_id, где parent отсутствует → issue "orphaned"
+    - Collection с incomplete children (child из children[] удалён) → issue "orphaned"
+    """
+    try:
+        from mcp_server.quality.issues import create_issue_async
+    except ImportError:
+        logger.warning("RECONCILE: create_issue_async not available — skip orphan detection")
+        return
+
+    # Парсим все .md и строим карту knowledge_id → frontmatter
+    entries: dict[str, dict] = {}
+    for path in md_paths:
+        try:
+            entry = store._parse_file(path)
+            fm = entry.frontmatter
+            kid = fm.knowledge_id
+            entries[kid] = {
+                "parent_knowledge_id": getattr(fm, "parent_knowledge_id", None),
+                "content_type": getattr(fm, "content_type", None),
+                "children": getattr(fm, "children", None),
+            }
+        except Exception:
+            pass
+
+    # Проверка 1: child без parent
+    for kid, info in entries.items():
+        parent_id = info.get("parent_knowledge_id")
+        if parent_id and parent_id not in entries:
+            logger.warning("RECONCILE: orphan child %s (parent %s not found)", kid, parent_id)
+            try:
+                await create_issue_async(
+                    "orphaned",
+                    kid,
+                    "warn",
+                    f"Parent '{parent_id}' not found — child is orphaned",
+                )
+            except Exception as e:
+                logger.debug("RECONCILE: failed to create orphan issue for %s: %s", kid, e)
+            result.orphaned_detected += 1
+
+    # Проверка 2: collection с incomplete children
+    for kid, info in entries.items():
+        if info.get("content_type") != "collection":
+            continue
+        children = info.get("children")
+        if not children:
+            continue
+        for child_ref in children:
+            if isinstance(child_ref, dict):
+                child_id = child_ref.get("knowledge_id")
+                if child_id and child_id not in entries:
+                    logger.warning(
+                        "RECONCILE: collection %s has missing child %s", kid, child_id
+                    )
+                    try:
+                        await create_issue_async(
+                            "orphaned",
+                            kid,
+                            "warn",
+                            f"Collection has missing child: {child_id}",
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "RECONCILE: failed to create orphan issue for %s: %s", kid, e
+                        )
+                    result.orphaned_detected += 1
+
+    if result.orphaned_detected > 0:
+        logger.info("RECONCILE: %d parent-child orphan issues detected", result.orphaned_detected)

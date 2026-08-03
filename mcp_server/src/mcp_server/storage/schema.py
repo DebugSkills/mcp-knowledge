@@ -34,6 +34,8 @@ PAYLOAD_SCHEMA = {
     "section_header": qmodels.PayloadSchemaType.KEYWORD,
     "chunk_index": qmodels.PayloadSchemaType.INTEGER,
     "updated_at": qmodels.PayloadSchemaType.DATETIME,
+    "parent_knowledge_id": qmodels.PayloadSchemaType.KEYWORD,  # Фаза 5: parent-child collection
+    "content_type": qmodels.PayloadSchemaType.KEYWORD,  # Фаза 5: book | pdf | collection
 }
 
 # Индексы для payload-полей
@@ -44,6 +46,8 @@ PAYLOAD_INDEXES: list[tuple[str, qmodels.PayloadSchemaType]] = [
     ("project", qmodels.PayloadSchemaType.KEYWORD),
     ("tags", qmodels.PayloadSchemaType.KEYWORD),
     ("updated_at", qmodels.PayloadSchemaType.DATETIME),
+    ("parent_knowledge_id", qmodels.PayloadSchemaType.KEYWORD),  # Фаза 5
+    ("content_type", qmodels.PayloadSchemaType.KEYWORD),  # Фаза 5
 ]
 
 # HNSW-параметры
@@ -93,6 +97,8 @@ def build_payload_point(
     section_header: str,
     chunk_index: int,
     updated_at: str,
+    parent_knowledge_id: str | None = None,
+    content_type: str | None = None,
 ) -> qmodels.PointStruct:
     """Собрать PointStruct для upsert."""
     payload = {
@@ -108,4 +114,8 @@ def build_payload_point(
         "chunk_index": chunk_index,
         "updated_at": updated_at,
     }
+    if parent_knowledge_id:
+        payload["parent_knowledge_id"] = parent_knowledge_id
+    if content_type:
+        payload["content_type"] = content_type
     return qmodels.PointStruct(id=point_id, vector=vector, payload=payload)

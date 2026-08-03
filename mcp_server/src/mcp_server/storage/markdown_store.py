@@ -93,6 +93,18 @@ class MarkdownStore:
         logger.info("write_knowledge: %s → %s", knowledge_id, path)
         return entry
 
+    async def write_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
+        """Записать готовую KnowledgeEntry на диск (без git-коммита).
+
+        Используется batch-импортом (Фаза 5) для записи секций с batched git-коммитами.
+        Git-коммиты делаются отдельно вызывающим кодом каждые IMPORT_BATCH_COMMIT секций.
+        """
+        path = self._resolve_path(entry.file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_file(path, entry)
+        logger.debug("write_entry: %s → %s", entry.frontmatter.knowledge_id, path)
+        return entry
+
     async def update(self, knowledge_id: str, content: Optional[str] = None,
                      metadata: Optional[dict] = None,
                      expected_version: Optional[int] = None) -> KnowledgeEntry:

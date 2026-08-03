@@ -15,6 +15,7 @@ from .crud import write_knowledge, update_entry, delete_entry
 from .browse import list_domains, list_subjects, list_projects
 from .admin import reindex
 from .quality import review_queue, list_quality_issues, resolve_quality_issue, run_quality_scan
+from .content import import_content
 
 # ── JSON Schema fragments ──────────────────────────────────
 
@@ -123,7 +124,7 @@ _LIST_QUALITY_ISSUES_SCHEMA: dict[str, Any] = {
     "properties": {
         "types": {
             "type": "array",
-            "items": {"type": "string", "enum": ["duplicate", "missing_field", "edit_war", "broken_link", "conflicting"]},
+            "items": {"type": "string", "enum": ["duplicate", "missing_field", "edit_war", "broken_link", "conflicting", "orphaned"]},
             "description": "Фильтр по типам issues",
         },
         "status": {"type": "string", "default": "open", "enum": ["open", "resolved", "ignored"]},
@@ -151,6 +152,26 @@ _RUN_QUALITY_SCAN_SCHEMA: dict[str, Any] = {
     "properties": {
         "domain": {"type": "string", "description": "Опционально: скан только одного домена"},
     },
+}
+
+# ── import_content schema (Фаза 5) ─────────────────────────
+
+_IMPORT_CONTENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "content": {"type": "string", "description": "Исходный текст (Markdown/plain)"},
+        "content_type": {"type": "string", "default": "book", "description": "Тип контента: book"},
+        "domain": {"type": "string", "description": "Первичная классификация"},
+        "subject": {"type": "string", "description": "Вторичная классификация"},
+        "project": {"type": "string", "description": "Опциональный проект"},
+        "title": {"type": "string", "description": "Заголовок коллекции (авто если не указан)"},
+        "tags": {"type": "array", "items": {"type": "string"}, "description": "Унаследованные теги"},
+        "cross_subjects": {"type": "array", "items": {"type": "string"}, "description": "Кросс-теги"},
+        "max_chunk_tokens": {"type": "integer", "default": 512, "minimum": 64, "maximum": 2048},
+        "wait_for_index": {"type": "boolean", "default": False},
+        "cleanup_orphans": {"type": "boolean", "default": False},
+    },
+    "required": ["content", "domain", "subject"],
 }
 
 # ── Tool definitions ───────────────────────────────────────
@@ -232,6 +253,12 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Запустить периодический quality scan: обход всех .md → staleness_score → dup-pair detection → issues + review_queue. Для cron (4.8).",
         "inputSchema": _RUN_QUALITY_SCAN_SCHEMA,
     },
+    # ── import_content (Фаза 5) ──────────────────────────────
+    {
+        "name": "import_content",
+        "description": "Импорт крупных текстов (книги, документация) в SSOT: декомпозиция на секции + авто-frontmatter + parent-child коллекции + best-effort batch запись. Переиспользует существующий write-path (markdown_store + pipeline + git).",
+        "inputSchema": _IMPORT_CONTENT_SCHEMA,
+    },
 ]
 
 # ── Handler dispatch table (реальные реализации) ───────────
@@ -253,4 +280,5 @@ TOOL_HANDLERS = {
     "list_quality_issues": list_quality_issues,
     "resolve_quality_issue": resolve_quality_issue,
     "run_quality_scan": run_quality_scan,
+    "import_content": import_content,
 }

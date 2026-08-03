@@ -42,6 +42,11 @@ class KnowledgeFrontmatter(BaseModel):
     status: str = Field(default="published", description="Lifecycle: published | deprecated (4.7)")
     evergreen: bool = Field(default=False, description="Фундаментальное знание — медленное старение (4.5 R1)")
     source: Optional[str] = Field(None, description="URL источника (link_health 4.5)")
+    # ── Фаза 5: parent-child collection fields ──────────────
+    parent_knowledge_id: Optional[str] = Field(None, description="ID родительской коллекции (null для root)")
+    sequence_number: Optional[int] = Field(None, ge=1, description="Порядковый номер в коллекции (1..N)")
+    content_type: Optional[str] = Field(None, description="Тип контента: book | pdf | collection | ...")
+    children: Optional[list[dict]] = Field(None, description="Список children для collection-root (TOC)")
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         description="Дата создания",
