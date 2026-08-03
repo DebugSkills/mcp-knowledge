@@ -1,0 +1,183 @@
+"""MCP Tools registry — 11 tools с JSON Schema (Блок A).
+
+Реальные реализации в модулях: search.py, read.py, crud.py, browse.py, admin.py.
+
+G1-fix: list_subjects + list_projects зарегистрированы (ранее были импортированы, но не добавлены в TOOLS/TOOL_HANDLERS).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .search import search_knowledge, search_by_tags
+from .read import get_entry, get_knowledge_map
+from .crud import write_knowledge, update_entry, delete_entry
+from .browse import list_domains, list_subjects, list_projects
+from .admin import reindex
+
+# ── JSON Schema fragments ──────────────────────────────────
+
+_SEARCH_QUERY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "description": "Поисковый запрос (естественный язык)"},
+        "top_k": {"type": "integer", "default": 5, "minimum": 1, "maximum": 50},
+        "domain": {"type": "string", "description": "Фильтр по домену"},
+        "subject": {"type": "string", "description": "Фильтр по предмету"},
+        "project": {"type": "string", "description": "Фильтр по проекту"},
+        "tags": {"type": "array", "items": {"type": "string"}, "description": "Фильтр по тегам"},
+        "score_threshold": {"type": "number", "default": 0.0, "minimum": 0.0, "maximum": 1.0},
+    },
+    "required": ["query"],
+}
+
+_SEARCH_TAGS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "tags": {"type": "array", "items": {"type": "string"}, "description": "Теги для поиска"},
+        "match_all": {"type": "boolean", "default": True, "description": "AND (true) или OR (false)"},
+        "limit": {"type": "integer", "default": 500, "minimum": 1, "maximum": 1000},
+    },
+    "required": ["tags"],
+}
+
+_GET_ENTRY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "knowledge_id": {"type": "string", "description": "ID записи"},
+    },
+    "required": ["knowledge_id"],
+}
+
+_GET_MAP_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "domain": {"type": "string", "description": "Опциональный фильтр по домену"},
+    },
+}
+
+_WRITE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "content": {"type": "string", "description": "Markdown-контент"},
+        "domain": {"type": "string"},
+        "subject": {"type": "string"},
+        "project": {"type": "string"},
+        "cross_subjects": {"type": "array", "items": {"type": "string"}},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "knowledge_id": {"type": "string", "description": "Опциональный ID (авто-генерация если не указан)"},
+        "wait_for_index": {"type": "boolean", "default": False},
+    },
+    "required": ["content", "domain", "subject"],
+}
+
+_UPDATE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "knowledge_id": {"type": "string"},
+        "content": {"type": "string"},
+        "version": {"type": "integer", "description": "Optimistic locking: ожидаемая версия"},
+    },
+    "required": ["knowledge_id", "content"],
+}
+
+_DELETE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "knowledge_id": {"type": "string"},
+    },
+    "required": ["knowledge_id"],
+}
+
+_LIST_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "cursor": {"type": "string", "description": "Курсор пагинации"},
+        "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000},
+        "domain": {"type": "string", "description": "Фильтр по домену (опционально)"},
+        "subject": {"type": "string", "description": "Фильтр по subject (опционально)"},
+    },
+}
+
+_REINDEX_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "domain": {"type": "string", "description": "Опционально: переиндексировать только один домен"},
+    },
+}
+
+# ── Tool definitions ───────────────────────────────────────
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "search_knowledge",
+        "description": "Семантический поиск по базе знаний. Возвращает наиболее релевантные записи с оценкой релевантности.",
+        "inputSchema": _SEARCH_QUERY_SCHEMA,
+    },
+    {
+        "name": "search_by_tags",
+        "description": "Поиск записей по тегам через payload-фильтр Qdrant (без GPU). Поддерживает AND/OR семантику.",
+        "inputSchema": _SEARCH_TAGS_SCHEMA,
+    },
+    {
+        "name": "get_entry",
+        "description": "Получить полную запись (frontmatter + Markdown-контент) по knowledge_id.",
+        "inputSchema": _GET_ENTRY_SCHEMA,
+    },
+    {
+        "name": "get_knowledge_map",
+        "description": "Структурная карта знаний: domains → subjects → knowledge_ids. Поддерживает фильтрацию по домену.",
+        "inputSchema": _GET_MAP_SCHEMA,
+    },
+    {
+        "name": "write_knowledge",
+        "description": "Записать новое знание: SSOT Markdown → chunk → embed → Qdrant upsert → INDEX update.",
+        "inputSchema": _WRITE_SCHEMA,
+    },
+    {
+        "name": "update_entry",
+        "description": "Обновить существующую запись с optimistic locking (version check).",
+        "inputSchema": _UPDATE_SCHEMA,
+    },
+    {
+        "name": "delete_entry",
+        "description": "Удалить запись: Markdown SSOT + Qdrant точки + Git commit.",
+        "inputSchema": _DELETE_SCHEMA,
+    },
+    {
+        "name": "list_domains",
+        "description": "Список всех доменов знаний с пагинацией (cursor-based).",
+        "inputSchema": _LIST_SCHEMA,
+    },
+    {
+        "name": "list_subjects",
+        "description": "Список subjects (тем) в заданном домене с пагинацией (cursor-based).",
+        "inputSchema": _LIST_SCHEMA,
+    },
+    {
+        "name": "list_projects",
+        "description": "Список проектов (опционально: в заданном domain/subject) с пагинацией (cursor-based).",
+        "inputSchema": _LIST_SCHEMA,
+    },
+    {
+        "name": "reindex",
+        "description": "Перестроить индекс: перечитать все Markdown-файлы → переиндексировать в Qdrant.",
+        "inputSchema": _REINDEX_SCHEMA,
+    },
+]
+
+# ── Handler dispatch table (реальные реализации) ───────────
+
+TOOL_HANDLERS = {
+    "search_knowledge": search_knowledge,
+    "search_by_tags": search_by_tags,
+    "get_entry": get_entry,
+    "get_knowledge_map": get_knowledge_map,
+    "write_knowledge": write_knowledge,
+    "update_entry": update_entry,
+    "delete_entry": delete_entry,
+    "list_domains": list_domains,
+    "list_subjects": list_subjects,
+    "list_projects": list_projects,
+    "reindex": reindex,
+}

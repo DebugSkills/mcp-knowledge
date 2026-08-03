@@ -1,10 +1,24 @@
-"""Qdrant payload-схема и константы коллекции knowledge."""
+"""Qdrant payload-схема и константы коллекции knowledge.
+
+Фаза 3 F1: Blue-green reindex через Qdrant Collection Aliases.
+- COLLECTION_ALIAS = "knowledge" — имя alias (search/upsert прозрачны)
+- Реальные коллекции: knowledge_v1, knowledge_v2 (чередуются)
+"""
 
 from __future__ import annotations
 
 from qdrant_client.http import models as qmodels
 
-COLLECTION_NAME = "knowledge"
+# Alias name (search/upsert прозрачны — код Ф1/Ф2 не меняется)
+COLLECTION_ALIAS = "knowledge"
+
+# Legacy: backward-compatible (используется как default для операций)
+COLLECTION_NAME = COLLECTION_ALIAS
+
+# Naming convention для blue-green коллекций
+COLLECTION_V1 = "knowledge_v1"
+COLLECTION_V2 = "knowledge_v2"
+
 VECTOR_SIZE = 1024  # BGE-M3
 DISTANCE_METRIC = qmodels.Distance.COSINE
 
@@ -45,17 +59,24 @@ OPTIMIZERS_CONFIG = qmodels.OptimizersConfigDiff(
 )
 
 
-def build_collection_params() -> qmodels.CreateCollection:
-    """Параметры создания коллекции knowledge."""
-    return qmodels.CreateCollection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=qmodels.VectorParams(
+def build_collection_params(collection_name: str | None = None) -> dict:
+    """Параметры создания коллекции.
+
+    Возвращает dict для прямой передачи в QdrantClient.create_collection(**kwargs).
+    Совместим с qdrant-client >=1.13 (CreateCollection model API меняется между версиями).
+
+    Args:
+        collection_name: имя коллекции (default: COLLECTION_ALIAS).
+    """
+    return {
+        "collection_name": collection_name or COLLECTION_ALIAS,
+        "vectors_config": qmodels.VectorParams(
             size=VECTOR_SIZE,
             distance=DISTANCE_METRIC,
         ),
-        hnsw_config=HNSW_CONFIG,
-        optimizers_config=OPTIMIZERS_CONFIG,
-    )
+        "hnsw_config": HNSW_CONFIG,
+        "optimizers_config": OPTIMIZERS_CONFIG,
+    }
 
 
 def build_payload_point(

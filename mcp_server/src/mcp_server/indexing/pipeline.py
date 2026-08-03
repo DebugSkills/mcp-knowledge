@@ -26,6 +26,8 @@ from ..storage.markdown_store import MarkdownStore
 from ..storage.qdrant_client import QdrantClient
 from ..storage.schema import build_payload_point
 from .chunker import MarkdownChunker
+from .sync_barrier import SyncBarrier
+from .dlq import DeadLetterQueue
 
 logger = logging.getLogger("mcp_knowledge.pipeline")
 
@@ -52,13 +54,11 @@ class IndexingPipeline:
         self._running = False
         self._worker_task: Optional[asyncio.Task] = None
 
-        # Sync barrier: dict[knowledge_id] = asyncio.Event
-        self._sync_events: dict[str, asyncio.Event] = {}
+        # C2: Sync barrier (выделен в sync_barrier.py)
+        self._sync = SyncBarrier()
 
-        # DLQ
-        self._dlq_dir = Path(settings.DLQ_DIR)
-        self._dlq_dir.mkdir(parents=True, exist_ok=True)
-        self._max_retries = settings.DLQ_MAX_RETRIES
+        # C3: DLQ (выделен в dlq.py)
+        self._dlq = DeadLetterQueue()
 
         # Статистика
         self.stats = {"queued": 0, "processed": 0, "failed": 0, "dlq": 0}
@@ -118,17 +118,10 @@ class IndexingPipeline:
         )
 
         if wait_for_index and event:
-            self._sync_events[entry.frontmatter.knowledge_id] = event
-            try:
-                await asyncio.wait_for(event.wait(), timeout=30.0)
-                result.indexed = True
-                result.pending = False
-            except asyncio.TimeoutError:
-                logger.warning("Sync wait timeout for %s (CPU backend?)",
-                               entry.frontmatter.knowledge_id)
-                result.pending = True  # всё ещё в процессе
-            finally:
-                self._sync_events.pop(entry.frontmatter.knowledge_id, None)
+            self._sync.register(entry.frontmatter.knowledge_id)
+            # Используем тот же event что и создали
+            self._sync._events[entry.frontmatter.knowledge_id] = event
+            result = await self._sync.wait(entry.frontmatter.knowledge_id, timeout=30.0)
 
         return result
 
@@ -143,6 +136,111 @@ class IndexingPipeline:
         # Очищаем Qdrant
         self._qdrant.delete_all()
 
+        return await self._reindex_from_ssot()
+
+    async def reindex_blue_green(self) -> dict:
+        """F1: Zero-downtime blue-green reindex через Qdrant Collection Aliases.
+
+        Flow:
+        1. Определить активную коллекцию (knowledge_v1 или knowledge_v2)
+        2. Создать новую коллекцию (противоположную)
+        3. Заполнить новую коллекцию (поиск продолжается через alias → старую)
+        4. Атомарно переключить alias на новую коллекцию (<1 сек)
+        5. Удалить старую коллекцию (cleanup)
+
+        Returns:
+            {active, target, alias_swapped, reindex_result, elapsed_sec}
+        """
+        from ..storage.schema import COLLECTION_V1, COLLECTION_V2
+
+        t0 = datetime.now(timezone.utc)
+        logger.info("reindex_blue_green: начало blue-green reindex")
+
+        # 1. Определить активную и целевую коллекции
+        try:
+            active = self._qdrant.get_active_collection()
+        except Exception:
+            active = COLLECTION_V1  # fallback: первая коллекция
+
+        # v1 → v2, v2 → v1
+        target = COLLECTION_V2 if active == COLLECTION_V1 else COLLECTION_V1
+        logger.info("reindex_blue_green: active=%s → target=%s", active, target)
+
+        # 2. Создать новую коллекцию
+        self._qdrant.create_collection_named(target, force_recreate=True)
+
+        # 3. Заполнить новую коллекцию
+        reindex_result = await self._reindex_into(target)
+
+        # 4. Атомарный swap alias
+        self._qdrant.swap_alias(COLLECTION_ALIAS, target)
+        alias_swapped = True
+        logger.info("reindex_blue_green: alias 'knowledge' → '%s' (swap complete)", target)
+
+        # 5. Cleanup старой коллекции
+        if active != COLLECTION_ALIAS:
+            self._qdrant.delete_collection_named(active)
+            logger.info("reindex_blue_green: старая коллекция '%s' удалена", active)
+
+        elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
+        result = {
+            "active": active,
+            "target": target,
+            "alias_swapped": alias_swapped,
+            "reindex_result": reindex_result,
+            "elapsed_sec": round(elapsed, 1),
+        }
+        logger.info("reindex_blue_green: завершено — %s", result)
+        return result
+
+    async def _reindex_into(self, collection_name: str) -> dict:
+        """F1: Переиндексировать все документы в заданную коллекцию.
+
+        Args:
+            collection_name: имя коллекции (knowledge_v1 или knowledge_v2)
+
+        Returns:
+            {total_docs, total_chunks, failed, elapsed_sec}
+        """
+        logger.info("_reindex_into: переиндекс в '%s'", collection_name)
+        t0 = datetime.now(timezone.utc)
+
+        paths = await self._store.reindex_scan()
+        total_docs = len(paths)
+        total_chunks = 0
+        failed = 0
+
+        for i, path in enumerate(paths):
+            try:
+                entry = self._store._parse_file(path)
+                chunks = self._chunker.chunk(
+                    knowledge_id=entry.frontmatter.knowledge_id,
+                    content=entry.content,
+                )
+                if chunks:
+                    await self._index_chunks(entry, chunks, collection_name=collection_name)
+                    total_chunks += len(chunks)
+
+                if (i + 1) % 100 == 0:
+                    logger.info("reindex: %d/%d документов, %d чанков (→ %s)",
+                                 i + 1, total_docs, total_chunks, collection_name)
+            except Exception as e:
+                logger.error("reindex error for %s: %s", path, e)
+                failed += 1
+
+        elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
+        result = {
+            "total_docs": total_docs,
+            "total_chunks": total_chunks,
+            "failed": failed,
+            "elapsed_sec": round(elapsed, 1),
+        }
+        logger.info("_reindex_into '%s': завершено — %s", collection_name, result)
+        return result
+
+    async def _reindex_from_ssot(self) -> dict:
+        """Legacy: полный переиндекс в текущую коллекцию (delete-all подход)."""
+        t0 = datetime.now(timezone.utc)
         paths = await self._store.reindex_scan()
         total_docs = len(paths)
         total_chunks = 0
@@ -284,42 +382,48 @@ class IndexingPipeline:
             await self._handle_batch_failure(batch, str(e))
             return
 
-        # Сигналим sync-ожидающим
-        for item in batch:
-            if item.get("event"):
-                item["event"].set()
+        # Сигналим sync-ожидающим (C2)
+        kids = [item["entry"].frontmatter.knowledge_id for item in batch if item.get("event")]
+        if kids:
+            self._sync.signal_batch(kids)
 
     async def _handle_batch_failure(self, batch: list[dict], error: str):
-        """Обработка неудачного батча: retry или DLQ."""
+        """Обработка неудачного батча: retry или DLQ (C3)."""
         for item in batch:
             item["retries"] += 1
-            if item["retries"] < self._max_retries:
-                logger.warning("Retry %d/%d for %s",
-                               item["retries"], self._max_retries,
-                               item["entry"].frontmatter.knowledge_id)
+            kid = item["entry"].frontmatter.knowledge_id
+
+            if self._dlq.should_retry(item["retries"]):
+                delay = self._dlq.backoff_delay(item["retries"])
+                logger.warning("Retry %d/%d for %s (delay=%.1fs)",
+                               item["retries"], settings.DLQ_MAX_RETRIES, kid, delay)
+                await asyncio.sleep(delay)
                 await self._queue.put(item)
             else:
-                # DLQ
-                entry: KnowledgeEntry = item["entry"]
-                dlq_entry = {
-                    "knowledge_id": entry.frontmatter.knowledge_id,
-                    "error": error,
-                    "retries": item["retries"],
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-                dlq_path = self._dlq_dir / f"{entry.frontmatter.knowledge_id}.json"
-                dlq_path.write_text(json.dumps(dlq_entry, ensure_ascii=False, indent=2))
+                # DLQ (C3)
+                self._dlq.record_failure(kid, error, item["retries"])
                 self.stats["dlq"] += 1
-                logger.error("DLQ: %s → %s", entry.frontmatter.knowledge_id, dlq_path)
 
                 # Всё равно сигналим sync-ожидающим
                 if item.get("event"):
                     item["event"].set()
 
         self.stats["failed"] += 1
+        self._dlq.check_alert()
 
-    async def _index_chunks(self, entry: KnowledgeEntry, chunks: list[Chunk]):
-        """Индексация чанков для reindex (без очереди)."""
+    async def _index_chunks(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[Chunk],
+        collection_name: str | None = None,
+    ):
+        """Индексация чанков (для reindex, без очереди).
+
+        Args:
+            entry: KnowledgeEntry с метаданными
+            chunks: список чанков для индексации
+            collection_name: имя коллекции для blue-green (default: COLLECTION_NAME alias)
+        """
         texts = [ch.content for ch in chunks]
         loop = asyncio.get_running_loop()
         vectors = await loop.run_in_executor(None, self._embedder.embed_sync, texts)
@@ -344,4 +448,7 @@ class IndexingPipeline:
             )
             points.append(point)
 
-        await loop.run_in_executor(None, self._qdrant.upsert_points, points)
+        await loop.run_in_executor(
+            None,
+            lambda: self._qdrant.upsert_points(points, collection_name=collection_name),
+        )

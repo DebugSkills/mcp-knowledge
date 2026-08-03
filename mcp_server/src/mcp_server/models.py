@@ -137,3 +137,21 @@ class WriteResult(BaseModel):
     knowledge_id: str
     indexed: bool = False
     pending: bool = True  # True если indexing ещё в очереди
+
+
+# ── F2: Optimistic locking exception ──────────────────────
+
+class VersionConflictError(Exception):
+    """Conflict: клиент передал expected_version, не совпадающий с актуальным.
+
+    Возникает при update_entry(expected_version=N) когда текущая версия ≠ N.
+    Атрибуты: knowledge_id, expected, actual.
+    """
+    def __init__(self, knowledge_id: str, expected: int, actual: int):
+        self.knowledge_id = knowledge_id
+        self.expected = expected
+        self.actual = actual
+        super().__init__(
+            f"Version conflict for '{knowledge_id}': "
+            f"expected v{expected}, actual v{actual}"
+        )

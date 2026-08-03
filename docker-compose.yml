@@ -36,11 +36,13 @@ services:
       qdrant:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
-      interval: 15s
-      timeout: 5s
+      # E1 (P1-1 fix): /health/live — всегда 200 пока процесс жив → NO restart storm
+      # Было: /health → при embed degraded 503 → Docker перезапускает → бесконечный цикл
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health/live"]
+      interval: 30s
+      timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 60s
     restart: unless-stopped
     # GPU (опционально):
     # deploy:

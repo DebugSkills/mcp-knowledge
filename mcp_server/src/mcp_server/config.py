@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # Pipeline
     WORKERS: int = 1  # ИНВАРИАНТ — не менять!
 
+    # Rate limiting (Фаза 3 E2: token bucket, per-key)
+    RATE_LIMIT_READ_PER_MIN: int = 100   # read-ключ: 100 запросов/мин (≈1.67 токенов/сек)
+    RATE_LIMIT_WRITE_PER_MIN: int = 20   # write-ключ: 20 запросов/мин (≈0.33 токенов/сек)
+
     # DLQ (#14)
     DLQ_DIR: str = "/app/data/dlq"
     DLQ_MAX_RETRIES: int = 3

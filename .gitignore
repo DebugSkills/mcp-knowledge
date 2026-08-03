@@ -18,6 +18,9 @@ __pycache__/
 .vscode/
 .idea/
 
+# Agent backups
+.backup/
+
 # SSOT Knowledge Base (auto-gen, подключается через symlink)
 .knowledge/
 .roomodes
@@ -27,3 +30,4 @@ AGENTS.md
 .boardData.md
 .roo/
 .knowledge
+plans

@@ -9,6 +9,8 @@
 - Каждый write/update/delete → git add && git commit (#21)
 - asyncio.Lock на git-операции (гонка на .git/index.lock)
 - git gc --auto встроен
+
+Фаза 3 F2: Atomic optimistic locking (expected_version → VersionConflictError).
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ import yaml
 from pydantic import ValidationError
 
 from ..config import settings
-from ..models import KnowledgeEntry, KnowledgeFrontmatter, WriteRequest
+from ..models import KnowledgeEntry, KnowledgeFrontmatter, WriteRequest, VersionConflictError
 
 logger = logging.getLogger("mcp_knowledge.markdown_store")
 
@@ -92,27 +94,47 @@ class MarkdownStore:
         return entry
 
     async def update(self, knowledge_id: str, content: Optional[str] = None,
-                     metadata: Optional[dict] = None) -> Optional[KnowledgeEntry]:
-        """Обновить запись (контент и/или метаданные)."""
+                     metadata: Optional[dict] = None,
+                     expected_version: Optional[int] = None) -> KnowledgeEntry:
+        """Обновить запись (контент и/или метаданные).
+
+        Фаза 3 F2: Atomic optimistic locking через expected_version.
+        - expected_version=None → last-write-wins (backward-compatible)
+        - expected_version=N → проверка внутри _git_lock → VersionConflictError при несовпадении
+
+        Возвращает обновлённый KnowledgeEntry.
+
+        Raises:
+            VersionConflictError: если expected_version не совпадает с текущим.
+        """
         path = self._find_by_id(knowledge_id)
         if path is None:
             return None
 
-        entry = self._parse_file(path)
-        fm = entry.frontmatter
+        # Атомарно (read-check-write под _git_lock): читаем, проверяем версию, обновляем
+        async with self._git_lock:
+            # Перечитываем с диска (на случай внешнего git pull / concurrent write)
+            entry = self._parse_file(path)
+            fm = entry.frontmatter
 
-        if content is not None:
-            entry.content = content
-        if metadata:
-            for key, value in metadata.items():
-                if hasattr(fm, key):
-                    setattr(fm, key, value)
+            # F2: Optimistic locking check
+            if expected_version is not None and fm.version != expected_version:
+                raise VersionConflictError(knowledge_id, expected_version, fm.version)
 
-        fm.updated_at = datetime.now(timezone.utc)
-        fm.version += 1
+            if content is not None:
+                entry.content = content
+            if metadata:
+                for key, value in metadata.items():
+                    if hasattr(fm, key):
+                        setattr(fm, key, value)
 
-        entry = KnowledgeEntry(frontmatter=fm, content=entry.content)
-        self._write_file(path, entry)
+            fm.updated_at = datetime.now(timezone.utc)
+            fm.version += 1
+
+            entry = KnowledgeEntry(frontmatter=fm, content=entry.content)
+            self._write_file(path, entry)
+
+        # Git-аудит (вне блокировки — git сам сериализует)
         await self._git_commit(f"update: {knowledge_id} v{fm.version}")
 
         logger.info("update_entry: %s v%d", knowledge_id, fm.version)

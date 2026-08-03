@@ -6,20 +6,90 @@
 - Markdown SSOT-хранилище (задача 1.1)
 - Indexing pipeline (задача 1.8)
 - Health-проверки (задача 1.7)
+
+Фаза 2 дополнения:
+- Auth middleware (B1)
+- MCP JSON-RPC эндпоинт POST /mcp (B2)
+
+Фаза 3 дополнения:
+- E1: Health hardening (liveness/readiness split)
+- E2: Rate limiting (token bucket, batch-aware)
+- F1: Blue-green migration at startup (legacy collection → aliases)
 """
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from .config import settings
-from .health import router as health_router, set_embedding_manager, set_qdrant_client
+from .health import router as health_router, set_embedding_manager, set_qdrant_client, set_pipeline
 from .storage import MarkdownStore, QdrantClient
 from .embedding import EmbeddingManager
 from .indexing import IndexingPipeline, MarkdownChunker
+from .auth import AuthMiddleware
+from .mcp_handler import handle_mcp_request
+from .metrics import metrics_endpoint, set_embed_backend
+from .rate_limit import TokenBucketLimiter
 
 logger = logging.getLogger("mcp_knowledge")
+
+
+# ── F1: Legacy migration helper ──────────────────────────
+
+
+async def _migrate_legacy_collection(qdrant: QdrantClient) -> None:
+    """F1: Миграция legacy-коллекции на aliases при первом старте Ф3.
+
+    Если коллекция "knowledge" существует как реальная коллекция (не alias),
+    переименовываем в knowledge_v1_DATETIME → создаём alias.
+
+    P1-2: rollback на случай сбоя create_alias.
+    """
+    from .storage.schema import COLLECTION_ALIAS
+
+    # Проверяем: коллекция существует и это НЕ alias
+    if not qdrant._client.collection_exists(COLLECTION_ALIAS):
+        return  # ничего нет — ensure_collection уже создал
+
+    if qdrant.has_alias(COLLECTION_ALIAS):
+        logger.info("Collection '%s' already has alias — migration not needed", COLLECTION_ALIAS)
+        return
+
+    # Legacy: коллекция "knowledge" существует как реальная
+    logger.info("⚙️  F1 migration: legacy collection 'knowledge' → aliases")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    backup_name = f"knowledge_v1_{ts}"
+
+    try:
+        qdrant.rename_collection(COLLECTION_ALIAS, backup_name)
+        logger.info("F1 migration: renamed 'knowledge' → '%s'", backup_name)
+    except Exception as exc:
+        logger.critical("F1 migration: rename_collection failed: %s", exc)
+        raise
+
+    try:
+        qdrant.create_alias(COLLECTION_ALIAS, backup_name)
+        logger.info("F1 migration: alias 'knowledge' → '%s' created", backup_name)
+    except Exception as exc:
+        # 🆕 P1-2: ROLLBACK — иначе alias "knowledge" не существует → всё падает
+        logger.error("F1 migration: alias create failed: %s → ROLLBACK rename", exc)
+        try:
+            qdrant.rename_collection(backup_name, COLLECTION_ALIAS)
+            logger.info("F1 migration: rollback successful — '%s' → 'knowledge'", backup_name)
+        except Exception as rollback_exc:
+            logger.critical(
+                "F1 migration: ROLLBACK FAILED! Collection '%s' orphaned, "
+                "alias 'knowledge' missing. Manual fix required: %s",
+                backup_name, rollback_exc,
+            )
+            raise RuntimeError(
+                f"F1 migration failed and rollback failed: {exc}. "
+                f"Orphaned collection: {backup_name}. "
+                f"Run: qdrant_client.rename_collection('{backup_name}', 'knowledge')"
+            ) from exc
+        raise
 
 
 # ── Lifespan: инициализация и останов ──────────────────────
@@ -49,6 +119,10 @@ async def lifespan(app: FastAPI):
     logger.info("🗄️  Подключение к Qdrant: %s", settings.QDRANT_URL)
     qdrant = QdrantClient()
     qdrant.ensure_collection(force_recreate=False)
+
+    # ── F1: Blue-green migration (legacy → aliases) ──────
+    await _migrate_legacy_collection(qdrant)
+
     app.state.qdrant = qdrant
     set_qdrant_client(qdrant)  # P1-2: прокидываем в health
 
@@ -73,12 +147,48 @@ async def lifespan(app: FastAPI):
     )
     await pipeline.start()
     app.state.pipeline = pipeline
+    set_pipeline(pipeline)  # E1: прокидываем pipeline в health для deep checks
 
     # 6. KnowledgeIndex (задача 1.11) — ленивая инициализация,
     #    полная перестройка INDEX при reconciliation (Фаза 2, задача 2.9)
     from .indexing import KnowledgeIndex
     knowledge_index = KnowledgeIndex(store=store)
     app.state.knowledge_index = knowledge_index
+
+    # ── C1: Reconciliation при старте (Фаза 2, задача 2.9) ──
+    logger.info("🔍 Запуск reconciliation Markdown↔Qdrant...")
+    from .indexing.reconcile import reconcile
+    try:
+        reconcile_result = await reconcile(store, qdrant, pipeline, knowledge_index)
+        logger.info(
+            "✅ Reconciliation: checked=%d, reindexed=%d, skipped=%d, orphans=%d",
+            reconcile_result["checked"],
+            reconcile_result["reindexed"],
+            reconcile_result["skipped"],
+            reconcile_result["deleted_orphans"],
+        )
+    except Exception as exc:
+        logger.warning("⚠️ Reconciliation failed (non-fatal): %s", exc)
+
+    # D1: Установка метрики embed backend
+    set_embed_backend(embedder.backend_name)
+
+    # E2: Rate limiting (token bucket, per-key, batch-aware)
+    logger.info("🪣 Инициализация rate limiter (read=%d/min, write=%d/min)...",
+                 settings.RATE_LIMIT_READ_PER_MIN, settings.RATE_LIMIT_WRITE_PER_MIN)
+    app.state.rate_limiter_read = TokenBucketLimiter(
+        refill_rate=settings.RATE_LIMIT_READ_PER_MIN / 60.0,
+        burst_size=max(10, settings.RATE_LIMIT_READ_PER_MIN // 10),
+    )
+    app.state.rate_limiter_write = TokenBucketLimiter(
+        refill_rate=settings.RATE_LIMIT_WRITE_PER_MIN / 60.0,
+        burst_size=max(5, settings.RATE_LIMIT_WRITE_PER_MIN // 10),
+    )
+    # Общий fallback rate limiter (для неаутентифицированных)
+    app.state.rate_limiter = app.state.rate_limiter_read
+    logger.info("✅ Rate limiter готов (read_burst=%d, write_burst=%d)",
+                 app.state.rate_limiter_read.burst_size,
+                 app.state.rate_limiter_write.burst_size)
 
     logger.info("✅ MCP Knowledge Server готов (backend=%s)", embedder.backend_name)
 
@@ -99,4 +209,26 @@ app = FastAPI(
     description="Семантическая база знаний для AI-агентов (MCP-протокол)",
     lifespan=lifespan,
 )
+
+# B1: Auth middleware (X-API-Key, constant-time сравнение)
+app.add_middleware(AuthMiddleware)
+
 app.include_router(health_router)
+
+
+# B2: MCP JSON-RPC 2.0 эндпоинт
+@app.post("/mcp")
+async def mcp_endpoint(request: Request):
+    """MCP JSON-RPC 2.0 эндпоинт.
+
+    Поддерживает: initialize, tools/list, tools/call,
+    resources/list, resources/read, prompts/list, prompts/get.
+    """
+    return await handle_mcp_request(request)
+
+
+# D1: Prometheus /metrics эндпоинт
+@app.get("/metrics")
+async def metrics_route(request: Request):
+    """Prometheus /metrics endpoint — метрики MCP Knowledge Server."""
+    return await metrics_endpoint(request)
