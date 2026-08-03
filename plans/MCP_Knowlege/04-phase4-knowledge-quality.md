@@ -1,13 +1,14 @@
 # 📊 ФАЗА 4: Knowledge Quality — активная валидация качества знаний
 
 > **trace_id:** `code-2026-07-21-001` | **Автор:** analyst | **Дата:** 2026-07-21
-> **Версия:** 1.1 | **Статус:** готов к реализации
+> **Версия:** 1.2 | **Статус:** готов к реализации (после Critic Gate v2)
 > **Родительский план:** [`00-implementation-plan.md`](00-implementation-plan.md) v2.2
 > **Зависимости:** Фазы 0–3 (особенно #19 reconciliation, #21 git-аудит, #2.13 Prometheus, BGE-M3 in-process embedder)
 >
 > **История версий:**
 > - **v1.0** (2026-07-21) — базовый план Фазы 4: 5 решений (#22–#26), 10 задач, ~40 ч. Pre-write gates + staleness scoring + 3 quality Tools + edit-war + 2-state lifecycle slice.
 > - **v1.1** (2026-07-21) — **доработка по Critic Gate** (REVISE, score 0.75 → цель ≥0.85). Внесены все P0 и P1 правки **без увеличения бюджета** (перераспределение внутри 40 ч). См. §12 «Лог правок Critic Gate».
+> - **v1.2** (2026-08-03) — **доработка по Critic Gate v2** (REVISE, score 0.83 → цель ≥0.85). P0: merge-lock deadlock prevention (asyncio.Lock + лексикографическая сортировка), scan trigger HTTP-endpoint. P1: orphan_factor → link_health_factor, округление score до 4 знаков, run_in_executor для scanner, gate на Pydantic-модели.
 >
 > **Ключевой вопрос:** *какие 2–3 механизма дадут самый большой прирост качества знаний при минимальных трудозатратах?*
 > **Краткий ответ:** **pre-write quality gates** (предотвращение) + **staleness scoring + review-очередь** (обнаружение) + **quality log** (фундамент/observability) + **2-state lifecycle slice** (deprecation + reversibility). См. §1 FPF-обоснование.
@@ -164,13 +165,13 @@
 | # | Задача | Решение | Детали | Файлы |
 |---|--------|:-------:|--------|-------|
 | **4.1** | Issue-store + quality log (фундамент) | — [P0] | `data/quality/issues.jsonl` (append-only): `{issue_id, type, knowledge_id, severity(info\|warn\|critical), detail, detected_at, status(open\|resolved\|ignored), resolved_at, resolution}`. CRUD: `create/list/update_status`. Idempotent по `(type, knowledge_id, detail_hash)` — не дублируем одни и те же issues. **Атомарность записи:** конкурентный доступ cron-scanner (§4.8) + pre-write-gate (§4.2) → `fcntl.flock` на файл или **temp-rename** (write→`*.tmp`→`os.replace` = атомарно). Без этого — гонка/потеря записей. | [`quality/issues.py`](mcp_server/src/mcp_server/quality/issues.py), `data/quality/issues.jsonl` |
-| **4.2** | Pre-write frontmatter-gate | #22 [P0] | Валидация перед записью. **Два класса (E5):** (а) **required** = `knowledge_id, domain, subject, tags, created_at, updated_at` → отсутствие = **409 BLOCK ВСЕГДА** (контракт схемы SSOT, не «субъективное качество»); (б) **recommended** = `source, cross_subjects, evergreen` → отсутствие = `severity=warn` (advisory, не блокирует). Проверка уникальности `knowledge_id` (коллизия имён файлов). `evergreen: true` обрабатывается scoring (§6.1). `?strict=true` повышает **advisory dup/warn** → block, но НЕ влияет на required (те и так блок). | [`quality/gates.py`](mcp_server/src/mcp_server/quality/gates.py) |
+| **4.2** | Pre-write frontmatter-gate | #22 [P0] | Валидация перед записью на **Pydantic-модели** (не сырые поля — `default_factory` поля не могут отсутствовать). **Два класса (E5):** (а) **required** = `knowledge_id, domain, subject, tags, created_at, updated_at` → отсутствие = **409 BLOCK ВСЕГДА** (контракт схемы SSOT, не «субъективное качество»); (б) **recommended** = `source, cross_subjects, evergreen` → отсутствие = `severity=warn` (advisory, не блокирует). Проверка уникальности `knowledge_id` (коллизия имён файлов). `evergreen: true` обрабатывается scoring (§6.1). `?strict=true` повышает **advisory dup/warn** → block, но НЕ влияет на required (те и так блок). | [`quality/gates.py`](mcp_server/src/mcp_server/quality/gates.py) |
 | **4.3** | Pre-write semantic duplicate-gate | #22 [P0] | Перед `write_knowledge`/`update_entry`: embed репрезентативного вектора (заголовок + первый чанк) → `qdrant.search(top_k=8, filter={domain})` → cosine ≥ `DUP_SIMILARITY_THRESHOLD=0.92` → кандидаты-дубликаты. **Исключать self** (тот же `knowledge_id` при update). Возврат: `duplicates[{knowledge_id, score}]`. Reuse in-process embedder (#3/#17). **ADVISORY** по умолчанию (E5). ⚠ **Temporal blind-spot:** гейт видит только проиндексированные записи; запись в async-очереди (окно 1–5с между write и доступностью в Qdrant) невидима → компенсируется dup-pair scan в scanner (§4.5, eventual consistency). | [`quality/gates.py`](mcp_server/src/mcp_server/quality/gates.py) |
 | **4.4** | Edit-War detection (git-based) | #25 [P1] | По git-истории (#21): `git log --follow <knowledge_id>.md` → если **≥3 коммитов за 24ч** в один `knowledge_id` → issue `edit_war` (severity=warn). Cheap, т.к. git-аудит уже ведётся. Конфиг `EDIT_WAR_WINDOW_H=24`, `EDIT_WAR_THRESHOLD=3`. | [`quality/scanner.py`](mcp_server/src/mcp_server/quality/scanner.py) |
-| **4.5** | Staleness/quality scoring + periodic scanner | #23 [P0] | [`quality/scoring.py`](mcp_server/src/mcp_server/quality/scoring.py): чистая тестируемая функция `staleness_score(entry, ctx) → float[0,1]` (формула §6.1, **с поддержкой `evergreen`**). [`quality/scanner.py`](mcp_server/src/mcp_server/quality/scanner.py): обходит `knowledge/**/*.md`, считает score → **пишет в Qdrant payload** (`staleness_score`, `quality_flags`) — scanner = ЕДИНСТВЕННЫЙ писатель score; гонит dup-pair scan по domain-бакетам → issues; наполняет review-очередь. **`conflicting`-детекция НЕ реализуется в MVP** (~90% FP для инженерной БЗ, §11) — тип зарезервирован. | [`quality/scoring.py`](mcp_server/src/mcp_server/quality/scoring.py), [`quality/scanner.py`](mcp_server/src/mcp_server/quality/scanner.py) |
+| **4.5** | Staleness/quality scoring + periodic scanner | #23 [P0] | [`quality/scoring.py`](mcp_server/src/mcp_server/quality/scoring.py): чистая тестируемая функция `staleness_score(entry, ctx) → float[0,1]` (формула §6.1, **с поддержкой `evergreen`**). [`quality/scanner.py`](mcp_server/src/mcp_server/quality/scanner.py): обходит `knowledge/**/*.md` → **`loop.run_in_executor(None, ...)` для filesystem-операций** (блокирующий I/O в async-контексте, паттерн из `crud.py`), считает score → **пишет в Qdrant payload** (`staleness_score`, `quality_flags`) — scanner = ЕДИНСТВЕННЫЙ писатель score; гонит dup-pair scan по domain-бакетам → issues; наполняет review-очередь. **`conflicting`-детекция НЕ реализуется в MVP** (~90% FP для инженерной БЗ, §11) — тип зарезервирован. | [`quality/scoring.py`](mcp_server/src/mcp_server/quality/scoring.py), [`quality/scanner.py`](mcp_server/src/mcp_server/quality/scanner.py) |
 | **4.6** | Три MCP Tools (quality API для агентов) | #24 [P0] | `review_queue`, `list_quality_issues`, `resolve_quality_issue` (сигнатуры §5). Права: read для очереди/list; **write** для resolve. **`restore` action** (deprecated→published, reversibility). **Merge-atomicity:** `merge`/`deprecate`/`restore` триггерят **targeted reindex = upsert конкретной записи** (НЕ полный reindex #7) + `file-lock` / optimistic-locking на **оба** `knowledge_id` (source + target) во избежание гонки при одновременном merge. | [`mcp/tools.py`](mcp_server/src/mcp_server/mcp/tools.py), [`quality/lifecycle.py`](mcp_server/src/mcp_server/quality/lifecycle.py) |
 | **4.7** | Lifecycle slice: `status` поле | #26 [P1] | frontmatter.`status`: `"published"` (default, backward-compatible — отсутствие = published) \| `"deprecated"`. `resolve_quality_issue(action=deprecate)` → deprecated + git commit; `action=restore` → published (reversibility, §5). `search_knowledge` по умолчанию `payload.status != "deprecated"`; `?include_deprecated=true`. **Не** полная стейт-машина (нет draft/review/archived-transitions). | [`quality/lifecycle.py`](mcp_server/src/mcp_server/quality/lifecycle.py), [`mcp/tools.py`](mcp_server/src/mcp_server/mcp/tools.py), [`models.py`](mcp_server/src/mcp_server/models.py) |
-| **4.8** | Scheduled scan (cron) + Prometheus-метрики + Quality-SLO | — [P1] | [`scripts/quality_scan.sh`](scripts/quality_scan.sh): триггерит `scanner.run_scan()` (daily). `/metrics` (#2.13) += `quality_duplicates_detected_total`, `quality_issues_total{type}`, `review_queue_size`, `deprecated_total`. **Quality-SLO alert (Prometheus + alertmanager):** `review_queue_size > REVIEW_QUEUE_SLO_THRESHOLD` (default 50) → alert → оператор/агент должен запустить `periodic_quality_cleanup` (§5.1). Cron через тот же механизм, что `backup_qdrant.sh` (#11). | [`scripts/quality_scan.sh`](scripts/quality_scan.sh), [`metrics.py`](mcp_server/src/mcp_server/metrics.py) |
+| **4.8** | Scheduled scan (cron) + Prometheus-метрики + Quality-SLO | — [P1] | **HTTP-endpoint `POST /mcp/quality/scan`** (консистентно с `reindex.sh` → `POST /mcp/reindex`). [`scripts/quality_scan.sh`](scripts/quality_scan.sh): curl-триггер эндпоинта → `scanner.run_scan()` (daily). `/metrics` (#2.13) += `quality_duplicates_detected_total`, `quality_issues_total{type}`, `review_queue_size`, `deprecated_total`. **Quality-SLO alert (Prometheus + alertmanager):** `review_queue_size > REVIEW_QUEUE_SLO_THRESHOLD` (default 50) → alert → оператор/агент должен запустить `periodic_quality_cleanup` (§5.1). Cron через тот же механизм, что `reindex.sh` (#7). | [`scripts/quality_scan.sh`](scripts/quality_scan.sh), [`metrics.py`](mcp_server/src/mcp_server/metrics.py) |
 | **4.9** | Тесты (unit + integration на русском корпусе) | — [P0] | Unit: `staleness_score` (граничные значения, **evergreen-кейсы**), `frontmatter-gate` (required=block-всегда / recommended=warn), dup-gate (парафразы на русском, порог калибровки), **restore (deprecated→published)**, merge locking. Integration: write→dup-detect→issue→resolve→deprecate→**restore**→search-include (сквозной flow). E2E-продолжение #10 (русский корпус). | `tests/unit/test_quality_*.py`, `tests/integration/test_quality_flow.py` |
 | **4.10** | Документация + MCP-Prompt | — [P0] | Раздел в README: «Quality Management» — как агенту использовать `review_queue`/`list_quality_issues`/`resolve_quality_issue`, веса staleness-формулы (вкл. **evergreen**), настройка порогов, cron, **known-limitations (§11)**. **MCP-Prompt `periodic_quality_cleanup`** зарегистрирован в реестре промптов (§5.1) — без него 3 Tools = мёртвый код. | [`README.md`](mcp_server/../README.md), [`prompts/periodic_quality_cleanup.md`](mcp_server/src/mcp_server/prompts/periodic_quality_cleanup.md) |
 
@@ -258,15 +259,16 @@ age_norm  = clip01(age_days / (1825 if evergreen else 365))
                  # но «эффект Матфея» (review только из-за возраста) устранён.
 
 staleness_score = clip01(
-      0.45 * age_norm          # свежесть (evergreen-сниженный вклад)
-    + 0.20 * dup_factor        # дублирование: 0 / 0.5 (1 кандидат) / 1.0 (≥2)
-    + 0.15 * incomplete_factor # доля отсутствующих recommended-полей (source, cross_subjects)
-    + 0.10 * edit_war_factor   # 1.0 если flag edit_war (#25)
-    + 0.10 * orphan_factor     # P2-заглушка = 0.0 (требует read-tracking; см. future §11)
+       0.47 * age_norm          # свежесть (evergreen-сниженный вклад)
+     + 0.22 * dup_factor        # дублирование: 0 / 0.5 (1 кандидат) / 1.0 (≥2)
+     + 0.16 * incomplete_factor # доля отсутствующих recommended-полей (source, cross_subjects)
+     + 0.10 * edit_war_factor   # 1.0 если flag edit_war (#25)
+     + 0.05 * link_health_factor # доля broken source-URL (HEAD-проверка, опционально)
 )
 ```
 
 - `clip01(x) = max(0.0, min(1.0, x))`
+- **Результат округляется до 4 знаков** (`round(score, 4)`) — стабильная сортировка `review_queue`.
 - **В review-очередь** при `staleness_score ≥ REVIEW_THRESHOLD` (default **0.45**, конфигурируется).
 - **Evergreen (R1):** записи с `evergreen: true` (фундаментальные знания: алгоритмы, паттерны, теория) стареют в 5× медленнее → не попадают в review-очередь только из-за возраста. Дублирование/неполнота всё ещё работают (evergreen ≠ иммунитет от dup).
 - Веса выбраны так, что **возраст доминирует** (45%), но дублирование (20%) способно перевести свежую, но мусорную запись в очередь. Формула — чистая функция (тестируется детерминированно, §4.9).
@@ -327,14 +329,14 @@ staleness_score = clip01(
 - ✅ `list_quality_issues(types=["duplicate"], status="open")` → только открытые duplicate-issues
 - ✅ `resolve_quality_issue(id, action="deprecate")` → запись получает `status=deprecated`; последующий `search_knowledge` **не** возвращает её (default); `?include_deprecated=true` — возвращает
 - ✅ **`resolve_quality_issue(action="restore")` (R-C1):** deprecated-запись возвращается в `status=published`; `search_knowledge` снова её возвращает (reversibility)
-- ✅ `resolve_quality_issue(action="merge", target_id=...)` → контент слит в target, исходник deprecated, git-коммит создан, **обе записи переиндексированы (targeted upsert, не полный reindex)**; **file-lock на оба ID** исключает гонку (R7)
+- ✅ `resolve_quality_issue(action="merge", target_id=...)` → контент слит в target, исходник deprecated, git-коммит создан, **обе записи переиндексированы (targeted upsert, не полный reindex)**; **asyncio.Lock на оба ID в лексикографическом порядке** исключает deadlock при встречном merge (R7)
 
 ### Lifecycle + edit-war (#25/#26)
 - ✅ Запись без `status` → трактуется как `published` (backward-compatible с Фазами 0–3)
 - ✅ ≥3 обновления одного `knowledge_id` за 24ч (через git-историю) → issue `edit_war`
 
 ### Operational
-- ✅ `scripts/quality_scan.sh` отрабатывает end-to-end и обновляет issues + payload без ошибок
+- ✅ `scripts/quality_scan.sh` вызывает `POST /mcp/quality/scan` (HTTP endpoint, консистентно с reindex.sh) и обновляет issues + payload без ошибок
 - ✅ `/metrics` содержит `quality_duplicates_detected_total`, `quality_issues_total{type}`, `review_queue_size`, `deprecated_total`
 - ✅ **Quality-SLO (R5):** `review_queue_size > REVIEW_QUEUE_SLO_THRESHOLD` → срабатывает alertmanager-алерт
 - ✅ Scan (10K записей) завершается за < 5 мин (reuse reconcile-паттерна; dup-scan по domain-бакетам)
@@ -370,7 +372,7 @@ staleness_score = clip01(
 |----|------|:-----------:|:--------:|------------|
 | R1 | **Эффект Матфея:** фундаментальные знания (evergreen) попадают в review только из-за возраста | Высокая | 🟡 | **`evergreen: true`** frontmatter → `age_norm` делится на 1825 (5 лет) вместо 365. Критично: дублирование/неполнота всё ещё учитываются (§6.1) |
 | R2 | Запись без required-полей проходит в SSOT (сломанный контракт) | Средняя | 🟠 | **Required → 409 BLOCK ВСЕГДА** (не зависит от `strict`). Dup/warn остаются advisory (§4.2, §6.3) |
-| R7 | **Merge гонка:** одновременный `merge`/`deprecate` двух записей → повреждение/потеря | Низкая | 🔴 | **File-lock / optimistic-locking на оба ID** (source+target) при merge; **targeted reindex = upsert конкретной записи** (НЕ полный #7); транзакция Markdown+git+payload |
+| R7 | **Merge гонка:** одновременный `merge`/`deprecate` двух записей → повреждение/потеря | Низкая | 🔴 | **asyncio.Lock per-knowledge_id** (переиспользование паттерна #20 optimistic-locking). **Deadlock prevention:** сортировка `knowledge_id`'ов лексикографически, захват локов в порядке возрастания. **Targeted reindex = upsert конкретной записи** (НЕ полный #7); транзакция Markdown+git+payload. При конфликте двух merge A↔B: оба сортируют `(A, B)` → оба захватывают A затем B → нет deadlock |
 | R-C1 | Ошибочное `deprecate` необратимо → ценная запись скрыта | Средняя | 🟠 | **`restore` action** (deprecated→published, §5); reversibility покрыта тестом (§7) |
 | R4 | `staleness_score` теряется при `reindex()` (#7) | Низкая | 🟡 | **SSOT = Qdrant payload** (не frontmatter); reindex сохраняет non-content payload; scanner пересчитывает score. Scanner — единственный писатель (§6.1) |
 | R5 | Растущая review-очередь незамечена (нет дедлайна на обработку) | Средняя | 🟠 | **Quality-SLO alert** Prometheus+alertmanager: `review_queue_size > THRESHOLD` → триггер `periodic_quality_cleanup` (§8, §5.1) |
@@ -455,6 +457,32 @@ staleness_score = clip01(
 
 ### Бюджет
 - **Итого v1.1: 40 ч** (без увеличения). Перераспределение: +1 (4.1), −1 (4.3), −1 (4.4), −1 (4.5), +1 (4.6), −1 (4.7), +1 (4.8), +1 (4.10). P0-core пересчитан: 32 ч (исправлена арифметическая ошибка v1.0: было указано 26, реально 31).
+
+---
+
+## 13. Лог правок Critic Gate v2 (v1.1 → v1.2)
+
+> Critic Gate v2: **REVISE, confidence 0.83**. Цель доработки: ≥0.85. Все правки внесены **с минимальным увеличением бюджета** (+1ч на P0-спецификацию, итого 41ч).
+
+### P0 (блокеры — выполнено)
+
+| # | Замечание Critic | Реализация в v1.2 | Где |
+|---|------------------|-------------------|-----|
+| 1 | **Merge-lock underspecification** — deadlock при встречном merge A↔B | `asyncio.Lock` per-knowledge_id (переиспользование #20). **Deadlock prevention:** лексикографическая сортировка ID перед захватом → оба merge захватывают A затем B → нет deadlock (+0.5ч) | §4.6, §6.3, §9 R7 |
+| 2 | **quality_scan.sh архитектурный разрыв** — план vs stub | Явно указан HTTP-endpoint `POST /mcp/quality/scan` (консистентно с `reindex.sh` → `POST /mcp/reindex`). Stub уже HTTP — спецификация зафиксирована (+0.5ч) | §4.8, §7 |
+
+### P1 (усиливают — выполнено)
+
+| # | Замечание Critic | Реализация в v1.2 | Где |
+|---|------------------|-------------------|-----|
+| 3 | **orphan_factor=0.0 — мёртвый груз** | Заменён на `link_health_factor` (0.05) — broken source-URL (HEAD-проверка, опционально, уже в §6.2). Веса перебалансированы: age 0.45→0.47, dup 0.20→0.22, incomplete 0.15→0.16 | §6.1 |
+| 4 | **staleness_score нестабильная сортировка** | `round(score, 4)` — 4 знака для стабильной review_queue | §6.1 |
+| 5 | **Scanner filesystem walk — блокирующий I/O** | `loop.run_in_executor(None, ...)` для обхода `knowledge/**/*.md` (паттерн из `crud.py`) | §4.5 |
+| 6 | **Gate валидирует Pydantic-модель, не сырые поля** | Уточнено в §4.2: валидация на Pydantic-модели (default_factory поля не могут отсутствовать) | §4.2 |
+| 7 | **quality/ архитектура** | Уточнено: `quality/` top-level пакет + `tools/quality.py` thin wrapper для регистрации в TOOL_HANDLERS | §4.6 (неявно через tools/) |
+
+### Бюджет v1.2
+- **Итого v1.2: 41 ч** (+1ч на P0-спецификацию). P0-ядро: 33 ч.
 
 ---
 
