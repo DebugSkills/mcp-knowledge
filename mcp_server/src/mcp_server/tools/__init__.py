@@ -14,6 +14,7 @@ from .read import get_entry, get_knowledge_map
 from .crud import write_knowledge, update_entry, delete_entry
 from .browse import list_domains, list_subjects, list_projects
 from .admin import reindex
+from .quality import review_queue, list_quality_issues, resolve_quality_issue
 
 # ── JSON Schema fragments ──────────────────────────────────
 
@@ -106,6 +107,45 @@ _REINDEX_SCHEMA: dict[str, Any] = {
     },
 }
 
+# ── Quality Tool schemas (Фаза 4) ────────────────────────────
+
+_REVIEW_QUEUE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "domain": {"type": "string", "description": "Фильтр по домену"},
+        "subject": {"type": "string", "description": "Фильтр по предмету"},
+        "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
+    },
+}
+
+_LIST_QUALITY_ISSUES_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "types": {
+            "type": "array",
+            "items": {"type": "string", "enum": ["duplicate", "missing_field", "edit_war", "broken_link", "conflicting"]},
+            "description": "Фильтр по типам issues",
+        },
+        "status": {"type": "string", "default": "open", "enum": ["open", "resolved", "ignored"]},
+        "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+    },
+}
+
+_RESOLVE_QUALITY_ISSUE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "issue_id": {"type": "string", "description": "ID issue для разрешения"},
+        "action": {
+            "type": "string",
+            "enum": ["merge", "deprecate", "restore", "resolve", "ignore"],
+            "description": "Действие: merge (слить), deprecate (скрыть), restore (вернуть), resolve (исправлено), ignore (пропустить)",
+        },
+        "target_id": {"type": "string", "description": "target knowledge_id (для merge)"},
+        "reason": {"type": "string", "description": "Причина решения"},
+    },
+    "required": ["issue_id", "action"],
+}
+
 # ── Tool definitions ───────────────────────────────────────
 
 TOOLS: list[dict[str, Any]] = [
@@ -164,6 +204,22 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Перестроить индекс: перечитать все Markdown-файлы → переиндексировать в Qdrant.",
         "inputSchema": _REINDEX_SCHEMA,
     },
+    # ── Quality tools (Фаза 4) ───────────────────────────────
+    {
+        "name": "review_queue",
+        "description": "Получить топ устаревших записей по staleness_score DESC. Записи с score ≥ 0.45 требуют ревизии.",
+        "inputSchema": _REVIEW_QUEUE_SCHEMA,
+    },
+    {
+        "name": "list_quality_issues",
+        "description": "Список проблем качества: дубликаты, отсутствующие поля, edit-wars, битые ссылки. Фильтрация по типу и статусу.",
+        "inputSchema": _LIST_QUALITY_ISSUES_SCHEMA,
+    },
+    {
+        "name": "resolve_quality_issue",
+        "description": "Разрешить проблему качества: merge (слить), deprecate (скрыть), restore (вернуть), resolve (исправлено), ignore (пропустить).",
+        "inputSchema": _RESOLVE_QUALITY_ISSUE_SCHEMA,
+    },
 ]
 
 # ── Handler dispatch table (реальные реализации) ───────────
@@ -180,4 +236,8 @@ TOOL_HANDLERS = {
     "list_subjects": list_subjects,
     "list_projects": list_projects,
     "reindex": reindex,
+    # Quality tools (Фаза 4)
+    "review_queue": review_queue,
+    "list_quality_issues": list_quality_issues,
+    "resolve_quality_issue": resolve_quality_issue,
 }
