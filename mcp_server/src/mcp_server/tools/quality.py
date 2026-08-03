@@ -10,6 +10,7 @@ import logging
 from typing import Any
 
 from mcp_server.quality.issues import list_issues, update_issue_status
+from mcp_server.quality import REVIEW_THRESHOLD
 
 logger = logging.getLogger("mcp_knowledge.tools.quality")
 
@@ -166,23 +167,72 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
             return {"resolved": True, "issue_id": issue_id, "status": "ignored", "side_effects": side_effects}
 
         elif action == "deprecate":
-            # TODO: lifecycle integration (4.7) — set status=deprecated in frontmatter + Qdrant payload
-            updated = update_issue_status(issue_id, "resolved", reason or "deprecated")
-            side_effects.append("marked issue as resolved; lifecycle deprecation pending (4.7)")
-            return {"resolved": True, "issue_id": issue_id, "status": "resolved", "side_effects": side_effects}
+            # Lifecycle: установить status=deprecated в Qdrant payload
+            try:
+                qdrant = getattr(app_state, 'qdrant_client', None)
+                if qdrant:
+                    from qdrant_client.models import Filter, FieldCondition, MatchValue
+                    from mcp_server.quality.lifecycle import make_deprecation_payload_update
+                    payload = make_deprecation_payload_update()
+                    qdrant.set_payload(
+                        collection_name="knowledge",
+                        payload=payload,
+                        points_filter=Filter(
+                            must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
+                        ),
+                    )
+                    side_effects.append(f"Qdrant payload status set to 'deprecated' for knowledge_id={knowledge_id}")
+                updated = update_issue_status(issue_id, "resolved", reason or "deprecated")
+                return {"resolved": True, "issue_id": issue_id, "status": "resolved", "side_effects": side_effects}
+            except Exception as exc:
+                logger.error("deprecate lifecycle failed for %s: %s", knowledge_id, exc)
+                return {"resolved": False, "error": f"Deprecate failed: {exc}"}
 
         elif action == "restore":
-            # TODO: lifecycle integration (4.7) — set status=published
-            updated = update_issue_status(issue_id, "resolved", reason or "restored")
-            side_effects.append("marked issue as resolved; lifecycle restore pending (4.7)")
-            return {"resolved": True, "issue_id": issue_id, "status": "resolved", "side_effects": side_effects}
+            # Lifecycle: установить status=published в Qdrant payload (reversibility)
+            try:
+                qdrant = getattr(app_state, 'qdrant_client', None)
+                if qdrant:
+                    from qdrant_client.models import Filter, FieldCondition, MatchValue
+                    from mcp_server.quality.lifecycle import make_restore_payload_update
+                    payload = make_restore_payload_update()
+                    qdrant.set_payload(
+                        collection_name="knowledge",
+                        payload=payload,
+                        points_filter=Filter(
+                            must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
+                        ),
+                    )
+                    side_effects.append(f"Qdrant payload status set to 'published' for knowledge_id={knowledge_id}")
+                updated = update_issue_status(issue_id, "resolved", reason or "restored")
+                return {"resolved": True, "issue_id": issue_id, "status": "resolved", "side_effects": side_effects}
+            except Exception as exc:
+                logger.error("restore lifecycle failed for %s: %s", knowledge_id, exc)
+                return {"resolved": False, "error": f"Restore failed: {exc}"}
 
         elif action == "merge":
             if not target_id:
                 return {"resolved": False, "error": "target_id is required for merge action"}
-            # TODO: lifecycle + markdown merge (4.7) — merge content into target, deprecate source
+            # Merge: deprecate source + update issue (content merge — future)
+            try:
+                qdrant = getattr(app_state, 'qdrant_client', None)
+                if qdrant:
+                    from qdrant_client.models import Filter, FieldCondition, MatchValue
+                    from mcp_server.quality.lifecycle import make_deprecation_payload_update
+                    payload = make_deprecation_payload_update()
+                    qdrant.set_payload(
+                        collection_name="knowledge",
+                        payload=payload,
+                        points_filter=Filter(
+                            must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
+                        ),
+                    )
+                    side_effects.append(f"Source '{knowledge_id}' deprecated via Qdrant payload")
+            except Exception as exc:
+                logger.error("merge lifecycle failed for %s: %s", knowledge_id, exc)
+                return {"resolved": False, "error": f"Merge failed: {exc}"}
             updated = update_issue_status(issue_id, "resolved", f"merged into {target_id}. {reason}")
-            side_effects.append(f"marked issue as resolved; content merge pending (4.7)")
+            side_effects.append(f"Content merge into '{target_id}' pending — markdown merge not yet implemented")
             return {
                 "resolved": True,
                 "issue_id": issue_id,

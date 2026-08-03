@@ -23,6 +23,32 @@ from ..metrics import record_write_latency
 logger = logging.getLogger("mcp_knowledge.tools.crud")
 
 
+def _get_qdrant(app_state):
+    """Получить Qdrant-клиент: app_state.qdrant_client (raw) или app_state.qdrant (wrapper)."""
+    return getattr(app_state, "qdrant_client", None) or getattr(app_state, "qdrant", None)
+
+
+def _recommended_field_warnings(params: dict, strict: bool) -> tuple[list[dict], list[str], bool]:
+    """Проверка recommended-полей (source/evergreen/cross_subjects) — advisory (E5).
+
+    Возвращает (issues, warnings, blocked). При strict=True warn повышается до block.
+    """
+    issues: list[dict] = []
+    warnings: list[str] = []
+    blocked = False
+    for rec_field in ("source", "evergreen", "cross_subjects"):
+        val = params.get(rec_field)
+        missing = val is None or val == "" or val is False or val == []
+        if missing:
+            msg = f"Recommended field '{rec_field}' is missing"
+            if strict:
+                issues.append({"field": rec_field, "severity": "critical", "message": msg})
+                blocked = True
+            else:
+                warnings.append(msg)
+    return issues, warnings, blocked
+
+
 async def write_knowledge(params: dict, app_state) -> dict:
     """Записать новое знание: SSOT → chunk → embed → Qdrant → INDEX.
 
@@ -42,6 +68,68 @@ async def write_knowledge(params: dict, app_state) -> dict:
         return {"error": "Missing required parameter: 'domain'"}
     if not subject:
         return {"error": "Missing required parameter: 'subject'"}
+
+    # ── Phase 4: Pre-write quality checks (GAP-1 fix) ──
+    strict = params.get("strict", False)
+    quality_issues: list[dict] = []
+    quality_warnings: list[str] = []
+    quality_duplicates: list[dict] = []
+    blocked = False
+
+    # 1. knowledge_id collision check (если клиент указал ID)
+    provided_kid = params.get("knowledge_id")
+    if provided_kid:
+        try:
+            qdrant = _get_qdrant(app_state)
+            if qdrant and hasattr(qdrant, "get_all_knowledge_ids"):
+                existing_ids = qdrant.get_all_knowledge_ids()
+                if provided_kid in existing_ids:
+                    msg = f"knowledge_id '{provided_kid}' already exists (duplicate)"
+                    quality_issues.append({"field": "knowledge_id", "severity": "critical", "message": msg})
+                    blocked = True
+        except Exception:
+            pass  # best-effort: Qdrant недоступен → пропускаем проверку коллизий
+
+    # 2. Recommended-поля (advisory, E5)
+    rec_issues, rec_warnings, rec_blocked = _recommended_field_warnings(params, strict)
+    quality_issues.extend(rec_issues)
+    quality_warnings.extend(rec_warnings)
+    blocked = blocked or rec_blocked
+
+    # 3. Semantic dup-gate (advisory, §4.3)
+    try:
+        embedder = getattr(app_state, "embedder", None)
+        qdrant = _get_qdrant(app_state)
+        if embedder is not None and qdrant is not None and hasattr(qdrant, "search"):
+            from mcp_server.quality.dup_gate import check_duplicates
+
+            quality_duplicates = await check_duplicates(
+                content, domain, provided_kid,
+                embedder=embedder,
+                qdrant_client=qdrant,
+            )
+            if quality_duplicates and strict:
+                msg = f"Semantic duplicates detected: {quality_duplicates}"
+                quality_issues.append({"field": "*content", "severity": "critical", "message": msg})
+                blocked = True
+    except Exception as exc:
+        logger.warning("Dup-gate check skipped (non-fatal): %s", exc)
+
+    if blocked:
+        logger.warning(
+            "write_knowledge blocked by quality gate: %d critical issues, %d duplicates",
+            len(quality_issues), len(quality_duplicates),
+        )
+        return {
+            "error": "Quality gate blocked the write",
+            "quality_report": {
+                "blocked": True,
+                "issues": quality_issues,
+                "warnings": quality_warnings,
+                "duplicates": quality_duplicates,
+            },
+        }
+    # ── End quality gate ──
 
     wait_for_index = params.get("wait_for_index", False)
 
@@ -99,6 +187,12 @@ async def write_knowledge(params: dict, app_state) -> dict:
         "subject": subject,
         "indexed": indexed,
         "pending": pending,
+        "quality_report": {
+            "blocked": False,
+            "issues": quality_issues,
+            "warnings": quality_warnings,
+            "duplicates": quality_duplicates,
+        },
     }
 
 
@@ -117,6 +211,57 @@ async def update_entry(params: dict, app_state) -> dict:
         return {"error": "Parameter 'content' must be a string"}
     if content is not None and not content.strip():
         return {"error": "Parameter 'content' must not be empty"}
+
+    # ── Phase 4: Pre-write quality checks (GAP-1 fix) ──
+    # Для update контент — только тело markdown (frontmatter сохраняется от
+    # существующей записи). Проверяем semantic dup-gate (advisory) + recommended-поля.
+    strict = params.get("strict", False)
+    quality_issues: list[dict] = []
+    quality_warnings: list[str] = []
+    quality_duplicates: list[dict] = []
+    blocked = False
+
+    if content is not None:
+        # Semantic dup-gate (advisory, §4.3) — только при обновлении контента
+        try:
+            embedder = getattr(app_state, "embedder", None)
+            qdrant = _get_qdrant(app_state)
+            if embedder is not None and qdrant is not None and hasattr(qdrant, "search"):
+                from mcp_server.quality.dup_gate import check_duplicates
+
+                quality_duplicates = await check_duplicates(
+                    content, "", knowledge_id,  # domain неизвестен — без фильтра
+                    embedder=embedder,
+                    qdrant_client=qdrant,
+                )
+                if quality_duplicates and strict:
+                    msg = f"Semantic duplicates detected: {quality_duplicates}"
+                    quality_issues.append({"field": "*content", "severity": "critical", "message": msg})
+                    blocked = True
+        except Exception as exc:
+            logger.warning("Dup-gate check skipped (non-fatal): %s", exc)
+
+    # Recommended-поля (advisory) — из параметров обновления
+    rec_issues, rec_warnings, rec_blocked = _recommended_field_warnings(params, strict)
+    quality_issues.extend(rec_issues)
+    quality_warnings.extend(rec_warnings)
+    blocked = blocked or rec_blocked
+
+    if blocked:
+        logger.warning(
+            "update_entry blocked by quality gate for %s: %d critical issues",
+            knowledge_id, len(quality_issues),
+        )
+        return {
+            "error": "Quality gate blocked the update",
+            "quality_report": {
+                "blocked": True,
+                "issues": quality_issues,
+                "warnings": quality_warnings,
+                "duplicates": quality_duplicates,
+            },
+        }
+    # ── End quality gate ──
 
     store = app_state.store
     try:
@@ -159,6 +304,12 @@ async def update_entry(params: dict, app_state) -> dict:
         "version": entry.frontmatter.version,
         "updated_at": entry.frontmatter.updated_at.isoformat(),
         "pending": True,
+        "quality_report": {
+            "blocked": False,
+            "issues": quality_issues,
+            "warnings": quality_warnings,
+            "duplicates": quality_duplicates,
+        },
     }
 
 

@@ -166,8 +166,13 @@ def evaluate_frontmatter(
         return GateResult(passed=False, blocked=True, issues=issues, warnings=warnings)
 
     # Шаг 3: проверка required-полей (по факту их присутствия в fm_dict)
-    # Pydantic уже отвалидировал модель, но проверяем raw-словарь
-    # чтобы поймать поля, которых нет в модели но они обязательны по контракту
+    # ПРИМЕЧАНИЕ (NF-9): Эта проверка намеренно дублирует Pydantic-валидацию.
+    # Pydantic KnowledgeFrontmatter заполняет поля с default_factory
+    # (created_at, updated_at, tags, cross_subjects) АВТОМАТИЧЕСКИ — модель
+    # никогда не «упадёт» на их отсутствии. Но по контракту SSOT (§4.2) эти
+    # поля ОБЯЗАНЫ присутствовать в raw YAML. Проверка raw-словаря ловит
+    # default_factory bypass: запись без created_at/updated_at в frontmatter
+    # должна блокироваться как нарушение контракта, а не молча заполняться.
     for field_name in REQUIRED_FIELDS:
         if field_name not in fm_dict or fm_dict[field_name] is None:
             issues.append(

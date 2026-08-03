@@ -28,6 +28,7 @@ from mcp_server.quality.scoring import (
     StalenessInput,
     staleness_score,
 )
+from mcp_server.quality.edit_war import detect_edit_war
 
 logger = logging.getLogger("mcp_knowledge.quality.scanner")
 
@@ -87,7 +88,7 @@ async def run_scan(
     # Шаг 2: вычисление staleness_score для каждой записи
     scored: list[tuple[Path, KnowledgeFrontmatter, float]] = []
     for filepath, frontmatter in entries:
-        score = _compute_score(frontmatter, now, entries)
+        score = _compute_score(frontmatter, now, filepath)
         scored.append((filepath, frontmatter, score))
         if score >= REVIEW_THRESHOLD:
             metrics["review_queue_size"] += 1
@@ -98,7 +99,8 @@ async def run_scan(
         metrics["scores_updated"] = len(scored)
 
     # Шаг 4: dup-pair scan по domain-бакетам
-    dup_count = _scan_dup_pairs(scored)
+    loop = asyncio.get_running_loop()
+    dup_count = await loop.run_in_executor(None, _scan_dup_pairs, scored)
     metrics["duplicates_detected"] = dup_count
 
     # Шаг 5: создание issues для проблемных записей
@@ -165,7 +167,7 @@ def _parse_frontmatter(
 def _compute_score(
     frontmatter: KnowledgeFrontmatter,
     now: datetime,
-    all_entries: list,
+    filepath: Path,
 ) -> float:
     """Вычисляет staleness_score для одной записи."""
     # Подсчитываем recommended-поля
@@ -175,20 +177,21 @@ def _compute_score(
     for field in ("source",):
         if field not in fm_dict or fm_dict[field] is None:
             recommended_missing += 1
-    # evergreen — из модели напрямую (нет поля, считаем отсутствующим)
+    # evergreen — из модели напрямую
     if "evergreen" not in fm_dict:
         recommended_missing += 1
-    # cross_subjects — всегда есть (default_factory=list), не считаем missing
-    # но проверяем что он не пустой
     is_evergreen = fm_dict.get("evergreen", False) is True
+
+    # NF-3: интеграция edit_war в scoring
+    is_edit_war = detect_edit_war(filepath)
 
     inp = StalenessInput(
         updated_at=frontmatter.updated_at,
         evergreen=is_evergreen,
-        dup_count=0,  # заполняется позже dup-pair scan
+        dup_count=0,
         recommended_missing=recommended_missing,
         recommended_total=recommended_total,
-        edit_war=False,  # заполняется edit_war detector
+        edit_war=is_edit_war,
         broken_links=0,
         total_links=0,
     )
@@ -199,37 +202,34 @@ async def _update_qdrant_payloads(
     client,  # QdrantClient
     scored: list[tuple[Path, KnowledgeFrontmatter, float]],
 ) -> None:
-    """Пишет staleness_score + quality_flags в Qdrant payload."""
-    from qdrant_client.models import PointStruct
+    """Обновляет staleness_score + quality_flags в Qdrant payload через set_payload.
 
-    points: list[PointStruct] = []
+    Использует set_payload (не upsert) — обновляет существующие chunk-точки
+    по фильтру knowledge_id, не создавая новых non-vector точек в коллекции.
+    """
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+
     for filepath, frontmatter, score in scored:
         knowledge_id = frontmatter.knowledge_id
         flags: list[str] = []
         if score >= REVIEW_THRESHOLD:
             flags.append("needs_review")
 
-        points.append(
-            PointStruct(
-                id=knowledge_id,  # knowledge_id как UUID-совместимый ID
-                payload={
-                    PAYLOAD_STALENESS_SCORE: score,
-                    PAYLOAD_QUALITY_FLAGS: flags,
-                },
-            )
-        )
+        payload_update = {
+            PAYLOAD_STALENESS_SCORE: score,
+            PAYLOAD_QUALITY_FLAGS: flags,
+        }
 
-    # Batch upsert — пишем пачками по 100
-    batch_size = 100
-    for i in range(0, len(points), batch_size):
-        batch = points[i : i + batch_size]
         try:
-            client.upsert(
+            client.set_payload(
                 collection_name="knowledge",
-                points=batch,
+                payload=payload_update,
+                points_filter=Filter(
+                    must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
+                ),
             )
         except Exception as exc:
-            logger.error("Failed to upsert batch %d: %s", i // batch_size, exc)
+            logger.error("Failed to set_payload for %s: %s", knowledge_id, exc)
 
 
 def _scan_dup_pairs(

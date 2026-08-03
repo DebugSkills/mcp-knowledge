@@ -12,6 +12,7 @@ strict=true → 409 BLOCK при наличии дублей.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -110,7 +111,9 @@ async def check_duplicates(
 
     # Шаг 2: embed
     try:
-        query_vector = embedder.encode(representative).tolist()
+        loop = asyncio.get_event_loop()
+        vec = await loop.run_in_executor(None, embedder.encode, representative)
+        query_vector = vec.tolist() if hasattr(vec, 'tolist') else list(vec)
     except Exception as exc:
         logger.error("Embed failed for dup-gate: %s", exc)
         return []
@@ -119,13 +122,18 @@ async def check_duplicates(
     try:
         from qdrant_client.models import Filter, FieldCondition, MatchValue
 
+        # domain-фильтр только если domain указан (для update_entry domain может быть неизвестен)
+        query_filter = None
+        if domain:
+            query_filter = Filter(
+                must=[FieldCondition(key="domain", match=MatchValue(value=domain))]
+            )
+
         results = qdrant_client.search(
             collection_name="knowledge",
             query_vector=query_vector,
             limit=SEARCH_TOP_K,
-            query_filter=Filter(
-                must=[FieldCondition(key="domain", match=MatchValue(value=domain))]
-            ),
+            query_filter=query_filter,
             with_payload=True,
             with_vectors=True,
         )

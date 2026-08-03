@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -292,3 +293,40 @@ def update_issue_status(
 
     logger.info("Updated issue %s: status=%s", issue_id, status)
     return updated
+
+
+# ── Async-safe wrappers (NF-5 fix) ─────────────────────────
+
+async def create_issue_async(
+    issue_type: IssueType,
+    knowledge_id: str,
+    severity: IssueSeverity,
+    detail: str,
+) -> Issue:
+    """Async-safe обёртка create_issue: run_in_executor + threading.Lock."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, create_issue, issue_type, knowledge_id, severity, detail
+    )
+
+
+async def list_issues_async(
+    types: Optional[list[IssueType]] = None,
+    status: str = "open",
+    limit: int = 50,
+) -> list[Issue]:
+    """Async-safe обёртка list_issues."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, list_issues, types, status, limit)
+
+
+async def update_issue_status_async(
+    issue_id: str,
+    status: IssueStatus,
+    resolution: Optional[str] = None,
+) -> Optional[Issue]:
+    """Async-safe обёртка update_issue_status."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, update_issue_status, issue_id, status, resolution
+    )

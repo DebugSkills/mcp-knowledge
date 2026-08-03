@@ -74,6 +74,11 @@ class OllamaEmbedder:
 
         try:
             import httpx
+        except ImportError as exc:
+            logger.error("httpx is required for Ollama embedder: %s", exc)
+            raise RuntimeError("httpx is required for Ollama embedder") from exc
+
+        try:
             payload = {"model": self.model, "input": inputs}
             response = httpx.post(
                 f"{self.base_url}/api/embed",
@@ -86,23 +91,6 @@ class OllamaEmbedder:
 
             if not embeddings:
                 raise RuntimeError(f"Ollama returned empty embeddings for model {self.model}")
-
-            if single:
-                return embeddings[0]
-            return embeddings
-
-        except ImportError:
-            # Fallback: requests
-            import requests
-            payload = {"model": self.model, "input": inputs}
-            response = requests.post(
-                f"{self.base_url}/api/embed",
-                json=payload,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
-            embeddings = data.get("embeddings", [])
 
             if single:
                 return embeddings[0]

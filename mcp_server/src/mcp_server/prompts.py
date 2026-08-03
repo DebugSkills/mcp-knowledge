@@ -1,8 +1,9 @@
 """B3: MCP Prompts — подсказки для AI-агентов.
 
-Два промпта:
+Три промпта:
 - how-to-structure-knowledge — как структурировать знание в Markdown
 - best-practice-write — best-practice для write_knowledge: SSOT, frontmatter, теги
+- periodic_quality_cleanup — регулярная чистка качества БЗ (Фаза 4, §5.1)
 """
 
 from __future__ import annotations
@@ -23,6 +24,22 @@ PROMPTS = [
         "name": "best-practice-write",
         "description": "Best-practice рекомендации для write_knowledge: SSOT, YAML frontmatter, теги, кросс-ссылки.",
         "arguments": [],
+    },
+    {
+        "name": "periodic_quality_cleanup",
+        "description": "Регулярная чистка качества базы знаний: review_queue + открытые issues → merge/deprecate/restore/resolve/ignore (Фаза 4).",
+        "arguments": [
+            {
+                "name": "domain",
+                "description": "Фильтр по домену (опционально)",
+                "required": False,
+            },
+            {
+                "name": "max_actions",
+                "description": "Максимальное число действий за один запуск (default 10)",
+                "required": False,
+            },
+        ],
     },
 ]
 
@@ -184,6 +201,40 @@ write_knowledge(content="...", domain="devops", subject="docker", wait_for_index
 """
 
 
+_PERIODIC_QUALITY_CLEANUP = """# Periodic Quality Cleanup (Фаза 4)
+
+Ты управляешь качеством базы знаний. Действуй по шагам:
+
+## Шаг 1: Получить очередь устаревших записей
+```
+review_queue(domain={domain}, limit={max_actions})
+```
+→ топ записей по staleness_score DESC с причинами (`reasons[]`).
+
+## Шаг 2: Получить открытые issues
+```
+list_quality_issues(status="open", limit={max_actions})
+```
+→ открытые проблемы: duplicates, missing_field, edit_war.
+
+## Шаг 3: Принять решение по каждой записи/issue
+- Устарела и есть дубль → `resolve_quality_issue(action="merge", target_id=<лучший дубль>)`
+- Устарела и бесполезна → `resolve_quality_issue(action="deprecate")`
+- Ошибочно скрыта (deprecated по ошибке) → `resolve_quality_issue(action="restore")`
+- False positive → `resolve_quality_issue(action="ignore")`
+- Актуальна после правки → `resolve_quality_issue(action="resolve")`
+
+## Шаг 4: SLO-мониторинг
+Если `review_queue_size` остаётся высоким (>50) после действий — сообщить оператору
+(SLO-breach: KnowledgeReviewQueueSLOBreach).
+
+## Критично
+- `merge`/`deprecate` необратимы через `restore` только частично — подтверждай destructive-действия.
+- `merge` требует `target_id` — убедись что target существует и лучше источника.
+- Не глуши все issues подряд — `ignore` только для false positives.
+"""
+
+
 def get_prompt(name: str) -> dict | None:
     """Получить содержимое промпта по имени.
 
@@ -214,6 +265,20 @@ def get_prompt(name: str) -> dict | None:
                     "content": {
                         "type": "text",
                         "text": _BEST_PRACTICE_WRITE,
+                    },
+                }
+            ],
+        }
+    elif name == "periodic_quality_cleanup":
+        return {
+            "name": name,
+            "description": "Регулярная чистка качества БЗ: review_queue + issues → merge/deprecate/restore.",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {
+                        "type": "text",
+                        "text": _PERIODIC_QUALITY_CLEANUP,
                     },
                 }
             ],

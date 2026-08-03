@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from mcp_server.quality.issues import (
     Issue,
@@ -189,7 +189,11 @@ class TestUpdateIssueStatus:
             issue = create_issue("duplicate", "kb-13", "warn", "test")
             updated = update_issue_status(issue.issue_id, "resolved")
             assert updated.resolved_at is not None
-            assert updated.resolved_at.tzinfo == timezone.utc
+            # Pydantic v2 парсит "+00:00" в pydantic_core.TzInfo(UTC) — отдельный
+            # объект, не identity с timezone.utc. Проверяем семантику UTC:
+            # tzinfo присутствует + utcoffset = 0.
+            assert updated.resolved_at.tzinfo is not None
+            assert updated.resolved_at.utcoffset() == timedelta(0)
 
 
 class TestIssueModel:

@@ -48,14 +48,13 @@ def build_search_filter(include_deprecated: bool = False) -> Optional[dict]:
     include_deprecated=True → без фильтра (видны все).
 
     Returns:
-        Qdrant Filter dict или None (без фильтра).
+        Qdrant Filter dict (совместимый с qdrant_client Filter / storage.qdrant_client.search
+        filters-параметром) или None (без фильтра).
     """
     if include_deprecated:
         return None  # без фильтра — видно всё
 
     # Исключаем deprecated: status != "deprecated"
-    from qdrant_client.models import Filter, FieldCondition, MatchExcept
-
     return {
         "must_not": [
             {

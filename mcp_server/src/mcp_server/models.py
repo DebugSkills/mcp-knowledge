@@ -39,6 +39,9 @@ class KnowledgeFrontmatter(BaseModel):
     cross_subjects: list[str] = Field(default_factory=list, description="Кросс-теги (#4)")
     tags: list[str] = Field(default_factory=list, description="Свободные теги")
     version: int = Field(default=1, ge=1, description="Optimistic locking (P2)")
+    status: str = Field(default="published", description="Lifecycle: published | deprecated (4.7)")
+    evergreen: bool = Field(default=False, description="Фундаментальное знание — медленное старение (4.5 R1)")
+    source: Optional[str] = Field(None, description="URL источника (link_health 4.5)")
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         description="Дата создания",
