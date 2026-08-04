@@ -1,4 +1,4 @@
-# ruff: noqa: BLE001, S110
+# ruff: noqa: BLE001
 """A5-A6: write_knowledge + update_entry + delete_entry.
 
 Three-way write flow (P1-2):
@@ -17,7 +17,7 @@ import asyncio
 import logging
 import time
 
-from ..metrics import record_write_latency
+from ..metrics import quality_gate_skipped, record_write_latency
 from ..models import VersionConflictError, WriteRequest
 
 logger = logging.getLogger("mcp_knowledge.tools.crud")
@@ -87,8 +87,9 @@ async def write_knowledge(params: dict, app_state) -> dict:
                     msg = f"knowledge_id '{provided_kid}' already exists (duplicate)"
                     quality_issues.append({"field": "knowledge_id", "severity": "critical", "message": msg})
                     blocked = True
-        except Exception:
-            pass  # best-effort: Qdrant недоступен → пропускаем проверку коллизий
+        except Exception as exc:
+            logger.warning("Collision check skipped (non-fatal): %s", exc)
+            quality_gate_skipped.labels(gate="collision", reason="exception").inc()
 
     # 2. Recommended-поля (advisory, E5)
     rec_issues, rec_warnings, rec_blocked = _recommended_field_warnings(params, strict)
@@ -114,6 +115,7 @@ async def write_knowledge(params: dict, app_state) -> dict:
                 blocked = True
     except Exception as exc:
         logger.warning("Dup-gate check skipped (non-fatal): %s", exc)
+        quality_gate_skipped.labels(gate="dup_gate", reason="exception").inc()
 
     if blocked:
         logger.warning(
@@ -153,10 +155,15 @@ async def write_knowledge(params: dict, app_state) -> dict:
     pipeline = app_state.pipeline
     indexed = False
     try:
-        await pipeline.enqueue(entry, wait_for_index=wait_for_index)
+        enqueue_result = await pipeline.enqueue(entry, wait_for_index=wait_for_index)
         if wait_for_index:
-            # Пайплайн завершился без исключения → считаем indexed
-            indexed = True
+            indexed = enqueue_result.indexed
+            if not indexed:
+                logger.warning(
+                    "write_knowledge: indexing NOT confirmed for %s (pending=%s) — "
+                    "worker may be dead/slow or event loop mismatch",
+                    knowledge_id, enqueue_result.pending,
+                )
     except Exception as exc:
         logger.error(
             "Pipeline enqueue failed for %s (wait=%s): %s",
@@ -240,6 +247,7 @@ async def update_entry(params: dict, app_state) -> dict:
                     blocked = True
         except Exception as exc:
             logger.warning("Dup-gate check skipped (non-fatal): %s", exc)
+            quality_gate_skipped.labels(gate="dup_gate", reason="exception").inc()
 
     # Recommended-поля (advisory) — из параметров обновления
     rec_issues, rec_warnings, rec_blocked = _recommended_field_warnings(params, strict)
@@ -271,6 +279,10 @@ async def update_entry(params: dict, app_state) -> dict:
             expected_version=expected_version,
         )
     except VersionConflictError as e:
+        # Фаза 12: инкремент метрики optimistic_lock_conflicts
+        from ..metrics import optimistic_lock_conflicts
+        optimistic_lock_conflicts.inc()
+
         # F2: Optimistic locking conflict — клиент должен перечитать и повторить
         logger.warning(
             "update_entry: version conflict for %s (expected=%s, actual=%s): %s",
@@ -287,9 +299,12 @@ async def update_entry(params: dict, app_state) -> dict:
     if entry is None:
         return {"error": f"Knowledge entry not found: '{knowledge_id}'"}
 
-    # Переиндексация
+    # Переиндексация (wait_for_index опционален — контракт: для синхронных
+    # сценариев (тесты, blue-green) ждём завершения, иначе drain очереди
+    # при stop может записать точку ПОСЛЕ delete_by_knowledge_id)
+    wait_for_index = params.get("wait_for_index", False)
     pipeline = app_state.pipeline
-    await pipeline.enqueue(entry, wait_for_index=False)
+    await pipeline.enqueue(entry, wait_for_index=wait_for_index)
 
     # INDEX update (best-effort)
     try:

@@ -59,6 +59,11 @@ async def health():
     Возвращает HTTP 200 при healthy.
     """
     checks = await _run_deep_checks()
+
+    # Фаза 12: обновить метрики здоровья после deep checks
+    from .metrics import update_health_metrics
+    update_health_metrics(checks)
+
     status = "healthy" if all(c.get("ok", False) for c in checks.values()) else "degraded"
     http_code = 200 if status == "healthy" else 503
     return JSONResponse(

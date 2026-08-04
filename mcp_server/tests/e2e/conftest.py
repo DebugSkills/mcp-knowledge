@@ -17,6 +17,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from starlette.requests import (
+    Request,
+)
 
 # ── Module-level env overrides (BEFORE any mcp_server import) ──
 os.environ.setdefault("MCP_READ_KEYS", '["e2e-read-key"]')
@@ -59,6 +62,18 @@ class _OllamaAdapter:
     def embed_sync(self, texts: list[str]) -> list[list[float]]:
         """pipeline/splitting: всегда list[str]→list[list[float]]."""
         return self._embedder.encode(texts)
+
+    def embed_latency_check(self) -> dict:
+        """Фаза 12: health-совместимый latency check."""
+        import time
+        t0 = time.monotonic()
+        self._embedder.encode("health_check_ping")
+        latency_ms = (time.monotonic() - t0) * 1000
+        return {
+            "backend": self.backend_name,
+            "model": self._embedder.model if hasattr(self._embedder, "model") else "mxbai-embed-large",
+            "latency_ms": round(latency_ms, 2),
+        }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -232,3 +247,84 @@ def e2e_app_state(e2e_store, real_qdrant, e2e_embedder_for_pipeline,
         pipeline=e2e_pipeline,
         knowledge_index=e2e_knowledge_index,
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+# Фаза 12: HTTP-level E2E fixture (TestClient против real backends)
+# ═══════════════════════════════════════════════════════════════
+
+@pytest.fixture
+async def e2e_http_app(real_qdrant, real_embedder, e2e_store, e2e_pipeline,
+                        e2e_knowledge_index, e2e_keys):
+    """Function-scoped httpx.AsyncClient with health + MCP + metrics.
+
+    Фаза 12 (v1.3 fix): httpx.AsyncClient + ASGITransport вместо TestClient —
+    устраняет event-loop mismatch между pytest-asyncio (pipeline worker loop)
+    и HTTP-обработчиком. Весь стек теперь в ОДНОМ event loop (pytest-asyncio).
+
+    Собирает минимальный FastAPI app (как в unit test_health.py):
+    - health router (liveness + readiness)
+    - AuthMiddleware (X-API-Key)
+    - POST /mcp → handle_mcp_request (JSON-RPC 2.0)
+    - GET /metrics → metrics_endpoint (Prometheus)
+
+    app.state заполняется реальными компонентами (session-scoped Qdrant,
+    Ollama embedder, per-test MarkdownStore/IndexingPipeline/KnowledgeIndex).
+    Health-глобалы прокидываются через set_*() для /health deep checks.
+
+    Изоляция: knowledge_e2e коллекция (через _patched_collection session fixture).
+    Teardown: сброс health-глобалов в None.
+    """
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+    from mcp_server.auth import AuthMiddleware
+    from mcp_server.health import router as health_router
+    from mcp_server.health import set_embedding_manager, set_pipeline, set_qdrant_client
+    from mcp_server.mcp_handler import handle_mcp_request
+    from mcp_server.metrics import metrics_endpoint
+    from mcp_server.rate_limit import TokenBucketLimiter
+
+    # Прокидываем реальные компоненты в health-глобалы
+    set_qdrant_client(real_qdrant)
+    set_embedding_manager(real_embedder)
+    set_pipeline(e2e_pipeline)
+
+    app = FastAPI()
+    app.add_middleware(AuthMiddleware)
+    app.include_router(health_router)
+
+    @app.post("/mcp")
+    async def mcp_endpoint(request: Request):
+        return await handle_mcp_request(request)
+
+    @app.get("/metrics")
+    async def metrics_route(request: Request):
+        return await metrics_endpoint(request)
+
+    # app.state для MCP handler, tools, metrics, auth
+    app.state.qdrant = real_qdrant
+    app.state.qdrant_client = real_qdrant
+    app.state.embedder = real_embedder
+    app.state.store = e2e_store
+    app.state.pipeline = e2e_pipeline
+    app.state.knowledge_index = e2e_knowledge_index
+
+    # Rate limiter (для S10)
+    app.state.rate_limiter_read = TokenBucketLimiter(
+        refill_rate=100.0 / 60.0, burst_size=10,
+    )
+    app.state.rate_limiter_write = TokenBucketLimiter(
+        refill_rate=20.0 / 60.0, burst_size=5,
+    )
+    app.state.rate_limiter = app.state.rate_limiter_read
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Тесты используют e2e_http_app.app.state.* (cleanup, rate limiter)
+        client.app = app
+        yield client
+
+    # Teardown: сброс health-глобалов
+    set_qdrant_client(None)
+    set_embedding_manager(None)
+    set_pipeline(None)

@@ -22,7 +22,12 @@ from ..embedding.manager import EmbeddingManager
 from ..models import Chunk, KnowledgeEntry, WriteResult
 from ..storage.markdown_store import MarkdownStore
 from ..storage.qdrant_client import QdrantClient
-from ..storage.schema import COLLECTION_ALIAS, build_payload_point
+from ..storage.schema import (
+    COLLECTION_ALIAS,
+    COLLECTION_V1,
+    COLLECTION_V2,
+    build_payload_point,
+)
 from .chunker import MarkdownChunker
 from .dlq import DeadLetterQueue
 from .sync_barrier import SyncBarrier
@@ -175,7 +180,12 @@ class IndexingPipeline:
 
         return await self._reindex_from_ssot()
 
-    async def reindex_blue_green(self) -> dict:
+    async def reindex_blue_green(
+        self,
+        alias_name: str | None = None,
+        collection_v1: str | None = None,
+        collection_v2: str | None = None,
+    ) -> dict:
         """F1: Zero-downtime blue-green reindex через Qdrant Collection Aliases.
 
         Flow:
@@ -185,22 +195,30 @@ class IndexingPipeline:
         4. Атомарно переключить alias на новую коллекцию (<1 сек)
         5. Удалить старую коллекцию (cleanup)
 
+        Args:
+            alias_name: имя alias (default: COLLECTION_ALIAS = "knowledge").
+                Для тестов: передать "knowledge_e2e_alias" (НЕ имя существующей коллекции).
+            collection_v1: имя первой blue-green коллекции (default: COLLECTION_V1).
+            collection_v2: имя второй blue-green коллекции (default: COLLECTION_V2).
+
         Returns:
             {active, target, alias_swapped, reindex_result, elapsed_sec}
         """
-        from ..storage.schema import COLLECTION_V1, COLLECTION_V2
+        alias = alias_name or COLLECTION_ALIAS
+        v1 = collection_v1 or COLLECTION_V1
+        v2 = collection_v2 or COLLECTION_V2
 
         t0 = datetime.now(timezone.utc)
-        logger.info("reindex_blue_green: начало blue-green reindex")
+        logger.info("reindex_blue_green: начало blue-green reindex (alias=%s)", alias)
 
         # 1. Определить активную и целевую коллекции
         try:
-            active = self._qdrant.get_active_collection()
+            active = self._qdrant.get_active_collection(alias_name=alias)
         except Exception:
-            active = COLLECTION_V1  # fallback: первая коллекция
+            active = v1  # fallback: первая коллекция
 
         # v1 → v2, v2 → v1
-        target = COLLECTION_V2 if active == COLLECTION_V1 else COLLECTION_V1
+        target = v2 if active == v1 else v1
         logger.info("reindex_blue_green: active=%s → target=%s", active, target)
 
         # 2. Создать новую коллекцию
@@ -210,12 +228,12 @@ class IndexingPipeline:
         reindex_result = await self._reindex_into(target)
 
         # 4. Атомарный swap alias
-        self._qdrant.swap_alias(COLLECTION_ALIAS, target)
+        self._qdrant.swap_alias(alias, target)
         alias_swapped = True
-        logger.info("reindex_blue_green: alias 'knowledge' → '%s' (swap complete)", target)
+        logger.info("reindex_blue_green: alias '%s' → '%s' (swap complete)", alias, target)
 
         # 5. Cleanup старой коллекции
-        if active != COLLECTION_ALIAS:
+        if active != alias:
             self._qdrant.delete_collection_named(active)
             logger.info("reindex_blue_green: старая коллекция '%s' удалена", active)
 

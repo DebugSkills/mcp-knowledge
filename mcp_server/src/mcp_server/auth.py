@@ -238,6 +238,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
             limiter = rate_limiter
 
         if not await limiter.check(key_hash, count=method_count):
+            # Фаза 12: инкремент rate_limit_rejected метрики
+            from .metrics import rate_limit_rejected
+            rate_limit_rejected.labels(key_level=auth_info.key_level).inc()
+
             return JSONResponse(
                 content={
                     "jsonrpc": "2.0",

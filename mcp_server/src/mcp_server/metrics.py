@@ -96,9 +96,58 @@ pipeline_failed = Counter(
     "mcp_pipeline_failed_total",
     "Всего неудачных попыток индексации",
 )
+quality_gate_skipped = Counter(
+    "mcp_quality_gate_skipped_total",
+    "Сколько раз quality-gate (collision check / dup-gate) был пропущен (non-fatal)",
+    ["gate", "reason"],
+)
+
+# ── Фаза 12: Observability metrics (V2) ─────────────────────
+
+health_check_status = Gauge(
+    "mcp_health_check_status",
+    "Состояние компонента (1=ok, 0=degraded)",
+    ["component"],
+)
+
+rate_limit_rejected = Counter(
+    "mcp_rate_limit_rejected_total",
+    "Отказано из-за rate limit",
+    ["key_level"],
+)
+
+optimistic_lock_conflicts = Counter(
+    "mcp_optimistic_lock_conflicts_total",
+    "Конфликтов optimistic locking (VersionConflictError)",
+)
+
+process_uptime_seconds = Gauge(
+    "mcp_process_uptime_seconds",
+    "Время работы процесса с последнего health refresh (сек)",
+)
+
+tool_requests = Counter(
+    "mcp_tool_requests_total",
+    "Всего вызовов MCP tools",
+    ["tool", "status"],
+)
 
 
 # ── Helpers ────────────────────────────────────────────────
+
+_process_start_time = time.monotonic()
+
+
+def update_health_metrics(checks: dict) -> None:
+    """Обновить health-метрики из результатов deep checks.
+
+    Args:
+        checks: {component: {ok: bool, ...}} — результат _run_deep_checks()
+    """
+    for component, check in checks.items():
+        ok = check.get("ok", False)
+        health_check_status.labels(component=component).set(1 if ok else 0)
+    process_uptime_seconds.set(time.monotonic() - _process_start_time)
 
 
 def update_queue_metrics(pipeline) -> None:

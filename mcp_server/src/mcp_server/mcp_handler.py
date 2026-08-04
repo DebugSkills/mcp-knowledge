@@ -163,6 +163,9 @@ async def _handle_tools_call(params: dict, request_id: Any, request: Request) ->
     # Поиск handler'а
     handler = TOOL_HANDLERS.get(tool_name)
     if handler is None:
+        # Фаза 12: tool_requests — инструмент не найден
+        from .metrics import tool_requests
+        tool_requests.labels(tool=tool_name, status="not_found").inc()
         return _jsonrpc_error(
             MCP_TOOL_NOT_FOUND,
             f"Tool not found: '{tool_name}'. Available: {sorted(TOOL_HANDLERS.keys())}",
@@ -184,6 +187,9 @@ async def _handle_tools_call(params: dict, request_id: Any, request: Request) ->
 
         # F2: Optimistic locking conflict detection
         if isinstance(result, dict) and result.get("conflict"):
+            # Фаза 12: tool_requests — conflict
+            from .metrics import tool_requests
+            tool_requests.labels(tool=tool_name, status="conflict").inc()
             return _jsonrpc_error(
                 MCP_CONFLICT,
                 result.get("message", "Version conflict"),
@@ -194,8 +200,14 @@ async def _handle_tools_call(params: dict, request_id: Any, request: Request) ->
                 },
             )
 
+        # Фаза 12: tool_requests — success (после conflict check)
+        from .metrics import tool_requests
+        tool_requests.labels(tool=tool_name, status="success").inc()
         return _jsonrpc_result({"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}, request_id)
     except Exception as exc:
+        # Фаза 12: tool_requests — error
+        from .metrics import tool_requests
+        tool_requests.labels(tool=tool_name, status="error").inc()
         logger.exception("Tool '%s' failed", tool_name)
         return _jsonrpc_error(
             JSONRPC_INTERNAL_ERROR,

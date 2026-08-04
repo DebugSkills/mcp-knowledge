@@ -164,21 +164,25 @@ class QdrantClient:
         )
         logger.info("Alias '%s' → '%s' created", alias_name, collection_name)
 
-    def get_active_collection(self) -> str:
+    def get_active_collection(self, alias_name: str | None = None) -> str:
         """Получить имя активной коллекции за alias'ом.
+
+        Args:
+            alias_name: имя alias для поиска (default: COLLECTION_ALIAS = "knowledge").
 
         Returns:
             Имя реальной коллекции (knowledge_v1 или knowledge_v2),
-            или COLLECTION_ALIAS если alias не настроен.
+            или alias_name если alias не настроен.
         """
+        alias = alias_name or COLLECTION_ALIAS
         try:
             aliases = self._client.get_aliases()
             for desc in aliases:
-                if desc.alias_name == COLLECTION_ALIAS:
+                if desc.alias_name == alias:
                     return desc.collection_name
         except Exception:
             pass
-        return COLLECTION_ALIAS
+        return alias
 
     # ── Point operations ──────────────────────────────────
 
@@ -201,7 +205,12 @@ class QdrantClient:
         )
 
     def delete_by_knowledge_id(self, knowledge_id: str) -> None:
-        """Удалить все точки (чанки) записи."""
+        """Удалить все точки (чанки) записи.
+
+        wait=True — синхронное удаление (qdrant-client 1.18.0 default wait=False):
+        без него точка может оставаться видимой для поиска сразу после delete
+        (eventual consistency) → тест-изоляция и cleanup ломаются.
+        """
         self._client.delete(
             collection_name=COLLECTION_NAME,
             points_selector=qmodels.FilterSelector(
@@ -214,6 +223,7 @@ class QdrantClient:
                     ]
                 )
             ),
+            wait=True,
         )
 
     def delete_all(self) -> None:
@@ -223,6 +233,7 @@ class QdrantClient:
             points_selector=qmodels.FilterSelector(
                 filter=qmodels.Filter()  # пустой фильтр = все точки
             ),
+            wait=True,
         )
 
     # ── Search ────────────────────────────────────────────
@@ -339,12 +350,21 @@ class QdrantClient:
         return ids
 
     def collection_info(self) -> dict:
-        """Информация о коллекции для /health."""
+        """Информация о коллекции для /health.
+
+        Фаза 12 fix: REST-mode Qdrant (qdrant-client 1.18) возвращает
+        CollectionInfo без vectors_count — используем indexed_vectors_count
+        как fallback (getattr безопасен для gRPC и REST).
+        """
         info = self._client.get_collection(COLLECTION_NAME)
         return {
             "name": COLLECTION_NAME,
-            "points_count": info.points_count,
-            "vectors_count": info.vectors_count,
+            "points_count": getattr(info, "points_count", 0),
+            "vectors_count": getattr(
+                info,
+                "vectors_count",
+                getattr(info, "indexed_vectors_count", 0),
+            ),
         }
 
     def scroll_unique_values(

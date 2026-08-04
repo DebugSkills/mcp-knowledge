@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from ..metrics import quality_gate_skipped
+
 logger = logging.getLogger("mcp_knowledge.quality.dup_gate")
 
 # ── Конфигурация ─────────────────────────────────────────────
@@ -103,6 +105,7 @@ async def check_duplicates(
     """
     if embedder is None or qdrant_client is None:
         logger.warning("Embedder or Qdrant client not available, skipping dup check")
+        quality_gate_skipped.labels(gate="dup_gate", reason="embedder_unavailable").inc()
         return []
 
     # Шаг 1: извлекаем репрезентативный текст (заголовок + первый чанк)
@@ -115,6 +118,7 @@ async def check_duplicates(
         query_vector = vec.tolist() if hasattr(vec, 'tolist') else list(vec)
     except Exception as exc:  # noqa: BLE001
         logger.error("Embed failed for dup-gate: %s", exc)
+        quality_gate_skipped.labels(gate="dup_gate", reason="embed_failed").inc()
         return []
 
     # Шаг 3: Qdrant search через wrapper API (Fix B: v1.2, задача 9.5a)
@@ -129,6 +133,7 @@ async def check_duplicates(
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("Qdrant search failed for dup-gate: %s", exc)
+        quality_gate_skipped.labels(gate="dup_gate", reason="search_failed").inc()
         return []
 
     # Шаг 4: find_duplicates

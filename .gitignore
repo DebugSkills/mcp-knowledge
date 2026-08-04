@@ -38,3 +38,6 @@ AGENTS.md
 .knowledge
 plans
 .venv/
+
+# Throwaway artifacts (реверсивное удаление)
+.trash/

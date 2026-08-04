@@ -573,27 +573,32 @@ async def test_s7c_metrics_exposition(e2e_app_state, e2e_pipeline):
 # S8: Blue-green reindex (ОПЦИОНАЛЬНЫЙ, e2e_slow — skip by default)
 # ═══════════════════════════════════════════════════════════════
 
+S8_ALIAS = "knowledge_e2e_alias"
+S8_V1 = "knowledge_e2e_v1"
+S8_V2 = "knowledge_e2e_v2"
+
+
 @pytest.mark.e2e_slow
 @pytest.mark.asyncio
 async def test_s8_blue_green_reindex(e2e_app_state, real_qdrant, e2e_store,
-                                      e2e_pipeline, e2e_knowledge_index):
+                                       e2e_pipeline, e2e_knowledge_index):
     """S8 (опц.): blue-green reindex через Qdrant aliases.
 
-    Требует monkeypatch COLLECTION_ALIAS (pipeline использует его напрямую).
-    Только под make e2e-slow.
-    """
-    # Patch COLLECTION_ALIAS to e2e collection
-    import mcp_server.indexing.pipeline as pipeline_mod
-    import mcp_server.storage.schema as schema_mod
-    from mcp_server.tools.crud import write_knowledge
+    Фаза 10 (фикс): вместо хрупких monkeypatch на COLLECTION_ALIAS/V1/V2
+    тест передаёт явные e2e-имена через параметры reindex_blue_green().
+    Это устраняет root cause деструктивного поведения (деструктивный
+    force_recreate прод-именованной knowledge_v1) и 409 Conflict
+    (alias-имя не должно совпадать с существующей коллекцией knowledge_e2e).
 
-    original_pipeline_alias = pipeline_mod.COLLECTION_ALIAS
-    original_schema_alias = schema_mod.COLLECTION_ALIAS
-    pipeline_mod.COLLECTION_ALIAS = "knowledge_e2e"
-    schema_mod.COLLECTION_ALIAS = "knowledge_e2e"
+    Alias: knowledge_e2e_alias (отдельный, не совпадает с коллекцией)
+    Коллекции: knowledge_e2e_v1, knowledge_e2e_v2 (полный cleanup в finally).
+    """
+    from mcp_server.tools.crud import write_knowledge
+    from mcp_server.tools.search import search_knowledge
+    from qdrant_client.http import models as qmodels
 
     try:
-        # Write test entry
+        # Step 1: Write test entry (идёт в knowledge_e2e через патч COLLECTION_NAME из conftest)
         await write_knowledge(
             {
                 "content": "# Blue-green test\n\nТестовая запись для blue-green.\n",
@@ -605,14 +610,17 @@ async def test_s8_blue_green_reindex(e2e_app_state, real_qdrant, e2e_store,
             e2e_app_state,
         )
 
-        # Run blue-green reindex
-        reindex_result = await e2e_pipeline.reindex_blue_green()
+        # Step 2: Blue-green reindex с явными e2e-именами
+        reindex_result = await e2e_pipeline.reindex_blue_green(
+            alias_name=S8_ALIAS,
+            collection_v1=S8_V1,
+            collection_v2=S8_V2,
+        )
         assert reindex_result["alias_swapped"] is True
-        assert "_v2" in reindex_result.get("target", ""), f"Expected _v2 target: {reindex_result}"
+        target = reindex_result.get("target", "")
+        assert target in (S8_V1, S8_V2), f"Expected target in ({S8_V1}, {S8_V2}), got {target}"
 
-        # Search should still work
-        from mcp_server.tools.search import search_knowledge
-
+        # Step 3: Search после swap — zero-downtime проверка
         search_result = await search_knowledge(
             {"query": "blue green test", "top_k": 5},
             e2e_app_state,
@@ -622,10 +630,24 @@ async def test_s8_blue_green_reindex(e2e_app_state, real_qdrant, e2e_store,
         assert len(results) >= 1, "Search failed after blue-green swap"
 
     finally:
-        pipeline_mod.COLLECTION_ALIAS = original_pipeline_alias
-        schema_mod.COLLECTION_ALIAS = original_schema_alias
-        # Cleanup v2 collection (may not exist — no-reraise is intentional)
+        # Step 4: Full cleanup — удалить alias + коллекции (идемпотентно)
+        # Удалить alias knowledge_e2e_alias
         try:
-            real_qdrant.delete_collection_named("knowledge_e2e_v2")
+            real_qdrant._client.update_collection_aliases(
+                change_aliases_operations=[
+                    qmodels.DeleteAliasOperation(
+                        delete_alias=qmodels.DeleteAlias(
+                            alias_name=S8_ALIAS,
+                        )
+                    )
+                ],
+            )
         except Exception:  # noqa: S110
             pass
+
+        # Удалить blue-green коллекции knowledge_e2e_v1, knowledge_e2e_v2
+        for coll in [S8_V1, S8_V2]:
+            try:
+                real_qdrant.delete_collection_named(coll)
+            except Exception:  # noqa: S110
+                pass
