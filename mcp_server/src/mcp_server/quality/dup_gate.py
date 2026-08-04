@@ -117,23 +117,14 @@ async def check_duplicates(
         logger.error("Embed failed for dup-gate: %s", exc)
         return []
 
-    # Шаг 3: Qdrant search
+    # Шаг 3: Qdrant search через wrapper API (Fix B: v1.2, задача 9.5a)
+    # Wrapper строит Filter из dict — ручная сборка Filter/FieldCondition/MatchValue удалена.
+    # with_vectors=True необходимо для find_duplicates (hit.vector).
     try:
-        from qdrant_client.models import FieldCondition, Filter, MatchValue
-
-        # domain-фильтр только если domain указан (для update_entry domain может быть неизвестен)
-        query_filter = None
-        if domain:
-            query_filter = Filter(
-                must=[FieldCondition(key="domain", match=MatchValue(value=domain))]
-            )
-
         results = qdrant_client.search(
-            collection_name="knowledge",
-            query_vector=query_vector,
-            limit=SEARCH_TOP_K,
-            query_filter=query_filter,
-            with_payload=True,
+            vector=query_vector,
+            top_k=SEARCH_TOP_K,
+            filters={"domain": domain} if domain else None,
             with_vectors=True,
         )
     except Exception as exc:  # noqa: BLE001

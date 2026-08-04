@@ -41,6 +41,17 @@ backup:
 	bash scripts/backup.sh
 
 # ═══════════════════════════════════════════════════════════════
+# E2E-тесты (Фаза 9) — реальный Qdrant (REST localhost:6333) + Ollama
+# ═══════════════════════════════════════════════════════════════
+
+.PHONY: e2e e2e-slow
+e2e:  ## E2E-тесты ключевых решений (нужен запущенный Qdrant + Ollama)
+	.venv/bin/python -m pytest mcp_server/tests/e2e -m "e2e and not e2e_slow" -v
+
+e2e-slow:  ## E2E + медленные сценарии (blue-green, GPU)
+	.venv/bin/python -m pytest mcp_server/tests/e2e -m "e2e or e2e_slow" -v
+
+# ═══════════════════════════════════════════════════════════════
 # Torch GPU/CPU установка (Фаза 8.1)
 # ═══════════════════════════════════════════════════════════════
 

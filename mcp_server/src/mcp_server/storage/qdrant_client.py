@@ -233,8 +233,20 @@ class QdrantClient:
         top_k: int = 5,
         filters: dict | None = None,
         score_threshold: float = 0.0,
+        with_vectors: bool = False,
     ) -> list[qmodels.ScoredPoint]:
-        """Семантический поиск по вектору."""
+        """Семантический поиск по вектору.
+
+        Args:
+            vector: вектор запроса.
+            top_k: число результатов.
+            filters: dict {key: value} для payload-фильтрации.
+            score_threshold: минимальный cosine-порог.
+            with_vectors: вернуть векторы в результатах (для dup-gate).
+
+        Returns:
+            list[qmodels.ScoredPoint] с payload (и векторами если with_vectors=True).
+        """
         query_filter = None
         if filters:
             must_conditions = []
@@ -256,15 +268,16 @@ class QdrantClient:
             if must_conditions:
                 query_filter = qmodels.Filter(must=must_conditions)
 
-        results = self._client.search(
+        results = self._client.query_points(
             collection_name=COLLECTION_NAME,
-            query_vector=vector,
+            query=vector,
             limit=top_k,
             query_filter=query_filter,
             score_threshold=score_threshold,
             with_payload=True,
+            with_vectors=with_vectors,
         )
-        return results
+        return results.points
 
     def search_by_tags(
         self,
@@ -314,9 +327,7 @@ class QdrantClient:
                 collection_name=COLLECTION_NAME,
                 limit=1000,
                 offset=offset,
-                with_payload=qmodels.WithPayloadSelector(
-                    include=["knowledge_id"]
-                ),
+                with_payload=["knowledge_id"],
                 with_vectors=False,
             )
             for point in points:
@@ -385,7 +396,7 @@ class QdrantClient:
                 limit=min(1000, limit * 2),
                 offset=offset,
                 scroll_filter=scroll_filter,
-                with_payload=qmodels.WithPayloadSelector(include=[field]),
+                with_payload=[field],
                 with_vectors=False,
             )
 
