@@ -10,7 +10,6 @@ kb://{domain}/{subject} → список knowledge_ids
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
 from urllib.parse import unquote
 
 logger = logging.getLogger("mcp_knowledge.resources")
@@ -39,7 +38,7 @@ RESOURCES = [
 ]
 
 
-def _parse_kb_uri(uri: str) -> Optional[tuple[str, ...]]:
+def _parse_kb_uri(uri: str) -> tuple[str, ...] | None:
     """Разобрать kb:// URI в компоненты пути.
 
     Returns:
@@ -125,7 +124,7 @@ async def get_kb_resource(uri: str, app_state) -> dict:
 async def _collect_unique_values(
     qdrant,
     field: str,
-    domain_filter: Optional[str] = None,
+    domain_filter: str | None = None,
     max_points: int = 10_000,
 ) -> set[str]:
     """Собрать уникальные значения поля через Qdrant scroll().

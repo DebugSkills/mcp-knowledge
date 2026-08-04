@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger("mcp_knowledge.quality.edit_war")
 
@@ -27,7 +26,7 @@ def detect_edit_war(
     window_h: int = EDIT_WAR_WINDOW_H,
     threshold: int = EDIT_WAR_THRESHOLD,
     repo_path: str | Path | None = None,
-    now: Optional[datetime] = None,
+    now: datetime | None = None,
 ) -> bool:
     """Проверяет — идёт ли «война правок» для конкретного файла знаний.
 
@@ -108,7 +107,7 @@ def detect_all_edit_wars(
     *,
     window_h: int = EDIT_WAR_WINDOW_H,
     threshold: int = EDIT_WAR_THRESHOLD,
-    repo_path: Optional[str | Path] = None,
+    repo_path: str | Path | None = None,
 ) -> list[str]:
     """Сканирует все .md файлы в knowledge_dir на edit-war.
 
@@ -131,7 +130,7 @@ def detect_all_edit_wars(
     return edit_war_ids
 
 
-def _find_git_root(start_dir: Path) -> Optional[Path]:
+def _find_git_root(start_dir: Path) -> Path | None:
     """Ищет корень git-репозитория, поднимаясь по дереву директорий."""
     current = start_dir.resolve()
     for _ in range(20):  # защита от бесконечного цикла

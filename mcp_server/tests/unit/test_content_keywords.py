@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import pytest
-
 from mcp_server.content.keywords import (
-    extract_keywords,
-    deduplicate_tags,
-    _normalize_tag,
     _is_stop_word,
+    _normalize_tag,
+    deduplicate_tags,
+    extract_keywords,
 )
 
 

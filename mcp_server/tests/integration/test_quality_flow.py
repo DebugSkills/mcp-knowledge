@@ -12,31 +12,29 @@ from __future__ import annotations
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
-from mcp_server.models import KnowledgeEntry, KnowledgeFrontmatter
-from mcp_server.quality.gates import GateResult, evaluate_frontmatter
+from mcp_server.quality.dup_gate import compute_cosine, find_duplicates
+from mcp_server.quality.edit_war import detect_edit_war
+from mcp_server.quality.gates import evaluate_frontmatter
 from mcp_server.quality.issues import (
     create_issue,
     list_issues,
     set_store_dir,
     update_issue_status,
 )
-from mcp_server.quality.scoring import (
-    StalenessInput,
-    REVIEW_THRESHOLD,
-    staleness_score,
-    should_review,
-)
 from mcp_server.quality.lifecycle import (
     get_status,
     make_deprecation_payload_update,
     make_restore_payload_update,
 )
-from mcp_server.quality.edit_war import detect_edit_war
-from mcp_server.quality.dup_gate import find_duplicates, compute_cosine
-
+from mcp_server.quality.scoring import (
+    REVIEW_THRESHOLD,
+    StalenessInput,
+    should_review,
+    staleness_score,
+)
 
 # ── Fixtures ─────────────────────────────────────────────────
 

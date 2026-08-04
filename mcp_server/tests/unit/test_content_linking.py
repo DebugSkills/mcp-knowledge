@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import pytest
-
 from mcp_server.content.linking import (
-    slugify,
-    make_knowledge_id,
-    make_collection_id,
-    build_collection,
-    CollectionRoot,
     ChildEntry,
+    CollectionRoot,
+    build_collection,
+    make_collection_id,
+    make_knowledge_id,
+    slugify,
 )
 
 

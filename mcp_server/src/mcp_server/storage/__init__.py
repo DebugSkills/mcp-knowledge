@@ -2,6 +2,6 @@
 
 from .markdown_store import MarkdownStore
 from .qdrant_client import QdrantClient
-from .schema import build_payload_point, build_collection_params, COLLECTION_NAME
+from .schema import COLLECTION_NAME, build_collection_params, build_payload_point
 
-__all__ = ["MarkdownStore", "QdrantClient", "build_payload_point", "build_collection_params", "COLLECTION_NAME"]
+__all__ = ["COLLECTION_NAME", "MarkdownStore", "QdrantClient", "build_collection_params", "build_payload_point"]

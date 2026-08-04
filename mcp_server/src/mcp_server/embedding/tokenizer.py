@@ -10,7 +10,7 @@ BGE-M3 использует XLM-RoBERTa токенизатор. Для русс�
 from __future__ import annotations
 
 import logging
-from functools import lru_cache
+import os
 
 from ..config import settings
 
@@ -26,9 +26,19 @@ def _load_tokenizer():
     if _tokenizer_instance is None:
         from transformers import AutoTokenizer
         logger.info("Загрузка токенайзера XLM-RoBERTa для %s...", settings.EMBEDDING_MODEL)
+        cache_dir = settings.MODELS_CACHE_DIR
+        try:
+            # Создать кэш-директорию, если не существует (idempotent; в Docker
+            # volume уже смонтирован, локально — создаём/используем fallback).
+            os.makedirs(cache_dir, exist_ok=True)
+        except OSError as exc:
+            # Кэш-путь недоступен (напр. локально нет /app) → transformers
+            # использует стандартный HF-кэш (~/.cache/huggingface).
+            logger.warning("Кэш-директория недоступна (%s); fallback на HF-кэш: %s", exc, cache_dir)
+            cache_dir = None
         _tokenizer_instance = AutoTokenizer.from_pretrained(
             settings.EMBEDDING_MODEL,
-            cache_dir=settings.MODELS_CACHE_DIR,
+            cache_dir=cache_dir,
         )
         logger.info("Токенайзер загружен (vocab_size=%d)", _tokenizer_instance.vocab_size)
     return _tokenizer_instance

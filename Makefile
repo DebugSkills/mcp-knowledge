@@ -39,3 +39,16 @@ reindex:
 # Бэкап Qdrant + SSOT
 backup:
 	bash scripts/backup.sh
+
+# ═══════════════════════════════════════════════════════════════
+# Torch GPU/CPU установка (Фаза 8.1)
+# ═══════════════════════════════════════════════════════════════
+
+.PHONY: install-gpu install-cpu
+install-gpu:  ## Установить CUDA-12 torch (cu121) для GPU-инференса (driver 535 / CUDA 12.2)
+	.venv/bin/pip install --upgrade --force-reinstall torch \
+	    --index-url https://download.pytorch.org/whl/cu121
+
+install-cpu:  ## Альтернатива: CPU-only torch (air-gap / dev, без CUDA-deps)
+	.venv/bin/pip install --upgrade --force-reinstall torch \
+	    --index-url https://download.pytorch.org/whl/cpu

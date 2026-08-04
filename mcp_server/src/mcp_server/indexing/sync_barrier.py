@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
 
 from ..config import settings
 from ..models import WriteResult
@@ -43,6 +42,19 @@ class SyncBarrier:
         logger.debug("SyncBarrier: registered %s", knowledge_id)
         return event
 
+    def bind_event(self, knowledge_id: str, event: asyncio.Event) -> None:
+        """Сохранить ВНЕШНИЙ event для knowledge_id (без создания нового).
+
+        Используется pipeline.enqueue() когда event создаётся в очереди,
+        а SyncBarrier должен использовать тот же объект для wait/signal.
+
+        Args:
+            knowledge_id: ID записи
+            event: asyncio.Event, созданный в item["event"] очереди
+        """
+        self._events[knowledge_id] = event
+        logger.debug("SyncBarrier: bind_event %s", knowledge_id)
+
     def signal(self, knowledge_id: str) -> None:
         """Сигнализировать о завершении индексации knowledge_id."""
         event = self._events.pop(knowledge_id, None)
@@ -54,6 +66,23 @@ class SyncBarrier:
         """Сигнализировать о завершении батча."""
         for kid in knowledge_ids:
             self.signal(kid)
+
+    def is_registered(self, knowledge_id: str) -> bool:
+        """Проверить, зарегистрирован ли knowledge_id для ожидания (без создания события)."""
+        return knowledge_id in self._events
+
+    def signal_if_registered(self, knowledge_id: str) -> bool:
+        """Сигнализировать о завершении, если knowledge_id зарегистрирован.
+
+        Returns:
+            True если сигнал отправлен, False если knowledge_id не был зарегистрирован.
+        """
+        event = self._events.pop(knowledge_id, None)
+        if event:
+            event.set()
+            logger.debug("SyncBarrier: signal_if_registered %s", knowledge_id)
+            return True
+        return False
 
     async def wait(self, knowledge_id: str, timeout: float = SYNC_TIMEOUT) -> WriteResult:
         """Ждать завершения индексации knowledge_id.

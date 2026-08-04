@@ -1,7 +1,7 @@
 """Indexing layer: async pipeline, chunker, reconciliation, DLQ, INDEX gen."""
 
-from .pipeline import IndexingPipeline
 from .chunker import MarkdownChunker
 from .knowledge_index import KnowledgeIndex
+from .pipeline import IndexingPipeline
 
-__all__ = ["IndexingPipeline", "MarkdownChunker", "KnowledgeIndex"]
+__all__ = ["IndexingPipeline", "KnowledgeIndex", "MarkdownChunker"]

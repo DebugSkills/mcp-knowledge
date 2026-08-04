@@ -12,9 +12,6 @@
 from __future__ import annotations
 
 import logging
-import os
-from pathlib import Path
-from typing import Optional
 
 from ..config import settings
 
@@ -31,7 +28,7 @@ def load_model() -> bool:
     Для MVP используем sentence-transformers на CPU через torch — даёт те же векторы,
     что и GPU-версия (решение P1-1: torch-CPU вместо ONNX для MVP).
     """
-    global _model, _tokenizer
+    global _model
     try:
         import torch
         from sentence_transformers import SentenceTransformer
@@ -49,7 +46,7 @@ def load_model() -> bool:
                      _model.get_sentence_embedding_dimension(),
                      torch.get_num_threads())
         return True
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error("CPU-загрузка BGE-M3 не удалась: %s", e)
         _model = None
         return False

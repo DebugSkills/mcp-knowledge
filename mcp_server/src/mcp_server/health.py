@@ -107,7 +107,7 @@ def _check_qdrant() -> dict:
             "points": info.get("points_count", 0),
             "vectors": info.get("vectors_count", 0),
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning("Health: Qdrant unreachable: %s", e)
         return {"ok": False, "connected": False, "error": str(e)[:200]}
 

@@ -8,9 +8,6 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
-
-from sklearn.feature_extraction.text import TfidfVectorizer
 
 logger = logging.getLogger("mcp_knowledge.content.keywords")
 
@@ -77,7 +74,7 @@ def extract_keywords(
     texts: list[str],
     top_n: int = 5,
     max_features: int = 100,
-    stop_words: Optional[set[str]] = None,
+    stop_words: set[str] | None = None,
 ) -> list[list[str]]:
     """Извлечь top-N ключевых слов на каждый текст через TF-IDF.
 
@@ -105,6 +102,9 @@ def extract_keywords(
     non_empty = [t for t in texts if t.strip()]
     if not non_empty:
         return [[] for _ in texts]
+
+    # Lazy import sklearn (P1-1: avoids numpy double-import during coverage measurement)
+    from sklearn.feature_extraction.text import TfidfVectorizer
 
     try:
         vectorizer = TfidfVectorizer(

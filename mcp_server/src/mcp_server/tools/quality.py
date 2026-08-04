@@ -1,3 +1,4 @@
+# ruff: noqa: BLE001
 """Quality MCP Tools — review_queue, list_quality_issues, resolve_quality_issue, run_quality_scan (4.6+4.8).
 
 Thin wrappers: делегируют доменную логику в quality/ пакет.
@@ -7,10 +8,9 @@ Thin wrappers: делегируют доменную логику в quality/ п
 from __future__ import annotations
 
 import logging
-from typing import Any
 
-from mcp_server.quality.issues import list_issues, update_issue_status
 from mcp_server.quality import REVIEW_THRESHOLD
+from mcp_server.quality.issues import list_issues, update_issue_status
 
 logger = logging.getLogger("mcp_knowledge.tools.quality")
 
@@ -37,7 +37,7 @@ async def review_queue(params: dict, app_state) -> dict:
     try:
         client = app_state.qdrant_client
         # Qdrant scroll с фильтром и сортировкой по payload.staleness_score DESC
-        from qdrant_client.models import Filter, FieldCondition, MatchValue, Range
+        from qdrant_client.models import FieldCondition, Filter, MatchValue, Range
 
         must_conditions: list[FieldCondition] = []
         if domain:
@@ -158,12 +158,20 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
     side_effects: list[str] = []
 
     try:
+        # Look up issue to get knowledge_id for lifecycle actions (deprecate/restore/merge)
+        if action in ("deprecate", "restore", "merge"):
+            all_issues = list_issues(limit=None)
+            issue_entry = next((i for i in all_issues if i.issue_id == issue_id), None)
+            if not issue_entry:
+                return {"resolved": False, "error": f"Issue {issue_id} not found"}
+            knowledge_id = issue_entry.knowledge_id
+
         if action == "resolve":
-            updated = update_issue_status(issue_id, "resolved", reason)
+            update_issue_status(issue_id, "resolved", reason)
             return {"resolved": True, "issue_id": issue_id, "status": "resolved", "side_effects": side_effects}
 
         elif action == "ignore":
-            updated = update_issue_status(issue_id, "ignored", reason)
+            update_issue_status(issue_id, "ignored", reason)
             return {"resolved": True, "issue_id": issue_id, "status": "ignored", "side_effects": side_effects}
 
         elif action == "deprecate":
@@ -171,8 +179,11 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
             try:
                 qdrant = getattr(app_state, 'qdrant_client', None)
                 if qdrant:
-                    from qdrant_client.models import Filter, FieldCondition, MatchValue
-                    from mcp_server.quality.lifecycle import make_deprecation_payload_update
+                    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+                    from mcp_server.quality.lifecycle import (
+                        make_deprecation_payload_update,
+                    )
                     payload = make_deprecation_payload_update()
                     qdrant.set_payload(
                         collection_name="knowledge",
@@ -182,7 +193,7 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
                         ),
                     )
                     side_effects.append(f"Qdrant payload status set to 'deprecated' for knowledge_id={knowledge_id}")
-                updated = update_issue_status(issue_id, "resolved", reason or "deprecated")
+                update_issue_status(issue_id, "resolved", reason or "deprecated")
                 return {"resolved": True, "issue_id": issue_id, "status": "resolved", "side_effects": side_effects}
             except Exception as exc:
                 logger.error("deprecate lifecycle failed for %s: %s", knowledge_id, exc)
@@ -193,7 +204,8 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
             try:
                 qdrant = getattr(app_state, 'qdrant_client', None)
                 if qdrant:
-                    from qdrant_client.models import Filter, FieldCondition, MatchValue
+                    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
                     from mcp_server.quality.lifecycle import make_restore_payload_update
                     payload = make_restore_payload_update()
                     qdrant.set_payload(
@@ -204,7 +216,7 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
                         ),
                     )
                     side_effects.append(f"Qdrant payload status set to 'published' for knowledge_id={knowledge_id}")
-                updated = update_issue_status(issue_id, "resolved", reason or "restored")
+                update_issue_status(issue_id, "resolved", reason or "restored")
                 return {"resolved": True, "issue_id": issue_id, "status": "resolved", "side_effects": side_effects}
             except Exception as exc:
                 logger.error("restore lifecycle failed for %s: %s", knowledge_id, exc)
@@ -217,8 +229,11 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
             try:
                 qdrant = getattr(app_state, 'qdrant_client', None)
                 if qdrant:
-                    from qdrant_client.models import Filter, FieldCondition, MatchValue
-                    from mcp_server.quality.lifecycle import make_deprecation_payload_update
+                    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+                    from mcp_server.quality.lifecycle import (
+                        make_deprecation_payload_update,
+                    )
                     payload = make_deprecation_payload_update()
                     qdrant.set_payload(
                         collection_name="knowledge",
@@ -231,7 +246,7 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
             except Exception as exc:
                 logger.error("merge lifecycle failed for %s: %s", knowledge_id, exc)
                 return {"resolved": False, "error": f"Merge failed: {exc}"}
-            updated = update_issue_status(issue_id, "resolved", f"merged into {target_id}. {reason}")
+            update_issue_status(issue_id, "resolved", f"merged into {target_id}. {reason}")
             side_effects.append(f"Content merge into '{target_id}' pending — markdown merge not yet implemented")
             return {
                 "resolved": True,
@@ -261,7 +276,7 @@ async def run_quality_scan(params: dict, app_state) -> dict:
     """
     from mcp_server.quality.scanner import run_scan
 
-    domain = params.get("domain")
+    
 
     try:
         knowledge_dir = app_state.settings.knowledge_dir if hasattr(app_state, 'settings') else None

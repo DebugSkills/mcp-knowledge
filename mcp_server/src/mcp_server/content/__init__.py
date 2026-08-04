@@ -5,9 +5,9 @@ MCP Tool import_content + модульные препроцессоры (content
 best-effort batch с orphan cleanup.
 """
 
-from .preprocessor import ContentPreprocessor, Section, ImportMeta, ValidationResult
 from . import registry
 from .book_preprocessor import BookPreprocessor
+from .preprocessor import ContentPreprocessor, ImportMeta, Section, ValidationResult
 
 # ── Регистрация препроцессоров ────────────────────────────
 # BookPreprocessor: content_type="book" — структурные книги/документы
@@ -15,10 +15,10 @@ from .book_preprocessor import BookPreprocessor
 registry.register(BookPreprocessor(embedder=None, token_counter=None))
 
 __all__ = [
+    "BookPreprocessor",
     "ContentPreprocessor",
-    "Section",
     "ImportMeta",
+    "Section",
     "ValidationResult",
     "registry",
-    "BookPreprocessor",
 ]

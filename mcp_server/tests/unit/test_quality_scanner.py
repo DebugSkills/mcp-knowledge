@@ -4,14 +4,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import yaml
 from mcp_server.models import KnowledgeFrontmatter
 from mcp_server.quality.scanner import (
     _are_dup_candidates,
     _empty_result,
     _parse_frontmatter,
 )
-
-import yaml
 
 
 def _make_fm(**overrides) -> KnowledgeFrontmatter:

@@ -1,3 +1,4 @@
+# ruff: noqa: BLE001, S110
 """C1: Reconciliation при старте — сверка Markdown SSOT ↔ Qdrant.
 
 Задача 2.9 плана Фазы 2.
@@ -14,11 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
-from ..models import KnowledgeEntry
 from ..storage.markdown_store import MarkdownStore
 from ..storage.qdrant_client import QdrantClient
 from .pipeline import IndexingPipeline

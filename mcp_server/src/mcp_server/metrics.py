@@ -1,3 +1,4 @@
+# ruff: noqa: BLE001, S110
 """D1: Prometheus-метрики — /metrics эндпоинт.
 
 Задача 2.13 плана Фазы 2.
@@ -16,11 +17,10 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
 
-from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from fastapi import Request
 from fastapi.responses import Response
+from prometheus_client import Counter, Gauge, Histogram, generate_latest
 
 logger = logging.getLogger("mcp_knowledge.metrics")
 

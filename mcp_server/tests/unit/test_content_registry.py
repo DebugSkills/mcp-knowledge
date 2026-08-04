@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import pytest
-
-from mcp_server.content.registry import get, register, list_types, reset
-from mcp_server.content.preprocessor import ContentPreprocessor, ImportMeta, Section, ValidationResult
+from mcp_server.content.preprocessor import (
+    ContentPreprocessor,
+    ImportMeta,
+    Section,
+    ValidationResult,
+)
+from mcp_server.content.registry import get, list_types, register, reset
 
 
 class _MockPreprocessor(ContentPreprocessor):

@@ -6,10 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Type
-
 from .preprocessor import ContentPreprocessor
-
 
 _registry: dict[str, ContentPreprocessor] = {}
 

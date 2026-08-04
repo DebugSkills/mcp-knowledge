@@ -1,3 +1,4 @@
+# ruff: noqa: BLE001
 """MCP Knowledge Server — точка входа.
 
 Интегрирует все компоненты Фазы 1:
@@ -23,15 +24,16 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
 
-from .config import settings
-from .health import router as health_router, set_embedding_manager, set_qdrant_client, set_pipeline
-from .storage import MarkdownStore, QdrantClient
-from .embedding import EmbeddingManager
-from .indexing import IndexingPipeline, MarkdownChunker
 from .auth import AuthMiddleware
+from .config import settings
+from .embedding import EmbeddingManager
+from .health import router as health_router
+from .health import set_embedding_manager, set_pipeline, set_qdrant_client
+from .indexing import IndexingPipeline, MarkdownChunker
 from .mcp_handler import handle_mcp_request
 from .metrics import metrics_endpoint, set_embed_backend
 from .rate_limit import TokenBucketLimiter
+from .storage import MarkdownStore, QdrantClient
 
 logger = logging.getLogger("mcp_knowledge")
 

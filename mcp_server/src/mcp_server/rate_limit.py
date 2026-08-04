@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Optional
 
 logger = logging.getLogger("mcp_knowledge.rate_limit")
 
@@ -25,7 +24,6 @@ MAX_BUCKET_KEYS = 5000
 
 class RateLimitedError(Exception):
     """Rate limit exceeded — должен вернуть MCP_RATE_LIMITED (-32003)."""
-    pass
 
 
 class TokenBucketLimiter:

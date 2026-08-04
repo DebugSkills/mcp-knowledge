@@ -1,3 +1,4 @@
+# ruff: noqa: BLE001
 """C3: Dead Letter Queue — выделен из pipeline.py.
 
 Задача 2.11 плана Фазы 2.
@@ -7,15 +8,12 @@ Retry с backoff (1s, 4s, 16s). Алерт при dlq_size > 10.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 from ..config import settings
-from ..models import KnowledgeEntry
 
 logger = logging.getLogger("mcp_knowledge.dlq")
 
@@ -77,7 +75,7 @@ class DeadLetterQueue:
         """Количество записей в DLQ."""
         return len(list(self._dir.glob("*.json")))
 
-    def check_alert(self) -> Optional[str]:
+    def check_alert(self) -> str | None:
         """Проверить, не превышен ли порог алерта.
 
         Returns:

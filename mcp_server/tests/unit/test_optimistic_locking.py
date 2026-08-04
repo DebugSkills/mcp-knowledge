@@ -15,14 +15,12 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-from mcp_server.tools.crud import update_entry
-from mcp_server.models import VersionConflictError
 from mcp_server.mcp_handler import (
     MCP_CONFLICT,
     _handle_tools_call,
-    _jsonrpc_error,
 )
+from mcp_server.models import VersionConflictError
+from mcp_server.tools.crud import update_entry
 
 pytestmark = pytest.mark.asyncio
 
@@ -191,8 +189,9 @@ class TestTocTouPrevention:
 
     async def test_crud_passes_expected_version_to_store(self):
         """F2 P1-4: crud.py update_entry passes expected_version directly to store.update(), not reading first."""
-        from mcp_server.models import KnowledgeEntry, KnowledgeFrontmatter
         from datetime import datetime, timezone
+
+        from mcp_server.models import KnowledgeEntry, KnowledgeFrontmatter
         from mcp_server.tools.crud import update_entry
 
         mock_store = MagicMock()
@@ -231,4 +230,4 @@ class TestTocTouPrevention:
 
 # ── Helpers ────────────────────────────────────────────────
 
-from unittest.mock import patch  # noqa: F401 — used in TestMcpHandlerConflict
+from unittest.mock import patch

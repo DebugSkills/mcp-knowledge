@@ -1,6 +1,6 @@
 """Настройки MCP Knowledge Server (pydantic-settings)."""
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List
 
 
 class Settings(BaseSettings):
@@ -17,8 +17,8 @@ class Settings(BaseSettings):
     MODELS_CACHE_DIR: str = "/app/models_cache"
 
     # MCP Auth (мульти-ключи #18)
-    MCP_READ_KEYS: List[str] = []
-    MCP_WRITE_KEYS: List[str] = []
+    MCP_READ_KEYS: list[str] = []
+    MCP_WRITE_KEYS: list[str] = []
 
     # Git audit (#21) + SSOT
     GIT_AUDIT: bool = True

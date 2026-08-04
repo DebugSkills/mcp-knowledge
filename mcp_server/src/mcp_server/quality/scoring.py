@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
 
 # ── Конфигурируемые константы ────────────────────────────────
 
@@ -40,14 +39,14 @@ class StalenessInput:
     """Входные данные для staleness_score() — только то что нужно формуле."""
 
     __slots__ = (
-        "updated_at",
-        "evergreen",
+        "broken_links",
         "dup_count",
+        "edit_war",
+        "evergreen",
         "recommended_missing",
         "recommended_total",
-        "edit_war",
-        "broken_links",
         "total_links",
+        "updated_at",
     )
 
     def __init__(
@@ -79,7 +78,7 @@ def _clip01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
 
-def _age_norm(updated_at: datetime, evergreen: bool, now: Optional[datetime] = None) -> float:
+def _age_norm(updated_at: datetime, evergreen: bool, now: datetime | None = None) -> float:
     """Нормализованный возраст записи: 0 (только что) → 1 (предельный возраст)."""
     if now is None:
         now = datetime.now(timezone.utc)
@@ -91,8 +90,7 @@ def _age_norm(updated_at: datetime, evergreen: bool, now: Optional[datetime] = N
         now = now.replace(tzinfo=timezone.utc)
 
     age_days = (now - updated_at).days
-    if age_days < 0:
-        age_days = 0  # будущая дата → считаем свежей
+    age_days = max(age_days, 0)  # будущая дата → считаем свежей
 
     max_days = EVERGREEN_MAX_AGE_DAYS if evergreen else NORMAL_MAX_AGE_DAYS
     return _clip01(age_days / max_days)
@@ -126,7 +124,7 @@ def _link_health_factor(broken: int, total: int) -> float:
 def staleness_score(
     inp: StalenessInput,
     *,
-    now: Optional[datetime] = None,
+    now: datetime | None = None,
 ) -> float:
     """Вычисляет staleness score записи знаний.
 

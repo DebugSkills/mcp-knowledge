@@ -14,10 +14,10 @@ import hashlib
 import hmac
 import json
 import logging
-from dataclasses import dataclass, field
-from typing import Optional
+import typing
+from dataclasses import dataclass
 
-from fastapi import Request, HTTPException
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
@@ -158,7 +158,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
     сохраняет AuthInfo в request.state.auth.
     """
 
-    SKIP_PATHS: set[str] = {
+    SKIP_PATHS: typing.ClassVar[set[str]] = {
         "/health",
         "/health/",
         "/health/live",
@@ -201,7 +201,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     # ── E2: Rate limit check ────────────────────────────────
 
-    async def _check_rate_limit(self, request: Request, auth_info: AuthInfo) -> Optional[JSONResponse]:
+    async def _check_rate_limit(self, request: Request, auth_info: AuthInfo) -> JSONResponse | None:
         """Проверить rate limit для POST /mcp.
 
         Batch-aware: парсит body, считает число JSON-RPC методов,

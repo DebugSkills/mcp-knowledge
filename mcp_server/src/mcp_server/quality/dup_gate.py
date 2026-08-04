@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
 
 logger = logging.getLogger("mcp_knowledge.quality.dup_gate")
 
@@ -49,7 +48,7 @@ def find_duplicates(
     candidates: list[tuple[str, list[float]]],  # [(knowledge_id, vector), ...]
     *,
     threshold: float = DUP_SIMILARITY_THRESHOLD,
-    exclude_id: Optional[str] = None,
+    exclude_id: str | None = None,
 ) -> list[dict]:
     """Находит дубликаты среди кандидатов по косинусному сходству.
 
@@ -77,7 +76,7 @@ def find_duplicates(
 async def check_duplicates(
     content: str,
     domain: str,
-    knowledge_id: Optional[str],
+    knowledge_id: str | None,
     *,
     embedder=None,         # SentenceTransformer (BGE-M3) — внедряется из app_state
     qdrant_client=None,    # QdrantClient — внедряется из app_state
@@ -114,13 +113,13 @@ async def check_duplicates(
         loop = asyncio.get_event_loop()
         vec = await loop.run_in_executor(None, embedder.encode, representative)
         query_vector = vec.tolist() if hasattr(vec, 'tolist') else list(vec)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.error("Embed failed for dup-gate: %s", exc)
         return []
 
     # Шаг 3: Qdrant search
     try:
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
 
         # domain-фильтр только если domain указан (для update_entry domain может быть неизвестен)
         query_filter = None
@@ -137,7 +136,7 @@ async def check_duplicates(
             with_payload=True,
             with_vectors=True,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.error("Qdrant search failed for dup-gate: %s", exc)
         return []
 

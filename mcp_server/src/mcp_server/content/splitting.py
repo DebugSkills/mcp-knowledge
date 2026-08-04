@@ -16,12 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass, field
-from typing import Optional
-
-import numpy as np
-from sklearn.cluster import AgglomerativeClustering
-from sklearn.metrics.pairwise import cosine_similarity
+from dataclasses import dataclass
 
 logger = logging.getLogger("mcp_knowledge.content.splitting")
 
@@ -79,8 +74,7 @@ def structural_split(content: str) -> list[Chunk]:
     seq = 0
 
     for i, match in enumerate(matches):
-        seq += 1
-        level = len(match.group(1))
+        seq = i + 1
         title = match.group(2).strip()
         start = match.start()
         # Для первой секции включаем preamble (текст до первого заголовка)
@@ -120,7 +114,7 @@ async def embed_paragraphs_async(
 
 
 def _cosine_clustering(
-    embeddings: np.ndarray,
+    embeddings,  # numpy ndarray — type omitted (lazy import of numpy)
     threshold: float = CLUSTER_COSINE,
 ) -> list[int]:
     """Аггломеративная кластеризация на основе cosine similarity с оконным ограничением.
@@ -135,6 +129,10 @@ def _cosine_clustering(
     Returns:
         list[int]: метки кластеров для каждого параграфа
     """
+    # Lazy imports (P1-1: avoid numpy double-import during coverage measurement)
+    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.metrics.pairwise import cosine_similarity
+
     n = embeddings.shape[0]
     if n <= 1:
         return [0] * n
@@ -204,6 +202,8 @@ def clustering_split(
     if len(paragraphs) <= 1:
         return [Chunk(title="Content", body=content.strip(), sequence_number=1)]
 
+    # Lazy import numpy (P1-1: avoid double-import during coverage measurement)
+    import numpy as np
     emb_array = np.array(embeddings, dtype=np.float64)
     labels = _cosine_clustering(emb_array, CLUSTER_COSINE)
     merged = _merge_clustered_paragraphs(paragraphs, labels)
@@ -246,7 +246,7 @@ def recursive_split(
     else:
         # Char-count fallback: ~4 символа/токен (русский + английский)
         CHARS_PER_TOKEN = 4
-        max_chars = max_tokens * CHARS_PER_TOKEN
+        
 
         def _count(text: str) -> int:
             return len(text) // CHARS_PER_TOKEN
@@ -347,7 +347,7 @@ async def hybrid_split(
                     "Clustering fallback: %d paragraphs → %d sections",
                     len(paragraphs), len(chunks),
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "Clustering fallback failed: %s — using structural result", e
                 )

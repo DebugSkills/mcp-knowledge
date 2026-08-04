@@ -26,7 +26,6 @@ import logging
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 import yaml
 
@@ -140,7 +139,7 @@ class KnowledgeIndex:
                     self._invalidate(section_name)
                     self._cache[section_name] = section_index
 
-    def get_map(self, domain: Optional[str] = None) -> dict:
+    def get_map(self, domain: str | None = None) -> dict:
         """Получить структурную карту (root или per-section).
 
         Использует in-memory cache с ленивой загрузкой при промахе.
@@ -184,7 +183,7 @@ class KnowledgeIndex:
                 fm = entry.frontmatter
                 section = fm.domain
                 sections.setdefault(section, []).append(entry)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.debug("Пропущен битый файл при INDEX gen: %s — %s", path, e)
 
         return sections

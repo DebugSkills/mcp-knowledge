@@ -18,17 +18,16 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 from mcp_server.config import Settings
 from mcp_server.models import KnowledgeFrontmatter
+from mcp_server.quality.edit_war import detect_edit_war
 from mcp_server.quality.issues import create_issue
 from mcp_server.quality.scoring import (
     REVIEW_THRESHOLD,
     StalenessInput,
     staleness_score,
 )
-from mcp_server.quality.edit_war import detect_edit_war
 
 logger = logging.getLogger("mcp_knowledge.quality.scanner")
 
@@ -43,10 +42,10 @@ MAX_PAIRS_PER_BUCKET: int = 500  # макс пар для проверки в о
 
 
 async def run_scan(
-    knowledge_dir: Optional[Path] = None,
+    knowledge_dir: Path | None = None,
     *,
     qdrant_client=None,
-    settings: Optional[Settings] = None,
+    settings: Settings | None = None,
 ) -> dict:
     """Запускает полный quality scan базы знаний.
 
@@ -139,7 +138,7 @@ async def _scan_filesystem(
                 fm = _parse_frontmatter(content, yaml)
                 if fm is not None:
                     results.append((md_file, fm))
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to parse %s: %s", md_file, exc)
         return results
 
@@ -160,7 +159,7 @@ def _parse_frontmatter(
         if not isinstance(fm_dict, dict):
             return None
         return KnowledgeFrontmatter(**fm_dict)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -207,7 +206,7 @@ async def _update_qdrant_payloads(
     Использует set_payload (не upsert) — обновляет существующие chunk-точки
     по фильтру knowledge_id, не создавая новых non-vector точек в коллекции.
     """
-    from qdrant_client.models import Filter, FieldCondition, MatchValue
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
 
     for filepath, frontmatter, score in scored:
         knowledge_id = frontmatter.knowledge_id
@@ -228,7 +227,7 @@ async def _update_qdrant_payloads(
                     must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
                 ),
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.error("Failed to set_payload for %s: %s", knowledge_id, exc)
 
 
@@ -249,7 +248,7 @@ def _scan_dup_pairs(
         by_domain.setdefault(fm.domain, []).append((filepath, fm, score))
 
     dup_count = 0
-    for domain, entries in by_domain.items():
+    for entries in by_domain.values():
         if len(entries) < 2:
             continue
         # Ограничиваем число пар для производительности

@@ -20,7 +20,7 @@ import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -38,13 +38,13 @@ def _get_default_store_dir() -> str:
             from ..config import settings
 
             _DEFAULT_STORE_DIR = settings.QUALITY_DIR
-        except Exception:
+        except Exception:  # noqa: BLE001
             _DEFAULT_STORE_DIR = "/app/data/quality"
     return _DEFAULT_STORE_DIR
 
 
 # Глобальное переопределение для тестов
-_store_dir_override: Optional[str] = None
+_store_dir_override: str | None = None
 
 # Блокировка для атомарных read-modify-write
 _store_lock = threading.Lock()
@@ -90,8 +90,8 @@ class Issue(BaseModel):
         description="Время обнаружения",
     )
     status: IssueStatus = Field(default="open", description="Статус: open | resolved | ignored")
-    resolved_at: Optional[datetime] = Field(default=None, description="Время разрешения")
-    resolution: Optional[str] = Field(default=None, description="Описание решения")
+    resolved_at: datetime | None = Field(default=None, description="Время разрешения")
+    resolution: str | None = Field(default=None, description="Описание решения")
 
 
 # ── Helpers ─────────────────────────────────────────────────
@@ -216,7 +216,7 @@ def create_issue(
 
 
 def list_issues(
-    types: Optional[list[IssueType]] = None,
+    types: list[IssueType] | None = None,
     status: str = "open",
     limit: int = 50,
 ) -> list[Issue]:
@@ -253,8 +253,8 @@ def list_issues(
 def update_issue_status(
     issue_id: str,
     status: IssueStatus,
-    resolution: Optional[str] = None,
-) -> Optional[Issue]:
+    resolution: str | None = None,
+) -> Issue | None:
     """Обновить статус issue (open → resolved | ignored).
 
     При статусе resolved или ignored автоматически устанавливается resolved_at.
@@ -311,7 +311,7 @@ async def create_issue_async(
 
 
 async def list_issues_async(
-    types: Optional[list[IssueType]] = None,
+    types: list[IssueType] | None = None,
     status: str = "open",
     limit: int = 50,
 ) -> list[Issue]:
@@ -323,8 +323,8 @@ async def list_issues_async(
 async def update_issue_status_async(
     issue_id: str,
     status: IssueStatus,
-    resolution: Optional[str] = None,
-) -> Optional[Issue]:
+    resolution: str | None = None,
+) -> Issue | None:
     """Async-safe обёртка update_issue_status."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(

@@ -12,14 +12,13 @@ Covers:
 from __future__ import annotations
 
 import pytest
-
-from mcp_server.tools.admin import reindex
 from mcp_server.storage.schema import (
     COLLECTION_ALIAS,
     COLLECTION_V1,
     COLLECTION_V2,
     build_collection_params,
 )
+from mcp_server.tools.admin import reindex
 
 pytestmark = pytest.mark.asyncio
 

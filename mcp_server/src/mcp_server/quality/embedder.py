@@ -16,7 +16,6 @@ API: POST http://localhost:11434/api/embed
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 logger = logging.getLogger("mcp_knowledge.quality.embedder")
 
@@ -50,7 +49,7 @@ class OllamaEmbedder:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        self._dim: Optional[int] = MODEL_DIMS.get(model)
+        self._dim: int | None = MODEL_DIMS.get(model)
 
     @property
     def dim(self) -> int:
@@ -104,7 +103,7 @@ class OllamaEmbedder:
 def create_embedder(
     model: str = DEFAULT_EMBED_MODEL,
     base_url: str = OLLAMA_BASE_URL,
-) -> Optional[OllamaEmbedder]:
+) -> OllamaEmbedder | None:
     """Фабрика эмбеддера с проверкой доступности Ollama.
 
     Пробует primary-модель, при неудаче — fallback.
@@ -117,7 +116,7 @@ def create_embedder(
             if test_vec and len(test_vec) > 0:
                 logger.info("Embedder ready: %s (dim=%d)", attempt_model, len(test_vec))
                 return emb
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("Embedder %s not available: %s", attempt_model, exc)
 
     return None

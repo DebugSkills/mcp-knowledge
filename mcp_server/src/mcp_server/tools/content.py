@@ -1,3 +1,4 @@
+# ruff: noqa: BLE001, S110
 """import_content MCP Tool (#16) — импорт крупных текстов в SSOT.
 
 Фаза 5 §5: отдельный tool для декомпозиции + best-effort batch записи.
@@ -18,11 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
 
 from ..content.linking import build_collection
-from ..content.registry import get as get_preprocessor
 from ..content.preprocessor import ImportMeta
+from ..content.registry import get as get_preprocessor
 from ..models import KnowledgeEntry, KnowledgeFrontmatter
 
 logger = logging.getLogger("mcp_knowledge.tools.content")
@@ -102,6 +102,7 @@ async def import_content(params: dict, app_state) -> dict:
             max_chunk_tokens? (int): лимит токенов (default 512)
             wait_for_index? (bool): ждать индексации (default false)
             cleanup_orphans? (bool): удалить orphan-детей при failure (default false)
+            quality_checks? (bool): включить quality gates (default true, отключить для массового импорта)
         }
         app_state: Application state (store, pipeline, embedder, qdrant, ...)
 
@@ -126,9 +127,10 @@ async def import_content(params: dict, app_state) -> dict:
     title = params.get("title", "")
     tags = params.get("tags", [])
     cross_subjects = params.get("cross_subjects", [])
-    max_chunk_tokens = params.get("max_chunk_tokens", 512)
+    
     wait_for_index = params.get("wait_for_index", False)
     cleanup_orphans = params.get("cleanup_orphans", False)
+    quality_checks = params.get("quality_checks", True)  # 6.4: опциональное отключение для mass-import
 
     # ── Валидация обязательных параметров ──────────────────
     quality_issues: list[dict] = []
@@ -168,7 +170,7 @@ async def import_content(params: dict, app_state) -> dict:
     try:
         sections = await preprocessor.decompose(content, metadata)
     except Exception as e:
-        logger.error("Decomposition failed: %s", e, exc_info=True)
+        logger.exception("Decomposition failed")
         return {"error": f"Decomposition failed: {e}"}
 
     if not sections:
@@ -246,28 +248,29 @@ async def import_content(params: dict, app_state) -> dict:
                     fm.knowledge_id, idx_err,
                 )
 
-            # Quality gate check (advisory — не блокирует)
-            try:
-                qdrant = getattr(app_state, "qdrant", None)
-                embedder = getattr(app_state, "embedder", None)
-                qr = await _collect_quality_report(
-                    section_body=section.body,
-                    fm=fm,
-                    domain=domain,
-                    embedder=embedder,
-                    qdrant_client=qdrant,
-                )
-                quality_issues.extend(qr["issues"])
-                quality_warnings.extend(qr["warnings"])
-                quality_duplicates.extend(qr["duplicates"])
-            except Exception as qe:
-                logger.debug("Quality report collection skipped: %s", qe)
+            # Quality gate check (advisory — не блокирует; 6.4: опционально)
+            if quality_checks:
+                try:
+                    qdrant = getattr(app_state, "qdrant", None)
+                    embedder = getattr(app_state, "embedder", None)
+                    qr = await _collect_quality_report(
+                        section_body=section.body,
+                        fm=fm,
+                        domain=domain,
+                        embedder=embedder,
+                        qdrant_client=qdrant,
+                    )
+                    quality_issues.extend(qr["issues"])
+                    quality_warnings.extend(qr["warnings"])
+                    quality_duplicates.extend(qr["duplicates"])
+                except Exception as qe:
+                    logger.debug("Quality report collection skipped: %s", qe)
 
             imported += 1
 
             # Batch git-commit каждые IMPORT_BATCH_COMMIT секций
             if imported % IMPORT_BATCH_COMMIT == 0:
-                await store._git_commit(
+                await store.flush(
                     f"import_content: batch #{imported // IMPORT_BATCH_COMMIT}"
                 )
                 logger.info(
@@ -291,7 +294,7 @@ async def import_content(params: dict, app_state) -> dict:
     # Финальный git-коммит для оставшихся
     if imported % IMPORT_BATCH_COMMIT != 0:
         try:
-            await store._git_commit(
+            await store.flush(
                 f"import_content: final batch (total {imported} sections)"
             )
         except Exception:
@@ -307,16 +310,15 @@ async def import_content(params: dict, app_state) -> dict:
     # ── Ожидание индексации (опционально) ──────────────────
     if wait_for_index:
         try:
-            await asyncio.wait_for(
-                pipeline._sync.wait(collection.knowledge_id, timeout=30.0),
-                timeout=30.0,
+            result = await pipeline.wait_for_index(  # N1+N3+N5: публичный метод
+                collection.knowledge_id, timeout=30.0
             )
-            indexed = True
-            pending = False
-        except asyncio.TimeoutError:
+            indexed = result.indexed
+            pending = result.pending
+        except Exception as e:
             logger.warning(
-                "import_content: indexing timeout for %s — pending=true",
-                collection.knowledge_id,
+                "import_content: indexing wait failed for %s: %s — pending=true",
+                collection.knowledge_id, e,
             )
             pending = True
 
@@ -365,6 +367,7 @@ async def import_content(params: dict, app_state) -> dict:
         "indexed": indexed,
         "pending": pending,
         "orphan_cleanup_count": orphan_cleanup_count,
+        "quality_checks_applied": quality_checks,
         "quality_report": {
             "issues": quality_issues,
             "warnings": quality_warnings,

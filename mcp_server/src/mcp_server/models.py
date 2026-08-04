@@ -18,10 +18,9 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
-
 
 # ── Frontmatter ────────────────────────────────────────────
 
@@ -35,18 +34,18 @@ class KnowledgeFrontmatter(BaseModel):
     )
     domain: str = Field(..., description="Первичная классификация")
     subject: str = Field(..., description="Вторичная классификация")
-    project: Optional[str] = Field(None, description="Опциональный проект")
+    project: str | None = Field(None, description="Опциональный проект")
     cross_subjects: list[str] = Field(default_factory=list, description="Кросс-теги (#4)")
     tags: list[str] = Field(default_factory=list, description="Свободные теги")
     version: int = Field(default=1, ge=1, description="Optimistic locking (P2)")
     status: str = Field(default="published", description="Lifecycle: published | deprecated (4.7)")
     evergreen: bool = Field(default=False, description="Фундаментальное знание — медленное старение (4.5 R1)")
-    source: Optional[str] = Field(None, description="URL источника (link_health 4.5)")
+    source: str | None = Field(None, description="URL источника (link_health 4.5)")
     # ── Фаза 5: parent-child collection fields ──────────────
-    parent_knowledge_id: Optional[str] = Field(None, description="ID родительской коллекции (null для root)")
-    sequence_number: Optional[int] = Field(None, ge=1, description="Порядковый номер в коллекции (1..N)")
-    content_type: Optional[str] = Field(None, description="Тип контента: book | pdf | collection | ...")
-    children: Optional[list[dict]] = Field(None, description="Список children для collection-root (TOC)")
+    parent_knowledge_id: str | None = Field(None, description="ID родительской коллекции (null для root)")
+    sequence_number: int | None = Field(None, ge=1, description="Порядковый номер в коллекции (1..N)")
+    content_type: str | None = Field(None, description="Тип контента: book | pdf | collection | ...")
+    children: list[dict] | None = Field(None, description="Список children для collection-root (TOC)")
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         description="Дата создания",
@@ -128,10 +127,10 @@ class WriteRequest(BaseModel):
     content: str = Field(..., min_length=1, description="Markdown-контент")
     domain: str = Field(..., min_length=1)
     subject: str = Field(..., min_length=1)
-    project: Optional[str] = None
+    project: str | None = None
     cross_subjects: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
-    knowledge_id: Optional[str] = Field(
+    knowledge_id: str | None = Field(
         None, description="ID (если None → авто-генерация из domain/subject/title)"
     )
     wait_for_index: bool = Field(

@@ -14,7 +14,7 @@ so fields with default_factory (cross_subjects, tags, ...) are never "missing".
 from __future__ import annotations
 
 import logging
-from typing import Literal, Optional
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -66,7 +66,7 @@ class GateResult(BaseModel):
 
 # ── Помощники ────────────────────────────────────────────────
 
-def _parse_frontmatter_dict(content: str) -> tuple[Optional[dict], Optional[str]]:
+def _parse_frontmatter_dict(content: str) -> tuple[dict | None, str | None]:
     """Парсит YAML frontmatter из markdown-строки.
 
     Возвращает (dict | None, error_message | None).
@@ -106,7 +106,7 @@ def _parse_frontmatter_dict(content: str) -> tuple[Optional[dict], Optional[str]
 
 def _check_knowledge_id_collision(
     knowledge_id: str, existing_ids: set[str]
-) -> Optional[str]:
+) -> str | None:
     """Проверяет коллизию knowledge_id с уже существующими записями."""
     if knowledge_id in existing_ids:
         return f"knowledge_id '{knowledge_id}' already exists (duplicate)"
@@ -119,7 +119,7 @@ def evaluate_frontmatter(
     content: str,
     *,
     strict: bool = False,
-    existing_ids: Optional[set[str]] = None,
+    existing_ids: set[str] | None = None,
 ) -> GateResult:
     """Валидирует YAML frontmatter markdown-записи.
 
@@ -152,7 +152,7 @@ def evaluate_frontmatter(
     # Шаг 2: валидация через Pydantic KnowledgeFrontmatter
     try:
         fm = KnowledgeFrontmatter(**fm_dict)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         # Pydantic ValidationError — извлекаем понятные сообщения
         errors = str(e)
         # Пытаемся извлечь имена полей из ошибки валидации

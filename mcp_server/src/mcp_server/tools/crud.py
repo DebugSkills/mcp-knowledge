@@ -1,3 +1,4 @@
+# ruff: noqa: BLE001, S110
 """A5-A6: write_knowledge + update_entry + delete_entry.
 
 Three-way write flow (P1-2):
@@ -15,10 +16,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
 
-from ..models import WriteRequest, VersionConflictError
 from ..metrics import record_write_latency
+from ..models import VersionConflictError, WriteRequest
 
 logger = logging.getLogger("mcp_knowledge.tools.crud")
 

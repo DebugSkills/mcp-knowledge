@@ -17,16 +17,16 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
+from mcp_server.health import (
+    DLQ_OVERFLOW_THRESHOLD,
+    QUEUE_UTILIZATION_THRESHOLD,
+    set_embedding_manager,
+    set_pipeline,
+    set_qdrant_client,
+)
 from mcp_server.health import (
     router as health_router,
-    set_embedding_manager,
-    set_qdrant_client,
-    set_pipeline,
-    QUEUE_UTILIZATION_THRESHOLD,
-    DLQ_OVERFLOW_THRESHOLD,
 )
-
 
 # ── Minimal test app (avoids importing main.py + qdrant_client) ──
 

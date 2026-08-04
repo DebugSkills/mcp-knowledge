@@ -5,18 +5,14 @@ Tests: import_content(book) → N записей в SSOT + git; get_entry(collec
 
 from __future__ import annotations
 
-import os
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-from mcp_server.models import KnowledgeEntry, KnowledgeFrontmatter, WriteRequest
-from mcp_server.content.registry import reset as registry_reset
 from mcp_server.content.book_preprocessor import BookPreprocessor
 from mcp_server.content.registry import register as registry_register
+from mcp_server.content.registry import reset as registry_reset
 
 
 @pytest.fixture
@@ -35,8 +31,8 @@ def tmp_knowledge_root():
 @pytest.fixture
 def real_store(tmp_knowledge_root):
     """Настоящий MarkdownStore с временной директорией (git-аудит отключён)."""
-    from mcp_server.storage.markdown_store import MarkdownStore
     from mcp_server.config import settings
+    from mcp_server.storage.markdown_store import MarkdownStore
 
     # Override KNOWLEDGE_ROOT for this fixture
     original_root = settings.KNOWLEDGE_ROOT

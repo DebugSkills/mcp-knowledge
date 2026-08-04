@@ -1,0 +1,6 @@
+# CUDA-12 torch для GPU-инференса (driver 535 / CUDA 12.2). cu121 = CUDA 12.1 ≤ 12.2 ✅.
+# Установка: pip install -r requirements-gpu.txt
+# ВАЖНО: НЕ использовать дефолтный `pip install torch` — тянет cu13 (несовместим с driver 535).
+# CPU-альтернатива: `make install-cpu` или `pip install torch --index-url https://download.pytorch.org/whl/cpu`
+--index-url https://download.pytorch.org/whl/cu121
+torch

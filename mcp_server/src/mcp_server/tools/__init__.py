@@ -9,13 +9,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from .search import search_knowledge, search_by_tags
-from .read import get_entry, get_knowledge_map
-from .crud import write_knowledge, update_entry, delete_entry
-from .browse import list_domains, list_subjects, list_projects
 from .admin import reindex
-from .quality import review_queue, list_quality_issues, resolve_quality_issue, run_quality_scan
+from .browse import list_domains, list_projects, list_subjects
 from .content import import_content
+from .crud import delete_entry, update_entry, write_knowledge
+from .quality import (
+    list_quality_issues,
+    resolve_quality_issue,
+    review_queue,
+    run_quality_scan,
+)
+from .read import get_entry, get_knowledge_map
+from .search import search_by_tags, search_knowledge
 
 # ── JSON Schema fragments ──────────────────────────────────
 

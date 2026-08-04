@@ -12,21 +12,17 @@ Covers:
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 from fastapi import Request
-from fastapi.responses import JSONResponse
-
 from mcp_server.mcp_handler import (
-    JSONRPC_INTERNAL_ERROR,
     JSONRPC_INVALID_PARAMS,
     JSONRPC_INVALID_REQUEST,
     JSONRPC_METHOD_NOT_FOUND,
     JSONRPC_PARSE_ERROR,
+    MAX_REQUEST_SIZE,
     MCP_REQUEST_TOO_LARGE,
     MCP_TOOL_NOT_FOUND,
-    MAX_REQUEST_SIZE,
     METHOD_DISPATCH,
     SERVER_PROTOCOL_VERSION,
     _dispatch_single,
@@ -38,7 +34,6 @@ from mcp_server.mcp_handler import (
     _validate_jsonrpc,
     handle_mcp_request,
 )
-
 
 # ── Helpers ────────────────────────────────────────────────────
 

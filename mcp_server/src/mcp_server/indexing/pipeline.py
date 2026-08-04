@@ -1,3 +1,4 @@
+# ruff: noqa: BLE001
 """Async-пайплайн индексации (#7): asyncio.Queue + worker + DLQ + sync barrier.
 
 Задачи 1.8 и 1.9 плана Фазы 1.
@@ -12,22 +13,19 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
 
 from ..config import settings
 from ..embedding.manager import EmbeddingManager
 from ..models import Chunk, KnowledgeEntry, WriteResult
 from ..storage.markdown_store import MarkdownStore
 from ..storage.qdrant_client import QdrantClient
-from ..storage.schema import build_payload_point
+from ..storage.schema import COLLECTION_ALIAS, build_payload_point
 from .chunker import MarkdownChunker
-from .sync_barrier import SyncBarrier
 from .dlq import DeadLetterQueue
+from .sync_barrier import SyncBarrier
 
 logger = logging.getLogger("mcp_knowledge.pipeline")
 
@@ -52,13 +50,17 @@ class IndexingPipeline:
         self._queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=max_queue)
         self._batch_size = batch_size
         self._running = False
-        self._worker_task: Optional[asyncio.Task] = None
+        self._worker_task: asyncio.Task | None = None
 
         # C2: Sync barrier (выделен в sync_barrier.py)
         self._sync = SyncBarrier()
 
         # C3: DLQ (выделен в dlq.py)
         self._dlq = DeadLetterQueue()
+
+        # N1: Кэш обработанных knowledge_id для sequential wait_for_index
+        self._completed: set[str] = set()
+        self._max_completed_cache = 5000
 
         # Статистика
         self.stats = {"queued": 0, "processed": 0, "failed": 0, "dlq": 0}
@@ -70,6 +72,7 @@ class IndexingPipeline:
         if self._running:
             return
         self._running = True
+        self._completed.clear()  # N1: сброс кэша при (ре)старте пайплайна
         self._worker_task = asyncio.create_task(self._worker_loop())
         logger.info("IndexingPipeline: worker запущен (batch_size=%d, max_queue=%d)",
                      self._batch_size, self._queue.maxsize)
@@ -118,10 +121,44 @@ class IndexingPipeline:
         )
 
         if wait_for_index and event:
-            self._sync.register(entry.frontmatter.knowledge_id)
-            # Используем тот же event что и создали
-            self._sync._events[entry.frontmatter.knowledge_id] = event
+            # Сохраняем внешний event (из очереди) вместо создания нового
+            self._sync.bind_event(entry.frontmatter.knowledge_id, event)
             result = await self._sync.wait(entry.frontmatter.knowledge_id, timeout=30.0)
+
+        return result
+
+    async def wait_for_index(self, knowledge_id: str, timeout: float = 30.0) -> WriteResult:
+        """Дождаться завершения индексации knowledge_id (N1).
+
+        Покрывает ДВА сценария:
+        1. Sequential (N1): knowledge_id уже обработан батчем → _completed содержит kid
+           → возвращает indexed=True немедленно (например, import_content после drain очереди)
+        2. Concurrent: knowledge_id ещё обрабатывается → self-register + wait
+           → signal от _process_batch() или timeout
+
+        Args:
+            knowledge_id: ID записи
+            timeout: таймаут ожидания (default 30s)
+
+        Returns:
+            WriteResult с indexed/pending статусом
+        """
+        # N1 — sequential case: уже обработан
+        if knowledge_id in self._completed:
+            return WriteResult(
+                knowledge_id=knowledge_id,
+                indexed=True,
+                pending=False,
+            )
+
+        # Concurrent case: self-register + wait
+        if not self._sync.is_registered(knowledge_id):  # N3: публичный API
+            self._sync.register(knowledge_id)
+
+        result = await self._sync.wait(knowledge_id, timeout=timeout)
+
+        if result.indexed:
+            self._completed.add(knowledge_id)
 
         return result
 
@@ -131,7 +168,7 @@ class IndexingPipeline:
         Обходит все .md в knowledge/, chunking → embed → Qdrant.
         """
         logger.info("reindex_all: начало полного переиндекса")
-        t0 = datetime.now(timezone.utc)
+        
 
         # Очищаем Qdrant
         self._qdrant.delete_all()
@@ -311,8 +348,8 @@ class IndexingPipeline:
                 if batch:
                     await self._process_batch(batch)
                 break
-            except Exception as e:
-                logger.error("Worker loop error: %s", e, exc_info=True)
+            except Exception:
+                logger.exception("Worker loop error")
                 # Не роняем worker
                 await asyncio.sleep(1)
 
@@ -384,10 +421,19 @@ class IndexingPipeline:
             await self._handle_batch_failure(batch, str(e))
             return
 
-        # Сигналим sync-ожидающим (C2)
-        kids = [item["entry"].frontmatter.knowledge_id for item in batch if item.get("event")]
-        if kids:
-            self._sync.signal_batch(kids)
+        # Защита от неограниченного роста _completed (до добавления новых)
+        if len(self._completed) > self._max_completed_cache:
+            logger.debug("_completed cache overflow (%d entries), clearing", len(self._completed))
+            self._completed.clear()
+
+        # N1: Добавляем ВСЕ knowledge_id в _completed (sequential wait_for_index)
+        for item in batch:
+            self._completed.add(item["entry"].frontmatter.knowledge_id)
+
+        # Сигналим ВСЕ зарегистрированные knowledge_id (N3: public API)
+        for item in batch:
+            kid = item["entry"].frontmatter.knowledge_id
+            self._sync.signal_if_registered(kid)
 
     async def _handle_batch_failure(self, batch: list[dict], error: str):
         """Обработка неудачного батча: retry или DLQ (C3)."""

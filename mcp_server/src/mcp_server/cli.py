@@ -24,10 +24,9 @@ async def reindex():
 
     Использование: python -m mcp_server.cli reindex
     """
-    from .config import settings
-    from .storage import MarkdownStore, QdrantClient
     from .embedding import EmbeddingManager
     from .indexing import IndexingPipeline, MarkdownChunker
+    from .storage import MarkdownStore, QdrantClient
 
     logger.info("=== REINDEX: полная перестройка Qdrant из Markdown SSOT ===")
 
@@ -59,9 +58,9 @@ async def dlq_replay():
     Использование: python -m mcp_server.cli dlq-replay
     """
     from .config import settings
-    from .storage import MarkdownStore, QdrantClient
     from .embedding import EmbeddingManager
     from .indexing import IndexingPipeline, MarkdownChunker
+    from .storage import MarkdownStore, QdrantClient
 
     dlq_dir = Path(settings.DLQ_DIR)
     if not dlq_dir.exists():
@@ -116,8 +115,9 @@ async def dlq_replay():
                         None, embedder.embed_sync, texts
                     )
                     # Собираем Qdrant points
-                    from .storage.schema import build_payload_point
                     import uuid
+
+                    from .storage.schema import build_payload_point
                     fm = entry.frontmatter
                     points = []
                     for ch, vector in zip(chunks, vectors):
@@ -145,7 +145,7 @@ async def dlq_replay():
                 replayed += 1
                 logger.info("DLQ replay OK: %s", knowledge_id)
 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error("DLQ replay failed for %s: %s", dlq_file, e)
                 failed += 1
 

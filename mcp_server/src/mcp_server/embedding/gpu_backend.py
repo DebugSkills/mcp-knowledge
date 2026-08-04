@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from ..config import settings
 
@@ -33,7 +32,7 @@ def load_model() -> bool:
         _ = _model.encode(["warmup"], show_progress_bar=False)
         logger.info("BGE-M3 GPU загружен (dim=%d)", _model.get_sentence_embedding_dimension())
         return True
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning("GPU-загрузка BGE-M3 не удалась: %s", e)
         _model = None
         return False

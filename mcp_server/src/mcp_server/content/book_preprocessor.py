@@ -11,17 +11,18 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Optional
 
-from .keywords import extract_keywords, deduplicate_tags
-from .linking import make_knowledge_id, make_collection_id, build_collection
+# F4: Глобальный синглтон XLM-RoBERTa токенизатора для точного подсчёта токенов
+from ..embedding.tokenizer import tokenizer as xlmr_tokenizer
+from .keywords import deduplicate_tags, extract_keywords
+from .linking import make_knowledge_id
 from .preprocessor import (
     ContentPreprocessor,
     ImportMeta,
     Section,
     ValidationResult,
 )
-from .splitting import hybrid_split, Chunk
+from .splitting import hybrid_split
 
 logger = logging.getLogger("mcp_knowledge.content.book_preprocessor")
 
@@ -37,7 +38,7 @@ class BookPreprocessor(ContentPreprocessor):
     def __init__(
         self,
         embedder=None,  # EmbeddingManager (опционально, для clustering fallback)
-        token_counter=None,  # XlmRobertaTokenizer (опционально, для recursive split)
+        token_counter=xlmr_tokenizer,  # XlmRobertaTokenizer — глобальный синглтон (F4 fix)
         max_chunk_tokens: int = 512,
     ):
         self._embedder = embedder

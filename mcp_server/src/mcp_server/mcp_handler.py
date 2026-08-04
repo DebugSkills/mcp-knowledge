@@ -14,15 +14,15 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from .auth import check_tool_permission, get_auth
-from .tools import TOOLS, TOOL_HANDLERS
-from .resources import RESOURCES, get_kb_resource
 from .prompts import PROMPTS, get_prompt
+from .resources import RESOURCES, get_kb_resource
+from .tools import TOOL_HANDLERS, TOOLS
 
 logger = logging.getLogger("mcp_knowledge.mcp")
 
@@ -65,7 +65,7 @@ def _jsonrpc_result(result: Any, id: Any) -> dict:
     return {"jsonrpc": "2.0", "result": result, "id": id}
 
 
-def _validate_jsonrpc(request_body: dict) -> Optional[dict]:
+def _validate_jsonrpc(request_body: dict) -> dict | None:
     """Проверить обязательные поля JSON-RPC 2.0: jsonrpc, method, id.
 
     Returns error dict если валидация не пройдена, None если OK.
@@ -196,7 +196,7 @@ async def _handle_tools_call(params: dict, request_id: Any, request: Request) ->
 
         return _jsonrpc_result({"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}, request_id)
     except Exception as exc:
-        logger.exception("Tool '%s' failed: %s", tool_name, exc)
+        logger.exception("Tool '%s' failed", tool_name)
         return _jsonrpc_error(
             JSONRPC_INTERNAL_ERROR,
             f"Tool execution failed: {exc}",
@@ -223,7 +223,7 @@ async def _handle_resources_read(params: dict, request_id: Any, request: Request
         contents = await get_kb_resource(uri, app_state)
         return _jsonrpc_result({"contents": [{"uri": uri, "text": json.dumps(contents, ensure_ascii=False), "mimeType": "application/json"}]}, request_id)
     except Exception as exc:
-        logger.exception("resources/read failed for uri=%s: %s", uri, exc)
+        logger.exception("resources/read failed for uri=%s", uri)
         return _jsonrpc_error(
             JSONRPC_INTERNAL_ERROR,
             f"Failed to read resource: {exc}",
@@ -337,7 +337,7 @@ async def handle_mcp_request(request: Request) -> JSONResponse:
     return JSONResponse(content=resp)
 
 
-async def _dispatch_single(body: dict, request: Request) -> Optional[dict]:
+async def _dispatch_single(body: dict, request: Request) -> dict | None:
     """Обработать один JSON-RPC запрос.
 
     Returns:
@@ -366,7 +366,7 @@ async def _dispatch_single(body: dict, request: Request) -> Optional[dict]:
     try:
         return await handler(params, request_id, request)
     except Exception as exc:
-        logger.exception("Unhandled error in method '%s': %s", method, exc)
+        logger.exception("Unhandled error in method '%s'", method)
         return _jsonrpc_error(
             JSONRPC_INTERNAL_ERROR,
             f"Internal error: {exc}",

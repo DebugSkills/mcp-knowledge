@@ -10,6 +10,12 @@ __pycache__/
 .venv/
 *.egg-info/
 
+# Coverage artifacts (generated)
+.coverage
+mcp_server/.coverage
+htmlcov/
+.coverage.*
+
 # Env (секреты)
 .env
 !.env.example

@@ -21,14 +21,17 @@ import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 import git
 import yaml
-from pydantic import ValidationError
 
 from ..config import settings
-from ..models import KnowledgeEntry, KnowledgeFrontmatter, WriteRequest, VersionConflictError
+from ..models import (
+    KnowledgeEntry,
+    KnowledgeFrontmatter,
+    VersionConflictError,
+    WriteRequest,
+)
 
 logger = logging.getLogger("mcp_knowledge.markdown_store")
 
@@ -57,7 +60,7 @@ class MarkdownStore:
 
     # ── Public API ─────────────────────────────────────────
 
-    async def read(self, knowledge_id: str) -> Optional[KnowledgeEntry]:
+    async def read(self, knowledge_id: str) -> KnowledgeEntry | None:
         """Прочитать запись по knowledge_id (поиск по всем директориям)."""
         path = self._find_by_id(knowledge_id)
         if path is None:
@@ -88,7 +91,7 @@ class MarkdownStore:
         self._write_file(path, entry)
 
         # Git-аудит
-        await self._git_commit(f"add: {knowledge_id}")
+        await self.flush(f"add: {knowledge_id}")
 
         logger.info("write_knowledge: %s → %s", knowledge_id, path)
         return entry
@@ -105,9 +108,9 @@ class MarkdownStore:
         logger.debug("write_entry: %s → %s", entry.frontmatter.knowledge_id, path)
         return entry
 
-    async def update(self, knowledge_id: str, content: Optional[str] = None,
-                     metadata: Optional[dict] = None,
-                     expected_version: Optional[int] = None) -> KnowledgeEntry:
+    async def update(self, knowledge_id: str, content: str | None = None,
+                     metadata: dict | None = None,
+                     expected_version: int | None = None) -> KnowledgeEntry:
         """Обновить запись (контент и/или метаданные).
 
         Фаза 3 F2: Atomic optimistic locking через expected_version.
@@ -147,7 +150,7 @@ class MarkdownStore:
             self._write_file(path, entry)
 
         # Git-аудит (вне блокировки — git сам сериализует)
-        await self._git_commit(f"update: {knowledge_id} v{fm.version}")
+        await self.flush(f"update: {knowledge_id} v{fm.version}")
 
         logger.info("update_entry: %s v%d", knowledge_id, fm.version)
         return entry
@@ -165,13 +168,13 @@ class MarkdownStore:
             trash_path = self._trash / f"{knowledge_id}.{ts}.md"
 
         path.rename(trash_path)
-        await self._git_commit(f"delete: {knowledge_id} → .trash/")
+        await self.flush(f"delete: {knowledge_id} → .trash/")
 
         logger.info("delete_entry: %s → %s", knowledge_id, trash_path.name)
         return True
 
-    async def list_entries(self, domain: Optional[str] = None,
-                           subject: Optional[str] = None) -> list[str]:
+    async def list_entries(self, domain: str | None = None,
+                           subject: str | None = None) -> list[str]:
         """Список knowledge_id в заданном домене/предмете (или все)."""
         scan_root = self._root
         if domain:
@@ -189,7 +192,7 @@ class MarkdownStore:
             try:
                 entry = self._parse_file(md_file)
                 ids.append(entry.frontmatter.knowledge_id)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 logger.warning("Пропущен битый файл: %s", md_file)
         return sorted(ids)
 
@@ -207,7 +210,7 @@ class MarkdownStore:
     def _resolve_path(self, relative: str) -> Path:
         return self._root / relative
 
-    def _find_by_id(self, knowledge_id: str) -> Optional[Path]:
+    def _find_by_id(self, knowledge_id: str) -> Path | None:
         """Поиск .md по knowledge_id (обходит все директории)."""
         pattern = f"{knowledge_id}.md"
         # Быстрый путь: ищем по имени файла
@@ -267,8 +270,8 @@ class MarkdownStore:
 
         return f"{domain}-{subject}-{slug}"[:128]
 
-    async def _git_commit(self, message: str) -> None:
-        """git add && git commit с защитой от гонки."""
+    async def flush(self, message: str) -> None:
+        """Публичный метод: git add && git commit с защитой от гонки."""
         if self._repo is None or not settings.GIT_AUDIT:
             return
 
@@ -280,3 +283,13 @@ class MarkdownStore:
             except git.GitCommandError as e:
                 logger.error("git commit failed: %s", e)
                 # Не роняем write-операцию из-за git-ошибки
+
+    async def _git_commit(self, message: str) -> None:
+        """Deprecated: используйте flush()."""
+        import warnings
+        warnings.warn(
+            "_git_commit() is deprecated, use flush()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return await self.flush(message)

@@ -10,9 +10,8 @@ production .env List[str] fields as JSON (which fails for comma-separated values
 from __future__ import annotations
 
 import os
-import asyncio
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -26,8 +25,12 @@ os.environ.setdefault("KNOWLEDGE_DIR", "/tmp/test-knowledge")
 os.environ.setdefault("DLQ_DIR", "/tmp/test-dlq")
 os.environ.setdefault("QUALITY_DIR", "/tmp/test-quality")
 
-from mcp_server.models import KnowledgeEntry, KnowledgeFrontmatter, VersionConflictError, WriteRequest
-
+from mcp_server.models import (
+    KnowledgeEntry,
+    KnowledgeFrontmatter,
+    VersionConflictError,
+    WriteRequest,
+)
 
 # ── Mock factories ────────────────────────────────────────────
 

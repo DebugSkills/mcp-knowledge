@@ -14,7 +14,7 @@ SSOT: статус в Qdrant payload (ключ: status). Frontmatter файла
 from __future__ import annotations
 
 import logging
-from typing import Literal, Optional
+from typing import Literal
 
 logger = logging.getLogger("mcp_knowledge.quality.lifecycle")
 
@@ -28,7 +28,7 @@ DEFAULT_STATUS: LifecycleStatus = "published"
 QDRANT_PAYLOAD_KEY: str = "status"
 
 
-def get_status(payload: Optional[dict]) -> LifecycleStatus:
+def get_status(payload: dict | None) -> LifecycleStatus:
     """Извлекает статус из Qdrant payload.
 
     Отсутствие поля = published (backward-compatible с Фазами 0–3).
@@ -41,7 +41,7 @@ def get_status(payload: Optional[dict]) -> LifecycleStatus:
     return raw
 
 
-def build_search_filter(include_deprecated: bool = False) -> Optional[dict]:
+def build_search_filter(include_deprecated: bool = False) -> dict | None:
     """Строит Qdrant фильтр для search_knowledge.
 
     По умолчанию исключает deprecated-записи.
@@ -67,7 +67,7 @@ def build_search_filter(include_deprecated: bool = False) -> Optional[dict]:
 
 def validate_transition(
     current: LifecycleStatus, target: LifecycleStatus
-) -> Optional[str]:
+) -> str | None:
     """Проверяет допустимость перехода.
 
     Возвращает None если переход допустим, или сообщение об ошибке.

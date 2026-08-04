@@ -1,3 +1,4 @@
+# ruff: noqa: BLE001, S110
 """Qdrant gRPC-клиент (#1): создание коллекции, upsert, search, delete.
 
 Фаза 3 F1: Blue-green reindex через Collection Aliases.
@@ -8,9 +9,6 @@
 from __future__ import annotations
 
 import logging
-import uuid
-from datetime import datetime, timezone
-from typing import Optional
 
 from qdrant_client import QdrantClient as QdrantSDKClient
 from qdrant_client.http import models as qmodels
@@ -19,11 +17,8 @@ from ..config import settings
 from .schema import (
     COLLECTION_ALIAS,
     COLLECTION_NAME,
-    COLLECTION_V1,
-    COLLECTION_V2,
     PAYLOAD_INDEXES,
     build_collection_params,
-    build_payload_point,
 )
 
 logger = logging.getLogger("mcp_knowledge.qdrant")
@@ -236,7 +231,7 @@ class QdrantClient:
         self,
         vector: list[float],
         top_k: int = 5,
-        filters: Optional[dict] = None,
+        filters: dict | None = None,
         score_threshold: float = 0.0,
     ) -> list[qmodels.ScoredPoint]:
         """Семантический поиск по вектору."""

@@ -12,87 +12,87 @@
 
 from __future__ import annotations
 
-from .issues import (
-    Issue,
-    IssueType,
-    IssueSeverity,
-    IssueStatus,
-    create_issue,
-    list_issues,
-    update_issue_status,
-    get_issues_store_path,
+from .dup_gate import (
+    DUP_SIMILARITY_THRESHOLD,
+    check_duplicates,
+    compute_cosine,
+    find_duplicates,
+)
+from .edit_war import (
+    EDIT_WAR_THRESHOLD,
+    EDIT_WAR_WINDOW_H,
+    detect_all_edit_wars,
+    detect_edit_war,
 )
 from .gates import (
-    GateResult,
     GateIssue,
+    GateResult,
     evaluate_frontmatter,
 )
-from .scoring import (
-    StalenessInput,
-    REVIEW_THRESHOLD,
-    staleness_score,
-    should_review,
+from .issues import (
+    Issue,
+    IssueSeverity,
+    IssueStatus,
+    IssueType,
+    create_issue,
+    get_issues_store_path,
+    list_issues,
+    update_issue_status,
+)
+from .lifecycle import (
+    build_search_filter,
+    get_status,
+    make_deprecation_payload_update,
+    make_published_payload_update,
+    make_restore_payload_update,
+    validate_transition,
 )
 from .scanner import (
     run_scan,
 )
-from .edit_war import (
-    detect_edit_war,
-    detect_all_edit_wars,
-    EDIT_WAR_WINDOW_H,
-    EDIT_WAR_THRESHOLD,
-)
-from .dup_gate import (
-    compute_cosine,
-    find_duplicates,
-    check_duplicates,
-    DUP_SIMILARITY_THRESHOLD,
-)
-from .lifecycle import (
-    get_status,
-    build_search_filter,
-    validate_transition,
-    make_deprecation_payload_update,
-    make_restore_payload_update,
-    make_published_payload_update,
+from .scoring import (
+    REVIEW_THRESHOLD,
+    StalenessInput,
+    should_review,
+    staleness_score,
 )
 
 __all__ = [
-    # issues (4.1)
-    "Issue",
-    "IssueType",
-    "IssueSeverity",
-    "IssueStatus",
-    "create_issue",
-    "list_issues",
-    "update_issue_status",
-    "get_issues_store_path",
+    "DUP_SIMILARITY_THRESHOLD",
+    "EDIT_WAR_THRESHOLD",
+    "EDIT_WAR_WINDOW_H",
+    "REVIEW_THRESHOLD",
+    "GateIssue",
     # gates (4.2)
     "GateResult",
-    "GateIssue",
-    "evaluate_frontmatter",
+    # issues (4.1)
+    "Issue",
+    "IssueSeverity",
+    "IssueStatus",
+    "IssueType",
     # scoring (4.5)
     "StalenessInput",
-    "REVIEW_THRESHOLD",
-    "staleness_score",
-    "should_review",
-    # scanner (4.5)
-    "run_scan",
-    # edit_war (4.4)
-    "detect_edit_war",
-    "detect_all_edit_wars",
-    "EDIT_WAR_WINDOW_H",
-    "EDIT_WAR_THRESHOLD",
+    "build_search_filter",
+    "check_duplicates",
     # dup_gate (4.3)
     "compute_cosine",
+    "create_issue",
+    "detect_all_edit_wars",
+    # edit_war (4.4)
+    "detect_edit_war",
+    "evaluate_frontmatter",
     "find_duplicates",
-    "check_duplicates",
-    "DUP_SIMILARITY_THRESHOLD",
+    "get_issues_store_path",
     # lifecycle (4.7)
     "get_status",
-    "build_search_filter",
-    "validate_transition",
+    "list_issues",
     "make_deprecation_payload_update",
-    "make_restore_payload_update",
     "make_published_payload_update",
+    "make_restore_payload_update",
+    # scanner (4.5)
+    "run_scan",
+    "should_review",
+    "staleness_score",
+    "update_issue_status",
+    "validate_transition",
 ]

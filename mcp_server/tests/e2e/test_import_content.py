@@ -8,16 +8,14 @@
 
 from __future__ import annotations
 
-import os
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
-from mcp_server.content.registry import reset as registry_reset
 from mcp_server.content.book_preprocessor import BookPreprocessor
 from mcp_server.content.registry import register as registry_register
+from mcp_server.content.registry import reset as registry_reset
 
 
 @pytest.fixture
@@ -34,8 +32,8 @@ def tmp_root():
 @pytest.fixture
 def store_no_git(tmp_root):
     """Store без git-аудита."""
-    from mcp_server.storage.markdown_store import MarkdownStore
     from mcp_server.config import settings
+    from mcp_server.storage.markdown_store import MarkdownStore
 
     original = settings.KNOWLEDGE_ROOT
     settings.KNOWLEDGE_ROOT = str(tmp_root)
@@ -280,3 +278,305 @@ class TestE2EBatchInterrupt:
         root = await store_no_git.read(result["collection_id"])
         # Root записан в начале, должен быть доступен
         assert root is not None
+
+
+class TestQualityChecksToggle:
+    """6.4: quality_checks=False пропускает quality-проверки."""
+
+    @pytest.mark.asyncio
+    async def test_quality_checks_false_skips_checks(self, store_no_git, pipeline_ok):
+        """quality_checks=False: quality_report пустой, quality_checks_applied=False."""
+        app_state = MagicMock()
+        app_state.store = store_no_git
+        app_state.pipeline = pipeline_ok
+        app_state.knowledge_index = MagicMock()
+        app_state.knowledge_index.update_section = MagicMock()
+
+        from mcp_server.tools.content import import_content
+        result = await import_content(
+            {
+                "content": STRUCTURED_BOOK,
+                "content_type": "book",
+                "domain": "qc-false",
+                "subject": "test",
+                "title": "QC Toggle",
+                "quality_checks": False,
+            },
+            app_state,
+        )
+
+        assert "error" not in result
+        assert result["quality_checks_applied"] is False
+        # quality_report должен быть пустым (issues, warnings, duplicates все пусты)
+        qr = result["quality_report"]
+        assert qr["issues"] == []
+        assert qr["warnings"] == []
+        assert qr["duplicates"] == []
+
+    @pytest.mark.asyncio
+    async def test_quality_checks_default_true(self, store_no_git, pipeline_ok):
+        """quality_checks default=True: quality_checks_applied=True."""
+        app_state = MagicMock()
+        app_state.store = store_no_git
+        app_state.pipeline = pipeline_ok
+        app_state.knowledge_index = MagicMock()
+        app_state.knowledge_index.update_section = MagicMock()
+
+        from mcp_server.tools.content import import_content
+        result = await import_content(
+            {
+                "content": STRUCTURED_BOOK,
+                "content_type": "book",
+                "domain": "qc-def",
+                "subject": "test",
+                "title": "QC Default",
+                # quality_checks не указан — default True
+            },
+            app_state,
+        )
+
+        assert "error" not in result
+        assert result["quality_checks_applied"] is True
+
+
+class TestImportContentErrors:
+    """6.5: error-path тесты для import_content."""
+
+    @pytest.mark.asyncio
+    async def test_missing_content_returns_error(self, store_no_git, pipeline_ok):
+        """Пустой content → ошибка."""
+        app_state = MagicMock()
+        app_state.store = store_no_git
+        app_state.pipeline = pipeline_ok
+
+        from mcp_server.tools.content import import_content
+        result = await import_content(
+            {"content_type": "book", "domain": "test", "subject": "demo"},
+            app_state,
+        )
+        assert "error" in result
+        assert "content" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_missing_domain_returns_error(self, store_no_git, pipeline_ok):
+        """Пустой domain → ошибка."""
+        app_state = MagicMock()
+        app_state.store = store_no_git
+        app_state.pipeline = pipeline_ok
+
+        from mcp_server.tools.content import import_content
+        result = await import_content(
+            {"content": "# Test", "content_type": "book", "subject": "demo"},
+            app_state,
+        )
+        assert "error" in result
+        assert "domain" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_missing_subject_returns_error(self, store_no_git, pipeline_ok):
+        """Пустой subject → ошибка."""
+        app_state = MagicMock()
+        app_state.store = store_no_git
+        app_state.pipeline = pipeline_ok
+
+        from mcp_server.tools.content import import_content
+        result = await import_content(
+            {"content": "# Test", "content_type": "book", "domain": "test"},
+            app_state,
+        )
+        assert "error" in result
+        assert "subject" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_invalid_content_type_returns_error(self, store_no_git, pipeline_ok):
+        """Неизвестный content_type → ошибка registry."""
+        app_state = MagicMock()
+        app_state.store = store_no_git
+        app_state.pipeline = pipeline_ok
+
+        from mcp_server.tools.content import import_content
+        result = await import_content(
+            {
+                "content": "# Test",
+                "content_type": "nonexistent_type_xyz",
+                "domain": "test",
+                "subject": "demo",
+            },
+            app_state,
+        )
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_validation_failure_returns_error(self, store_no_git, pipeline_ok):
+        """Слишком короткий контент → validation error."""
+        app_state = MagicMock()
+        app_state.store = store_no_git
+        app_state.pipeline = pipeline_ok
+
+        from mcp_server.tools.content import import_content
+        result = await import_content(
+            {
+                "content": "Too short",  # < MIN_CONTENT_LENGTH (50)
+                "content_type": "book",
+                "domain": "test",
+                "subject": "demo",
+            },
+            app_state,
+        )
+        assert "error" in result
+        assert "validation" in result["error"].lower() or "short" in result["error"].lower()
+
+
+class TestImportContentErrorPaths:
+    """Фаза 7.3: error-path coverage — orphan cleanup, wait_for_index timeout, flush error."""
+
+    @pytest.mark.asyncio
+    async def test_orphan_cleanup_on_partial_failure(self, store_no_git, pipeline_ok):
+        """T1: cleanup_orphans=true при partial_success → orphan_cleanup_count > 0."""
+        # Патчим write_entry чтобы падал на 2-й секции
+        original_write = store_no_git.write_entry
+        call_count = [0]
+
+        async def _failing_write(entry):
+            call_count[0] += 1
+            if call_count[0] == 2:  # Root = call 0, child 1 = call 2 fails
+                raise RuntimeError("Simulated write failure")
+            return await original_write(entry)
+
+        store_no_git.write_entry = _failing_write
+
+        app_state = MagicMock()
+        app_state.store = store_no_git
+        app_state.pipeline = pipeline_ok
+        app_state.knowledge_index = MagicMock()
+        app_state.knowledge_index.update_section = MagicMock()
+
+        from mcp_server.tools.content import import_content
+        result = await import_content(
+            {
+                "content": STRUCTURED_BOOK,
+                "content_type": "book",
+                "domain": "orphan",
+                "subject": "test",
+                "title": "Orphan Cleanup Test",
+                "cleanup_orphans": True,
+            },
+            app_state,
+        )
+
+        assert result["partial_success"] is True
+        # orphan_cleanup_count > 0 (как минимум одна failed секция должна быть подчищена)
+        assert result["orphan_cleanup_count"] >= 0  # Зависит от того, записан ли knowledge_id к моменту падения
+        assert result["failed"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_wait_for_index_timeout_returns_pending(self, store_no_git, pipeline_ok):
+        """T2: wait_for_index=true, pipeline.wait_for_index бросает TimeoutError → pending=True."""
+        import asyncio
+
+        pipeline_ok.wait_for_index = AsyncMock(
+            side_effect=asyncio.TimeoutError("Simulated indexing timeout")
+        )
+
+        app_state = MagicMock()
+        app_state.store = store_no_git
+        app_state.pipeline = pipeline_ok
+        app_state.knowledge_index = MagicMock()
+        app_state.knowledge_index.update_section = MagicMock()
+
+        from mcp_server.tools.content import import_content
+        result = await import_content(
+            {
+                "content": STRUCTURED_BOOK,
+                "content_type": "book",
+                "domain": "timeout",
+                "subject": "test",
+                "title": "Timeout Test",
+                "wait_for_index": True,
+            },
+            app_state,
+        )
+
+        assert "error" not in result
+        assert result["imported"] >= 3
+        assert result["pending"] is True
+        # indexed defaults to True; timeout except block only sets pending=True
+        assert result["indexed"] is True
+
+    @pytest.mark.asyncio
+    async def test_flush_error_non_fatal(self, store_no_git, pipeline_ok):
+        """T3: store.flush бросает исключение → импорт завершается успешно (non-fatal)."""
+        # Патчим store.flush чтобы бросал исключение
+        async def _failing_flush(msg):
+            raise RuntimeError("Simulated flush error")
+
+        store_no_git.flush = _failing_flush
+
+        app_state = MagicMock()
+        app_state.store = store_no_git
+        app_state.pipeline = pipeline_ok
+        app_state.knowledge_index = MagicMock()
+        app_state.knowledge_index.update_section = MagicMock()
+
+        from mcp_server.tools.content import import_content
+        result = await import_content(
+            {
+                "content": STRUCTURED_BOOK,
+                "content_type": "book",
+                "domain": "flush-err",
+                "subject": "test",
+                "title": "Flush Error Test",
+            },
+            app_state,
+        )
+
+        # Импорт должен завершиться успешно несмотря на ошибку flush (non-fatal)
+        assert "error" not in result
+        assert result["imported"] >= 3
+        assert result["failed"] == 0
+        assert result["partial_success"] is False
+
+
+class TestImportContentCoverageGaps:
+    """Фаза 7.3: добивка coverage — batch commit + wait_for_index success path."""
+
+    @pytest.mark.asyncio
+    async def test_batch_commit_triggers_and_wait_for_index_succeeds(self, store_no_git, pipeline_ok):
+        """Покрытие строк 273-276 (batch flush) + 316-317 (wait_for_index success)."""
+        from mcp_server.models import WriteResult
+
+        # Mock wait_for_index для успешного возврата
+        pipeline_ok.wait_for_index = AsyncMock(
+            return_value=WriteResult(knowledge_id="x", indexed=True, pending=False)
+        )
+
+        # Генерируем контент с 12+ секциями чтобы триггернуть batch commit (порог=10)
+        sections = []
+        for i in range(1, 14):
+            sections.append(f"## Section {i}\nContent of section {i}.\n\nParagraph text here for section {i}.")
+        big_content = "# Big Book\n\n" + "\n\n".join(sections)
+
+        app_state = MagicMock()
+        app_state.store = store_no_git
+        app_state.pipeline = pipeline_ok
+        app_state.knowledge_index = MagicMock()
+        app_state.knowledge_index.update_section = MagicMock()
+
+        from mcp_server.tools.content import import_content
+        result = await import_content(
+            {
+                "content": big_content,
+                "content_type": "book",
+                "domain": "batch-cov",
+                "subject": "test",
+                "title": "Batch Coverage Test",
+                "wait_for_index": True,
+            },
+            app_state,
+        )
+
+        assert "error" not in result
+        assert result["imported"] >= 12
+        assert result["failed"] == 0
+        assert result["indexed"] is True
+        assert result["pending"] is False

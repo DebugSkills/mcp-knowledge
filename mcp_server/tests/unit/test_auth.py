@@ -10,13 +10,10 @@ Covers:
 
 from __future__ import annotations
 
-import hashlib
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException, Request
-from starlette.responses import Response
-
 from mcp_server.auth import (
     AuthInfo,
     AuthMiddleware,
@@ -26,7 +23,7 @@ from mcp_server.auth import (
     get_auth,
     mask_key,
 )
-
+from starlette.responses import Response
 
 # ── monkeypatched settings ────────────────────────────────────
 

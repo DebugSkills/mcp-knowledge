@@ -9,9 +9,9 @@ from __future__ import annotations
 import pytest
 from mcp_server.quality.dup_gate import (
     DUP_SIMILARITY_THRESHOLD,
+    _extract_representative_text,
     compute_cosine,
     find_duplicates,
-    _extract_representative_text,
 )
 
 

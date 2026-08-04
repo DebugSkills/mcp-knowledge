@@ -7,7 +7,6 @@ get_knowledge_map: knowledge_index.get_map(domain?) → структурная �
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 logger = logging.getLogger("mcp_knowledge.tools.read")
 

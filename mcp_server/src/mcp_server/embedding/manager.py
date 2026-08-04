@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
 
 from ..config import settings
 from . import cpu_backend, gpu_backend
@@ -99,7 +98,7 @@ class EmbeddingManager:
                 "latency_ms": round(elapsed_ms, 1),
                 "dim": len(vectors[0]) if vectors else 0,
             }
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             return {
                 "backend": self._backend,
                 "model": settings.EMBEDDING_MODEL,

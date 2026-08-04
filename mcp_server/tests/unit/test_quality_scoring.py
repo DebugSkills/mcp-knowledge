@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from mcp_server.quality.scoring import (
-    REVIEW_THRESHOLD,
     StalenessInput,
     should_review,
     staleness_score,

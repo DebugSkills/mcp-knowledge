@@ -7,12 +7,11 @@ Uses mock fixtures from conftest.py — no Qdrant/embedding/filesystem required.
 from __future__ import annotations
 
 import pytest
-
-from mcp_server.tools.search import search_knowledge, search_by_tags
-from mcp_server.tools.read import get_entry, get_knowledge_map
-from mcp_server.tools.crud import write_knowledge, update_entry, delete_entry
-from mcp_server.tools.browse import list_domains, list_subjects, list_projects
 from mcp_server.tools.admin import reindex
+from mcp_server.tools.browse import list_domains, list_projects, list_subjects
+from mcp_server.tools.crud import delete_entry, update_entry, write_knowledge
+from mcp_server.tools.read import get_entry, get_knowledge_map
+from mcp_server.tools.search import search_by_tags, search_knowledge
 
 pytestmark = pytest.mark.asyncio
 
