@@ -68,6 +68,18 @@ async def _migrate_legacy_collection(qdrant: QdrantClient) -> None:
         qdrant.rename_collection(COLLECTION_ALIAS, backup_name)
         logger.info("F1 migration: renamed 'knowledge' → '%s'", backup_name)
     except Exception as exc:
+        # Qdrant rename через alias API работает только с aliases.
+        # Если 'knowledge' — реальная коллекция (не alias) → 404 "Alias knowledge
+        # does not exists!". Тогда blue-green неприменим: деградируем в прямой
+        # доступ к коллекции (search/upsert по имени работают), F1 откладывается
+        # (P1 backlog). Без этого — restart storm на каждом старте.
+        if "does not exists" in str(exc) or "doesn't exist" in str(exc):
+            logger.warning(
+                "F1 migration skipped: '%s' is a real collection (not alias) — "
+                "blue-green deferred (P1). %s",
+                COLLECTION_ALIAS, exc,
+            )
+            return
         logger.critical("F1 migration: rename_collection failed: %s", exc)
         raise
 
@@ -120,10 +132,16 @@ async def lifespan(app: FastAPI):
     # 2. Qdrant gRPC-клиент (задача 1.3)
     logger.info("🗄️  Подключение к Qdrant: %s", settings.QDRANT_URL)
     qdrant = QdrantClient()
-    qdrant.ensure_collection(force_recreate=False)
+    created = qdrant.ensure_collection(force_recreate=False)
 
     # ── F1: Blue-green migration (legacy → aliases) ──────
-    await _migrate_legacy_collection(qdrant)
+    if created:
+        # Коллекция только что создана — мигрировать нечего.
+        # Иначе _migrate_legacy_collection принял бы свежую коллекцию за legacy
+        # и попытался rename_alias (404: rename работает только с aliases).
+        logger.info("Collection '%s' created fresh — F1 migration skipped", settings.QDRANT_COLLECTION)
+    else:
+        await _migrate_legacy_collection(qdrant)
 
     app.state.qdrant = qdrant
     set_qdrant_client(qdrant)  # P1-2: прокидываем в health

@@ -8,6 +8,8 @@ import logging
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
+from .config import settings
+
 logger = logging.getLogger("mcp_knowledge.health")
 
 router = APIRouter(tags=["health"])
@@ -126,7 +128,7 @@ def _check_embedding() -> dict:
         return {
             "ok": False,
             "backend": getattr(_embedding_manager, "backend_name", "unknown"),
-            "model": "BAAI/bge-m3",
+            "model": settings.EMBEDDING_MODEL,
             "loaded": False,
         }
 
@@ -134,7 +136,7 @@ def _check_embedding() -> dict:
     return {
         "ok": True,
         "backend": emb_info.get("backend", "unknown"),
-        "model": emb_info.get("model", "BAAI/bge-m3"),
+        "model": emb_info.get("model", settings.EMBEDDING_MODEL),
         "loaded": True,
         "latency_ms": emb_info.get("latency_ms"),
     }

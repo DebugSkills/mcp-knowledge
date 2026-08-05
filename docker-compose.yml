@@ -1,30 +1,16 @@
 version: "3.8"
 
 services:
-  qdrant:
-    image: qdrant/qdrant:v1.13.4
-    container_name: mcp-qdrant
-    ports:
-      - "6333:6333"   # REST
-      - "6334:6334"   # gRPC
-    volumes:
-      - ../data/qdrant:/qdrant/storage     # bind mount — локальный диск (#27)
-      - ../data/qdrant/snapshots:/qdrant/snapshots
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:6333/healthz"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
-    restart: unless-stopped
-
   mcp-server:
     build:
       context: ./mcp_server
       dockerfile: Dockerfile
     container_name: mcp-knowledge-server
-    ports:
-      - "8000:8000"
+    # host-сеть: Ollama на хосте слушает ТОЛЬКО 127.0.0.1:11434 (loopback),
+    # host.docker.internal недоступен без OLLAMA_HOST=0.0.0.0 (требует sudo на хосте).
+    # host-сеть даёт прямой доступ к loopback хоста: localhost:11434 + localhost:6333.
+    # Альтернатива для удалённых окружений: OLLAMA_HOST=0.0.0.0 + host.docker.internal.
+    network_mode: host
     volumes:
       - ../knowledge:/app/knowledge           # SSOT (read-write: write_knowledge + git commit)
       - ../data/dlq:/app/data/dlq
@@ -32,9 +18,15 @@ services:
       - ../models_cache:/app/models_cache
     env_file:
       - .env
-    depends_on:
-      qdrant:
-        condition: service_healthy
+    environment:
+      - EMBEDDING_BACKEND=ollama
+      - OLLAMA_URL=http://localhost:11434
+      - OLLAMA_MODEL=mxbai-embed-large
+      # EMBEDDING_MODEL — имя HF-токенизатора для chunker (не Ollama-модель!)
+      - EMBEDDING_MODEL=BAAI/bge-m3
+      # Хостовый qdrant (gRPC 6334 наружу не проброшен → REST 6333)
+      - QDRANT_URL=http://localhost:6333
+      - QDRANT_PREFER_GRPC=false
     healthcheck:
       # E1 (P1-1 fix): /health/live — всегда 200 пока процесс жив → NO restart storm
       # Было: /health → при embed degraded 503 → Docker перезапускает → бесконечный цикл

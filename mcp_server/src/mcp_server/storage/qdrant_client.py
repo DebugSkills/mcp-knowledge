@@ -29,7 +29,7 @@ class QdrantClient:
 
     def __init__(self, url: str = settings.QDRANT_URL):
         # Qdrant SDK синхронный, вызовы через run_in_executor
-        self._client = QdrantSDKClient(url=url, prefer_grpc=True)
+        self._client = QdrantSDKClient(url=url, prefer_grpc=settings.QDRANT_PREFER_GRPC)
         self._url = url
         logger.info("QdrantClient: url=%s", url)
 

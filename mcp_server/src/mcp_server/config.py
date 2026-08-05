@@ -8,13 +8,16 @@ class Settings(BaseSettings):
 
     # Qdrant
     QDRANT_URL: str = "http://qdrant:6334"
+    QDRANT_PREFER_GRPC: bool = True  # false → REST (для хостового qdrant, gRPC 6334 не проброшен)
     QDRANT_COLLECTION: str = "knowledge"
 
     # Embedding
-    EMBEDDING_BACKEND: str = "auto"  # auto | cpu | gpu
+    EMBEDDING_BACKEND: str = "auto"  # auto | ollama | gpu | cpu
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
     EMBEDDING_DIM: int = 1024
     MODELS_CACHE_DIR: str = "/app/models_cache"
+    OLLAMA_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "mxbai-embed-large"
 
     # MCP Auth (мульти-ключи #18)
     MCP_READ_KEYS: list[str] = []

@@ -1,11 +1,12 @@
-"""Embedding Manager: авто-выбор GPU/CPU + авто-деградация (#8, #17).
+"""Embedding Manager: авто-выбор Ollama/GPU/CPU + авто-деградация (#8, #17).
 
 Задачи 1.5, 1.6 плана Фазы 1.
 
-Логика:
+Логика (Фаза 13.5 — ollama first):
+- EMBEDDING_BACKEND=ollama → Ollama (mxbai-embed-large, без torch)
 - EMBEDDING_BACKEND=gpu → GPU, при отказе — исключение
 - EMBEDDING_BACKEND=cpu → CPU
-- EMBEDDING_BACKEND=auto → GPU → при отказе CPU с WARN
+- EMBEDDING_BACKEND=auto → Ollama → GPU → CPU (fallback chain)
 """
 
 from __future__ import annotations
@@ -14,23 +15,33 @@ import logging
 import time
 
 from ..config import settings
-from . import cpu_backend, gpu_backend
+from . import cpu_backend, gpu_backend, ollama_backend
 
 logger = logging.getLogger("mcp_knowledge.embedding.manager")
 
 
 class EmbeddingManager:
-    """Управление embedding-бэкендом (GPU primary + CPU fallback)."""
+    """Управление embedding-бэкендом (Ollama primary + GPU/CPU fallback)."""
 
     def __init__(self):
-        self._backend = None  # "gpu" | "cpu"
+        self._backend = None  # "ollama" | "gpu" | "cpu"
         self._initialized = False
 
     async def initialize(self) -> bool:
         """Инициализировать бэкенд согласно EMBEDDING_BACKEND."""
         backend = settings.EMBEDDING_BACKEND.lower()
 
-        if backend == "gpu":
+        if backend == "ollama":
+            ok = ollama_backend.load_model()
+            if not ok:
+                raise RuntimeError(
+                    "EMBEDDING_BACKEND=ollama, но Ollama недоступна "
+                    f"(url={settings.OLLAMA_URL}, model={settings.OLLAMA_MODEL})"
+                )
+            self._backend = "ollama"
+            logger.info("Embedding: Ollama (mxbai-embed-large, %s)", settings.OLLAMA_URL)
+
+        elif backend == "gpu":
             ok = gpu_backend.load_model()
             if not ok:
                 raise RuntimeError("EMBEDDING_BACKEND=gpu, но GPU-модель не загрузилась")
@@ -43,24 +54,38 @@ class EmbeddingManager:
             self._backend = "cpu"
 
         elif backend == "auto":
-            # Пробуем GPU
-            gpu_ok = gpu_backend.load_model()
-            if gpu_ok:
-                self._backend = "gpu"
-                logger.info("Embedding: GPU (auto-detected)")
+            # Фаза 13.5: пробуем Ollama первой (быстро, без скачивания 3 ГБ моделей)
+            ollama_ok = ollama_backend.load_model()
+            if ollama_ok:
+                self._backend = "ollama"
+                logger.info("Embedding: Ollama (auto-detected)")
             else:
-                # Fallback на CPU
-                logger.warning("GPU недоступен — переключаюсь на CPU (WARN)")
-                cpu_ok = cpu_backend.load_model()
-                if not cpu_ok:
-                    raise RuntimeError("EMBEDDING_BACKEND=auto: ни GPU, ни CPU не загрузились")
-                self._backend = "cpu"
+                # Пробуем GPU
+                gpu_ok = gpu_backend.load_model()
+                if gpu_ok:
+                    self._backend = "gpu"
+                    logger.info("Embedding: GPU (auto-detected)")
+                else:
+                    # Fallback на CPU
+                    logger.warning(
+                        "Ollama и GPU недоступны — переключаюсь на CPU (WARN)"
+                    )
+                    cpu_ok = cpu_backend.load_model()
+                    if not cpu_ok:
+                        raise RuntimeError(
+                            "EMBEDDING_BACKEND=auto: ни Ollama, ни GPU, ни CPU не загрузились"
+                        )
+                    self._backend = "cpu"
 
         else:
             raise ValueError(f"Неизвестный EMBEDDING_BACKEND: {backend}")
 
         self._initialized = True
-        logger.info("EmbeddingManager: backend=%s, initialized=%s", self._backend, self._initialized)
+        logger.info(
+            "EmbeddingManager: backend=%s, initialized=%s",
+            self._backend,
+            self._initialized,
+        )
         return True
 
     @property
@@ -76,15 +101,27 @@ class EmbeddingManager:
         if not self._initialized:
             raise RuntimeError("EmbeddingManager не инициализирован")
 
-        if self._backend == "gpu":
+        if self._backend == "ollama":
+            return ollama_backend.embed(texts)
+        elif self._backend == "gpu":
             return gpu_backend.embed(texts)
         else:
             return cpu_backend.embed(texts)
 
     def embed_latency_check(self) -> dict:
         """Проверка latency embedding для /health (задача 1.7)."""
+        # Фаза 13.5: model зависит от backend
+        if self._backend == "ollama":
+            current_model = settings.OLLAMA_MODEL
+        else:
+            current_model = settings.EMBEDDING_MODEL
+
         if not self._initialized:
-            return {"backend": "none", "model": settings.EMBEDDING_MODEL, "loaded": False}
+            return {
+                "backend": "none",
+                "model": current_model,
+                "loaded": False,
+            }
 
         try:
             t0 = time.monotonic()
@@ -93,22 +130,24 @@ class EmbeddingManager:
             elapsed_ms = (time.monotonic() - t0) * 1000
             return {
                 "backend": self._backend,
-                "model": settings.EMBEDDING_MODEL,
+                "model": current_model,
                 "loaded": True,
                 "latency_ms": round(elapsed_ms, 1),
                 "dim": len(vectors[0]) if vectors else 0,
             }
-        except Exception as e:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             return {
                 "backend": self._backend,
-                "model": settings.EMBEDDING_MODEL,
+                "model": current_model,
                 "loaded": False,
-                "error": str(e),
+                "error": str(exc),
             }
 
     def get_model_info(self) -> dict:
         """Информация о модели."""
-        if self._backend == "gpu":
+        if self._backend == "ollama":
+            return {"backend": "ollama", "model": settings.OLLAMA_MODEL, "loaded": True}
+        elif self._backend == "gpu":
             return gpu_backend.get_model_info()
         elif self._backend == "cpu":
             return cpu_backend.get_model_info()

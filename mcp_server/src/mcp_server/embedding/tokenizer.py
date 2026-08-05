@@ -19,12 +19,49 @@ logger = logging.getLogger("mcp_knowledge.tokenizer")
 # Ленивая загрузка transformers (P1-2: экономия памяти при старте)
 _tokenizer_instance = None
 
+# Приближённое число символов на токен XLM-R для кириллицы
+# (точный токенайзер — в полном окружении; fallback — только для лёгкого образа)
+_FALLBACK_CHARS_PER_TOKEN = 4
+
+
+class _FallbackTokenizer:
+    """Лёгкий токенайзер БЕЗ transformers (лёгкий Docker-образ без torch).
+
+    Используется, когда transformers недоступен: приближённый подсчёт токенов
+    для chunker (len(text)//4 ≈ XLM-R для кириллицы). Точность ниже, но
+    нарезка стабильна и не требует скачивания модели (~1.1 ГБ).
+    """
+
+    vocab_size = 250_000
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        if not text:
+            return []
+        n = max(1, (len(text) + _FALLBACK_CHARS_PER_TOKEN - 1) // _FALLBACK_CHARS_PER_TOKEN)
+        return list(range(n))
+
+    def decode(self, token_ids: list[int], skip_special_tokens: bool = True) -> str:
+        # Текст из псевдо-токенов не восстановить — chunker использует decode
+        # только для truncate_to_tokens, который для fallback обрабатывается
+        # отдельно (см. XlmRobertaTokenizer.truncate_to_tokens).
+        return ""
+
 
 def _load_tokenizer():
-    """Ленивая загрузка XLM-RoBERTa токенайзера."""
+    """Ленивая загрузка XLM-RoBERTa токенайзера (с fallback без transformers)."""
     global _tokenizer_instance
     if _tokenizer_instance is None:
-        from transformers import AutoTokenizer
+        try:
+            from transformers import AutoTokenizer
+        except ImportError:
+            logger.warning(
+                "transformers недоступен (лёгкий образ) — fallback на "
+                "приближённый токенизатор (~%d симв/токен). Точная нарезка "
+                "XLM-R для chunking отключена.",
+                _FALLBACK_CHARS_PER_TOKEN,
+            )
+            _tokenizer_instance = _FallbackTokenizer()
+            return _tokenizer_instance
         logger.info("Загрузка токенайзера XLM-RoBERTa для %s...", settings.EMBEDDING_MODEL)
         cache_dir = settings.MODELS_CACHE_DIR
         try:
@@ -77,6 +114,9 @@ class XlmRobertaTokenizer:
         """Обрезать текст до max_tokens токенов."""
         if not text:
             return text
+        if isinstance(self._tok, _FallbackTokenizer):
+            # Псевдо-токены не декодируются — обрезаем по символам.
+            return text[: max_tokens * _FALLBACK_CHARS_PER_TOKEN]
         token_ids = self.tokenize(text)
         if len(token_ids) <= max_tokens:
             return text
