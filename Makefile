@@ -3,15 +3,21 @@ DATA_DIR := ../data
 KNOWLEDGE_DIR := ../knowledge
 MODELS_DIR := ../models_cache
 
-.PHONY: dev down logs test lint clean dlq-replay reindex backup prereq-dirs
+.PHONY: dev deploy down logs test lint clean dlq-replay reindex backup prereq-dirs
 
 # Проверка и создание необходимых директорий перед запуском
 prereq-dirs:
 	@mkdir -p $(DATA_DIR)/{qdrant/snapshots,dlq,quality,backups} $(MODELS_DIR)
 	@test -d $(KNOWLEDGE_DIR)/.git || (echo "❌ knowledge/ должен быть git-репозиторием (git init)" && exit 1)
 
+# dev: сервер + kb-console с ЖИВЫМИ логами (foreground, Ctrl+C — стоп).
+# Требуются собранные образы: сделайте `make deploy` один раз.
 dev: prereq-dirs
-	$(DOCKER_COMPOSE) up -d --wait
+	$(DOCKER_COMPOSE) up mcp-server kb-console
+
+# deploy: сборка образов (mcp-server + kb-console) и запуск стека в фоне
+deploy: prereq-dirs
+	$(DOCKER_COMPOSE) up -d --build
 
 down:
 	$(DOCKER_COMPOSE) down

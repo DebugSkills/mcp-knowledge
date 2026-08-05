@@ -49,6 +49,9 @@ services:
   # Отдельный образ: работает и на клиентских хостах (MCP_SERVER_URL из env).
   # host-сеть: обращается к mcp-server на localhost:8000 (как и сервер — к Ollama).
   kb-console:
+    build:
+      context: ./kb-console
+      dockerfile: Dockerfile
     image: kb-console:prod
     container_name: kb-console
     network_mode: host
