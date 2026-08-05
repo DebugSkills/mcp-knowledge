@@ -20,6 +20,11 @@ _KB_CONSOLE_SRC = str(Path(__file__).resolve().parents[3] / "kb-console" / "src"
 if _KB_CONSOLE_SRC not in sys.path:
     sys.path.insert(0, _KB_CONSOLE_SRC)
 
+# В контейнере mcp-server пакета kb-console НЕТ (отдельный образ kb-console:prod) —
+# там S20 пропускается, а связку консоль↔сервер проверяет smoke-проба :8085 (verify).
+# Локально / в dev (kb-console установлен) — тест работает полностью.
+pytest.importorskip("kb_console")
+
 # Ключ из фикстуры e2e (conftest.py: MCP_READ_KEYS='["e2e-read-key"]')
 E2E_READ_KEY = "e2e-read-key"
 
