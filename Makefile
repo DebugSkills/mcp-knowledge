@@ -13,6 +13,13 @@ prereq-dirs:
 # dev: сервер + kb-console с ЖИВЫМИ логами (foreground, Ctrl+C — стоп).
 # Требуются собранные образы: сделайте `make deploy` один раз.
 dev: prereq-dirs
+	@echo ""
+	@echo "🚀 Поднимается стек (живые логи, Ctrl+C — стоп):"
+	@echo "   • kb-console (клиент):  http://localhost:8085"
+	@echo "   • mcp-server (API):     http://localhost:8000/health"
+	@echo "   • Если в консоли «Authentication failed» — задайте MCP_API_KEY в .env"
+	@echo "     (равным ключу из MCP_READ_KEYS сервера)"
+	@echo ""
 	$(DOCKER_COMPOSE) up mcp-server kb-console
 
 # deploy: сборка образов (mcp-server + kb-console) и запуск стека в фоне

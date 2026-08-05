@@ -43,7 +43,7 @@ async def search_knowledge(params: dict, app_state) -> dict:
     # Embedding (CPU-bound → run_in_executor)
     embedder = app_state.embedder
     loop = asyncio.get_running_loop()
-    vector = await loop.run_in_executor(None, embedder.encode, query)
+    vector = await loop.run_in_executor(None, embedder.embed_sync, query)
 
     # Qdrant search (Issue-#5-fix: latency tracking)
     t0 = time.monotonic()

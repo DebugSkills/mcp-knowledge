@@ -42,36 +42,41 @@ async def _fetch_status_data(client: MCPClient):
 
 
 def build_status() -> None:
-    """Построить страницу «Статус»."""
+    """Построить страницу «Статус».
+
+    Автообновление через @ui.refreshable: перерисовываются ТОЛЬКО элементы
+    внутри refreshable-блока (diff), страница не перезагружается, позиция
+    скролла сохраняется — обновление незаметно.
+    """
+
+    latest: dict = {}
+
+    @ui.refreshable
+    def render_status() -> None:
+        _render_status(latest.get("data", {}))
 
     async def refresh() -> None:
-        container.clear()
-        with container:
-            ui.spinner(size="lg").classes("q-mx-auto")
         client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
         try:
-            data = await _fetch_status_data(client)
+            latest["data"] = await _fetch_status_data(client)
         finally:
             await client.close()
-
-        container.clear()
-        with container:
-            _render_status(data)
+        render_status.refresh()  # точечное обновление только контентных элементов
 
     # ── Layout ─────────────────────────────────────────────
     ui.label("Статус MCP Knowledge Server").classes("text-h4 q-mb-md")
 
     with ui.row().classes("gap-4 items-center"):
         ui.button("🔄 Обновить", on_click=refresh).props("flat")
-        ui.label(f"Автообновление: каждые {REFRESH_SECONDS} сек.").classes("text-grey")
+        ui.label(f"Автообновление: каждые {REFRESH_SECONDS} сек. (элементы, скролл сохраняется)").classes("text-grey")
 
-    container = ui.column().classes("w-full")
+    render_status()
 
     # Автообновление
-    ui.timer(REFRESH_SECONDS, lambda: refresh())
+    ui.timer(REFRESH_SECONDS, refresh)
 
     # Первичная загрузка
-    ui.timer(0.1, lambda: refresh(), once=True)
+    ui.timer(0.1, refresh, once=True)
 
 
 def _render_status(data: dict) -> None:

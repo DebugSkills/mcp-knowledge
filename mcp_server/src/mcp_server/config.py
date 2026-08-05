@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     # MCP Auth (мульти-ключи #18)
     MCP_READ_KEYS: list[str] = []
     MCP_WRITE_KEYS: list[str] = []
+    # Ключ kb-console (лежит в .env рядом с ключами сервера; сам сервер его НЕ использует —
+    # консоль шлёт его как X-API-Key. Поле нужно, чтобы pydantic не падал на extra_forbidden).
+    MCP_API_KEY: str = ""
 
     # Git audit (#21) + SSOT
     GIT_AUDIT: bool = True

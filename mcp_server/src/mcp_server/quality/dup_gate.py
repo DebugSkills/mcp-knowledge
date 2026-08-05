@@ -114,7 +114,7 @@ async def check_duplicates(
     # Шаг 2: embed
     try:
         loop = asyncio.get_event_loop()
-        vec = await loop.run_in_executor(None, embedder.encode, representative)
+        vec = await loop.run_in_executor(None, embedder.embed_sync, representative)
         query_vector = vec.tolist() if hasattr(vec, 'tolist') else list(vec)
     except Exception as exc:  # noqa: BLE001
         logger.error("Embed failed for dup-gate: %s", exc)
