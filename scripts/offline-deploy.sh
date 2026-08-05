@@ -28,6 +28,7 @@ BUNDLE="$GIT_ROOT/mcp-kb-airgap-bundle.tar.gz"
 
 MCP_IMAGE="mcp-knowledge-server:prod"
 QDRANT_IMAGE="qdrant/qdrant:v1.13.4"
+KB_CONSOLE_IMAGE="kb-console:prod"
 COMPOSE_PROD="docker-compose.prod.yml"
 
 # Ollama-модели, которые нужны embedder'у (основная + fallback)
@@ -132,14 +133,17 @@ prepare() {
     echo "[1/5] Building mcp-server image (без torch)..."
     docker build -t "$MCP_IMAGE" "$GIT_ROOT/mcp_server"
 
-    echo "[2/5] Saving Docker images (mcp-server + qdrant)..."
-    docker save "$MCP_IMAGE" "$QDRANT_IMAGE" -o "$STAGING_DIR/images/images.tar"
+    echo "[2/6] Building kb-console image (NiceGUI-клиент)..."
+    docker build -t "$KB_CONSOLE_IMAGE" "$GIT_ROOT/kb-console"
+
+    echo "[3/6] Saving Docker images (mcp-server + qdrant + kb-console)..."
+    docker save "$MCP_IMAGE" "$QDRANT_IMAGE" "$KB_CONSOLE_IMAGE" -o "$STAGING_DIR/images/images.tar"
     echo "  images.tar: $(du -sh "$STAGING_DIR/images/images.tar" | cut -f1)"
 
-    echo "[3/5] Exporting Ollama models..."
+    echo "[4/6] Exporting Ollama models..."
     export_ollama_models "$STAGING_DIR/ollama/models"
 
-    echo "[4/5] Copying configs, scripts, docs..."
+    echo "[5/6] Copying configs, scripts, docs..."
     cp "$GIT_ROOT/$COMPOSE_PROD" "$STAGING_DIR/"
     cp "$GIT_ROOT/.env.prod.example" "$STAGING_DIR/.env.example"
     cp "$GIT_ROOT/scripts/seed_knowledge.py" "$STAGING_DIR/scripts/"
@@ -147,7 +151,7 @@ prepare() {
     cp "$GIT_ROOT/scripts/offline-deploy.sh" "$STAGING_DIR/scripts/"
     cp "$GIT_ROOT/docs/air-gap-validation.md" "$STAGING_DIR/DEPLOYMENT.md" 2>/dev/null || true
 
-    echo "[5/5] Checksums + pack..."
+    echo "[6/6] Checksums + pack..."
     ( cd "$STAGING_DIR" && find . -type f ! -name CHECKSUMS.sha256 -exec sha256sum {} \; > CHECKSUMS.sha256 )
     tar -C "$GIT_ROOT/artifacts" -czf "$BUNDLE" "$(basename "$STAGING_DIR")"
 
@@ -214,6 +218,7 @@ verify() {
         "mcp-server /health     |http://localhost:8000/health"
         "qdrant /healthz        |http://localhost:6333/healthz"
         "Ollama /api/tags       |http://localhost:11434/api/tags"
+        "kb-console /           |http://localhost:8080/"
     )
     for p in "${probes[@]}"; do
         local label url
@@ -235,9 +240,9 @@ verify() {
 
     echo ""
     if [ "$fail" -eq 0 ]; then
-        echo "✅ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (smoke $ok/4 + E2E). Система работоспособна."
+        echo "✅ ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ (smoke $ok/5 + E2E). Система работоспособна."
     else
-        echo "❌ $fail проверок не прошли (smoke ok=$ok/4)."
+        echo "❌ $fail проверок не прошли (smoke ok=$ok/5)."
         exit 1
     fi
 }

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kb-console"
+version = "0.1.0"
+description = "MCP Knowledge Console — NiceGUI-клиент для MCP Knowledge Server (диагностика + импорт + поиск)"
+requires-python = ">=3.11"
+dependencies = [
+    "nicegui>=1.4.0",
+    "httpx>=0.27",
+    "uvicorn>=0.34",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.8",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# BLE001/S110 — намеренные: UI-страницы ловят исключения и показывают
+# пользователю человекочитаемое сообщение (дашборд не должен падать).
+[tool.ruff.lint.per-file-ignores]
+"src/kb_console/pages/*.py" = ["BLE001", "S110"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests/"]
+addopts = "--strict-markers"

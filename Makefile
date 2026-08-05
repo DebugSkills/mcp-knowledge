@@ -58,6 +58,17 @@ prod-verify:  ## Высокоуровневая проверка прода: smo
 	./scripts/offline-deploy.sh verify
 
 # ═══════════════════════════════════════════════════════════════
+# kb-console (Фаза 13.7) — NiceGUI-клиент (диагностика + импорт + поиск)
+# ═══════════════════════════════════════════════════════════════
+
+.PHONY: console-build console-test
+console-build:  ## Собрать образ kb-console:prod
+	docker build -t kb-console:prod ./kb-console
+
+console-test:  ## Юнит + smoke тесты kb-console (нужен установленный пакет)
+	.venv/bin/python -m pytest kb-console/tests -v
+
+# ═══════════════════════════════════════════════════════════════
 # Torch GPU/CPU установка (Фаза 8.1)
 # ═══════════════════════════════════════════════════════════════
 

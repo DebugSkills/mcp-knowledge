@@ -44,3 +44,24 @@ services:
     #         - driver: nvidia
     #           count: 1
     #           capabilities: [gpu]
+
+  # kb-console — NiceGUI-клиент (диагностика + импорт + поиск).
+  # Отдельный образ: работает и на клиентских хостах (MCP_SERVER_URL из env).
+  # host-сеть: обращается к mcp-server на localhost:8000 (как и сервер — к Ollama).
+  kb-console:
+    image: kb-console:prod
+    container_name: kb-console
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      - MCP_SERVER_URL=http://localhost:8000
+      - MCP_API_KEY=${MCP_API_KEY:-}
+      - CONSOLE_PORT=8080
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped

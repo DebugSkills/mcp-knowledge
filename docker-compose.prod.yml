@@ -68,3 +68,27 @@ services:
       retries: 3
       start_period: 60s
     restart: unless-stopped
+
+  # kb-console — NiceGUI-клиент (диагностика + импорт + поиск).
+  # Отдельный самодостаточный образ: может жить и на клиентских хостах —
+  # достаточно docker run -e MCP_SERVER_URL=http://<server-ip>:8000 -p 8080:8080 kb-console:prod
+  kb-console:
+    image: kb-console:prod
+    container_name: kb-console
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      - MCP_SERVER_URL=http://localhost:8000
+      - MCP_API_KEY=${MCP_API_KEY:-}
+      - CONSOLE_PORT=8080
+    depends_on:
+      mcp-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped

@@ -32,7 +32,28 @@ cd staging
 
 Топология: qdrant — контейнер из compose (6333 REST / 6334 gRPC), mcp-server — контейнер с `network_mode: host` (видит Ollama на `localhost:11434` и qdrant на `localhost:6333`), Ollama — системный сервис хоста. E2E-тесты изолированы от прод-данных (коллекция `knowledge_e2e` создаётся и удаляется).
 
-> ⚠️ При первом deploy в `.env` попадают ключи-заглушки — **замените** `MCP_READ_KEYS` / `MCP_WRITE_KEYS`.
+> ⚠️ При первом deploy в `.env` попадают ключи-заглушки — **замените** `MCP_READ_KEYS` / `MCP_WRITE_KEYS` / `MCP_API_KEY`.
+
+---
+
+## 0.1 Консоль мониторинга (kb-console, Фаза 13.7)
+
+В bundle входит **kb-console** — отдельный NiceGUI-клиент (порт **8080**) для проверки и обслуживания системы:
+
+- **Статус** — жив ли сервер (liveness/readiness: Qdrant, Embedding, Pipeline, DLQ), ключевые метрики, таблица всех 16 MCP-инструментов (auto-refresh 10 c).
+- **Импорт** — загрузка материалов (Markdown) через `import_content` (поля: content, content_type, domain, subject, tags).
+- **Поиск** — пробный поиск по корпусу (`search_knowledge`) с результатами (title/score/domain/subject).
+
+Запускается автоматически как сервис `kb-console` в `docker-compose.prod.yml` (host-сеть, `MCP_SERVER_URL=http://localhost:8000`). Проверка после deploy: `curl -sf http://localhost:8080/` (входит в `verify`).
+
+**На клиентском хосте** (отдельно от сервера) — контейнер самодостаточен:
+```bash
+docker run -d --name kb-console \
+  -e MCP_SERVER_URL=http://<server-ip>:8000 \
+  -e MCP_API_KEY=<ключ из .env сервера> \
+  -p 8080:8080 kb-console:prod
+```
+Открыть `http://localhost:8080`. Ключ `MCP_API_KEY` должен входить в `MCP_READ_KEYS` (чтение/поиск) или `MCP_WRITE_KEYS` (импорт).
 
 ---
 
