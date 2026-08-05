@@ -150,6 +150,7 @@ prepare() {
     cp "$GIT_ROOT/scripts/backup.sh" "$STAGING_DIR/scripts/"
     cp "$GIT_ROOT/scripts/offline-deploy.sh" "$STAGING_DIR/scripts/"
     cp "$GIT_ROOT/docs/air-gap-validation.md" "$STAGING_DIR/DEPLOYMENT.md" 2>/dev/null || true
+    cp "$GIT_ROOT/kb-console/USER_GUIDE.md" "$STAGING_DIR/USER_GUIDE.md" 2>/dev/null || true
 
     echo "[6/6] Checksums + pack..."
     ( cd "$STAGING_DIR" && find . -type f ! -name CHECKSUMS.sha256 -exec sha256sum {} \; > CHECKSUMS.sha256 )
