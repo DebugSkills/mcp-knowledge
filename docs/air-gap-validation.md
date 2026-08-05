@@ -1,7 +1,38 @@
 # 🔒 Air-gap Deployment Validation — MCP Knowledge Server
 
-> **trace_id:** `code-2026-07-31-003` | **Phase:** 3 G4 | **Last updated:** 2026-08-03
-> **Dependencies:** `scripts/offline-deploy.sh`, `docker-compose.yml`, `.env.example`
+> **trace_id:** `code-2026-07-31-003` | **Phase:** 3 G4 | **Last updated:** 2026-08-05 (Фаза 13.5: Ollama-embedder, лёгкий образ, самодостаточный bundle)
+> **Dependencies:** `scripts/offline-deploy.sh`, `docker-compose.prod.yml`, `.env.prod.example`
+
+---
+
+## 0. Быстрый старт (Фаза 13.5 — актуальный процесс)
+
+Принцип: **один архивный bundle** переносится на продовую машину (USB/диск). Внутри — всё: docker-образы (mcp-server без torch + qdrant), Ollama-модели (mxbai-embed-large + nomic-embed-text), compose-файл, конфиги и сам скрипт деплоя.
+
+**На машине с интернетом (сборка):**
+```bash
+make bundle   # или: ./scripts/offline-deploy.sh prepare
+# → mcp-kb-airgap-bundle.tar.gz (~1.1 GB)
+```
+
+**На изолированном хосте (перенос архива):**
+```bash
+tar -xzf mcp-kb-airgap-bundle.tar.gz   # → каталог staging/
+cd staging
+./scripts/offline-deploy.sh deploy     # образы + Ollama-модели + запуск (qdrant + mcp-server)
+./scripts/offline-deploy.sh verify     # smoke + высокоуровневые E2E-тесты S1-S19
+```
+
+**Импорт знаний** (Markdown-каталог → SSOT + переиндексация):
+```bash
+./scripts/offline-deploy.sh import --src /path/to/markdown_dir
+```
+
+Требования на изолированном хосте: **Docker** (сеть не нужна — образы из архива) и **Ollama** (системный сервис; модели доставляются в bundle и размещаются автоматически). Python не требуется — всё работает в контейнерах.
+
+Топология: qdrant — контейнер из compose (6333 REST / 6334 gRPC), mcp-server — контейнер с `network_mode: host` (видит Ollama на `localhost:11434` и qdrant на `localhost:6333`), Ollama — системный сервис хоста. E2E-тесты изолированы от прод-данных (коллекция `knowledge_e2e` создаётся и удаляется).
+
+> ⚠️ При первом deploy в `.env` попадают ключи-заглушки — **замените** `MCP_READ_KEYS` / `MCP_WRITE_KEYS`.
 
 ---
 
@@ -23,7 +54,7 @@
 | Machine | Network | Role | Minimum Specs |
 |---------|---------|------|---------------|
 | **Build host** | Internet access | Download artifacts, build bundle | Docker, Python 3.11, pip, 10 GB free disk |
-| **Target host** | **Isolated** (no internet) | Run MCP Knowledge Server | Docker, Python 3.11, 8 GB RAM, 15 GB free disk |
+| **Target host** | **Isolated** (no internet) | Run MCP Knowledge Server | Docker, **Ollama**, 8 GB RAM, 15 GB free disk |
 
 ### 1.2 Software Requirements (both machines)
 

@@ -51,6 +51,12 @@ e2e:  ## E2E-тесты ключевых решений (нужен запуще
 e2e-slow:  ## E2E + медленные сценарии (blue-green, GPU)
 	.venv/bin/python -m pytest mcp_server/tests/e2e -m "e2e or e2e_slow" -v
 
+bundle:  ## Собрать air-gap bundle для изолированного контура (машина с интернетом)
+	./scripts/offline-deploy.sh prepare
+
+prod-verify:  ## Высокоуровневая проверка прода: smoke + E2E S1-S19 (из docker-compose.prod.yml)
+	./scripts/offline-deploy.sh verify
+
 # ═══════════════════════════════════════════════════════════════
 # Torch GPU/CPU установка (Фаза 8.1)
 # ═══════════════════════════════════════════════════════════════
