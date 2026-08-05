@@ -1,6 +1,6 @@
 # 🖥️ MCP Knowledge Console — руководство пользователя
 
-**kb-console** — веб-интерфейс для проверки и обслуживания MCP Knowledge Server: статус системы, загрузка материалов, поиск по базе знаний. Открывается в браузере на порту **8080**.
+**kb-console** — веб-интерфейс для проверки и обслуживания MCP Knowledge Server: статус системы, загрузка материалов, поиск по базе знаний. Открывается в браузере на порту **8085**.
 
 ## 🚀 Запуск
 
@@ -10,16 +10,16 @@ docker compose up -d            # dev
 # или из air-gap bundle:
 ./scripts/offline-deploy.sh deploy
 ```
-→ открыть `http://localhost:8080`
+→ открыть `http://localhost:8085`
 
 **На клиентском хосте** (отдельно от сервера):
 ```bash
 docker run -d --name kb-console \
   -e MCP_SERVER_URL=http://<server-ip>:8000 \
   -e MCP_API_KEY=<ключ из .env сервера> \
-  -p 8080:8080 kb-console:prod
+  -p 8085:8085 kb-console:prod
 ```
-→ открыть `http://localhost:8080`
+→ открыть `http://localhost:8085`
 
 ## 📑 Страницы
 
@@ -57,5 +57,5 @@ docker run -d --name kb-console \
 |---|---|---|
 | `MCP_SERVER_URL` | `http://localhost:8000` | Адрес MCP-сервера (на клиентском хосте — IP сервера) |
 | `MCP_API_KEY` | пусто | Ключ доступа (если на сервере включена авторизация) |
-| `CONSOLE_PORT` | `8080` | Порт веб-интерфейса |
+| `CONSOLE_PORT` | `8085` | Порт веб-интерфейса |
 | `REFRESH_SECONDS` | `10` | Интервал автообновления страницы «Статус» |

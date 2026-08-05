@@ -57,9 +57,9 @@ services:
     environment:
       - MCP_SERVER_URL=http://localhost:8000
       - MCP_API_KEY=${MCP_API_KEY:-}
-      - CONSOLE_PORT=8080
+      - CONSOLE_PORT=8085
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8085/"]
       interval: 30s
       timeout: 5s
       retries: 3

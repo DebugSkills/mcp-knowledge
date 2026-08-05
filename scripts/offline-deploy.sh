@@ -219,7 +219,7 @@ verify() {
         "mcp-server /health     |http://localhost:8000/health"
         "qdrant /healthz        |http://localhost:6333/healthz"
         "Ollama /api/tags       |http://localhost:11434/api/tags"
-        "kb-console /           |http://localhost:8080/"
+        "kb-console /           |http://localhost:8085/"
     )
     for p in "${probes[@]}"; do
         local label url

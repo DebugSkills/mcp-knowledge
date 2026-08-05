@@ -15,8 +15,8 @@ MCP_API_KEY: str = os.environ.get("MCP_API_KEY", "")
 Если пустой — заголовок X-API-Key не отправляется (auth отключена).
 """
 
-CONSOLE_PORT: int = int(os.environ.get("CONSOLE_PORT", "8080"))
-"""Порт, на котором работает NiceGUI-консоль (по умолчанию 8080)."""
+CONSOLE_PORT: int = int(os.environ.get("CONSOLE_PORT", "8085"))
+"""Порт, на котором работает NiceGUI-консоль (по умолчанию 8085)."""
 
 REFRESH_SECONDS: int = int(os.environ.get("REFRESH_SECONDS", "10"))
 """Интервал автообновления страницы «Статус» в секундах."""
