@@ -1,0 +1,607 @@
+"""S13-S19: E2E-покрытие инструментов через HTTP /mcp против реального Qdrant.
+
+Фаза 13 (v1.0): закрывает gap-анализ — добавляет E2E для:
+- S13: delete_entry (HTTP tools/call)
+- S14: list_domains / list_subjects / list_projects (HTTP)
+- S15: reindex blue_green=False (HTTP)
+- S16: import_content (HTTP путь, дополняет S6)
+- S17: MCP initialize
+- S18: resources/read kb:// (после прода-правки resources.py Ш10a)
+- S19: prompts/list + prompts/get
+
+Изоляция: коллекция knowledge_e2e (_patched_collection session fixture).
+Все тесты async — httpx.AsyncClient + ASGITransport (один event loop).
+
+Ловушки:
+- wait_for_index(kid, timeout=10) перед delete и перед assert после write
+- delete_entry — передача wait=True при прямом обращении к Qdrant
+- reindex blue_green=False обязателен (иначе разрушит session-scoped коллекцию)
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+# ═══════════════════════════════════════════════════════════════
+# S13: delete_entry через HTTP /mcp tools/call
+# ═══════════════════════════════════════════════════════════════
+
+S13_KNOWLEDGE_ID = "e2e-s13-delete"
+
+
+@pytest.mark.e2e
+async def test_s13_delete_entry_via_http(e2e_http_app):
+    """S13: write(e2e-s13) → tools/call delete_entry → verify get_entry error + точка отсутствует в Qdrant.
+
+    Паттерн из S9d/S11: wait_for_index ДО delete (иначе drain перезапишет после delete).
+    """
+    headers_write = {"X-API-Key": "e2e-write-key"}
+
+    # Step 1: Write entry
+    write_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "write_knowledge",
+            "arguments": {
+                "content": "# S13 Delete Test\n\nТестовый контент для проверки удаления.\n",
+                "domain": "e2e-delete",
+                "subject": "test",
+                "knowledge_id": S13_KNOWLEDGE_ID,
+                "wait_for_index": True,
+            },
+        },
+        "id": 1,
+    }
+    resp = await e2e_http_app.post("/mcp", json=write_payload, headers=headers_write)
+    assert resp.status_code == 200
+    write_body = resp.json()
+    assert "result" in write_body, f"Write failed: {write_body}"
+    write_data = json.loads(write_body["result"]["content"][0]["text"])
+    assert write_data["knowledge_id"] == S13_KNOWLEDGE_ID
+
+    # Step 2: Verify entry exists in Qdrant (get_entry)
+    get_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "get_entry",
+            "arguments": {"knowledge_id": S13_KNOWLEDGE_ID},
+        },
+        "id": 2,
+    }
+    resp = await e2e_http_app.post("/mcp", json=get_payload, headers=headers_write)
+    assert resp.status_code == 200
+    get_body = resp.json()
+    assert "result" in get_body, f"get_entry before delete failed: {get_body}"
+
+    # Step 3: Wait for index (иначе drain перезапишет после delete)
+    await e2e_http_app.app.state.pipeline.wait_for_index(S13_KNOWLEDGE_ID, timeout=10.0)
+
+    # Step 4: Delete entry
+    delete_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "delete_entry",
+            "arguments": {"knowledge_id": S13_KNOWLEDGE_ID},
+        },
+        "id": 3,
+    }
+    resp = await e2e_http_app.post("/mcp", json=delete_payload, headers=headers_write)
+    assert resp.status_code == 200
+    delete_body = resp.json()
+    assert "result" in delete_body, f"Delete failed: {delete_body}"
+    delete_data = json.loads(delete_body["result"]["content"][0]["text"])
+    assert delete_data["deleted"] is True
+    assert delete_data["knowledge_id"] == S13_KNOWLEDGE_ID
+
+    # Step 5: Verify get_entry returns error (entry deleted)
+    resp = await e2e_http_app.post("/mcp", json=get_payload, headers=headers_write)
+    assert resp.status_code == 200
+    get_body2 = resp.json()
+    assert "result" in get_body2
+    get_data2 = json.loads(get_body2["result"]["content"][0]["text"])
+    assert "error" in get_data2, f"Expected error after delete, got: {get_data2}"
+
+    # Step 6: Verify point absent from Qdrant
+    all_ids = e2e_http_app.app.state.qdrant.get_all_knowledge_ids()
+    assert S13_KNOWLEDGE_ID not in all_ids, (
+        f"Point {S13_KNOWLEDGE_ID} still in Qdrant: {all_ids}"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# S14: list_domains / list_subjects / list_projects через HTTP
+# ═══════════════════════════════════════════════════════════════
+
+S14_KNOWLEDGE_A = "e2e-s14-list-a"
+S14_KNOWLEDGE_B = "e2e-s14-list-b"
+S14_DOMAIN_A = "e2e-list-domain-a"
+S14_DOMAIN_B = "e2e-list-domain-b"
+
+
+@pytest.mark.e2e
+async def test_s14_list_domains_subjects_projects_via_http(e2e_http_app):
+    """S14: write 2 записи (domain=e2e-list-a/-b) → list_domains → list_subjects → list_projects."""
+    headers_write = {"X-API-Key": "e2e-write-key"}
+
+    # Step 1: Write entry A (domain=e2e-list-domain-a, subject=python)
+    payload_a = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "write_knowledge",
+            "arguments": {
+                "content": "# S14 Entry A\n\nPython testing content.\n",
+                "domain": S14_DOMAIN_A,
+                "subject": "python",
+                "project": "test-proj-a",
+                "knowledge_id": S14_KNOWLEDGE_A,
+                "wait_for_index": True,
+            },
+        },
+        "id": 1,
+    }
+    resp = await e2e_http_app.post("/mcp", json=payload_a, headers=headers_write)
+    assert resp.status_code == 200
+    write_a = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert write_a["knowledge_id"] == S14_KNOWLEDGE_A
+
+    # Step 2: Write entry B (domain=e2e-list-domain-b, subject=golang)
+    payload_b = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "write_knowledge",
+            "arguments": {
+                "content": "# S14 Entry B\n\nGolang testing content.\n",
+                "domain": S14_DOMAIN_B,
+                "subject": "golang",
+                "project": "test-proj-b",
+                "knowledge_id": S14_KNOWLEDGE_B,
+                "wait_for_index": True,
+            },
+        },
+        "id": 2,
+    }
+    resp = await e2e_http_app.post("/mcp", json=payload_b, headers=headers_write)
+    assert resp.status_code == 200
+    write_b = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert write_b["knowledge_id"] == S14_KNOWLEDGE_B
+
+    # Step 3: list_domains → both domains present
+    list_domains_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "list_domains", "arguments": {}},
+        "id": 3,
+    }
+    resp = await e2e_http_app.post("/mcp", json=list_domains_payload, headers=headers_write)
+    assert resp.status_code == 200
+    domains_data = json.loads(resp.json()["result"]["content"][0]["text"])
+    domains = domains_data["results"]
+    assert S14_DOMAIN_A in domains, f"Expected {S14_DOMAIN_A} in domains: {domains}"
+    assert S14_DOMAIN_B in domains, f"Expected {S14_DOMAIN_B} in domains: {domains}"
+
+    # Step 4: list_subjects(domain=e2e-list-domain-a) → [python]
+    list_subjects_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "list_subjects",
+            "arguments": {"domain": S14_DOMAIN_A},
+        },
+        "id": 4,
+    }
+    resp = await e2e_http_app.post("/mcp", json=list_subjects_payload, headers=headers_write)
+    assert resp.status_code == 200
+    subjects_data = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "python" in subjects_data["results"], f"Expected python in subjects: {subjects_data['results']}"
+    assert subjects_data["domain"] == S14_DOMAIN_A
+
+    # Step 5: list_projects → both projects present
+    list_projects_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "list_projects", "arguments": {}},
+        "id": 5,
+    }
+    resp = await e2e_http_app.post("/mcp", json=list_projects_payload, headers=headers_write)
+    assert resp.status_code == 200
+    projects_data = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "test-proj-a" in projects_data["results"], f"Projects: {projects_data['results']}"
+    assert "test-proj-b" in projects_data["results"], f"Projects: {projects_data['results']}"
+
+    # Cleanup
+    await e2e_http_app.app.state.pipeline.wait_for_index(S14_KNOWLEDGE_A, timeout=10.0)
+    await e2e_http_app.app.state.pipeline.wait_for_index(S14_KNOWLEDGE_B, timeout=10.0)
+    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S14_KNOWLEDGE_A)
+    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S14_KNOWLEDGE_B)
+
+
+# ═══════════════════════════════════════════════════════════════
+# S15: reindex blue_green=False через HTTP
+# ═══════════════════════════════════════════════════════════════
+
+S15_KNOWLEDGE_ID = "e2e-s15-reindex"
+
+
+@pytest.mark.e2e
+async def test_s15_reindex_blue_green_false_via_http(e2e_http_app):
+    """S15: write(e2e-s15) → tools/call reindex (blue_green=false) → verify total_docs≥1, failed=0.
+
+    КРИТИЧНО: blue_green=False (иначе blue-green разрушит session-scoped knowledge_e2e).
+    """
+    headers_write = {"X-API-Key": "e2e-write-key"}
+
+    # Step 1: Write entry (чтобы коллекция не была пустой)
+    write_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "write_knowledge",
+            "arguments": {
+                "content": "# S15 Reindex Test\n\nКонтент для проверки reindex.\n",
+                "domain": "e2e-reindex",
+                "subject": "test",
+                "knowledge_id": S15_KNOWLEDGE_ID,
+                "wait_for_index": True,
+            },
+        },
+        "id": 1,
+    }
+    resp = await e2e_http_app.post("/mcp", json=write_payload, headers=headers_write)
+    assert resp.status_code == 200
+    write_data = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert write_data["knowledge_id"] == S15_KNOWLEDGE_ID
+
+    # Step 2: reindex с blue_green=false (delete-all + rebuild в той же коллекции)
+    reindex_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "reindex",
+            "arguments": {"blue_green": False},
+        },
+        "id": 2,
+    }
+    resp = await e2e_http_app.post("/mcp", json=reindex_payload, headers=headers_write)
+    assert resp.status_code == 200
+    reindex_body = resp.json()
+    assert "result" in reindex_body, f"Reindex failed: {reindex_body}"
+    reindex_data = json.loads(reindex_body["result"]["content"][0]["text"])
+
+    # Verify response fields (admin.py:58-67)
+    assert reindex_data["total_docs"] >= 1, f"Expected total_docs≥1, got: {reindex_data}"
+    assert reindex_data["failed"] == 0, f"Expected failed=0, got: {reindex_data}"
+    assert reindex_data["blue_green"] is False, f"Expected blue_green=false, got: {reindex_data}"
+    assert "total_chunks" in reindex_data
+    assert "index_sections" in reindex_data
+
+    # Step 3: Verify коллекция не разрушена — get_entry still works
+    # (после reindex_all коллекция очищается и перестраивается, S15_KNOWLEDGE_ID должен быть перестроен)
+    get_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "get_entry",
+            "arguments": {"knowledge_id": S15_KNOWLEDGE_ID},
+        },
+        "id": 3,
+    }
+    resp = await e2e_http_app.post("/mcp", json=get_payload, headers=headers_write)
+    assert resp.status_code == 200
+
+    # Step 4: Verify НЕТ knowledge_v1/v2 коллекций (blue_green=false не должен создавать)
+    import httpx
+    async with httpx.AsyncClient() as c:
+        r = await c.get("http://localhost:6333/collections", timeout=5.0)
+        collections_data = r.json()
+        collection_names = [col["name"] for col in collections_data.get("result", {}).get("collections", [])]
+        # knowledge_e2e — наша тестовая коллекция (OK)
+        # knowledge — продакшн коллекция (OK)
+        # knowledge_v1 / knowledge_v2 — НЕ должны появиться
+        assert "knowledge_v1" not in collection_names, (
+            f"knowledge_v1 found after reindex blue_green=False! Collections: {collection_names}"
+        )
+        assert "knowledge_v2" not in collection_names, (
+            f"knowledge_v2 found after reindex blue_green=False! Collections: {collection_names}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+# S16: import_content через HTTP /mcp tools/call
+# ═══════════════════════════════════════════════════════════════
+
+S16_DOMAIN = "e2e-import-http"
+
+STRUCTURED_BOOK_S16 = """# Python Async Programming
+
+## Chapter 1: Introduction to Asyncio
+Asynchronous programming allows concurrent execution of tasks.
+The asyncio module provides event loop, coroutines, and futures.
+
+## Chapter 2: Coroutines and Tasks
+Coroutines are the core of asyncio. Use async def to define them.
+Tasks wrap coroutines and schedule them on the event loop.
+
+## Chapter 3: Event Loop Internals
+The event loop is the heart of asyncio. It manages callbacks,
+schedules tasks, and handles I/O events efficiently.
+"""
+
+
+@pytest.mark.e2e
+async def test_s16_import_content_via_http(e2e_http_app):
+    """S16: POST /mcp tools/call import_content (book, 3 главы) → verify imported≥3, failed=0.
+
+    Дополняет существующий S6 (прямой вызов) — здесь HTTP-путь.
+    """
+    # S6 (test_russian_corpus) вызывает reset() в finally → реестр препроцессоров пуст.
+    # Восстанавливаем book-препроцессор локально (паттерн S6 setup) для самодостаточности.
+    from mcp_server.content.book_preprocessor import BookPreprocessor
+    from mcp_server.content.registry import register, reset
+
+    reset()
+    token_counter = type("TokenCounter", (), {
+        "count_tokens": lambda self, text: len(text.split()),
+        "truncate_to_tokens": lambda self, text, max_t: " ".join(text.split()[:max_t]),
+    })()
+    register(BookPreprocessor(embedder=e2e_http_app.app.state.embedder, token_counter=token_counter))
+
+    headers_write = {"X-API-Key": "e2e-write-key"}
+
+    import_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "import_content",
+            "arguments": {
+                "content": STRUCTURED_BOOK_S16,
+                "content_type": "book",
+                "domain": S16_DOMAIN,
+                "subject": "python",
+                "title": "Python Async HTTP",
+                "tags": ["async", "python", "e2e"],
+                "wait_for_index": True,
+            },
+        },
+        "id": 1,
+    }
+    resp = await e2e_http_app.post("/mcp", json=import_payload, headers=headers_write)
+    assert resp.status_code == 200
+    import_body = resp.json()
+    assert "result" in import_body, f"import_content HTTP failed: {import_body}"
+    import_data = json.loads(import_body["result"]["content"][0]["text"])
+
+    # import_content может вернуть error при взаимодействии с другими тестами
+    if "error" in import_data:
+        pytest.fail(f"import_content returned error: {import_data}")
+
+    assert import_data.get("imported", 0) >= 3, f"Expected imported≥3, got: {import_data}"
+    assert import_data.get("failed", 0) == 0, f"Expected failed=0, got: {import_data}"
+    assert import_data.get("partial_success", True) is False
+    assert import_data.get("collection_id", "").endswith("-collection"), (
+        f"collection_id should end with '-collection': {import_data.get('collection_id')}"
+    )
+
+    # Cleanup: удаляем коллекцию и её children
+    collection_id = import_data["collection_id"]
+    await e2e_http_app.app.state.pipeline.wait_for_index(collection_id, timeout=10.0)
+    # Удаляем коллекцию из Qdrant
+    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(collection_id)
+    # Удаляем children
+    root = await e2e_http_app.app.state.store.read(collection_id)
+    if root and root.frontmatter.children:
+        for child_ref in root.frontmatter.children:
+            cid = child_ref["knowledge_id"]
+            e2e_http_app.app.state.qdrant.delete_by_knowledge_id(cid)
+
+
+# ═══════════════════════════════════════════════════════════════
+# S17: MCP initialize через HTTP POST /mcp
+# ═══════════════════════════════════════════════════════════════
+
+@pytest.mark.e2e
+async def test_s17_initialize_via_http(e2e_http_app):
+    """S17: POST /mcp {method:"initialize"} → verify protocolVersion, capabilities."""
+    headers = {"X-API-Key": "e2e-read-key"}
+
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "clientInfo": {"name": "e2e-test-client", "version": "0.1.0"},
+            "capabilities": {},
+        },
+        "id": 1,
+    }
+    resp = await e2e_http_app.post("/mcp", json=payload, headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["jsonrpc"] == "2.0"
+    assert "result" in body, f"Initialize failed: {body}"
+    result = body["result"]
+
+    # protocolVersion
+    assert result["protocolVersion"] == "2024-11-05", f"protocolVersion: {result['protocolVersion']}"
+
+    # serverInfo
+    assert result["serverInfo"]["name"] == "mcp-knowledge-server"
+    assert "version" in result["serverInfo"]
+
+    # capabilities
+    caps = result["capabilities"]
+    assert "tools" in caps, f"Missing tools capability: {caps}"
+    assert "resources" in caps, f"Missing resources capability: {caps}"
+    assert "prompts" in caps, f"Missing prompts capability: {caps}"
+
+
+# ═══════════════════════════════════════════════════════════════
+# S18: resources/read kb:// через HTTP POST /mcp
+# ═══════════════════════════════════════════════════════════════
+
+S18_KNOWLEDGE_ID = "e2e-s18-resources"
+S18_DOMAIN = "e2e-resources-read"
+S18_SUBJECT = "networking"
+
+
+@pytest.mark.e2e
+async def test_s18_resources_read_kb_uri_via_http(e2e_http_app):
+    """S18: write(e2e-s18) → resources/read kb:// → kb://{domain} → kb://{domain}/{subject}.
+
+    Требует Ш10a: resources.py fix (COLLECTION_NAME import) + conftest patch.
+    """
+    headers_write = {"X-API-Key": "e2e-write-key"}
+    headers_read = {"X-API-Key": "e2e-read-key"}
+
+    # Step 1: Write entry
+    write_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "write_knowledge",
+            "arguments": {
+                "content": "# S18 Resources Test\n\nNetworking knowledge entry.\n",
+                "domain": S18_DOMAIN,
+                "subject": S18_SUBJECT,
+                "knowledge_id": S18_KNOWLEDGE_ID,
+                "wait_for_index": True,
+            },
+        },
+        "id": 1,
+    }
+    resp = await e2e_http_app.post("/mcp", json=write_payload, headers=headers_write)
+    assert resp.status_code == 200
+
+    # Step 2: resources/read kb:// → список доменов
+    # Формат ответа: result.contents[0] = {uri, text: json_str, mimeType}
+    # Где text содержит JSON с полем contents (список доменов)
+    kb_root_payload = {
+        "jsonrpc": "2.0",
+        "method": "resources/read",
+        "params": {"uri": "kb://"},
+        "id": 2,
+    }
+    resp = await e2e_http_app.post("/mcp", json=kb_root_payload, headers=headers_read)
+    assert resp.status_code == 200
+    root_body = resp.json()
+    assert "result" in root_body, f"resources/read kb:// failed: {root_body}"
+    root_result = root_body["result"]
+
+    # Парсим вложенный JSON из text
+    assert len(root_result.get("contents", [])) >= 1, f"No contents in: {root_result}"
+    inner_json = json.loads(root_result["contents"][0]["text"])
+    domain_names = [c["name"] for c in inner_json.get("contents", [])]
+    assert S18_DOMAIN in domain_names, f"Expected {S18_DOMAIN} in kb:// contents: {domain_names}"
+
+    # Step 3: resources/read kb://{domain} → список subjects
+    kb_domain_payload = {
+        "jsonrpc": "2.0",
+        "method": "resources/read",
+        "params": {"uri": f"kb://{S18_DOMAIN}"},
+        "id": 3,
+    }
+    resp = await e2e_http_app.post("/mcp", json=kb_domain_payload, headers=headers_read)
+    assert resp.status_code == 200
+    domain_body = resp.json()
+    assert "result" in domain_body, f"resources/read kb://{S18_DOMAIN} failed: {domain_body}"
+    domain_result = domain_body["result"]
+
+    assert len(domain_result.get("contents", [])) >= 1
+    domain_inner = json.loads(domain_result["contents"][0]["text"])
+    subject_names = [c["name"] for c in domain_inner.get("contents", [])]
+    assert S18_SUBJECT in subject_names, f"Expected {S18_SUBJECT} in subjects: {subject_names}"
+
+    # Step 4: resources/read kb://{domain}/{subject} → список knowledge_ids
+    kb_subject_payload = {
+        "jsonrpc": "2.0",
+        "method": "resources/read",
+        "params": {"uri": f"kb://{S18_DOMAIN}/{S18_SUBJECT}"},
+        "id": 4,
+    }
+    resp = await e2e_http_app.post("/mcp", json=kb_subject_payload, headers=headers_read)
+    assert resp.status_code == 200
+    subject_body = resp.json()
+    assert "result" in subject_body, f"resources/read kb://{S18_DOMAIN}/{S18_SUBJECT} failed: {subject_body}"
+    subject_result = subject_body["result"]
+
+    assert len(subject_result.get("contents", [])) >= 1
+    subject_inner = json.loads(subject_result["contents"][0]["text"])
+    kid_names = [c["name"] for c in subject_inner.get("contents", [])]
+    assert S18_KNOWLEDGE_ID in kid_names, f"Expected {S18_KNOWLEDGE_ID} in knowledge_ids: {kid_names}"
+
+    # Cleanup
+    await e2e_http_app.app.state.pipeline.wait_for_index(S18_KNOWLEDGE_ID, timeout=10.0)
+    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S18_KNOWLEDGE_ID)
+
+
+# ═══════════════════════════════════════════════════════════════
+# S19: prompts/list + prompts/get через HTTP POST /mcp
+# ═══════════════════════════════════════════════════════════════
+
+@pytest.mark.e2e
+async def test_s19_prompts_list_and_get_via_http(e2e_http_app):
+    """S19: prompts/list → verify 3 промпта → prompts/get("best-practice-write") → messages непустой."""
+    headers = {"X-API-Key": "e2e-read-key"}
+
+    # Step 1: prompts/list
+    list_payload = {
+        "jsonrpc": "2.0",
+        "method": "prompts/list",
+        "params": {},
+        "id": 1,
+    }
+    resp = await e2e_http_app.post("/mcp", json=list_payload, headers=headers)
+    assert resp.status_code == 200
+    list_body = resp.json()
+    assert "result" in list_body, f"prompts/list failed: {list_body}"
+    prompts = list_body["result"].get("prompts", [])
+    prompt_names = [p["name"] for p in prompts]
+
+    # Verify 3 prompts exist
+    assert "how-to-structure-knowledge" in prompt_names, f"Missing how-to-structure-knowledge: {prompt_names}"
+    assert "best-practice-write" in prompt_names, f"Missing best-practice-write: {prompt_names}"
+    assert "periodic_quality_cleanup" in prompt_names, f"Missing periodic_quality_cleanup: {prompt_names}"
+    assert len(prompts) >= 3
+
+    # Step 2: prompts/get("best-practice-write")
+    get_payload = {
+        "jsonrpc": "2.0",
+        "method": "prompts/get",
+        "params": {"name": "best-practice-write"},
+        "id": 2,
+    }
+    resp = await e2e_http_app.post("/mcp", json=get_payload, headers=headers)
+    assert resp.status_code == 200
+    get_body = resp.json()
+    assert "result" in get_body, f"prompts/get failed: {get_body}"
+    prompt_result = get_body["result"]
+
+    # messages непустой
+    messages = prompt_result.get("messages", [])
+    assert len(messages) > 0, f"Expected non-empty messages, got: {prompt_result}"
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"]["type"] == "text"
+    assert len(messages[0]["content"]["text"]) > 100, (
+        f"Expected substantial prompt text, got {len(messages[0]['content']['text'])} chars"
+    )
+
+    # Step 3: prompts/get("how-to-structure-knowledge") — тоже непустой
+    get_payload2 = {
+        "jsonrpc": "2.0",
+        "method": "prompts/get",
+        "params": {"name": "how-to-structure-knowledge"},
+        "id": 3,
+    }
+    resp = await e2e_http_app.post("/mcp", json=get_payload2, headers=headers)
+    assert resp.status_code == 200
+    get_body2 = resp.json()
+    assert "result" in get_body2
+    messages2 = get_body2["result"]["messages"]
+    assert len(messages2) > 0

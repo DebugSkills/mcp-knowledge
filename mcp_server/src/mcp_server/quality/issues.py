@@ -244,7 +244,7 @@ def list_issues(
         if entry.get("status") != status:
             continue
         result.append(_issue_from_dict(entry))
-        if len(result) >= limit:
+        if limit is not None and len(result) >= limit:
             break
 
     return result

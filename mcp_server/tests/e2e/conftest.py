@@ -103,13 +103,21 @@ def _e2e_services_available():
 
 @pytest.fixture(scope="session")
 def _patched_collection():
-    """Monkeypatch COLLECTION_NAME = 'knowledge_e2e' на всю сессию."""
+    """Monkeypatch COLLECTION_NAME = 'knowledge_e2e' на всю сессию.
+    
+    Фаза 13 (v1.0): также патчит resources.COLLECTION_NAME (иначе resources.py
+    читает свою локальную ссылку из schema.py, минуя monkeypatch qdrant_client).
+    """
+    import mcp_server.resources as res_mod
     import mcp_server.storage.qdrant_client as qc_mod
 
-    original = qc_mod.COLLECTION_NAME
+    original_qc = qc_mod.COLLECTION_NAME
+    original_res = res_mod.COLLECTION_NAME
     qc_mod.COLLECTION_NAME = E2E_COLLECTION
+    res_mod.COLLECTION_NAME = E2E_COLLECTION
     yield
-    qc_mod.COLLECTION_NAME = original
+    qc_mod.COLLECTION_NAME = original_qc
+    res_mod.COLLECTION_NAME = original_res
 
 
 @pytest.fixture(scope="session")

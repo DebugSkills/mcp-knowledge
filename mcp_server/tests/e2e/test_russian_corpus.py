@@ -439,7 +439,10 @@ async def test_s6_import_content_parent_child_toc(e2e_app_state, e2e_store):
                 f"Child {child_kid} parent mismatch"
             )
     finally:
+        # Восстанавливаем default-регистрацию: reset() опустошает глобальный реестр,
+        # и последующие тесты (S16 import_content via HTTP) получают "Available types: []".
         reset()
+        register(BookPreprocessor(embedder=None, token_counter=None))
 
 
 # ═══════════════════════════════════════════════════════════════

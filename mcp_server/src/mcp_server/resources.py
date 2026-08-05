@@ -12,6 +12,8 @@ from __future__ import annotations
 import logging
 from urllib.parse import unquote
 
+from .storage.schema import COLLECTION_NAME
+
 logger = logging.getLogger("mcp_knowledge.resources")
 
 # ── Resource definitions for resources/list ────────────────
@@ -158,11 +160,11 @@ async def _collect_unique_values(
             )
 
         points, offset = qdrant._client.scroll(
-            collection_name="knowledge",
+            collection_name=COLLECTION_NAME,
             limit=1000,
             offset=offset,
             scroll_filter=scroll_filter,
-            with_payload=qmodels.WithPayloadSelector(include=[field]),
+            with_payload=qmodels.PayloadSelectorInclude(include=[field]),
             with_vectors=False,
         )
 
@@ -214,11 +216,11 @@ async def _collect_knowledge_ids(
 
     while total_scanned < max_points:
         points, offset = qdrant._client.scroll(
-            collection_name="knowledge",
+            collection_name=COLLECTION_NAME,
             limit=1000,
             offset=offset,
             scroll_filter=scroll_filter,
-            with_payload=qmodels.WithPayloadSelector(include=["knowledge_id"]),
+            with_payload=qmodels.PayloadSelectorInclude(include=["knowledge_id"]),
             with_vectors=False,
         )
 
