@@ -2,64 +2,72 @@
 
 MCP Knowledge Server — семантическая база знаний для AI-агентов по протоколу MCP (Model Context Protocol). Проект сообщества DebugSkills.
 
-Хранение: Markdown SSOT → chunk → BGE-M3/Ollama embed → Qdrant vector search. 15 MCP Tools, air-gap совместимость, production-ready (health, rate-limit, blue-green reindex).
+Хранение: Markdown SSOT → chunk → Ollama embed (mxbai-embed-large) → Qdrant vector search. **16 MCP Tools**, air-gap совместимость (одноархивный deploy-bundle), production-ready (health, rate-limit, blue-green reindex, quality system). Веб-консоль **kb-console** (NiceGUI, :8085) для диагностики и обслуживания.
 
 ## Архитектура
 
 ```
-MCP Client (Claude/Cline/Kilo)
-    │ JSON-RPC 2.0 over HTTP
-    ▼
-┌─────────────────────────────────────┐
-│  FastAPI + MCP Handler (v0.1.0)     │
-│  Auth: multi-key (read/write)       │
-│  Rate-limit: token bucket            │
-├─────────────────────────────────────┤
-│  Tools (15)                         │
-│  search read crud browse admin      │
-│  review_queue list_quality_issues   │
-│  resolve_quality_issue run_scan     │
-├─────────────────────────────────────┤
-│  Pipeline: chunk → embed → upsert   │
-│  Qdrant (vector DB)                 │
-│  Ollama (mxbai-embed-large 1024d)   │
-├─────────────────────────────────────┤
-│  Quality System                     │
-│  gates scoring scanner lifecycle     │
-│  edit-war dup-gate issues embedder  │
-├─────────────────────────────────────┤
-│  Markdown SSOT (knowledge/)         │
-│  Git audit (#21)                    │
-│  Backups (Qdrant snapshots)         │
-└─────────────────────────────────────┘
+MCP Client (Claude/Cline/Kilo) ─── kb-console (NiceGUI, :8085)
+    │ JSON-RPC 2.0 over HTTP           │  диаг. :8085 → :8000
+    ▼                                  ▼  (или с клиентского хоста)
+┌────────────────────────────────────────────────────┐
+│  FastAPI + MCP Handler (v0.1.0)                    │
+│  Auth: multi-key (read/write, X-API-Key)           │
+│  Rate-limit: token bucket (REST, 429)              │
+│  Endpoints: POST /mcp · /health · /health/live · /metrics │
+├────────────────────────────────────────────────────┤
+│  Tools (16)                                        │
+│  search read crud browse admin quality import      │
+├────────────────────────────────────────────────────┤
+│  Pipeline: chunk → embed → upsert (async worker)   │
+│  Qdrant (vector DB, REST 6333 / gRPC 6334)         │
+│  Ollama (mxbai-embed-large 1024d, системный сервис)│
+├────────────────────────────────────────────────────┤
+│  Quality System (Фаза 4)                           │
+│  gates scoring scanner lifecycle dup-gate issues   │
+├────────────────────────────────────────────────────┤
+│  Markdown SSOT (knowledge/) + Git audit            │
+│  DLQ (dead-letter queue) · Backups (snapshots)     │
+└────────────────────────────────────────────────────┘
 ```
+
+**kb-console** — отдельный самодостаточный контейнер (образ `kb-console:prod`): страницы **Статус** (health-карточки, метрики, 16 инструментов), **Импорт** (загрузка материалов через `import_content`), **Поиск** (по корпусу). Может жить на клиентских хостах (`MCP_SERVER_URL` из env). Руководство: `kb-console/USER_GUIDE.md`.
 
 ## Быстрый старт
 
 ```bash
-# Клонирование
-git clone <repo-url> && cd mcp-knowledge
-
-# Продакшен (Docker)
-docker compose up -d
-
 # Разработка (venv)
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e mcp_server/
+pip install -e mcp_server/ && pip install -e kb-console/   # kb-console для E2E S20
 
-# Тесты
-python -m pytest mcp_server/tests/ -v
+# Запуск (dev: host-network, хостовые Qdrant+Ollama)
+cp .env.example .env && docker compose up -d mcp-server
+docker compose up -d kb-console      # → http://localhost:8085
 
-# Запуск quality scan (cron)
-./scripts/quality_scan.sh
+# Тесты (нужны запущенные Qdrant :6333 и Ollama :11434)
+make e2e-slow                        # E2E S1-S20 (32 + S20 4/4)
+.venv/bin/python -m pytest mcp_server/tests -q   # полный suite (428)
+make console-test                    # unit + smoke kb-console (8)
 ```
 
-## MCP Tools (15)
+## Продовый деплой (air-gap, одноархивный bundle)
+
+```bash
+make bundle                          # машина с интернетом → mcp-kb-airgap-bundle.tar.gz (~1.2 GB)
+# перенос архива на изолированный хост (USB/диск):
+tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
+./scripts/offline-deploy.sh deploy   # образы (mcp-server+qdrant+kb-console) + Ollama-модели + запуск
+./scripts/offline-deploy.sh verify   # smoke (5 проб, включая kb-console :8085) + E2E S1-S19
+./scripts/offline-deploy.sh import --src /path/to/md/   # импорт знаний
+```
+Подробности: `docs/air-gap-validation.md` (в bundle — `DEPLOYMENT.md`), руководство консоли — `USER_GUIDE.md`.
+
+## MCP Tools (16)
 
 ### Search & Read
 | # | Tool | Назначение |
 |---|------|-----------|
-| 1 | `search_knowledge` | Семантический поиск (BGE-M3/Ollama embed) |
+| 1 | `search_knowledge` | Семантический поиск (Ollama embed) |
 | 2 | `search_by_tags` | Поиск по тегам (payload-фильтр Qdrant) |
 | 3 | `get_entry` | Получить полную запись (frontmatter + Markdown) |
 | 4 | `get_knowledge_map` | Структурная карта: domains → subjects → IDs |
@@ -91,6 +99,11 @@ python -m pytest mcp_server/tests/ -v
 | 14 | `resolve_quality_issue` | Разрешить: merge/deprecate/restore/resolve/ignore |
 | 15 | `run_quality_scan` | Периодический scan (для cron, daily) |
 
+### Import (Фаза 5)
+| # | Tool | Назначение |
+|---|------|-----------|
+| 16 | `import_content` | Декомпозиция + batch запись: content → collection (book, cross_subjects, wait_for_index) |
+
 ## MCP Prompts
 
 | Prompt | Назначение |
@@ -108,28 +121,45 @@ python -m pytest mcp_server/tests/ -v
 | **Lifecycle** | 2-state: published ↔ deprecated (reversible restore) |
 | **Quality SLO** | `review_queue_size > 50` → Prometheus/alertmanager alert |
 
-## Конфигурация
+## Конфигурация (env)
 
 | Переменная | Default | Описание |
 |-----------|---------|----------|
-| `QDRANT_URL` | `http://localhost:6333` | Qdrant векторная БД |
+| `EMBEDDING_BACKEND` | `ollama` | Прод-эмбеддер (Ollama, без torch) |
+| `OLLAMA_URL` / `OLLAMA_MODEL` | `http://localhost:11434` / `mxbai-embed-large` | Эмбеддер |
+| `EMBEDDING_MODEL` | `BAAI/bge-m3` | HF-токенизатор chunker (НЕ Ollama-модель; fallback без transformers) |
+| `QDRANT_URL` / `QDRANT_PREFER_GRPC` | `http://localhost:6333` / `true` | Qdrant (REST; gRPC при контейнерной сети) |
 | `KNOWLEDGE_DIR` | `knowledge/` | Markdown SSOT |
-| `MCP_READ_KEYS` | `[...]` | API-ключи для чтения |
-| `MCP_WRITE_KEYS` | `[...]` | API-ключи для записи |
-| `OLLAMA_URL` | `http://localhost:11434` | Ollama API (эмбеддинг + LLM) |
+| `MCP_READ_KEYS` / `MCP_WRITE_KEYS` | `[]` | API-ключи (read/write; пусто = без auth) |
+| `MCP_API_KEY` | — | Ключ kb-console (должен входить в read/write keys) |
+| `MCP_SERVER_URL` / `CONSOLE_PORT` | `http://localhost:8000` / `8085` | kb-console: адрес сервера / порт UI |
+| `RATE_LIMIT_READ_PER_MIN` / `RATE_LIMIT_WRITE_PER_MIN` | `100` / `20` | Rate-limit (429) |
 | `REVIEW_THRESHOLD` | 0.45 | Порог для review-очереди |
 | `DUP_SIMILARITY_THRESHOLD` | 0.92 | Cosine-порог для дублей |
-| `HF_HUB_OFFLINE` | — | Air-gap режим (не качать модели) |
 
 ## Реализованные фазы
 
 | Фаза | Статус | Ключевой результат |
 |------|:------:|-------------------|
-| 0 | ✅ | Scaffolding: Pydantic-модели, Qdrant setup |
-| 1 | ✅ | SSOT: Markdown-хранение, INDEX.gen.yaml |
-| 2 | ✅ | MCP Server: 11 Tools, FastAPI, auth, rate-limit |
-| 3 | ✅ | Production: health, blue-green, backup/restore, air-gap |
-| 4 | ✅ | Quality: gates, scoring, lifecycle, 15 Tools, 133 теста |
+| 0-4 | ✅ | Scaffolding → Quality System (16 tools, промпт, gates) |
+| 9 | ✅ | Idempotent E2E-сьют (S1-S8), фикс latent dup-gate бага |
+| 12 | ✅ | HTTP-level E2E (S9-S12: health/metrics/429/409/503) + observability-метрики |
+| 13 | ✅ | Полное E2E-покрытие (S13-S19) + 24 quality unit-теста + 2 прод-фикса |
+| 13.5 | ✅ | Ollama как прод-embedder + лёгкий Docker-образ (без torch, 424 passed) |
+| 13.6 | ✅ | Air-gap deploy bundle: один архив (образы + Ollama-модели), deploy/verify/import |
+| 13.7 | ✅ | kb-console (NiceGUI :8085): диагностика, импорт, поиск; E2E S20; bundle с 3 образами |
+
+## Тесты (актуальные цифры)
+
+| Уровень | Результат |
+|---------|-----------|
+| Unit + integration (сервер) | 393 passed |
+| E2E S1-S19 (реальные Qdrant+Ollama) | 32/32 (S8 — e2e_slow) |
+| E2E S20 (kb-console MCPClient ↔ сервер) | 4/4 (в контейнере mcp-server — skip, exit 0) |
+| kb-console unit + smoke | 8/8 |
+| Полный suite (локально) | **428 passed**, 1 deselected |
+| Docker (в контейнере mcp-server) | 424 passed / E2E 31 passed |
+| Ruff | 0 ошибок |
 
 ## Known Limitations
 
@@ -137,22 +167,21 @@ python -m pytest mcp_server/tests/ -v
 - **Coverage gaps:** не детектируются непокрытые темы
 - **Conflicting entries:** тип зарезервирован (~90% FP)
 - **Temporal dup-blind-spot:** async-окно 1-5с (компенсируется periodic scan)
+- **Backlog (§11):** gRPC-сценарий 6334 (REST эквивалентен), F1 blue-green для legacy-коллекции, CLI subprocess-тест
 
-## Коммиты (Фаза 4)
+## Коммиты (последние фазы)
 
 ```
-b8b4772 Ollama embedder adapter — replaces BGE-M3 for air-gap
-89ae16c quality/__init__.py — dup_gate + lifecycle exports
-7bf041e Quality Management docs + MCP Prompt
-92baa15 integration tests — quality flow E2E
-83a2f64 semantic dup-gate — cosine check
-a4e5570 lifecycle slice — published|deprecated
-143b5b8 cron scan + run_quality_scan tool
-ef55e84 MCP Quality Tools — review_queue + list + resolve
-09bcf8e edit-war detection — git-based
-8677d90 quality foundation — issues + gates + scoring + scanner
+e0973b9 fix(phase13.7): S20 importorskip — E2E зелёный в verify
+1414acd chore(phase13.7): порт kb-console 8080 → 8085
+c8044e3 docs(phase13.7): user guide kb-console (USER_GUIDE.md)
+0a83736 feat(phase13.7): kb-console — NiceGUI-клиент (диагностика + импорт + поиск)
+3530d47 feat(phase13.6): air-gap deploy bundle — one-archive install for isolated hosts
+487542c feat(phase13.5): Ollama as prod embedder + lightweight Docker (no torch)
+5f48c3c feat(phase13): full E2E coverage — S13-S19 + 24 quality unit tests
+a2e6479 feat(phase12): HTTP-level E2E S9-S12 + 5 observability metrics
 ```
 
 ---
 
-*Фаза 4 завершена. 15 MCP Tools, 1 Prompt, 133 теста, Ollama mxbai-embed-large.*
+*Актуально на 2026-08-05. 16 MCP Tools, 428 тестов, kb-console :8085, air-gap bundle 1.2 GB.*
