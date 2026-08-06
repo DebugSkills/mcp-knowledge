@@ -45,3 +45,4 @@ plans
 
 # Throwaway artifacts (реверсивное удаление)
 .trash/
+.playwright-mcp/
