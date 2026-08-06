@@ -187,6 +187,15 @@ def build_import() -> None:
             _timer = None
         timer_label.visible = False
 
+    def _cleanup_timer() -> None:
+        """Отмена секундомера при закрытии/перезагрузке вкладки
+        (иначе RuntimeError: parent slot deleted в логах)."""
+        nonlocal _timer
+        if _timer is not None:
+            _timer.cancel()
+            _timer = None
+    ui.context.client.on_disconnect(_cleanup_timer)
+
     result_container = ui.column().classes("w-full")
 
     # ── Analyze handler (НОВЫЙ) ───────────────────────────

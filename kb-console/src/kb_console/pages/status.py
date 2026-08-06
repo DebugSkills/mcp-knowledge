@@ -79,10 +79,16 @@ def build_status() -> None:
     render_status()
 
     # Автообновление
-    ui.timer(REFRESH_SECONDS, refresh)
+    refresh_timer = ui.timer(REFRESH_SECONDS, refresh)
 
     # Первичная загрузка
     ui.timer(0.1, refresh, once=True)
+
+    # Отмена таймера при закрытии/перезагрузке вкладки — иначе
+    # RuntimeError: The parent slot of Timer has been deleted (в логах).
+    def _cleanup_timers() -> None:
+        refresh_timer.cancel()
+    ui.context.client.on_disconnect(_cleanup_timers)
 
 
 def _render_status(data: dict) -> None:
