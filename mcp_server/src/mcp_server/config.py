@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     # Embedding
     EMBEDDING_BACKEND: str = "auto"  # auto | ollama | gpu | cpu
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
-    EMBEDDING_DIM: int = 1024
+    EMBEDDING_DIM: int = 768  # nomic-embed-text (был 1024 для mxbai) — зависимо от OLLAMA_MODEL
     MODELS_CACHE_DIR: str = "/app/models_cache"
     OLLAMA_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "mxbai-embed-large"

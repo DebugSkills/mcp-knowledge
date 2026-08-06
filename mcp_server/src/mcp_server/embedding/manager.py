@@ -139,12 +139,28 @@ class EmbeddingManager:
                     "(выполните: sudo systemctl start ollama)"
                 )
 
+        t0 = time.monotonic()
         if self._backend == "ollama":
-            return ollama_backend.embed(texts)
+            vectors = ollama_backend.embed(texts)
         elif self._backend == "gpu":
-            return gpu_backend.embed(texts)
+            vectors = gpu_backend.embed(texts)
         else:
-            return cpu_backend.embed(texts)
+            vectors = cpu_backend.embed(texts)
+
+        # Диагностика производительности: медленный embed (>5 сек) — аномалия
+        # (Ollama грузит модель, сеть, большой батч). INFO-уровень для
+        # обнаружения деградации в логах (инцидент 2026-08-06).
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        if elapsed_ms > 5000:
+            logger.warning(
+                "[EMBED] SLOW %.1fs n=%d",
+                elapsed_ms / 1000, len(texts),
+            )
+        else:
+            logger.debug(
+                "embed_sync: %.0f ms (%d текстов)", elapsed_ms, len(texts),
+            )
+        return vectors
 
     def embed_latency_check(self) -> dict:
         """Проверка latency embedding для /health (задача 1.7)."""

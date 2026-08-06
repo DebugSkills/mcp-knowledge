@@ -29,6 +29,24 @@ dev: prereq-dirs
 dev-latest-log:
 	@ls -t .trash/dev-*.log 2>/dev/null | head -1 || echo "нет логов .trash/dev-*.log"
 
+# dev-follow: следить за свежим логом dev-стека в реальном времени (Ctrl+C — выход)
+dev-follow:
+	@LOG=$$(ls -t .trash/dev-*.log 2>/dev/null | head -1); \
+	if [ -z "$$LOG" ]; then echo "нет логов .trash/dev-*.log — запустите make dev"; exit 1; fi; \
+	echo "📡 follow: $$LOG (Ctrl+C — выход)"; tail -f "$$LOG"
+
+# dev-follow-server: live-логи контейнера mcp-knowledge-server (docker logs -f)
+dev-follow-server:
+	@docker logs -f --tail 100 mcp-knowledge-server
+
+# dev-follow-console: live-логи контейнера kb-console (docker logs -f)
+dev-follow-console:
+	@docker logs -f --tail 100 kb-console
+
+# dev-resources: live-мониторинг ресурсов контейнеров (2 сек)
+dev-resources:
+	@docker stats --format "table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}"
+
 # deploy: сборка образов (mcp-server + kb-console) и запуск стека в фоне
 deploy: prereq-dirs
 	$(DOCKER_COMPOSE) up -d --build --force-recreate

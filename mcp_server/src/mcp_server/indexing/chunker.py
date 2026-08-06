@@ -133,6 +133,19 @@ class MarkdownChunker:
     ) -> list[Chunk]:
         """Разбить длинную секцию на overlapping чанки."""
         chunks = []
+
+        # Overlap: берём max(overlap_tokens, min_overlap), но не больше max_tokens/2
+        effective_overlap = max(self.overlap_tokens, self._min_overlap)
+        effective_overlap = min(effective_overlap, self.max_tokens // 2)
+
+        # Fallback-токенизатор не умеет decode → нарезаем по символам напрямую,
+        # БЕЗ вызова tokenize() (избегаем материализации range/list на 100K+ элементах).
+        if xlmr_tokenizer.is_fallback:
+            return self._split_long_section_by_chars(
+                knowledge_id, text, section_header, start_index,
+                effective_overlap,
+            )
+
         tokens = xlmr_tokenizer.tokenize(text)
         total_tokens = len(tokens)
 
@@ -146,23 +159,12 @@ class MarkdownChunker:
                 token_count=total_tokens,
             )]
 
-        # Overlap: берём max(overlap_tokens, min_overlap), но не больше max_tokens/2
-        effective_overlap = max(self.overlap_tokens, self._min_overlap)
-        effective_overlap = min(effective_overlap, self.max_tokens // 2)
-
         chunk_idx = start_index
         pos = 0
         while pos < total_tokens:
             end = min(pos + self.max_tokens, total_tokens)
             chunk_tokens = tokens[pos:end]
             chunk_text = xlmr_tokenizer.decode(chunk_tokens)
-            if xlmr_tokenizer.is_fallback and not chunk_text:
-                # Fallback не декодирует псевдо-токены → нарезаем по символам
-                # (иначе длинные секции > max_tokens давали ПУСТЫЕ чанки).
-                chars_per = xlmr_tokenizer.fallback_chars_per_token
-                start_char = min(pos * chars_per, len(text))
-                end_char = min(end * chars_per, len(text))
-                chunk_text = text[start_char:end_char]
 
             chunks.append(Chunk(
                 chunk_id=f"{knowledge_id}#{chunk_idx}",
@@ -174,11 +176,63 @@ class MarkdownChunker:
             ))
             chunk_idx += 1
 
+            # БЕЗОПАСНЫЙ ВЫХОД: end == total_tokens → НЕ сдвигать pos назад,
+            # иначе (pos = end - overlap < total) последний чанк дублируется
+            # бесконечно → OOM (инцидент 2026-08-06, фикс синхронизирован
+            # с _split_long_section_by_chars).
+            if end == total_tokens:
+                break
             # Следующий блок начинается с отступом overlap
             pos = end - effective_overlap
-            if pos >= total_tokens:
-                break
             # Не даём pos застрять (если overlap >= max_tokens)
+            if pos <= 0:
+                pos = end
+
+        return chunks
+
+    def _split_long_section_by_chars(
+        self,
+        knowledge_id: str,
+        text: str,
+        section_header: str,
+        start_index: int,
+        effective_overlap: int,
+    ) -> list[Chunk]:
+        """Разбить длинную секцию по символам (fallback-режим, без токенизации).
+
+        Использует _FALLBACK_CHARS_PER_TOKEN для пересчёта токен-лимита
+        в символьный. Не аллоцирует список токенов — только нарезка строк.
+        """
+        from ..embedding.tokenizer import _FALLBACK_CHARS_PER_TOKEN
+
+        chars_per_token = _FALLBACK_CHARS_PER_TOKEN
+        max_chars = self.max_tokens * chars_per_token
+        overlap_chars = effective_overlap * chars_per_token
+        total_chars = len(text)
+
+        chunks = []
+        chunk_idx = start_index
+        pos = 0
+        while pos < total_chars:
+            end = min(pos + max_chars, total_chars)
+            chunk_text = text[pos:end]
+
+            chunks.append(Chunk(
+                chunk_id=f"{knowledge_id}#{chunk_idx}",
+                knowledge_id=knowledge_id,
+                content=f"## {section_header}\n\n{chunk_text}" if section_header else chunk_text,
+                section_header=section_header,
+                chunk_index=chunk_idx,
+                token_count=max(1, len(chunk_text) // chars_per_token),
+            ))
+            chunk_idx += 1
+
+            # БЕЗОПАСНЫЙ ВЫХОД: если дошли до конца текста (end == total),
+            # НЕ сдвигать pos назад — иначе (end - overlap < total) цикл
+            # вечно дублирует последний чанк → OOM (инцидент 2026-08-06).
+            if end == total_chars:
+                break
+            pos = end - overlap_chars
             if pos <= 0:
                 pos = end
 

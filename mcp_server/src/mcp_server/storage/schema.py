@@ -19,7 +19,9 @@ COLLECTION_NAME = COLLECTION_ALIAS
 COLLECTION_V1 = "knowledge_v1"
 COLLECTION_V2 = "knowledge_v2"
 
-VECTOR_SIZE = 1024  # BGE-M3
+from ..config import settings
+
+VECTOR_SIZE = settings.EMBEDDING_DIM  # 768 nomic-embed-text (был 1024 mxbai)
 DISTANCE_METRIC = qmodels.Distance.COSINE
 
 # Payload-поля с индексами для фильтрации

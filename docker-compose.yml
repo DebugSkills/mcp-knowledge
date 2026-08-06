@@ -21,7 +21,8 @@ services:
     environment:
       - EMBEDDING_BACKEND=ollama
       - OLLAMA_URL=http://localhost:11434
-      - OLLAMA_MODEL=mxbai-embed-large
+      # nomic-embed-text (8192 токенов) вместо mxbai (512) — учебники/книги не влазят в mxbai
+      - OLLAMA_MODEL=nomic-embed-text
       # EMBEDDING_MODEL — имя HF-токенизатора для chunker (не Ollama-модель!)
       - EMBEDDING_MODEL=BAAI/bge-m3
       # Хостовый qdrant (gRPC 6334 наружу не проброшен → REST 6333)
@@ -38,7 +39,7 @@ services:
     restart: unless-stopped
     # Ограничение ресурсов (инцидент 2026-08-06: сервер умирал из-за нагрузки):
     # Python-сервер лёгкий — 1 ГБ с запасом; embeddings выполняет ВНЕШНЯЯ Ollama.
-    mem_limit: 1g
+    mem_limit: 2g
     cpus: 2
     # Ротация docker-логов: 3 файла × 10 МБ (не дать разрастись бесконечно)
     logging:

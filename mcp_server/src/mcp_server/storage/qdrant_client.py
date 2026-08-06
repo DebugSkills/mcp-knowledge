@@ -18,6 +18,7 @@ from .schema import (
     COLLECTION_ALIAS,
     COLLECTION_NAME,
     PAYLOAD_INDEXES,
+    VECTOR_SIZE,
     build_collection_params,
 )
 
@@ -57,7 +58,7 @@ class QdrantClient:
             )
 
         logger.info("Коллекция %s создана (dim=%d, distance=COSINE, HNSW)",
-                     COLLECTION_NAME, 1024)
+                     COLLECTION_NAME, VECTOR_SIZE)
         return True
 
     # ── F1: Blue-green alias management ────────────────────
@@ -91,7 +92,7 @@ class QdrantClient:
                 field_schema=field_type,
             )
 
-        logger.info("Коллекция %s создана (dim=%d, distance=COSINE)", name, 1024)
+        logger.info("Коллекция %s создана (dim=%d, distance=COSINE)", name, VECTOR_SIZE)
         return True
 
     def swap_alias(self, alias: str, target: str) -> None:

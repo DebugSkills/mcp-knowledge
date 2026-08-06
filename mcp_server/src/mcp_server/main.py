@@ -18,7 +18,21 @@
 - F1: Blue-green migration at startup (legacy collection → aliases)
 """
 
+import asyncio
+import faulthandler
 import logging
+
+# ── Усиленное логирование (инцидент 2026-08-06) ─────────────
+# Сервер стартует через uvicorn БЕЗ basicConfig → INFO от mcp_knowledge
+# печатался только через lastResort-handler (WARNING+), диагностика шла
+# вслепую. Настраиваем INFO + формат явно. faulthandler даёт python-стек
+# при краше (SIGSEGV/SIGABRT) — «тихая смерть» без traceback больше не
+# должна оставаться без следов.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+faulthandler.enable()
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -28,7 +42,12 @@ from .auth import AuthMiddleware
 from .config import settings
 from .embedding import EmbeddingManager
 from .health import router as health_router
-from .health import set_embedding_manager, set_pipeline, set_qdrant_client
+from .health import (
+    set_embedding_manager,
+    set_pipeline,
+    set_qdrant_client,
+    set_reconcile_state,
+)
 from .indexing import IndexingPipeline, MarkdownChunker
 from .mcp_handler import handle_mcp_request
 from .metrics import metrics_endpoint, set_embed_backend
@@ -112,9 +131,12 @@ async def _migrate_legacy_collection(qdrant: QdrantClient) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: валидация инвариантов, инициализация компонентов Фазы 1."""
-    logger.info("🚀 MCP Knowledge Server v0.1.0 starting")
-    logger.info("   EMBEDDING_BACKEND: %s", settings.EMBEDDING_BACKEND)
-    logger.info("   QDRANT_URL: %s", settings.QDRANT_URL)
+    import resource
+    import time as _time
+    _start_ts = _time.monotonic()
+    rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    logger.info("[START] begin v0.1.0 backend=%s qdrant=%s rss=%.0f MB",
+                settings.EMBEDDING_BACKEND, settings.QDRANT_URL, rss0)
     logger.info("   GIT_AUDIT: %s", settings.GIT_AUDIT)
     logger.info("   WORKERS: %d (инвариант)", settings.WORKERS)
 
@@ -141,7 +163,10 @@ async def lifespan(app: FastAPI):
         # и попытался rename_alias (404: rename работает только с aliases).
         logger.info("Collection '%s' created fresh — F1 migration skipped", settings.QDRANT_COLLECTION)
     else:
-        await _migrate_legacy_collection(qdrant)
+        try:
+            await _migrate_legacy_collection(qdrant)
+        except Exception as exc:
+            logger.warning("⚠️ F1 migration failed (non-fatal): %s", exc)
 
     app.state.qdrant = qdrant
     set_qdrant_client(qdrant)  # P1-2: прокидываем в health
@@ -165,7 +190,11 @@ async def lifespan(app: FastAPI):
         embedder=embedder,
         chunker=chunker,
     )
-    await pipeline.start()
+    try:
+        await pipeline.start()
+    except Exception as exc:
+        logger.critical("🔥 Pipeline start failed: %s", exc, exc_info=True)
+        raise
     app.state.pipeline = pipeline
     set_pipeline(pipeline)  # E1: прокидываем pipeline в health для deep checks
 
@@ -176,24 +205,38 @@ async def lifespan(app: FastAPI):
     app.state.knowledge_index = knowledge_index
 
     # ── C1: Reconciliation при старте (Фаза 2, задача 2.9) ──
-    logger.info("🔍 Запуск reconciliation Markdown↔Qdrant...")
+    # Фоновая задача: reindex не должен блокировать старт сервера — иначе
+    # healthcheck фейлится → docker restart-loop → процесс убивается в D-state
+    # (инцидент 2026-08-06: thrashing/OOM при reindex большого файла).
+    logger.info("🔍 Запуск reconciliation Markdown↔Qdrant (фоновая задача)...")
     from .indexing.reconcile import reconcile
-    try:
-        # Degraded-режим (Ollama недоступна): reindex пропускается — иначе
-        # reindex_all падает на каждом файле и блокирует старт (инцидент 2026-08-06).
-        reconcile_result = await reconcile(
-            store, qdrant, pipeline, knowledge_index,
-            skip_reindex=not embedder.is_ready,
-        )
-        logger.info(
-            "✅ Reconciliation: checked=%d, reindexed=%d, skipped=%d, orphans=%d",
-            reconcile_result["checked"],
-            reconcile_result["reindexed"],
-            reconcile_result["skipped"],
-            reconcile_result["deleted_orphans"],
-        )
-    except Exception as exc:
-        logger.warning("⚠️ Reconciliation failed (non-fatal): %s", exc)
+
+    async def _run_reconcile() -> None:
+        try:
+            # Degraded-режим (Ollama недоступна): reindex пропускается — иначе
+            # reindex_all падает на каждом файле и блокирует старт (инцидент 2026-08-06).
+            # skip_orphan_detection: children коллекции-книги — секции внутри .md,
+            # проверка по файлам даёт тысячи ложных issues и блокирует старт на
+            # минуты (инцидент 2026-08-06, P1: проверка по Qdrant scroll).
+            reconcile_result = await reconcile(
+                store, qdrant, pipeline, knowledge_index,
+                skip_reindex=not embedder.is_ready,
+                skip_orphan_detection=True,
+            )
+            logger.info(
+                "✅ Reconciliation: checked=%d, reindexed=%d, skipped=%d, orphans=%d",
+                reconcile_result["checked"],
+                reconcile_result["reindexed"],
+                reconcile_result["skipped"],
+                reconcile_result["deleted_orphans"],
+            )
+            set_reconcile_state("done", reconcile_result)
+        except Exception as exc:
+            logger.exception("⚠️ Reconciliation failed (non-fatal)")
+            set_reconcile_state("error", None, str(exc))
+
+    app.state.reconcile_state = "running"
+    app.state.reconcile_task = asyncio.create_task(_run_reconcile())
 
     # D1: Установка метрики embed backend
     set_embed_backend(embedder.backend_name)
@@ -215,15 +258,18 @@ async def lifespan(app: FastAPI):
                  app.state.rate_limiter_read.burst_size,
                  app.state.rate_limiter_write.burst_size)
 
-    logger.info("✅ MCP Knowledge Server готов (backend=%s)", embedder.backend_name)
+    elapsed = _time.monotonic() - _start_ts
+    rss_end = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    logger.info("[START] ready backend=%s elapsed=%.1fs rss=%.0f MB",
+                embedder.backend_name, elapsed, rss_end)
 
     yield  # --- сервер работает ---
 
     # ── Shutdown ──────────────────────────────────────────
-    logger.info("🛑 MCP Knowledge Server shutting down")
+    logger.info("[START] shutdown")
     await pipeline.stop()
     qdrant.close()
-    logger.info("👋 Shutdown complete")
+    logger.info("[START] shutdown_done")
 
 
 # ── FastAPI application ────────────────────────────────────

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from ..storage.markdown_store import MarkdownStore
 from ..storage.qdrant_client import QdrantClient
+from .knowledge_index import KnowledgeIndex
 from .pipeline import IndexingPipeline
 
 logger = logging.getLogger("mcp_knowledge.reconcile")
@@ -50,8 +51,9 @@ async def reconcile(
     store: MarkdownStore,
     qdrant: QdrantClient,
     pipeline: IndexingPipeline,
-    knowledge_index,
+    knowledge_index: KnowledgeIndex,
     skip_reindex: bool = False,
+    skip_orphan_detection: bool = False,
 ) -> dict:
     """Выполнить полную сверку Markdown SSOT ↔ Qdrant при старте.
 
@@ -64,7 +66,7 @@ async def reconcile(
         dict с результатами: {checked, reindexed, skipped, deleted_orphans, errors}
     """
     result = ReconcileResult()
-    logger.info("🔍 RECONCILE: starting Markdown↔Qdrant consistency check")
+    logger.info("🔍 [RECONCILE] starting Markdown↔Qdrant consistency check")
 
     # ── Шаг 1: Прямая сверка — Markdown → Qdrant ──────────────────
     md_paths = await store.reindex_scan()
@@ -81,14 +83,14 @@ async def reconcile(
             if kid not in qdrant_ids:
                 # Запись есть в Markdown, но отсутствует в Qdrant
                 missing_in_qdrant.append(path)
-                logger.info("RECONCILE: %s not in Qdrant — will reindex", kid)
+                logger.info("[RECONCILE] %s not in Qdrant — will reindex", kid)
             else:
                 # Проверяем updated_at (если доступен в payload)
                 result.skipped += 1
         except Exception as e:
             msg = f"Failed to parse {path}: {e}"
             result.errors.append(msg)
-            logger.warning("RECONCILE: %s", msg)
+            logger.warning("[RECONCILE] %s", msg)
 
     # Доиндексация отсутствующих
     if missing_in_qdrant:
@@ -97,20 +99,20 @@ async def reconcile(
             # файлы доиндексируются после запуска Ollama (ленивый retry embed
             # или следующий старт сервера).
             logger.warning(
-                "RECONCILE: %d entries missing in Qdrant — reindex SKIPPED "
+                "[RECONCILE] %d entries missing in Qdrant — reindex SKIPPED "
                 "(embedding недоступна, degraded-режим)",
                 len(missing_in_qdrant),
             )
             result.skipped += len(missing_in_qdrant)
         else:
-            logger.info("RECONCILE: %d entries missing in Qdrant — reindexing", len(missing_in_qdrant))
+            logger.info("[RECONCILE] %d entries missing in Qdrant — reindexing", len(missing_in_qdrant))
             try:
                 reindex_result = await pipeline.reindex_all()
                 result.reindexed = reindex_result.get("total_docs", len(missing_in_qdrant))
             except Exception as e:
                 msg = f"Reindex failed: {e}"
                 result.errors.append(msg)
-                logger.error("RECONCILE: %s", msg)
+                logger.error("[RECONCILE] %s", msg)
 
     # ── Шаг 2: Обратная сверка — Qdrant → Markdown ──────────────────
     md_ids = set()
@@ -123,7 +125,7 @@ async def reconcile(
 
     orphan_ids = qdrant_ids - md_ids
     if orphan_ids:
-        logger.info("RECONCILE: %d orphan points in Qdrant — deleting", len(orphan_ids))
+        logger.info("[RECONCILE] %d orphan points in Qdrant — deleting", len(orphan_ids))
         loop = asyncio.get_running_loop()
         for kid in orphan_ids:
             try:
@@ -132,23 +134,31 @@ async def reconcile(
             except Exception as e:
                 msg = f"Failed to delete orphan {kid}: {e}"
                 result.errors.append(msg)
-                logger.warning("RECONCILE: %s", msg)
+                logger.warning("[RECONCILE] %s", msg)
 
     # ── Шаг 3: Перестройка INDEX.gen.yaml ───────────────────────────
     try:
         knowledge_index.rebuild_all()
-        logger.info("RECONCILE: INDEX.gen.yaml rebuilt")
+        logger.info("[RECONCILE] INDEX.gen.yaml rebuilt")
     except Exception as e:
         msg = f"INDEX rebuild failed: {e}"
         result.errors.append(msg)
-        logger.warning("RECONCILE: %s", msg)
+        logger.warning("[RECONCILE] %s", msg)
 
     # ── Шаг 4: Parent-child orphan detection (Фаза 5) ────────────────
-    if skip_reindex:
+    if skip_reindex or skip_orphan_detection:
         # Degraded: children не в Qdrant (embed недоступен) → тысячи ложных
         # "orphaned" issues + минуты старта. Диагностика имеет смысл только
         # при полной индексации.
-        logger.warning("RECONCILE: parent-child orphan detection SKIPPED (degraded)")
+        # Ложные срабатывания: children коллекции-книги — секции ВНУТРИ
+        # одного .md (не отдельные файлы) → проверка по MD-файлам даёт
+        # тысячи ложных missing child (инцидент 2026-08-06, P1: проверка
+        # по Qdrant scroll).
+        logger.warning(
+            "[RECONCILE] parent-child orphan detection SKIPPED "
+            "(skip_reindex=%s, skip_orphan_detection=%s)",
+            skip_reindex, skip_orphan_detection,
+        )
     else:
         await _detect_parent_child_orphans(store, md_paths, result)
 
@@ -175,7 +185,7 @@ async def _detect_parent_child_orphans(
     try:
         from mcp_server.quality.issues import create_issue_async
     except ImportError:
-        logger.warning("RECONCILE: create_issue_async not available — skip orphan detection")
+        logger.warning("[RECONCILE] create_issue_async not available — skip orphan detection")
         return
 
     # Парсим все .md и строим карту knowledge_id → frontmatter
@@ -197,7 +207,7 @@ async def _detect_parent_child_orphans(
     for kid, info in entries.items():
         parent_id = info.get("parent_knowledge_id")
         if parent_id and parent_id not in entries:
-            logger.warning("RECONCILE: orphan child %s (parent %s not found)", kid, parent_id)
+            logger.warning("[RECONCILE] orphan child %s (parent %s not found)", kid, parent_id)
             try:
                 await create_issue_async(
                     "orphaned",
@@ -206,7 +216,7 @@ async def _detect_parent_child_orphans(
                     f"Parent '{parent_id}' not found — child is orphaned",
                 )
             except Exception as e:
-                logger.debug("RECONCILE: failed to create orphan issue for %s: %s", kid, e)
+                logger.debug("[RECONCILE] failed to create orphan issue for %s: %s", kid, e)
             result.orphaned_detected += 1
 
     # Проверка 2: collection с incomplete children
@@ -221,7 +231,7 @@ async def _detect_parent_child_orphans(
                 child_id = child_ref.get("knowledge_id")
                 if child_id and child_id not in entries:
                     logger.warning(
-                        "RECONCILE: collection %s has missing child %s", kid, child_id
+                        "[RECONCILE] collection %s has missing child %s", kid, child_id
                     )
                     try:
                         await create_issue_async(
@@ -232,9 +242,9 @@ async def _detect_parent_child_orphans(
                         )
                     except Exception as e:
                         logger.debug(
-                            "RECONCILE: failed to create orphan issue for %s: %s", kid, e
+                            "[RECONCILE] failed to create orphan issue for %s: %s", kid, e
                         )
                     result.orphaned_detected += 1
 
     if result.orphaned_detected > 0:
-        logger.info("RECONCILE: %d parent-child orphan issues detected", result.orphaned_detected)
+        logger.info("[RECONCILE] %d parent-child orphan issues detected", result.orphaned_detected)

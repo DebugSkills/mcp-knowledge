@@ -16,6 +16,7 @@ from mcp_server.storage.schema import (
     COLLECTION_ALIAS,
     COLLECTION_V1,
     COLLECTION_V2,
+    VECTOR_SIZE,
     build_collection_params,
 )
 from mcp_server.tools.admin import reindex
@@ -90,7 +91,7 @@ class TestSchemaConstants:
         """build_collection_params() without name uses COLLECTION_ALIAS."""
         params = build_collection_params()
         assert params["collection_name"] == COLLECTION_ALIAS
-        assert params["vectors_config"].size == 1024
+        assert params["vectors_config"].size == VECTOR_SIZE
 
     def test_build_collection_params_with_name(self):
         """build_collection_params(name='knowledge_v2') sets custom name."""

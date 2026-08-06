@@ -176,6 +176,13 @@ async def import_content(params: dict, app_state) -> dict:
     if not sections:
         return {"error": "Decomposition produced 0 sections"}
 
+    # [IMPORT] start — размер и число секций для диагностики тяжёлой операции
+    # (инцидент 2026-08-06: крупный импорт без общего timing невидим).
+    logger.info(
+        "[IMPORT] start type=%s domain=%s subject=%s size=%.1f KB sections=%d",
+        content_type, domain, subject, len(content.encode("utf-8")) / 1024, len(sections),
+    )
+
     # ── Создание коллекции (linking) ────────────────────────
     section_titles = [s.title for s in sections]
     section_ids = [s.meta["knowledge_id"] for s in sections]
@@ -376,7 +383,7 @@ async def import_content(params: dict, app_state) -> dict:
     }
 
     logger.info(
-        "import_content complete: collection=%s imported=%d failed=%d partial=%s",
-        collection.knowledge_id, imported, failed, partial_success,
+        "[IMPORT] done collection=%s imported=%d failed=%d partial=%s indexed=%s",
+        collection.knowledge_id, imported, failed, partial_success, indexed,
     )
     return result

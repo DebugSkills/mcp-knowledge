@@ -34,11 +34,17 @@ class _FallbackTokenizer:
 
     vocab_size = 250_000
 
-    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+    def encode(self, text: str, add_special_tokens: bool = False) -> range:
         if not text:
-            return []
+            return range(0)
         n = max(1, (len(text) + _FALLBACK_CHARS_PER_TOKEN - 1) // _FALLBACK_CHARS_PER_TOKEN)
-        return list(range(n))
+        return range(n)
+
+    def count_tokens(self, text: str) -> int:
+        """Быстрый подсчёт псевдо-токенов без аллокаций (O(1))."""
+        if not text:
+            return 0
+        return max(1, (len(text) + _FALLBACK_CHARS_PER_TOKEN - 1) // _FALLBACK_CHARS_PER_TOKEN)
 
     def decode(self, token_ids: list[int], skip_special_tokens: bool = True) -> str:
         # Текст из псевдо-токенов не восстановить — chunker использует decode
@@ -94,10 +100,16 @@ class XlmRobertaTokenizer:
         return self._tok
 
     def count_tokens(self, text: str) -> int:
-        """Подсчитать реальное количество токенов XLM-RoBERTa."""
+        """Подсчитать реальное количество токенов XLM-RoBERTa.
+
+        Для fallback-токенизатора использует быстрый count_tokens (O(1), без аллокаций).
+        """
         if not text:
             return 0
-        encoded = self.tokenizer.encode(text, add_special_tokens=False)
+        tok = self.tokenizer
+        if isinstance(tok, _FallbackTokenizer):
+            return tok.count_tokens(text)
+        encoded = tok.encode(text, add_special_tokens=False)
         return len(encoded)
 
     def tokenize(self, text: str) -> list[int]:

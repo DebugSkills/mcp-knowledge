@@ -173,6 +173,14 @@ async def _handle_tools_call(params: dict, request_id: Any, request: Request) ->
             request_id,
         )
 
+    # [MCP] tool start — критично для обнаружения зависших вызовов:
+    # без него виден только "completed", а зависший tool невидим
+    # (инцидент 2026-08-06: reindex висел минуты без следа).
+    logger.info(
+        "[MCP] tool=%s start args=%s key=%s",
+        tool_name, sorted(tool_args.keys()), auth_info.key_hash or "none",
+    )
+
     # Вызов handler'а
     try:
         start = time.monotonic()
@@ -180,7 +188,7 @@ async def _handle_tools_call(params: dict, request_id: Any, request: Request) ->
         result = await handler(tool_args, app_state)
         elapsed_ms = (time.monotonic() - start) * 1000
         logger.info(
-            "Tool '%s' completed in %.1f ms (key_hash=%s)",
+            "[MCP] tool=%s ok %.1f ms key=%s",
             tool_name,
             elapsed_ms,
             auth_info.key_hash or "none",
@@ -209,7 +217,7 @@ async def _handle_tools_call(params: dict, request_id: Any, request: Request) ->
         # Фаза 12: tool_requests — error
         from .metrics import tool_requests
         tool_requests.labels(tool=tool_name, status="error").inc()
-        logger.exception("Tool '%s' failed", tool_name)
+        logger.exception("[MCP] tool=%s ERROR", tool_name)
         return _jsonrpc_error(
             JSONRPC_INTERNAL_ERROR,
             f"Tool execution failed: {exc}",

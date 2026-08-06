@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import resource
 import uuid
 from datetime import datetime, timezone
 
@@ -257,7 +258,7 @@ class IndexingPipeline:
         Returns:
             {total_docs, total_chunks, failed, elapsed_sec}
         """
-        logger.info("_reindex_into: переиндекс в '%s'", collection_name)
+        logger.info("[REINDEX] blue_green start collection=%s", collection_name)
         t0 = datetime.now(timezone.utc)
 
         paths = await self._store.reindex_scan()
@@ -277,10 +278,11 @@ class IndexingPipeline:
                     total_chunks += len(chunks)
 
                 if (i + 1) % 100 == 0:
-                    logger.info("reindex: %d/%d документов, %d чанков (→ %s)",
-                                 i + 1, total_docs, total_chunks, collection_name)
+                    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+                    logger.info("[REINDEX] progress i=%d/%d chunks=%d rss=%.0f MB (→ %s)",
+                                 i + 1, total_docs, total_chunks, rss_mb, collection_name)
             except Exception as e:
-                logger.error("reindex error for %s: %s", path, e)
+                logger.error("[REINDEX] error file=%s: %s", path, e)
                 failed += 1
 
         elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
@@ -290,7 +292,10 @@ class IndexingPipeline:
             "failed": failed,
             "elapsed_sec": round(elapsed, 1),
         }
-        logger.info("_reindex_into '%s': завершено — %s", collection_name, result)
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        logger.info("[REINDEX] blue_green done collection=%s docs=%d chunks=%d failed=%d elapsed=%.1fs rss=%.0f MB",
+                     collection_name, result["total_docs"], result["total_chunks"],
+                     result["failed"], result["elapsed_sec"], rss_mb)
         return result
 
     async def _reindex_from_ssot(self) -> dict:
@@ -300,7 +305,7 @@ class IndexingPipeline:
         total_docs = len(paths)
         total_chunks = 0
         failed = 0
-
+        logger.info("[REINDEX] start docs=%d", total_docs)
         for i, path in enumerate(paths):
             try:
                 entry = self._store._parse_file(path)
@@ -313,10 +318,11 @@ class IndexingPipeline:
                     total_chunks += len(chunks)
 
                 if (i + 1) % 100 == 0:
-                    logger.info("reindex: %d/%d документов, %d чанков",
-                                 i + 1, total_docs, total_chunks)
+                    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+                    logger.info("[REINDEX] progress i=%d/%d chunks=%d rss=%.0f MB",
+                                 i + 1, total_docs, total_chunks, rss_mb)
             except Exception as e:
-                logger.error("reindex error for %s: %s", path, e)
+                logger.error("[REINDEX] error file=%s: %s", path, e)
                 failed += 1
 
         elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
@@ -326,7 +332,9 @@ class IndexingPipeline:
             "failed": failed,
             "elapsed_sec": round(elapsed, 1),
         }
-        logger.info("reindex_all: завершено — %s", result)
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        logger.info("[REINDEX] done docs=%d chunks=%d failed=%d elapsed=%.1fs rss=%.0f MB",
+                    total_docs, total_chunks, failed, elapsed, rss_mb)
         return result
 
     # ── Internal ───────────────────────────────────────────
@@ -485,38 +493,59 @@ class IndexingPipeline:
     ):
         """Индексация чанков (для reindex, без очереди).
 
+        Батчирование по INDEX_BATCH_SIZE (64): каждый батч embed → points →
+        upsert, с освобождением памяти между батчами. Без этого весь файл
+        (тысячи чанков) одним embed-запросом + все points в RAM → пик ~660 МБ
+        на 20 МБ файле (инцидент 2026-08-06, OOM/thrashing при reindex).
+
         Args:
             entry: KnowledgeEntry с метаданными
             chunks: список чанков для индексации
             collection_name: имя коллекции для blue-green (default: COLLECTION_NAME alias)
         """
-        texts = [ch.content for ch in chunks]
-        loop = asyncio.get_running_loop()
-        vectors = await loop.run_in_executor(None, self._embedder.embed_sync, texts)
-
-        points = []
+        batch_size = getattr(self, "_index_batch_size", 64)
         fm = entry.frontmatter
-        for ch, vector in zip(chunks, vectors):
-            point = build_payload_point(
-                point_id=str(uuid.uuid4()),
-                vector=vector,
-                knowledge_id=fm.knowledge_id,
-                chunk_id=ch.chunk_id,
-                content=ch.content,
-                domain=fm.domain,
-                subject=fm.subject,
-                project=fm.project,
-                tags=fm.tags,
-                cross_subjects=fm.cross_subjects,
-                section_header=ch.section_header,
-                chunk_index=ch.chunk_index,
-                updated_at=fm.updated_at.isoformat(),
-                parent_knowledge_id=getattr(fm, "parent_knowledge_id", None),
-                content_type=getattr(fm, "content_type", None),
-            )
-            points.append(point)
+        loop = asyncio.get_running_loop()
+        total = len(chunks)
+        indexed = 0
 
-        await loop.run_in_executor(
-            None,
-            lambda: self._qdrant.upsert_points(points, collection_name=collection_name),
-        )
+        for start in range(0, total, batch_size):
+            batch = chunks[start : start + batch_size]
+            texts = [ch.content for ch in batch]
+            vectors = await loop.run_in_executor(None, self._embedder.embed_sync, texts)
+
+            points = []
+            for ch, vector in zip(batch, vectors):
+                point = build_payload_point(
+                    point_id=str(uuid.uuid4()),
+                    vector=vector,
+                    knowledge_id=fm.knowledge_id,
+                    chunk_id=ch.chunk_id,
+                    content=ch.content,
+                    domain=fm.domain,
+                    subject=fm.subject,
+                    project=fm.project,
+                    tags=fm.tags,
+                    cross_subjects=fm.cross_subjects,
+                    section_header=ch.section_header,
+                    chunk_index=ch.chunk_index,
+                    updated_at=fm.updated_at.isoformat(),
+                    parent_knowledge_id=getattr(fm, "parent_knowledge_id", None),
+                    content_type=getattr(fm, "content_type", None),
+                )
+                points.append(point)
+
+            await loop.run_in_executor(
+                None,
+                lambda pts=points: self._qdrant.upsert_points(
+                    pts, collection_name=collection_name
+                ),
+            )
+
+            indexed += len(batch)
+            del vectors, points, texts, batch
+            if indexed % 512 == 0 or indexed == total:
+                logger.info(
+                    "index: %d/%d chunks (%s)",
+                    indexed, total, fm.knowledge_id,
+                )

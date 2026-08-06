@@ -18,6 +18,7 @@ router = APIRouter(tags=["health"])
 _embedding_manager = None
 _qdrant_client = None
 _pipeline = None
+_reconcile_state = {"state": "pending", "checked": 0, "reindexed": 0, "skipped": 0, "orphans": 0, "error": None}
 
 # Пороги для deep checks
 QUEUE_UTILIZATION_THRESHOLD = 0.9  # >90% заполнения → degraded
@@ -37,6 +38,19 @@ def set_qdrant_client(client):
 def set_pipeline(pipeline):
     global _pipeline
     _pipeline = pipeline
+
+
+def set_reconcile_state(state: str, result: dict | None = None, error: str | None = None):
+    """Обновить статус фоновой reconciliation (для /health)."""
+    global _reconcile_state
+    _reconcile_state = {
+        "state": state,
+        "checked": (result or {}).get("checked", 0),
+        "reindexed": (result or {}).get("reindexed", 0),
+        "skipped": (result or {}).get("skipped", 0),
+        "orphans": (result or {}).get("deleted_orphans", 0),
+        "error": error,
+    }
 
 
 # ── Liveness probe (Docker healthcheck) ────────────────────
@@ -72,6 +86,7 @@ async def health():
         content={
             "status": status,
             "version": "0.1.0",
+            "reconcile": _reconcile_state,
             "checks": checks,
         },
         status_code=http_code,
