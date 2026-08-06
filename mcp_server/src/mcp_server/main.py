@@ -179,7 +179,12 @@ async def lifespan(app: FastAPI):
     logger.info("🔍 Запуск reconciliation Markdown↔Qdrant...")
     from .indexing.reconcile import reconcile
     try:
-        reconcile_result = await reconcile(store, qdrant, pipeline, knowledge_index)
+        # Degraded-режим (Ollama недоступна): reindex пропускается — иначе
+        # reindex_all падает на каждом файле и блокирует старт (инцидент 2026-08-06).
+        reconcile_result = await reconcile(
+            store, qdrant, pipeline, knowledge_index,
+            skip_reindex=not embedder.is_ready,
+        )
         logger.info(
             "✅ Reconciliation: checked=%d, reindexed=%d, skipped=%d, orphans=%d",
             reconcile_result["checked"],

@@ -26,18 +26,32 @@ class EmbeddingManager:
     def __init__(self):
         self._backend = None  # "ollama" | "gpu" | "cpu"
         self._initialized = False
+        self._degraded = False  # Ollama недоступна на старте — сервер жив, embed лениво переподключается
 
     async def initialize(self) -> bool:
-        """Инициализировать бэкенд согласно EMBEDDING_BACKEND."""
+        """Инициализировать бэкенд согласно EMBEDDING_BACKEND.
+
+        Ollama/auto: при недоступности — degraded-режим (НЕ падаем: сервер
+        поднимается, health показывает embedding loaded=false, первый же
+        embed-вызов повторяет попытку подключения к Ollama).
+        """
         backend = settings.EMBEDDING_BACKEND.lower()
 
         if backend == "ollama":
             ok = ollama_backend.load_model()
             if not ok:
-                raise RuntimeError(
-                    "EMBEDDING_BACKEND=ollama, но Ollama недоступна "
-                    f"(url={settings.OLLAMA_URL}, model={settings.OLLAMA_MODEL})"
+                # Инцидент 2026-08-06: сервер уходил в crash-loop без Ollama.
+                # Degraded-режим: сервер жив, при старте Ollama — авто-подхват.
+                logger.warning(
+                    "Ollama недоступна (url=%s, model=%s) — DEGRADED: "
+                    "импорт/поиск вернут ошибку до запуска Ollama; "
+                    "повторная попытка при первом вызове embed",
+                    settings.OLLAMA_URL,
+                    settings.OLLAMA_MODEL,
                 )
+                self._degraded = True
+                self._initialized = False
+                return True
             self._backend = "ollama"
             logger.info("Embedding: Ollama (mxbai-embed-large, %s)", settings.OLLAMA_URL)
 
@@ -72,9 +86,14 @@ class EmbeddingManager:
                     )
                     cpu_ok = cpu_backend.load_model()
                     if not cpu_ok:
-                        raise RuntimeError(
-                            "EMBEDDING_BACKEND=auto: ни Ollama, ни GPU, ни CPU не загрузились"
+                        # Degraded вместо crash-loop (инцидент 2026-08-06)
+                        logger.warning(
+                            "EMBEDDING_BACKEND=auto: ни Ollama, ни GPU, ни CPU — DEGRADED "
+                            "(сервер жив, embed недоступен до запуска Ollama)"
                         )
+                        self._degraded = True
+                        self._initialized = False
+                        return True
                     self._backend = "cpu"
 
         else:
@@ -97,9 +116,28 @@ class EmbeddingManager:
         return self._initialized
 
     def embed_sync(self, texts: list[str]) -> list[list[float]]:
-        """Синхронный embed (должен вызываться через run_in_executor)."""
+        """Синхронный embed (должен вызываться через run_in_executor).
+
+        Degraded-режим: ленивая повторная инициализация — при запущенной
+        Ollama первый же вызов переподключается без рестарта сервера.
+        """
         if not self._initialized:
-            raise RuntimeError("EmbeddingManager не инициализирован")
+            # Ленивый retry: Ollama могла подняться после старта сервера
+            if self._degraded:
+                try:
+                    ok = ollama_backend.load_model()
+                    if ok:
+                        self._backend = "ollama"
+                        self._initialized = True
+                        self._degraded = False
+                        logger.info("Embedding: Ollama подключена (lazy retry)")
+                except Exception as exc:  # noqa: BLE001  — retry намеренно тихий, ниже понятная ошибка
+                    logger.debug("Lazy embed retry failed: %s", exc)
+            if not self._initialized:
+                raise RuntimeError(
+                    "Embedding недоступна: Ollama не запущена "
+                    "(выполните: sudo systemctl start ollama)"
+                )
 
         if self._backend == "ollama":
             return ollama_backend.embed(texts)

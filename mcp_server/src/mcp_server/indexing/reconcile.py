@@ -51,8 +51,14 @@ async def reconcile(
     qdrant: QdrantClient,
     pipeline: IndexingPipeline,
     knowledge_index,
+    skip_reindex: bool = False,
 ) -> dict:
     """Выполнить полную сверку Markdown SSOT ↔ Qdrant при старте.
+
+    Args:
+        skip_reindex: True при недоступном embed (degraded-режим) — пропустить
+            доиндексацию missing-записей (иначе reindex_all падает на каждом
+            файле и блокирует старт сервера / уводит в рестарт-цикл).
 
     Returns:
         dict с результатами: {checked, reindexed, skipped, deleted_orphans, errors}
@@ -86,14 +92,25 @@ async def reconcile(
 
     # Доиндексация отсутствующих
     if missing_in_qdrant:
-        logger.info("RECONCILE: %d entries missing in Qdrant — reindexing", len(missing_in_qdrant))
-        try:
-            reindex_result = await pipeline.reindex_all()
-            result.reindexed = reindex_result.get("total_docs", len(missing_in_qdrant))
-        except Exception as e:
-            msg = f"Reindex failed: {e}"
-            result.errors.append(msg)
-            logger.error("RECONCILE: %s", msg)
+        if skip_reindex:
+            # Degraded (Ollama недоступна): не блокируем старт reindex-циклом —
+            # файлы доиндексируются после запуска Ollama (ленивый retry embed
+            # или следующий старт сервера).
+            logger.warning(
+                "RECONCILE: %d entries missing in Qdrant — reindex SKIPPED "
+                "(embedding недоступна, degraded-режим)",
+                len(missing_in_qdrant),
+            )
+            result.skipped += len(missing_in_qdrant)
+        else:
+            logger.info("RECONCILE: %d entries missing in Qdrant — reindexing", len(missing_in_qdrant))
+            try:
+                reindex_result = await pipeline.reindex_all()
+                result.reindexed = reindex_result.get("total_docs", len(missing_in_qdrant))
+            except Exception as e:
+                msg = f"Reindex failed: {e}"
+                result.errors.append(msg)
+                logger.error("RECONCILE: %s", msg)
 
     # ── Шаг 2: Обратная сверка — Qdrant → Markdown ──────────────────
     md_ids = set()
@@ -127,7 +144,13 @@ async def reconcile(
         logger.warning("RECONCILE: %s", msg)
 
     # ── Шаг 4: Parent-child orphan detection (Фаза 5) ────────────────
-    await _detect_parent_child_orphans(store, md_paths, result)
+    if skip_reindex:
+        # Degraded: children не в Qdrant (embed недоступен) → тысячи ложных
+        # "orphaned" issues + минуты старта. Диагностика имеет смысл только
+        # при полной индексации.
+        logger.warning("RECONCILE: parent-child orphan detection SKIPPED (degraded)")
+    else:
+        await _detect_parent_child_orphans(store, md_paths, result)
 
     summary = result.to_dict()
     logger.info(
