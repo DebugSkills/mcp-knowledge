@@ -7,11 +7,13 @@ MODELS_DIR := ../models_cache
 
 # Проверка и создание необходимых директорий перед запуском
 prereq-dirs:
-	@mkdir -p $(DATA_DIR)/{qdrant/snapshots,dlq,quality,backups} $(MODELS_DIR)
+	@mkdir -p $(DATA_DIR)/{qdrant/snapshots,dlq,quality,backups} $(MODELS_DIR) .trash
 	@test -d $(KNOWLEDGE_DIR)/.git || (echo "❌ knowledge/ должен быть git-репозиторием (git init)" && exit 1)
 
 # dev: сервер + kb-console с ЖИВЫМИ логами (foreground, Ctrl+C — стоп).
-# Требуются собранные образы: сделайте `make deploy` один раз.
+# Логи ДУБЛИРУЮТСЯ в .trash/dev-<timestamp>.log — агент/разбор инцидентов
+# читают файл, а не консоль. Требуются собранные образы: `make deploy` один раз.
+DEV_LOG := .trash/dev-$(shell date +%Y%m%d-%H%M%S).log
 dev: prereq-dirs
 	@echo ""
 	@echo "🚀 Поднимается стек (живые логи, Ctrl+C — стоп):"
@@ -19,8 +21,13 @@ dev: prereq-dirs
 	@echo "   • mcp-server (API):     http://localhost:8000/health"
 	@echo "   • Если в консоли «Authentication failed» — задайте MCP_API_KEY в .env"
 	@echo "     (равным ключу из MCP_READ_KEYS сервера)"
+	@echo "   • Копия логов: $(DEV_LOG)"
 	@echo ""
-	$(DOCKER_COMPOSE) up mcp-server kb-console
+	@$(DOCKER_COMPOSE) up mcp-server kb-console 2>&1 | tee $(DEV_LOG)
+
+# dev-latest-log: путь к последнему лог-файлу make dev (для агента/диагностики)
+dev-latest-log:
+	@ls -t .trash/dev-*.log 2>/dev/null | head -1 || echo "нет логов .trash/dev-*.log"
 
 # deploy: сборка образов (mcp-server + kb-console) и запуск стека в фоне
 deploy: prereq-dirs

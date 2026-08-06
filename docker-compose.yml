@@ -40,6 +40,12 @@ services:
     # Python-сервер лёгкий — 1 ГБ с запасом; embeddings выполняет ВНЕШНЯЯ Ollama.
     mem_limit: 1g
     cpus: 2
+    # Ротация docker-логов: 3 файла × 10 МБ (не дать разрастись бесконечно)
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # GPU (опционально):
     # deploy:
     #   resources:
@@ -68,6 +74,11 @@ services:
     # NiceGUI-клиент лёгкий — 512 МБ достаточно.
     mem_limit: 512m
     cpus: 1
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       # curl в python:3.11-slim отсутствует → проверка через urllib
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8085/', timeout=3)"]
