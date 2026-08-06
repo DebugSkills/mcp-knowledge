@@ -69,7 +69,8 @@ services:
     mem_limit: 512m
     cpus: 1
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8085/"]
+      # curl в python:3.11-slim отсутствует → проверка через urllib
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8085/', timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3
