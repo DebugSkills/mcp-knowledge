@@ -78,7 +78,9 @@ class OllamaEmbedder:
             raise RuntimeError("httpx is required for Ollama embedder") from exc
 
         try:
-            payload = {"model": self.model, "input": inputs}
+            # truncate=True: Ollama обрезает вход до контекста модели (иначе
+            # длинные секции/чанки → 400 "input length exceeds context length").
+            payload = {"model": self.model, "input": inputs, "truncate": True}
             response = httpx.post(
                 f"{self.base_url}/api/embed",
                 json=payload,

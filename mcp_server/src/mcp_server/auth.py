@@ -35,6 +35,7 @@ READ_TOOLS: set[str] = {
     "list_domains",
     "list_subjects",
     "list_projects",
+    "analyze_content",  # read-only: LLM/TF-IDF анализ без записи в хранилище (Фаза 13.8)
     "resources/list",
     "resources/read",
     "prompts/list",
@@ -49,6 +50,11 @@ WRITE_TOOLS: set[str] = {
     "reindex",
 }
 
+# ── Import tools (MCP_IMPORT_KEYS: read + import_content, без delete/reindex) ──
+IMPORT_TOOLS: set[str] = {
+    "import_content",
+}
+
 # ── Methods, не требующие аутентификации ─────────────────
 UNAUTHENTICATED_METHODS: set[str] = {
     "initialize",
@@ -60,7 +66,7 @@ UNAUTHENTICATED_METHODS: set[str] = {
 class AuthInfo:
     """Результат аутентификации, сохраняется в request.state."""
     authenticated: bool = False
-    key_level: str = "none"  # "read" | "write" | "none"
+    key_level: str = "none"  # "read" | "import" | "write" | "none"
     key_hash: str = ""  # sha256 первых 8 символов для аудита
 
 
@@ -79,10 +85,10 @@ def _constant_time_compare(a: str, b: str) -> bool:
 
 
 def authenticate_key(provided_key: str) -> AuthInfo:
-    """Проверить API-ключ constant-time против READ и WRITE списков.
+    """Проверить API-ключ constant-time против WRITE/IMPORT/READ списков.
 
     Возвращает AuthInfo с уровнем доступа.
-    Первый совпавший ключ определяет уровень.
+    Первый совпавший ключ определяет уровень (приоритет: write > import > read).
     """
     # Проверяем write-ключи (более высокий приоритет)
     for stored_key in settings.MCP_WRITE_KEYS:
@@ -94,6 +100,19 @@ def authenticate_key(provided_key: str) -> AuthInfo:
             return AuthInfo(
                 authenticated=True,
                 key_level="write",
+                key_hash=hashlib.sha256(provided_key.encode()).hexdigest()[:16],
+            )
+
+    # Проверяем import-ключи (read + import_content)
+    for stored_key in settings.MCP_IMPORT_KEYS:
+        if stored_key and _constant_time_compare(provided_key, stored_key):
+            logger.debug(
+                "Auth SUCCESS: import-key matched (masked=%s)",
+                mask_key(provided_key),
+            )
+            return AuthInfo(
+                authenticated=True,
+                key_level="import",
                 key_hash=hashlib.sha256(provided_key.encode()).hexdigest()[:16],
             )
 
@@ -132,6 +151,21 @@ def check_tool_permission(auth_info: AuthInfo, tool_name: str) -> None:
     # Write-ключ → доступ ко всему
     if auth_info.key_level == "write":
         return
+
+    # Import-ключ → read-tools + import_content
+    if auth_info.key_level == "import":
+        if tool_name in READ_TOOLS or tool_name in IMPORT_TOOLS:
+            return
+        logger.warning(
+            "Auth FORBIDDEN: import-key attempted non-import tool '%s' (key_hash=%s)",
+            tool_name,
+            auth_info.key_hash,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"Import key cannot access tool '{tool_name}'. "
+            f"Use a write key for write operations.",
+        )
 
     # Read-ключ → только read-tools
     if tool_name in READ_TOOLS:

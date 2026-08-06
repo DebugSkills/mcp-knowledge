@@ -19,9 +19,20 @@ class Settings(BaseSettings):
     OLLAMA_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "mxbai-embed-large"
 
+    # Content Analysis (Фаза 13.8: AI-рекомендации)
+    OLLAMA_CHAT_MODEL: str = "qwen2.5:7b"
+    ANALYZE_FRAGMENT_CHARS: int = 8000
+    ANALYZE_TIMEOUT: float = 60.0
+    ANALYZE_LLM_ENABLED: bool = True
+    ANALYZE_LLM_NUM_CTX: int = 4096
+    ANALYZE_MAX_TAGS: int = 10
+
     # MCP Auth (мульти-ключи #18)
     MCP_READ_KEYS: list[str] = []
     MCP_WRITE_KEYS: list[str] = []
+    # Import-ключи (Фаза 13.8): read-tools + import_content (без delete/reindex/write).
+    # Используется kb-console: импорт учебников без полного write-доступа.
+    MCP_IMPORT_KEYS: list[str] = []
     # Ключ kb-console (лежит в .env рядом с ключами сервера; сам сервер его НЕ использует —
     # консоль шлёт его как X-API-Key. Поле нужно, чтобы pydantic не падал на extra_forbidden).
     MCP_API_KEY: str = ""

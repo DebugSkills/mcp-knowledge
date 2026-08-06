@@ -24,7 +24,7 @@ dev: prereq-dirs
 
 # deploy: сборка образов (mcp-server + kb-console) и запуск стека в фоне
 deploy: prereq-dirs
-	$(DOCKER_COMPOSE) up -d --build
+	$(DOCKER_COMPOSE) up -d --build --force-recreate
 
 down:
 	$(DOCKER_COMPOSE) down

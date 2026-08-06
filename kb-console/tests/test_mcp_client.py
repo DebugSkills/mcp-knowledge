@@ -34,7 +34,7 @@ def mock_transport():
                 },
             )
         elif method == "tools/list":
-            tools = [{"name": f"tool_{i}", "description": f"Tool {i}"} for i in range(1, 17)]
+            tools = [{"name": f"tool_{i}", "description": f"Tool {i}"} for i in range(1, 18)]
             return httpx.Response(
                 200,
                 json={"jsonrpc": "2.0", "id": rid, "result": {"tools": tools}},
@@ -42,12 +42,16 @@ def mock_transport():
         elif method == "tools/call":
             arguments = body.get("params", {}) if isinstance(body.get("params", {}), dict) else {}
             param_name = arguments.get("name", "")
+            # Реалистичный MCP content envelope (как в mcp_handler.py:206)
+            inner_result = {"ok": True, "tool": param_name, "args": arguments.get("arguments", {})}
             return httpx.Response(
                 200,
                 json={
                     "jsonrpc": "2.0",
                     "id": rid,
-                    "result": {"ok": True, "tool": param_name, "args": arguments.get("arguments", {})},
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps(inner_result)}],
+                    },
                 },
             )
         elif method == "health/check":
@@ -146,10 +150,10 @@ async def test_initialize_returns_protocol_version(client):
 
 
 @pytest.mark.asyncio
-async def test_tools_list_returns_16_tools(client):
-    """tools_list должен вернуть 16 инструментов."""
+async def test_tools_list_returns_17_tools(client):
+    """tools_list должен вернуть 17 инструментов (после добавления analyze_content)."""
     tools = await client.tools_list()
-    assert len(tools) == 16
+    assert len(tools) == 17
     assert tools[0]["name"] == "tool_1"
 
 
@@ -158,11 +162,29 @@ async def test_tools_list_returns_16_tools(client):
 
 @pytest.mark.asyncio
 async def test_tools_call_passes_params(client):
-    """tools_call должен передавать params и возвращать result."""
+    """tools_call должен передавать params и возвращать unwrapped result."""
     result = await client.tools_call("search_knowledge", {"query": "test", "top_k": 5})
+    # После unwrap в _unwrap_result() — плоский dict, не envelope
     assert result["ok"] is True
     assert result["tool"] == "search_knowledge"
     assert result["args"]["query"] == "test"
+
+
+@pytest.mark.asyncio
+async def test_tools_call_unwraps_envelope(client):
+    """tools_call должен анрапнуть MCP content envelope и вернуть реальные данные."""
+    # Mock handler возвращает конверт {"content": [{"type": "text", "text": json.dumps({...})}]}
+    # После unwrap → плоский dict БЕЗ envelope-обёртки
+    result = await client.tools_call("import_content", {"content": "test", "domain": "d", "subject": "s"})
+    assert isinstance(result, dict)
+    # Проверяем, что НЕ конверт (нет ключа "content" с list[dict])
+    if "content" in result:
+        content_val = result["content"]
+        assert not (isinstance(content_val, list) and len(content_val) > 0
+                     and isinstance(content_val[0], dict) and content_val[0].get("type") == "text"), \
+            "Result should NOT contain MCP envelope after unwrap"
+    # Результат — плоский dict (mock возвращает ok/tool/args)
+    assert result.get("ok") is True or result.get("tool") is not None
 
 
 @pytest.mark.asyncio

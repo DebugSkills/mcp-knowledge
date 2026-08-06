@@ -56,12 +56,18 @@ def build_status() -> None:
         _render_status(latest.get("data", {}))
 
     async def refresh() -> None:
-        client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
         try:
-            latest["data"] = await _fetch_status_data(client)
-        finally:
-            await client.close()
-        render_status.refresh()  # точечное обновление только контентных элементов
+            client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+            try:
+                latest["data"] = await _fetch_status_data(client)
+            finally:
+                await client.close()
+            render_status.refresh()
+        except RuntimeError as exc:
+            if "parent slot" in str(exc):
+                # Вкладка скрыта — подавляем, таймер сам остановится.
+                return
+            raise
 
     # ── Layout ─────────────────────────────────────────────
     ui.label("Статус MCP Knowledge Server").classes("text-h4 q-mb-md")

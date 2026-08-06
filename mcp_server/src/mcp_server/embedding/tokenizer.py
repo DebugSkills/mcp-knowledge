@@ -110,6 +110,19 @@ class XlmRobertaTokenizer:
         """Декодировать token IDs обратно в текст."""
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
+    @property
+    def is_fallback(self) -> bool:
+        """True если активен лёгкий псевдо-токенизатор (без transformers).
+
+        Fallback не умеет decode → chunker нарезает текст по символам.
+        """
+        return isinstance(self._tok, _FallbackTokenizer)
+
+    @property
+    def fallback_chars_per_token(self) -> int:
+        """Символов на 1 псевдо-токен fallback-токенизатора."""
+        return _FALLBACK_CHARS_PER_TOKEN
+
     def truncate_to_tokens(self, text: str, max_tokens: int) -> str:
         """Обрезать текст до max_tokens токенов."""
         if not text:

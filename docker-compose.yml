@@ -36,6 +36,10 @@ services:
       retries: 3
       start_period: 60s
     restart: unless-stopped
+    # Ограничение ресурсов (инцидент 2026-08-06: сервер умирал из-за нагрузки):
+    # Python-сервер лёгкий — 1 ГБ с запасом; embeddings выполняет ВНЕШНЯЯ Ollama.
+    mem_limit: 1g
+    cpus: 2
     # GPU (опционально):
     # deploy:
     #   resources:
@@ -61,6 +65,9 @@ services:
       - MCP_SERVER_URL=http://localhost:8000
       - MCP_API_KEY=${MCP_API_KEY:-}
       - CONSOLE_PORT=8085
+    # NiceGUI-клиент лёгкий — 512 МБ достаточно.
+    mem_limit: 512m
+    cpus: 1
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8085/"]
       interval: 30s

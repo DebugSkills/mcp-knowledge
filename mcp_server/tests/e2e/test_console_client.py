@@ -3,9 +3,10 @@
 Импортирует MCPClient из kb-console, подключается через e2e_http_app
 (httpx.AsyncClient + ASGITransport in-process), проверяет:
 - initialize OK
-- tools_list → 16 инструментов
+- tools_list → 17 инструментов (включая analyze_content)
 - health → healthy (qdrant/embedding ok)
 - tools_call search_knowledge → работает
+- tools_call analyze_content → возвращает рекомендации (llm или tfidf fallback)
 """
 
 from __future__ import annotations
@@ -45,8 +46,8 @@ class TestMCPClientE2E:
         finally:
             await client.close()
 
-    async def test_tools_list_16_tools(self, e2e_http_app):
-        """tools_list должен вернуть 16 инструментов (с auth)."""
+    async def test_tools_list_17_tools(self, e2e_http_app):
+        """tools_list должен вернуть 17 инструментов (с auth)."""
         from kb_console.core.mcp_client import MCPClient
 
         client = MCPClient(
@@ -56,10 +57,11 @@ class TestMCPClientE2E:
         )
         try:
             tools = await client.tools_list()
-            assert len(tools) == 16, f"Expected 16 tools, got {len(tools)}"
+            assert len(tools) == 17, f"Expected 17 tools, got {len(tools)}"
             tool_names = {t["name"] for t in tools}
             assert "search_knowledge" in tool_names
             assert "import_content" in tool_names
+            assert "analyze_content" in tool_names
             assert "write_knowledge" in tool_names
             assert "reindex" in tool_names
         finally:
@@ -101,11 +103,41 @@ class TestMCPClientE2E:
             data = r.json()
             assert "status" in data
             checks = data.get("checks", {})
-
             # Qdrant должен быть ok (реальный localhost:6333)
             qdrant_check = checks.get("qdrant", {})
             assert qdrant_check.get("ok") is True, f"Qdrant check failed: {qdrant_check}"
-
             # Embedding должен быть ok (реальный Ollama)
             embed_check = checks.get("embedding", {})
             assert embed_check.get("ok") is True, f"Embedding check failed: {embed_check}"
+
+    async def test_analyze_content(self, e2e_http_app):
+        """analyze_content должен вернуть рекомендации (LLM или TF-IDF fallback).
+
+        Не требует жёсткой зависимости от LLM — если Ollama недоступен,
+        fallback-ветка source!="llm" тоже проходит.
+        """
+        from kb_console.core.mcp_client import MCPClient
+
+        client = MCPClient(
+            base_url="http://test",
+            api_key=E2E_READ_KEY,
+            client=e2e_http_app,
+        )
+        try:
+            result = await client.tools_call(
+                "analyze_content",
+                {"content": "# Python Basics\n\nPython is a programming language."},
+            )
+            assert isinstance(result, dict), f"Expected dict, got {type(result)}"
+            assert "content_type" in result
+            assert result["content_type"] == "book"
+            assert "domain" in result
+            assert isinstance(result["domain"], str)
+            assert "subject" in result
+            assert isinstance(result["subject"], str)
+            assert "tags" in result
+            assert isinstance(result["tags"], list)
+            assert "source" in result
+            assert result["source"] in ("llm", "tfidf", "heuristic")
+        finally:
+            await client.close()

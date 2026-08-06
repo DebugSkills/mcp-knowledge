@@ -39,6 +39,10 @@ def _mock_settings(monkeypatch: pytest.MonkeyPatch):
         "mcp_server.auth.settings.MCP_WRITE_KEYS",
         ["write-key-abcdefgh"],
     )
+    monkeypatch.setattr(
+        "mcp_server.auth.settings.MCP_IMPORT_KEYS",
+        ["import-key-12345678"],
+    )
 
 
 # ── mask_key ──────────────────────────────────────────────────
@@ -89,6 +93,11 @@ class TestAuthenticateKey:
         assert result.authenticated is True
         assert result.key_level == "read"
 
+    def test_import_key_match(self):
+        result = authenticate_key("import-key-12345678")
+        assert result.authenticated is True
+        assert result.key_level == "import"
+
     def test_unknown_key(self):
         result = authenticate_key("totally-invalid-key")
         assert result.authenticated is False
@@ -126,6 +135,22 @@ class TestCheckToolPermission:
         auth = AuthInfo(authenticated=True, key_level="read")
         with pytest.raises(HTTPException) as exc:
             check_tool_permission(auth, "reindex")
+        assert exc.value.status_code == 403
+
+    def test_import_key_grants_read_and_import_tools(self):
+        auth = AuthInfo(authenticated=True, key_level="import")
+        check_tool_permission(auth, "search_knowledge")
+        check_tool_permission(auth, "list_domains")
+        check_tool_permission(auth, "analyze_content")
+        check_tool_permission(auth, "import_content")
+
+    def test_import_key_blocks_delete_and_write(self):
+        auth = AuthInfo(authenticated=True, key_level="import")
+        with pytest.raises(HTTPException) as exc:
+            check_tool_permission(auth, "delete_entry")
+        assert exc.value.status_code == 403
+        with pytest.raises(HTTPException) as exc:
+            check_tool_permission(auth, "write_knowledge")
         assert exc.value.status_code == 403
 
     def test_unauthenticated_raises_401(self):

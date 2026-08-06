@@ -6,10 +6,20 @@
 
 from __future__ import annotations
 
-from nicegui import ui
+from nicegui import core, ui
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .config import CONSOLE_PORT
 from .pages import PAGES
+
+
+class RequestLogMiddleware(BaseHTTPMiddleware):
+    """Логирует все входящие HTTP-запросы для отладки."""
+
+    async def dispatch(self, request, call_next):
+        print(f"[REQ] {request.method} {request.url.path}")
+        response = await call_next(request)
+        return response
 
 # ── Routes ──────────────────────────────────────────────────
 
@@ -28,6 +38,9 @@ def index() -> None:
 
 
 # ── Start ───────────────────────────────────────────────────
+
+# Глобальный request logger для отладки upload.
+core.app.add_middleware(RequestLogMiddleware)
 
 ui.run(
     host="0.0.0.0",

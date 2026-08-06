@@ -1,6 +1,6 @@
-"""MCP Tools registry — 11 tools с JSON Schema (Блок A).
+"""MCP Tools registry — 17 tools с JSON Schema (Блок A).
 
-Реальные реализации в модулях: search.py, read.py, crud.py, browse.py, admin.py.
+Реальные реализации в модулях: search.py, read.py, crud.py, browse.py, admin.py, content.py.
 
 G1-fix: list_subjects + list_projects зарегистрированы (ранее были импортированы, но не добавлены в TOOLS/TOOL_HANDLERS).
 """
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..content.analyzer import analyze_content
 from .admin import reindex
 from .browse import list_domains, list_projects, list_subjects
 from .content import import_content
@@ -179,6 +180,17 @@ _IMPORT_CONTENT_SCHEMA: dict[str, Any] = {
     "required": ["content", "domain", "subject"],
 }
 
+# ── analyze_content schema (Фаза 13.8) ─────────────────────
+
+_ANALYZE_CONTENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "content": {"type": "string", "description": "Текст контента для анализа"},
+        "max_fragment_chars": {"type": "integer", "description": "Максимальный размер фрагмента для анализа (по умолчанию ANALYZE_FRAGMENT_CHARS)"},
+    },
+    "required": ["content"],
+}
+
 # ── Tool definitions ───────────────────────────────────────
 
 TOOLS: list[dict[str, Any]] = [
@@ -264,6 +276,11 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Импорт крупных текстов (книги, документация) в SSOT: декомпозиция на секции + авто-frontmatter + parent-child коллекции + best-effort batch запись. Переиспользует существующий write-path (markdown_store + pipeline + git).",
         "inputSchema": _IMPORT_CONTENT_SCHEMA,
     },
+    {
+        "name": "analyze_content",
+        "description": "AI-анализ контента: рекомендации content_type/domain/subject/tags через Ollama LLM + TF-IDF fallback.",
+        "inputSchema": _ANALYZE_CONTENT_SCHEMA,
+    },
 ]
 
 # ── Handler dispatch table (реальные реализации) ───────────
@@ -286,4 +303,5 @@ TOOL_HANDLERS = {
     "resolve_quality_issue": resolve_quality_issue,
     "run_quality_scan": run_quality_scan,
     "import_content": import_content,
+    "analyze_content": analyze_content,
 }

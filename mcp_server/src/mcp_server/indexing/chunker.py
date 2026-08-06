@@ -156,6 +156,13 @@ class MarkdownChunker:
             end = min(pos + self.max_tokens, total_tokens)
             chunk_tokens = tokens[pos:end]
             chunk_text = xlmr_tokenizer.decode(chunk_tokens)
+            if xlmr_tokenizer.is_fallback and not chunk_text:
+                # Fallback не декодирует псевдо-токены → нарезаем по символам
+                # (иначе длинные секции > max_tokens давали ПУСТЫЕ чанки).
+                chars_per = xlmr_tokenizer.fallback_chars_per_token
+                start_char = min(pos * chars_per, len(text))
+                end_char = min(end * chars_per, len(text))
+                chunk_text = text[start_char:end_char]
 
             chunks.append(Chunk(
                 chunk_id=f"{knowledge_id}#{chunk_idx}",

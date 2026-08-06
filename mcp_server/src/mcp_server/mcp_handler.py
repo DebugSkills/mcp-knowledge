@@ -3,7 +3,7 @@
 MCP Protocol Spec (P1-1):
 - Protocol version: 2024-11-05
 - initialize → handshake с capabilities
-- tools/list → все 9 tools с JSON Schema
+- tools/list → все 17 tools с JSON Schema
 - tools/call → валидация params → вызов handler
 - Error codes: −32700, −32600, −32601, −32602, −32000..−32099
 - Request body ≤ 1 MB
@@ -31,7 +31,8 @@ logger = logging.getLogger("mcp_knowledge.mcp")
 SERVER_PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "mcp-knowledge-server"
 SERVER_VERSION = "0.1.0"
-MAX_REQUEST_SIZE = 1_048_576  # 1 MB
+# 64 МБ — импорт учебников (kb-console MAX_FILE_SIZE=50 МБ + JSON-оверхед content/метаданные).
+MAX_REQUEST_SIZE = 67_108_864
 
 # ── JSON-RPC 2.0 Error codes ──────────────────────────────
 
@@ -124,7 +125,7 @@ async def _handle_initialize(params: dict, request_id: Any, _request: Request) -
 
 
 async def _handle_tools_list(_params: dict, request_id: Any, _request: Request) -> dict:
-    """tools/list: возврат всех 9 tools с JSON Schema."""
+    """tools/list: возврат всех 17 tools с JSON Schema."""
     return _jsonrpc_result({"tools": TOOLS}, request_id)
 
 

@@ -127,6 +127,31 @@ class MCPClient:
 
         return data.get("result", {})
 
+    def _unwrap_result(self, result: Any) -> Any:
+        """Развернуть MCP content envelope если есть.
+
+        mcp_handler.py:206 оборачивает результат tools/call в:
+        {"content": [{"type": "text", "text": json.dumps(result)}]}
+
+        Этот метод извлекает настоящий result, или возвращает как есть
+        (backward-compat для initialize/tools_list, где конверта нет).
+        """
+        if not isinstance(result, dict):
+            return result
+        content = result.get("content")
+        if not isinstance(content, list) or len(content) == 0:
+            return result
+        first = content[0]
+        if not isinstance(first, dict) or first.get("type") != "text":
+            return result
+        text = first.get("text", "")
+        if not isinstance(text, str):
+            return result
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return result
+
     # ── High-level MCP methods ─────────────────────────────
 
     async def initialize(self) -> dict[str, Any]:
@@ -156,9 +181,11 @@ class MCPClient:
             params: Параметры вызова.
 
         Returns:
-            Результат выполнения инструмента.
+            Результат выполнения инструмента (автоматически разворачивает
+            MCP content envelope).
         """
-        return await self._call("tools/call", {"name": name, "arguments": params or {}})
+        raw = await self._call("tools/call", {"name": name, "arguments": params or {}})
+        return self._unwrap_result(raw)
 
     async def resources_list(self) -> list[dict[str, Any]]:
         """Получить список MCP-ресурсов."""

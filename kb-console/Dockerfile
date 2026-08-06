@@ -1,11 +1,15 @@
 FROM python:3.11-slim
 
+# pypi.org недоступен из build-контейнеров на этом хосте (SSL handshake timeout);
+# зеркало Tencent проверено 2026-08-06. Переопределение: --build-arg PIP_INDEX_URL=...
+ARG PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple
+
 WORKDIR /app
 
 COPY pyproject.toml .
 COPY src/ ./src/
 
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --no-build-isolation --index-url ${PIP_INDEX_URL} .
 
 ENV CONSOLE_PORT=8085
 ENV MCP_SERVER_URL=http://localhost:8000
