@@ -2,6 +2,9 @@
 
 Запуск:
     python -m kb_console.app
+
+Многостраничная архитектура (V4a): каждая вкладка — отдельный @ui.page.
+Reload сохраняет раздел (в отличие от ui.tabs, которые сбрасываются на первую).
 """
 
 from __future__ import annotations
@@ -9,8 +12,8 @@ from __future__ import annotations
 from nicegui import core, ui
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from .components.header import render_header
 from .config import CONSOLE_PORT
-from .pages import PAGES
 
 
 class RequestLogMiddleware(BaseHTTPMiddleware):
@@ -21,20 +24,49 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         return response
 
+
 # ── Routes ──────────────────────────────────────────────────
 
 
 @ui.page("/")
 def index() -> None:
-    """Главная страница с табами по реестру PAGES."""
-    with ui.tabs().classes("w-full") as tabs:
-        for label, _ in PAGES:
-            ui.tab(label)
+    """Корневой URL — редирект на /status.
 
-    with ui.tab_panels(tabs, value=PAGES[0][0]).classes("w-full"):
-        for label, builder in PAGES:
-            with ui.tab_panel(label):
-                builder()
+    NiceGUI ui.navigate.to выполняет клиентский редирект (не цикл).
+    """
+    ui.navigate.to("/status")
+
+
+@ui.page("/status")
+def page_status() -> None:
+    """Страница «Статус» — liveness, health, метрики, инструменты."""
+    render_header("status")
+    from .pages.status import build_status
+    build_status()
+
+
+@ui.page("/books")
+def page_books() -> None:
+    """Страница «Книги» — список коллекций + модалка деталей."""
+    render_header("books")
+    from .pages.books import build_books
+    build_books()
+
+
+@ui.page("/import")
+def page_import() -> None:
+    """Страница «Импорт» — загрузка и обработка контента."""
+    render_header("import")
+    from .pages.import_page import build_import
+    build_import()
+
+
+@ui.page("/search")
+def page_search() -> None:
+    """Страница «Поиск» — семантический поиск по базе знаний."""
+    render_header("search")
+    from .pages.search import build_search
+    build_search()
 
 
 # ── Start ───────────────────────────────────────────────────

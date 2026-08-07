@@ -5,6 +5,11 @@ Variant A (13.10):
   - Деталь книги (get_entry): TOC из children (sorted by sequence_number).
   - Секция (get_entry): полный markdown-контент.
 
+13.11 UX:
+  - Модалка non-persistent (крестик/Esc/фон) вместо inline master-detail.
+  - Прелоадеры (spinners) при TOC/секции/списке.
+  - Кнопка «✏️ Переименовать» в модалке (update_entry с санитизацией).
+
 render_book_detail / show_book_dialog переиспользуются страницей «Поиск»
 (кнопка «Открыть книгу» в результатах).
 """
@@ -15,6 +20,7 @@ from nicegui import ui
 
 from ..config import MCP_API_KEY, MCP_SERVER_URL
 from ..core.mcp_client import MCPClient
+from ..core.utils import _sanitize_title
 
 # Пагинация TOC: книги бывают на тысячи секций — рендерим постранично,
 # иначе NiceGUI-слот перегружается и рвётся websocket-handshake.
@@ -23,8 +29,18 @@ TOC_PAGE_SIZE = 100
 
 # ── Переиспользуемый рендер детали книги (для «Книги» и диалога «Поиска») ──
 
-async def render_book_detail(container: ui.element, client: MCPClient, collection_id: str) -> None:
-    """Отрисовать в container: заголовок книги + TOC (children, постранично) → контент секции."""
+async def render_book_detail(
+    container: ui.element,
+    client: MCPClient,
+    collection_id: str,
+) -> None:
+    """Отрисовать в container: заголовок книги + TOC (children, постранично) → контент секции.
+
+    Args:
+        container: Контейнер NiceGUI для рендера.
+        client: MCPClient (собственный, не переиспользуемый).
+        collection_id: knowledge_id коллекции.
+    """
     container.clear()
     try:
         entry = await client.get_entry(collection_id)
@@ -43,27 +59,43 @@ async def render_book_detail(container: ui.element, client: MCPClient, collectio
     total = len(children)
 
     async def _show_section(section: dict) -> None:
+        """Показать контент секции (с защитой от закрытия диалога во время загрузки)."""
+        # Прелоадер (Фаза C2): спиннер в dialog-context перед загрузкой секции
         container.clear()
         with container:
-            async def _back_to_toc() -> None:
-                await render_book_detail(container, client, collection_id)
-            ui.button("← Назад к оглавлению", on_click=_back_to_toc)
-            ui.label(section.get("title", "—")).classes("text-h5 q-mt-md")
-            ui.separator()
+            ui.spinner(size="md").props("color=primary")
+            ui.label("Загрузка секции…").classes("text-grey q-ml-sm")
+
+        sec = None
         try:
             sec = await client.get_entry(section["knowledge_id"])
         except Exception as exc:
             sec = {"error": str(exc)}
-        with container:
-            if "error" in sec:
-                ui.label(f"❌ {sec['error']}").classes("text-negative")
-                return
-            ui.markdown(sec.get("content", "_(пусто)_"))
+
+        # Убираем спиннер и рендерим секцию (Фаза B4: guard от RuntimeError)
+        try:
+            container.clear()
+            with container:
+                async def _back_to_toc() -> None:
+                    await render_book_detail(container, client, collection_id)
+
+                ui.button("← Назад к оглавлению", on_click=_back_to_toc)
+                ui.label(section.get("title", "—")).classes("text-h5 q-mt-md")
+                ui.separator()
+
+                if sec and "error" in sec:
+                    ui.label(f"❌ {sec['error']}").classes("text-negative")
+                    return
+                ui.markdown(sec.get("content", "_(пусто)_") if sec else "_(пусто)_")
+        except RuntimeError as e:
+            if "parent slot" in str(e) or "has been deleted" in str(e):
+                return  # диалог закрыт пользователем — молча выходим
+            raise
 
     def _render_toc_page(page: int) -> None:
         """Отрисовать страницу TOC (children[page*SIZE:(page+1)*SIZE])."""
         container.clear()
-        pages = max(1, (total + TOC_PAGE_SIZE - 1) // TOC_PAGE_SIZE)
+        pages_count = max(1, (total + TOC_PAGE_SIZE - 1) // TOC_PAGE_SIZE)
         start = page * TOC_PAGE_SIZE
         end = min(start + TOC_PAGE_SIZE, total)
         with container:
@@ -83,33 +115,64 @@ async def render_book_detail(container: ui.element, client: MCPClient, collectio
                     ).props("clickable").on("click", _open).classes("text-body2")
             with ui.row().classes("items-center q-mt-sm"):
                 ui.button("← Пред.", on_click=lambda: _render_toc_page(max(0, page - 1))) \
-                    .props("flat dense").enabled(page > 0)
+                    .props("flat dense").set_enabled(page > 0)
                 ui.label(f"Секции {start + 1}–{end} из {total}").classes("text-caption text-grey q-mx-md")
-                ui.button("След. →", on_click=lambda: _render_toc_page(min(pages - 1, page + 1))) \
-                    .props("flat dense").enabled(page < pages - 1)
+                ui.button("След. →", on_click=lambda: _render_toc_page(min(pages_count - 1, page + 1))) \
+                    .props("flat dense").set_enabled(page < pages_count - 1)
 
     _render_toc_page(0)
 
 
 async def show_book_dialog(collection_id: str, title: str | None = None) -> None:
-    """Открыть модальный диалог с содержимым книги (для результатов поиска).
+    """Открыть модальный диалог с содержимым книги.
 
-    Создаёт собственный MCPClient (не переиспользует чужой — тот может быть
-    уже закрыт после поискового вызова) и закрывает его при закрытии диалога.
-    persistent: закрытие только через кнопку — контролируем lifecycle клиента.
+    Диалог создаётся прямо здесь (как в search.py — проверенный паттерн).
+    Non-persistent: крестик, Esc, клик по фону.
     """
+    import asyncio
     client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+    current_title: str = title or collection_id
 
     async def _close() -> None:
         dialog.close()
         await client.close()
 
     with ui.dialog() as dialog, ui.card().classes("w-[720px] max-w-[90vw]"), ui.column().classes("w-full"):
-        ui.label(f"📖 {title or collection_id}").classes("text-h6")
+        with ui.row().classes("items-center w-full justify-between"):
+            title_label = ui.label(f"📖 {current_title}").classes("text-h6")
+            with ui.row().classes("items-center gap-2"):
+                rename_btn = ui.button("✏️ Переименовать", icon="edit").props("flat dense")
+                async def _do_rename() -> None:
+                    nonlocal current_title
+                    _rename_input = None
+                    async def _confirm_rename() -> None:
+                        nonlocal current_title
+                        raw = _rename_input.value or ""
+                        sanitized = _sanitize_title(raw)
+                        if not sanitized:
+                            ui.notify("Название не может быть пустым", type="warning")
+                            return
+                        try:
+                            await client.update_entry(collection_id, content=f"# {sanitized}\n\nКоллекция импортированных секций. Оглавление — в frontmatter.children.")
+                            current_title = sanitized
+                            title_label.set_text(f"📖 {sanitized}")
+                            ui.notify(f"Книга переименована в «{sanitized}»", type="positive")
+                            rename_dialog.close()
+                        except Exception as exc:
+                            ui.notify(f"Ошибка переименования: {exc}", type="negative")
+                    with ui.dialog() as rename_dialog, ui.card():
+                        ui.label("Переименовать книгу").classes("text-h6")
+                        _rename_input = ui.input(label="Новое название", value=current_title).classes("w-full")
+                        with ui.row().classes("gap-2 q-mt-md"):
+                            ui.button("Сохранить", on_click=_confirm_rename, icon="save").props("color=primary")
+                            ui.button("Отмена", on_click=rename_dialog.close).props("flat")
+                    rename_dialog.open()
+                rename_btn.on("click", _do_rename)
+                ui.button(icon="close", on_click=_close).props("flat round dense")
         detail_container = ui.column().classes("w-full")
         with ui.row().classes("q-mt-md"):
             ui.button("Закрыть", on_click=_close).props("flat")
-    dialog.props("persistent")
+    dialog.on("hide", lambda: asyncio.create_task(client.close()))
     await render_book_detail(detail_container, client, collection_id)
     dialog.open()
 
@@ -117,9 +180,7 @@ async def show_book_dialog(collection_id: str, title: str | None = None) -> None
 # ── Страница «Книги» ─────────────────────────────────────────
 
 def build_books() -> None:
-    """Построить страницу «Книги»: список → деталь → секция (master-detail в табе)."""
-
-    ui.label("Книги").classes("text-h4 q-mb-md")
+    """Построить страницу «Книги»: список → модалка (13.11: модалка вместо inline)."""
 
     view_container = ui.column().classes("w-full")
     _client: MCPClient | None = None
@@ -129,12 +190,21 @@ def build_books() -> None:
         view_container.clear()
         if _client is None:
             _client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+
+        # Прелоадер (Фаза C3): spinner при загрузке списка
+        with view_container:
+            ui.spinner(size="md").props("color=primary")
+            ui.label("Загрузка списка книг…").classes("text-grey")
+
         try:
             books = await _client.list_collections()
         except Exception as exc:
+            view_container.clear()
             with view_container:
                 ui.label(f"❌ Ошибка загрузки списка книг: {exc}").classes("text-negative")
             return
+
+        view_container.clear()
 
         if not books:
             with view_container:
@@ -144,21 +214,29 @@ def build_books() -> None:
         with view_container:
             ui.label(f"Найдено книг: {len(books)}").classes("text-subtitle1 q-mt-md")
             for b in sorted(books, key=lambda x: x.get("title", "")):
-                async def _open(cid: str = b["collection_id"]) -> None:
-                    await _open_book(cid)
-                with ui.card().props("clickable").classes("w-full cursor-pointer").on("click", _open), ui.row().classes("items-center w-full"), ui.column().classes("flex-1"):
+                cid = b["collection_id"]
+                btitle = b.get("title") or cid
+
+                with ui.card().classes("w-full"), ui.row().classes("items-center w-full"), ui.column().classes("flex-1"):
                     ui.label(b.get("title", b.get("collection_id", "—"))).classes("text-subtitle1")
                     ui.label(
                         f"{b.get('domain', '—')}/{b.get('subject', '—')}"
                         + (f"  ·  {b.get('project')}" if b.get("project") else "")
                     ).classes("text-caption text-grey")
-                    ui.label(f"📄 {b.get('section_count', 0)} секций").classes("text-caption text-grey q-mr-md")
+                    with ui.row().classes("items-center"):
+                        ui.label(f"📄 {b.get('section_count', 0)} секций").classes("text-caption text-grey q-mr-md")
+                        async def _open_btn(cid: str = cid, t: str = btitle) -> None:
+                            await _open_book(cid, t)
+                        ui.button("📖 Открыть", on_click=_open_btn, icon="menu_book").props("flat dense")
 
-    async def _open_book(collection_id: str) -> None:
-        view_container.clear()
-        with view_container:
-            ui.button("← Назад к списку книг", on_click=_show_list)
-        await render_book_detail(view_container, _client, collection_id)
+    async def _open_book(collection_id: str, title: str = "") -> None:
+        """Открыть модалку книги (вызов напрямую, без обёрток view_container).
+
+        ВАЖНО: в async-обработчиках NiceGUI контекст слота сохраняется через
+        contextvar — обёртки (спиннер/clear в view_container) создавали dialog
+        внутри view_container, и его clear() удалял диалог из DOM. Паттерн как в search.py.
+        """
+        await show_book_dialog(collection_id, title)
 
     # Таймер безопасности: закрыть MCPClient при дисконнекте
     def _cleanup() -> None:

@@ -231,6 +231,21 @@ class MCPClient:
             return raw.get("results", [])
         return raw if isinstance(raw, list) else []
 
+    async def update_entry(self, knowledge_id: str, content: str) -> dict[str, Any]:
+        """Обновить запись (контент body) через update_entry тул.
+
+        Args:
+            knowledge_id: ID записи для обновления.
+            content: Новый markdown-контент (заменяет body, frontmatter сохраняется).
+
+        Returns:
+            Результат update_entry (словарь с knowledge_id, title и др.).
+        """
+        return await self.tools_call(
+            "update_entry",
+            {"knowledge_id": knowledge_id, "content": content},
+        )
+
     async def resources_list(self) -> list[dict[str, Any]]:
         """Получить список MCP-ресурсов."""
         result = await self._call("resources/list")

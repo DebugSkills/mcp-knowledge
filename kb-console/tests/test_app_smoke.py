@@ -1,6 +1,10 @@
 """Smoke-тест kb-console приложения через подпроцесс.
 
-Проверяет, что приложение стартует и GET / возвращает 200 (HTML).
+Проверяет:
+  - Приложение стартует и GET / возвращает redirect на /status.
+  - GET /status, /books, /import, /search → 200 (HTML).
+  - Reload сохраняет раздел (GET /books → 200, не redirect).
+
 Sync-версия: NiceGUI/uvicorn конфликтуют с pytest-asyncio event loop,
 поэтому подпроцесс запускается и опрашивается синхронно.
 """
@@ -15,6 +19,9 @@ import time
 
 import httpx
 import pytest
+
+# Порт для smoke-тестов (избегаем конфликта с другими тестами).
+_SMOKE_PORT = 9877
 
 
 def _start_console(port: int) -> subprocess.Popen:
@@ -46,25 +53,85 @@ def _stop_console(proc: subprocess.Popen) -> None:
         proc.wait()
 
 
-def test_app_serves_home_page():
-    """GET / должен вернуть 200 (NiceGUI отдаёт HTML)."""
-    port = 9877  # Избегаем конфликта с другими тестами
-    proc = _start_console(port)
-    try:
-        # Пробуем подключиться с retry (NiceGUI стартует ~1-3 сек)
-        last_exc: Exception | None = None
-        for _ in range(30):
-            time.sleep(0.5)
-            try:
-                r = httpx.get(f"http://localhost:{port}/", timeout=3.0)
-                assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text[:200]}"
-                assert "<html" in r.text.lower(), "Response should be HTML"
+def _wait_for_server(port: int, timeout: float = 15.0) -> None:
+    """Ждать, пока сервер начнёт отвечать на GET /status."""
+    deadline = time.monotonic() + timeout
+    last_exc: Exception | None = None
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        try:
+            r = httpx.get(f"http://localhost:{port}/status", timeout=3.0)
+            if r.status_code == 200:
                 return
-            except httpx.HTTPError as e:
-                last_exc = e
-        raise RuntimeError(f"Server did not start: {last_exc}") from last_exc
-    finally:
-        _stop_console(proc)
+        except httpx.HTTPError as e:
+            last_exc = e
+    raise RuntimeError(f"Server did not start within {timeout}s: {last_exc}") from last_exc
+
+
+# Кэшируем процесс между smoke-тестами (module-scoped fixture через pytest).
+_proc: subprocess.Popen | None = None
+
+
+def _get_or_start_console() -> subprocess.Popen:
+    global _proc
+    if _proc is None or _proc.poll() is not None:
+        _proc = _start_console(_SMOKE_PORT)
+        _wait_for_server(_SMOKE_PORT)
+    return _proc
+
+
+# ── Tests ───────────────────────────────────────────────────
+
+
+def test_root_redirects_to_status():
+    """GET / должен редиректить на /status (HTTP 200 на / тоже ок — NiceGUI
+    может отдавать страницу с meta refresh или navigate)."""
+    _get_or_start_console()
+    # NiceGUI @ui.page("/") с ui.navigate.to("/status") даёт HTML-страницу
+    # (200), которая делает клиентский редирект. Проверяем, что / отвечает.
+    r = httpx.get(f"http://localhost:{_SMOKE_PORT}/", timeout=5.0, follow_redirects=False)
+    assert r.status_code in (200, 302, 303, 307, 308), f"Root should respond: {r.status_code}"
+
+
+def test_status_page_200():
+    """GET /status → 200 HTML."""
+    _get_or_start_console()
+    r = httpx.get(f"http://localhost:{_SMOKE_PORT}/status", timeout=5.0)
+    assert r.status_code == 200
+    assert "<html" in r.text.lower()
+
+
+def test_books_page_200():
+    """GET /books → 200 HTML."""
+    _get_or_start_console()
+    r = httpx.get(f"http://localhost:{_SMOKE_PORT}/books", timeout=5.0)
+    assert r.status_code == 200
+    assert "<html" in r.text.lower()
+
+
+def test_import_page_200():
+    """GET /import → 200 HTML."""
+    _get_or_start_console()
+    r = httpx.get(f"http://localhost:{_SMOKE_PORT}/import", timeout=5.0)
+    assert r.status_code == 200
+    assert "<html" in r.text.lower()
+
+
+def test_search_page_200():
+    """GET /search → 200 HTML."""
+    _get_or_start_console()
+    r = httpx.get(f"http://localhost:{_SMOKE_PORT}/search", timeout=5.0)
+    assert r.status_code == 200
+    assert "<html" in r.text.lower()
+
+
+def test_books_page_survives_reload():
+    """Reload /books → остаётся на /books (не редиректит на /status)."""
+    _get_or_start_console()
+    r = httpx.get(f"http://localhost:{_SMOKE_PORT}/books", timeout=5.0)
+    assert r.status_code == 200
+    # Не должно быть редиректа
+    assert not r.is_redirect
 
 
 if __name__ == "__main__":

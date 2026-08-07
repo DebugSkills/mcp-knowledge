@@ -18,6 +18,7 @@ from nicegui import ui
 
 from ..config import MCP_API_KEY, MCP_SERVER_URL
 from ..core.mcp_client import MCPClient
+from ..core.utils import _sanitize_title
 
 # Расширения, поддерживаемые файловым импортом (.md/.txt, PDF — в перспективе).
 SUPPORTED_EXTENSIONS = {".md", ".markdown", ".txt"}
@@ -114,6 +115,8 @@ def build_import() -> None:
             file_status_label.set_text(
                 f"📄 {filename} — {len(raw) / 1_048_576:.1f} МБ ({len(text):,} символов)"
             )
+            # Pre-fill title_input из имени файла (без расширения)
+            title_input.value = Path(filename).stem
             analyze_btn.enable()
             ui.notify(f"«{filename}» загружен ({len(text):,} символов)", type="positive")
             print(f"[IMPORT-UPLOAD] OK {len(text)} chars — pending_file set, textarea untouched")
@@ -131,6 +134,15 @@ def build_import() -> None:
         )
 
     file_status_label = ui.label("").classes("text-body2 text-grey q-mb-sm")
+
+    title_input = ui.input(
+        label="Название книги",
+        placeholder="Авто: домен/предмет book",
+    ).classes("w-full q-mb-sm")
+    title_input.tooltip(
+        "Введите название книги. Если оставить пустым — сервер сгенерирует автоматически "
+        "(домен/предмет book)."
+    )
 
     content_input = ui.textarea(
         label="Контент (Markdown/plain) — или вставьте текст вручную",
@@ -287,7 +299,7 @@ def build_import() -> None:
                 {"content": pending_file["content"][:ANALYZE_FRAGMENT_CHARS]},
             )
 
-            # Заполняем поля (редактируемые!)
+            # Заполняем поля (редактируемые!) — title_input НЕ трогаем (ручное поле)
             content_type.value = result.get("content_type", "book")
             domain_input.value = result.get("domain", "")
             subject_input.value = result.get("subject", "")
@@ -341,6 +353,10 @@ def build_import() -> None:
             "domain": domain,
             "subject": subject,
         }
+        # Санитизированный title (пустой → сервер генерит авто)
+        title = _sanitize_title(title_input.value or "")
+        if title:
+            params["title"] = title
         if tags:
             params["tags"] = tags
         # 13.9: идентификатор импорта для живого прогресса (poll GET /imports/{id}/progress)
