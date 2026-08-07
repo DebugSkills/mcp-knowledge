@@ -4,6 +4,8 @@ search_knowledge: query → embed (in-process) → Qdrant search с фильтр
 search_by_tags: exhaustive поиск через Qdrant payload filter по tags[]. AND/OR семантика. Без GPU.
 
 Issue-#5-fix: latency tracking — search_latency и tag_search_latency гистограммы.
+Variant A (13.10): результаты обогащены title/parent_knowledge_id/content_type;
+фильтры collection_id (→ parent_knowledge_id) и content_type.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import logging
 import time
 
 from ..metrics import search_latency, tag_search_latency
+from .read import _derive_title
 
 logger = logging.getLogger("mcp_knowledge.tools.search")
 
@@ -40,6 +43,17 @@ async def search_knowledge(params: dict, app_state) -> dict:
     if tags and isinstance(tags, list):
         filters["tags"] = tags  # OR-семантика через MatchAny в search()
 
+    # Variant A (13.10): поиск внутри книги / по типу контента
+    collection_id = params.get("collection_id")
+    if collection_id:
+        filters["parent_knowledge_id"] = collection_id
+    content_type = params.get("content_type")
+    if content_type:
+        filters["content_type"] = content_type
+    # Root-заглушки коллекций (content_type=collection) — шум в результатах:
+    # исключаем по умолчанию, если пользователь явно не ищет коллекции.
+    exclude_content_types = None if content_type == "collection" else ["collection"]
+
     # Embedding (CPU-bound → run_in_executor)
     embedder = app_state.embedder
     loop = asyncio.get_running_loop()
@@ -56,6 +70,7 @@ async def search_knowledge(params: dict, app_state) -> dict:
             top_k=top_k,
             filters=filter_dict,
             score_threshold=score_threshold,
+            exclude_content_types=exclude_content_types,
         ),
     )
 
@@ -72,6 +87,13 @@ async def search_knowledge(params: dict, app_state) -> dict:
             "domain": payload.get("domain", ""),
             "subject": payload.get("subject", ""),
             "tags": payload.get("tags", []),
+            # Variant A (13.10): title + какая книга (parent) + тип
+            "title": (
+                payload.get("section_header")
+                or _derive_title(payload.get("content", ""), payload.get("knowledge_id", ""))
+            ),
+            "parent_knowledge_id": payload.get("parent_knowledge_id"),
+            "content_type": payload.get("content_type"),
         })
 
     search_elapsed = time.monotonic() - t0

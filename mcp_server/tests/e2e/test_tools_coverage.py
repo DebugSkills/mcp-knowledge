@@ -605,3 +605,94 @@ async def test_s19_prompts_list_and_get_via_http(e2e_http_app):
     assert "result" in get_body2
     messages2 = get_body2["result"]["messages"]
     assert len(messages2) > 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# S20: list_collections — новый tool (Variant A: Surface & Enrich)
+# ═══════════════════════════════════════════════════════════════
+
+S20_DOMAIN = "e2e-collections"
+S20_SUBJECT = "list-test"
+
+
+@pytest.mark.e2e
+async def test_s20_list_collections_via_http(e2e_http_app):
+    """S20: import_content (collection) → list_collections → get_entry(TOC).
+
+    Flow:
+      1. import_content(e2e-collections) → collection_id
+      2. list_collections(domain=e2e-collections) → collection in results
+      3. get_entry(collection_id) → TOC with children
+    """
+    headers_write = {"X-API-Key": "e2e-write-key"}
+    headers_read = {"X-API-Key": "e2e-read-key"}
+
+    # Step 1: Import a small book
+    import_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "import_content",
+            "arguments": {
+                "content": "# Глава 1\n\nКонтент первой главы.\n\n## Раздел 1.1\n\nПодраздел.\n\n# Глава 2\n\nКонтент второй главы.",
+                "content_type": "book",
+                "domain": S20_DOMAIN,
+                "subject": S20_SUBJECT,
+                "title": "E2E Collections Test Book",
+                "tags": ["e2e", "collections-test"],
+                "wait_for_index": True,
+            },
+        },
+        "id": 1,
+    }
+    resp = await e2e_http_app.post("/mcp", json=import_payload, headers=headers_write)
+    assert resp.status_code == 200
+    import_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" not in import_result, f"import failed: {import_result}"
+    assert import_result["imported"] >= 2, f"Expected >=2 sections, got {import_result.get('imported')}"
+    collection_id = import_result["collection_id"]
+    assert collection_id.endswith("-collection")
+
+    # Step 2: list_collections — find the collection
+    list_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "list_collections",
+            "arguments": {"domain": S20_DOMAIN},
+        },
+        "id": 2,
+    }
+    resp = await e2e_http_app.post("/mcp", json=list_payload, headers=headers_read)
+    assert resp.status_code == 200
+    list_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" not in list_result, f"list_collections failed: {list_result}"
+    assert "results" in list_result
+    assert len(list_result["results"]) >= 1
+    # Find our collection
+    our = [c for c in list_result["results"] if c["collection_id"] == collection_id]
+    assert len(our) == 1, f"Collection {collection_id} not found in list_collections results"
+    assert our[0]["domain"] == S20_DOMAIN
+    assert our[0]["section_count"] >= 2
+    assert "title" in our[0]
+
+    # Step 3: get_entry on collection → TOC with children
+    get_payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "get_entry",
+            "arguments": {"knowledge_id": collection_id},
+        },
+        "id": 3,
+    }
+    resp = await e2e_http_app.post("/mcp", json=get_payload, headers=headers_read)
+    assert resp.status_code == 200
+    get_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" not in get_result, f"get_entry failed: {get_result}"
+    assert get_result["content_type"] == "collection"
+    children = get_result.get("children", [])
+    assert len(children) >= 2, f"Expected >=2 children, got {len(children)}: {get_result}"
+    assert children[0]["sequence_number"] == 1
+    assert "title" in children[0]
+    assert "knowledge_id" in children[0]

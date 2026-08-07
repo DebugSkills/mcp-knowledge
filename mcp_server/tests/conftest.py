@@ -77,6 +77,7 @@ def mock_qdrant() -> MagicMock:
         top_k: int = 5,
         filters: dict | None = None,
         score_threshold: float = 0.0,
+        exclude_content_types: list[str] | None = None,
     ):
         point = MagicMock()
         point.id = 1
@@ -90,6 +91,7 @@ def mock_qdrant() -> MagicMock:
             "subject": "testing",
             "tags": ["test", "mock"],
         }
+        client._last_search_exclude = exclude_content_types
         return [point]
 
     client.search = _fake_search
@@ -137,6 +139,27 @@ def mock_qdrant() -> MagicMock:
     # get_all_knowledge_ids()
     client.get_all_knowledge_ids = MagicMock(return_value={"ru-test-entry"})
 
+    # scroll() — for list_collections / reconciliation
+    def _fake_scroll(limit=100, offset=None, scroll_filter=None,
+                     with_payload=None, with_vectors=False):
+        point = MagicMock()
+        point.id = 99
+        point.payload = {
+            "knowledge_id": "eng-testing-book-collection",
+            "chunk_id": "chunk-coll-1",
+            "content": "# Test Book\n\nКоллекция...",
+            "domain": "engineering",
+            "subject": "testing",
+            "project": "test-project",
+            "tags": ["test"],
+            "content_type": "collection",
+            "parent_knowledge_id": None,
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+        return ([point], None)
+
+    client.scroll = _fake_scroll
+
     # close()
     client.close = MagicMock()
 
@@ -158,9 +181,31 @@ def mock_store(sample_entry: KnowledgeEntry) -> MagicMock:
     """Mock MarkdownStore — CRUD operations."""
     store = MagicMock()
 
+    # Collection entry (for list_collections / get_entry TOC tests)
+    _coll_fm = KnowledgeFrontmatter(
+        knowledge_id="eng-testing-book-collection",
+        domain="engineering",
+        subject="testing",
+        project="test-project",
+        content_type="collection",
+        tags=["test"],
+        children=[
+            {"knowledge_id": "eng-testing-ch01", "title": "Chapter 1", "sequence_number": 1},
+            {"knowledge_id": "eng-testing-ch02", "title": "Chapter 2", "sequence_number": 2},
+        ],
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    _coll_entry = KnowledgeEntry(
+        frontmatter=_coll_fm,
+        content="# Test Book\n\nКоллекция импортированных секций.",
+    )
+
     async def _read(knowledge_id):
         if knowledge_id == sample_entry.frontmatter.knowledge_id:
             return sample_entry
+        if knowledge_id == "eng-testing-book-collection":
+            return _coll_entry
         return None
 
     store.read = _read

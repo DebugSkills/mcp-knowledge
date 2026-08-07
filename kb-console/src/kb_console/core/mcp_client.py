@@ -187,6 +187,50 @@ class MCPClient:
         raw = await self._call("tools/call", {"name": name, "arguments": params or {}})
         return self._unwrap_result(raw)
 
+    async def get_progress(self, import_id: str) -> dict[str, Any] | None:
+        """GET /imports/{import_id}/progress — снапшот живого прогресса импорта.
+
+        Args:
+            import_id: Идентификатор импорта (UUID, сгенерированный клиентом).
+
+        Returns:
+            Словарь прогресса (imported, total, failed, status, messages[], ...)
+            или None при любой ошибке (404 / endpoint отсутствует / сеть) —
+            никогда не бросает.
+        """
+        url = f"{self.base_url}/imports/{import_id}/progress"
+        try:
+            response = await self._client.get(url, headers=self._headers(), timeout=5.0)
+        except httpx.HTTPError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            return response.json()
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    # ── Variant A (13.10): хелперы для «Книги» + информативный поиск ──
+
+    async def get_entry(self, knowledge_id: str) -> dict[str, Any]:
+        """Получить полную запись (frontmatter + content + TOC children)."""
+        return await self.tools_call("get_entry", {"knowledge_id": knowledge_id})
+
+    async def search_knowledge(self, query: str, **params: Any) -> list[dict[str, Any]]:
+        """Семантический поиск; возвращает список results (обогащённый payload)."""
+        params["query"] = query
+        raw = await self.tools_call("search_knowledge", params)
+        if isinstance(raw, dict):
+            return raw.get("results", [])
+        return raw if isinstance(raw, list) else []
+
+    async def list_collections(self, **params: Any) -> list[dict[str, Any]]:
+        """Список книг/коллекций; возвращает список results."""
+        raw = await self.tools_call("list_collections", params)
+        if isinstance(raw, dict):
+            return raw.get("results", [])
+        return raw if isinstance(raw, list) else []
+
     async def resources_list(self) -> list[dict[str, Any]]:
         """Получить список MCP-ресурсов."""
         result = await self._call("resources/list")

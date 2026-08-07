@@ -1,0 +1,198 @@
+"""Unit tests: ImportProgressTracker — in-memory import progress store.
+
+Фаза 13.9: live import progress (Variant A — progress bar + log panel).
+"""
+
+from __future__ import annotations
+
+import time
+from datetime import datetime, timezone
+
+import pytest
+from mcp_server.progress import ImportProgressTracker
+
+
+class TestImportProgressTracker:
+    """Тесты ImportProgressTracker: start, section_done, log, done, error, get, TTL, robustness."""
+
+    # ── start / get ──────────────────────────────────────────
+
+    def test_start_creates_entry_with_total(self):
+        """start создаёт запись с total и статусом running."""
+        t = ImportProgressTracker()
+        t.start("abc", total=100, meta={"file": "test.md"})
+        snap = t.get("abc")
+        assert snap is not None
+        assert snap["import_id"] == "abc"
+        assert snap["status"] == "running"
+        assert snap["total"] == 100
+        assert snap["imported"] == 0
+        assert snap["failed"] == 0
+        assert snap["phase"] == "decomposing"
+        assert isinstance(snap["started_at"], str)
+        assert isinstance(snap["messages"], list)
+        assert len(snap["messages"]) == 0
+
+    def test_get_unknown_returns_none(self):
+        """get для неизвестного import_id возвращает None."""
+        t = ImportProgressTracker()
+        assert t.get("nonexistent") is None
+
+    def test_get_returns_snapshot_not_mutable_ref(self):
+        """get возвращает копию, а не ссылку на внутренний dict."""
+        t = ImportProgressTracker()
+        t.start("x", total=10)
+        snap = t.get("x")
+        snap["imported"] = 999
+        assert t.get("x")["imported"] == 0  # оригинал не изменился
+
+    # ── section_done / section_failed ────────────────────────
+
+    def test_section_done_increments_imported(self):
+        """section_done увеличивает imported и пушит message."""
+        t = ImportProgressTracker()
+        t.start("abc", total=10)
+        t.section_done("abc", sequence=1, title="Intro")
+        t.section_done("abc", sequence=2, title="Chapter 1")
+        snap = t.get("abc")
+        assert snap["imported"] == 2
+        assert snap["status"] == "running"
+
+    def test_section_failed_increments_failed(self):
+        """section_failed увеличивает failed и логирует warning."""
+        t = ImportProgressTracker()
+        t.start("abc", total=5)
+        t.section_failed("abc", sequence=1, title="Bad", error="Parse error")
+        snap = t.get("abc")
+        assert snap["failed"] == 1
+        assert any("Parse error" in m["text"] for m in snap["messages"])
+
+    # ── log ─────────────────────────────────────────────────
+
+    def test_log_appends_message(self):
+        """log добавляет запись в messages."""
+        t = ImportProgressTracker()
+        t.start("abc", total=10)
+        t.log("abc", "info", "import_content: 10/100 sections written, git commit")
+        snap = t.get("abc")
+        assert len(snap["messages"]) == 1
+        msg = snap["messages"][0]
+        assert msg["level"] == "info"
+        assert "10/100" in msg["text"]
+        assert isinstance(msg["t"], str)  # HH:MM:SS
+
+    def test_log_respects_max_messages(self):
+        """log обрезает messages до max_messages (самые новые)."""
+        t = ImportProgressTracker(max_messages=3)
+        t.start("abc", total=10)
+        for i in range(5):
+            t.log("abc", "info", f"msg {i}")
+        snap = t.get("abc")
+        assert len(snap["messages"]) == 3
+        # Должны остаться самые новые: msg 2, 3, 4
+        texts = [m["text"] for m in snap["messages"]]
+        assert "msg 0" not in texts
+        assert "msg 4" in texts
+
+    # ── set_phase ────────────────────────────────────────────
+
+    def test_set_phase_updates_phase(self):
+        """set_phase обновляет phase и опционально логирует."""
+        t = ImportProgressTracker()
+        t.start("abc", total=5)
+        t.set_phase("abc", "writing", text="Writing sections...")
+        snap = t.get("abc")
+        assert snap["phase"] == "writing"
+        assert any("Writing sections" in m["text"] for m in snap["messages"])
+
+    # ── done / error ────────────────────────────────────────
+
+    def test_done_sets_status_and_summary(self):
+        """done переводит статус в done и сохраняет summary."""
+        t = ImportProgressTracker()
+        t.start("abc", total=5)
+        t.section_done("abc", 1, "ok")
+        t.done("abc", summary={"collection_id": "coll-1", "imported": 1})
+        snap = t.get("abc")
+        assert snap["status"] == "done"
+
+    def test_error_sets_status_error(self):
+        """error переводит статус в error и логирует."""
+        t = ImportProgressTracker()
+        t.start("abc", total=5)
+        t.error("abc", error="Connection lost")
+        snap = t.get("abc")
+        assert snap["status"] == "error"
+        assert any("Connection lost" in m["text"] for m in snap["messages"])
+
+    # ── TTL prune ───────────────────────────────────────────
+
+    def test_get_prunes_expired_entries(self):
+        """get удаляет записи старше ttl_seconds (ttl=0 для мгновенного истечения)."""
+        t = ImportProgressTracker(ttl_seconds=0)
+        t.start("expired", total=1)
+        time.sleep(0.01)  # гарантируем, что ttl истёк
+        assert t.get("expired") is None  # просроченная запись удалена
+
+    # ── Robustness: mutators never raise ─────────────────────
+
+    def test_mutators_never_raise_on_bad_id(self):
+        """Все мутаторы — best-effort: не должны кидать исключения на плохих id."""
+        t = ImportProgressTracker()
+        # Начинаем без start (нет записи)
+        t.section_done("no-such", 1, "X")       # не должно упасть
+        t.section_failed("no-such", 1, "X", "E")  # не должно упасть
+        t.log("no-such", "info", "msg")           # не должно упасть
+        t.set_phase("no-such", "writing")          # не должно упасть
+        t.done("no-such", {})                      # не должно упасть
+        t.error("no-such", "err")                  # не должно упасть
+        # None id
+        t.start(None, total=10)  # type: ignore[arg-type] — не должно упасть
+        # Всё ок — дошли до assert
+        assert True
+
+    def test_start_with_none_id_does_not_create_entry(self):
+        """start с None id не создаёт запись."""
+        t = ImportProgressTracker()
+        t.start(None, total=10)  # type: ignore[arg-type]
+        assert t.get(None) is None  # type: ignore[arg-type]
+
+    # ── Edge cases ──────────────────────────────────────────
+
+    def test_multiple_imports_independent(self):
+        """Два параллельных импорта не мешают друг другу."""
+        t = ImportProgressTracker()
+        t.start("a", total=10)
+        t.start("b", total=20)
+        t.section_done("a", 1, "A1")
+        t.section_done("b", 1, "B1")
+        assert t.get("a")["imported"] == 1
+        assert t.get("b")["imported"] == 1
+        assert t.get("a")["total"] == 10
+        assert t.get("b")["total"] == 20
+
+    def test_empty_messages_on_fresh_start(self):
+        """Свежая запись имеет пустой список messages."""
+        t = ImportProgressTracker()
+        t.start("x", total=5)
+        snap = t.get("x")
+        assert snap["messages"] == []
+
+    def test_updated_at_changes_on_mutation(self):
+        """updated_at обновляется при каждом мутаторе."""
+        t = ImportProgressTracker()
+        t.start("x", total=5)
+        ts1 = t.get("x")["updated_at"]
+        t.section_done("x", 1, "hi")
+        ts2 = t.get("x")["updated_at"]
+        assert ts2 != ts1
+
+    def test_default_ttl_is_600(self):
+        """TTL по умолчанию — 600 секунд."""
+        t = ImportProgressTracker()
+        assert t._ttl_seconds == 600
+
+    def test_default_max_messages_is_50(self):
+        """max_messages по умолчанию — 50."""
+        t = ImportProgressTracker()
+        assert t._max_messages == 50

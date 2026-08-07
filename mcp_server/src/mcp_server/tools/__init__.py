@@ -1,8 +1,9 @@
-"""MCP Tools registry — 17 tools с JSON Schema (Блок A).
+"""MCP Tools registry — 18 tools с JSON Schema (Блок A).
 
-Реальные реализации в модулях: search.py, read.py, crud.py, browse.py, admin.py, content.py.
+Реальные реализации в модулях: search.py, read.py, crud.py, browse.py, admin.py, content.py, collections.py.
 
 G1-fix: list_subjects + list_projects зарегистрированы (ранее были импортированы, но не добавлены в TOOLS/TOOL_HANDLERS).
+Variant A (13.10): +list_collections (список книг); search_knowledge обогащён (collection_id/content_type фильтры).
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from typing import Any
 from ..content.analyzer import analyze_content
 from .admin import reindex
 from .browse import list_domains, list_projects, list_subjects
+from .collections import list_collections
 from .content import import_content
 from .crud import delete_entry, update_entry, write_knowledge
 from .quality import (
@@ -35,8 +37,19 @@ _SEARCH_QUERY_SCHEMA: dict[str, Any] = {
         "project": {"type": "string", "description": "Фильтр по проекту"},
         "tags": {"type": "array", "items": {"type": "string"}, "description": "Фильтр по тегам"},
         "score_threshold": {"type": "number", "default": 0.0, "minimum": 0.0, "maximum": 1.0},
+        "collection_id": {"type": "string", "description": "Поиск внутри книги (фильтр по parent_knowledge_id)"},
+        "content_type": {"type": "string", "description": "Фильтр по типу контента (book, collection)"},
     },
     "required": ["query"],
+}
+
+_LIST_COLLECTIONS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "domain": {"type": "string", "description": "Фильтр по домену"},
+        "cursor": {"type": "string", "description": "Курсор пагинации"},
+        "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 500},
+    },
 }
 
 _SEARCH_TAGS_SCHEMA: dict[str, Any] = {
@@ -215,6 +228,11 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _GET_MAP_SCHEMA,
     },
     {
+        "name": "list_collections",
+        "description": "Список книг/коллекций с метаданными (title, domain/subject, tags, section_count, updated_at). Фильтр по домену.",
+        "inputSchema": _LIST_COLLECTIONS_SCHEMA,
+    },
+    {
         "name": "write_knowledge",
         "description": "Записать новое знание: SSOT Markdown → chunk → embed → Qdrant upsert → INDEX update.",
         "inputSchema": _WRITE_SCHEMA,
@@ -290,6 +308,7 @@ TOOL_HANDLERS = {
     "search_by_tags": search_by_tags,
     "get_entry": get_entry,
     "get_knowledge_map": get_knowledge_map,
+    "list_collections": list_collections,
     "write_knowledge": write_knowledge,
     "update_entry": update_entry,
     "delete_entry": delete_entry,

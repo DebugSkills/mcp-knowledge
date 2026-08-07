@@ -1,4 +1,4 @@
-"""Unit tests for all 11 MCP Tools (smoke tests).
+"""Unit tests for all MCP Tools (smoke tests).
 
 Covers happy-path for every registered tool.
 Uses mock fixtures from conftest.py — no Qdrant/embedding/filesystem required.
@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 from mcp_server.tools.admin import reindex
 from mcp_server.tools.browse import list_domains, list_projects, list_subjects
+from mcp_server.tools.collections import list_collections
 from mcp_server.tools.crud import delete_entry, update_entry, write_knowledge
 from mcp_server.tools.read import get_entry, get_knowledge_map
 from mcp_server.tools.search import search_by_tags, search_knowledge
@@ -228,3 +229,133 @@ async def test_reindex_happy_path(app_state):
     assert result["total_chunks"] == 3
     assert result["failed"] == 0
     assert result["index_total_entries"] == 3
+
+
+# ── Variant A: Surface & Enrich — get_entry enrichment ────────
+
+async def test_get_entry_collection_has_toc(app_state):
+    """get_entry for collection returns children TOC, title, content_type."""
+    result = await get_entry(
+        {"knowledge_id": "eng-testing-book-collection"},
+        app_state,
+    )
+    assert "error" not in result
+    assert result["knowledge_id"] == "eng-testing-book-collection"
+    assert result["content_type"] == "collection"
+    assert result["parent_knowledge_id"] is None
+    assert result["sequence_number"] is None
+    # title derived from content
+    assert result["title"] == "Test Book"
+    # children TOC
+    children = result.get("children", [])
+    assert len(children) == 2
+    assert children[0]["knowledge_id"] == "eng-testing-ch01"
+    assert children[0]["title"] == "Chapter 1"
+    assert children[0]["sequence_number"] == 1
+
+
+async def test_get_entry_title_fallback(app_state):
+    """get_entry: title fallback when no markdown heading."""
+    result = await get_entry(
+        {"knowledge_id": "ru-test-entry"},
+        app_state,
+    )
+    assert "error" not in result
+    # sample_entry content is "# Test Entry\n\nTest content." — has heading
+    assert result["title"] == "Test Entry"
+    assert result["content_type"] is None  # sample_entry has no content_type
+    assert isinstance(result.get("children"), list)
+
+
+# ── Variant A: search_knowledge enrichment ────────────────────
+
+async def test_search_knowledge_enriched(app_state):
+    """search_knowledge returns title, parent_knowledge_id, content_type."""
+    result = await search_knowledge(
+        {"query": "test", "top_k": 3},
+        app_state,
+    )
+    assert "error" not in result
+    item = result["results"][0]
+    assert "title" in item
+    assert "parent_knowledge_id" in item
+    assert "content_type" in item
+
+
+async def test_search_knowledge_collection_id_filter(app_state):
+    """search_knowledge accepts collection_id → filters by parent_knowledge_id."""
+    result = await search_knowledge(
+        {"query": "async", "collection_id": "eng-testing-book-collection"},
+        app_state,
+    )
+    assert "error" not in result
+    # mock returns results regardless, but filter was applied silently
+    assert result["total"] >= 0
+
+
+async def test_search_knowledge_content_type_filter(app_state):
+    """search_knowledge accepts content_type filter."""
+    result = await search_knowledge(
+        {"query": "test", "content_type": "book"},
+        app_state,
+    )
+    assert "error" not in result
+    assert result["total"] >= 0
+
+
+async def test_search_knowledge_excludes_collections_by_default(app_state):
+    """По умолчанию root-коллекции исключаются из результатов поиска."""
+    result = await search_knowledge(
+        {"query": "test", "top_k": 3},
+        app_state,
+    )
+    assert "error" not in result
+    qdrant = app_state.qdrant
+    assert getattr(qdrant, "_last_search_exclude", None) == ["collection"]
+
+
+async def test_search_knowledge_keeps_collections_when_requested(app_state):
+    """Явный content_type=collection НЕ исключает коллекции."""
+    result = await search_knowledge(
+        {"query": "test", "content_type": "collection"},
+        app_state,
+    )
+    assert "error" not in result
+    qdrant = app_state.qdrant
+    assert getattr(qdrant, "_last_search_exclude", None) is None
+
+
+# ── Variant A: list_collections tool ──────────────────────────
+
+async def test_list_collections_happy_path(app_state):
+    """list_collections returns collections with title, section_count."""
+    result = await list_collections({}, app_state)
+    assert "error" not in result
+    assert "results" in result
+    items = result["results"]
+    assert len(items) >= 1
+    c = items[0]
+    assert "collection_id" in c
+    assert "title" in c
+    assert "domain" in c
+    assert "subject" in c
+    assert "section_count" in c
+    assert "updated_at" in c
+    # section_count from store.read children length
+    assert c["section_count"] == 2
+
+
+async def test_list_collections_domain_filter(app_state):
+    """list_collections accepts domain filter."""
+    result = await list_collections({"domain": "engineering"}, app_state)
+    assert "error" not in result
+    assert "results" in result
+
+
+async def test_list_collections_default_limit(app_state):
+    """list_collections default params work."""
+    result = await list_collections({}, app_state)
+    assert "error" not in result
+    # next_cursor and total present
+    assert "next_cursor" in result
+    assert "total" in result

@@ -99,8 +99,9 @@ class MarkdownStore:
     async def write_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
         """Записать готовую KnowledgeEntry на диск (без git-коммита).
 
-        Используется batch-импортом (Фаза 5) для записи секций с batched git-коммитами.
-        Git-коммиты делаются отдельно вызывающим кодом каждые IMPORT_BATCH_COMMIT секций.
+        Используется batch-импортом (Фаза 5) для записи секций.
+        Git-коммит делается вызывающим кодом ОДИН на импорт (в конце import_content) —
+        не на каждую секцию и не на каждый батч.
         """
         path = self._resolve_path(entry.file_path)
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -246,6 +246,7 @@ class QdrantClient:
         filters: dict | None = None,
         score_threshold: float = 0.0,
         with_vectors: bool = False,
+        exclude_content_types: list[str] | None = None,
     ) -> list[qmodels.ScoredPoint]:
         """Семантический поиск по вектору.
 
@@ -255,13 +256,16 @@ class QdrantClient:
             filters: dict {key: value} для payload-фильтрации.
             score_threshold: минимальный cosine-порог.
             with_vectors: вернуть векторы в результатах (для dup-gate).
+            exclude_content_types: исключить точки с этими content_type
+                (например ["collection"] — root-заглушки книг из результатов поиска).
 
         Returns:
             list[qmodels.ScoredPoint] с payload (и векторами если with_vectors=True).
         """
         query_filter = None
+        must_conditions = []
+        must_not_conditions = []
         if filters:
-            must_conditions = []
             for key, value in filters.items():
                 if isinstance(value, list):
                     must_conditions.append(
@@ -277,8 +281,19 @@ class QdrantClient:
                             match=qmodels.MatchValue(value=value),
                         )
                     )
-            if must_conditions:
-                query_filter = qmodels.Filter(must=must_conditions)
+        if exclude_content_types:
+            must_not_conditions.extend(
+                qmodels.FieldCondition(
+                    key="content_type",
+                    match=qmodels.MatchValue(value=ct),
+                )
+                for ct in exclude_content_types
+            )
+        if must_conditions or must_not_conditions:
+            query_filter = qmodels.Filter(
+                must=must_conditions or None,
+                must_not=must_not_conditions or None,
+            )
 
         results = self._client.query_points(
             collection_name=COLLECTION_NAME,
@@ -327,6 +342,35 @@ class QdrantClient:
             with_vectors=False,
         )
         return results[0]  # (points, next_page_offset)
+
+    def scroll(
+        self,
+        scroll_filter: qmodels.Filter | None = None,
+        limit: int = 100,
+        offset: object = None,
+        with_payload: list[str] | bool = True,
+        with_vectors: bool = False,
+    ) -> tuple[list[qmodels.Record], object]:
+        """Scroll по payload-фильтру (для list_collections и обходов).
+
+        Args:
+            scroll_filter: Qdrant Filter (payload-условия).
+            limit: число точек за один scroll.
+            offset: курсор пагинации (None = с начала).
+            with_payload: список полей payload или True (все).
+            with_vectors: возвращать ли векторы.
+
+        Returns:
+            (points, next_page_offset) — как в qdrant SDK.
+        """
+        return self._client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=scroll_filter,
+            limit=limit,
+            offset=offset,
+            with_payload=with_payload,
+            with_vectors=with_vectors,
+        )
 
     # ── Reconciliation helpers ────────────────────────────
 

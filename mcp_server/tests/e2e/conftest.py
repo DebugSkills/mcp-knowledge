@@ -30,8 +30,10 @@ os.environ.setdefault("DLQ_DIR", "/tmp/test-e2e-dlq")
 E2E_COLLECTION = "knowledge_e2e"
 QDRANT_REST_URL = "http://localhost:6333"
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL = "mxbai-embed-large"
-VECTOR_DIM = 1024
+# Текущий embedder проекта (после миграции dim 1024→768, коммит 352b54d):
+# nomic-embed-text (768-dim). e2e-коллекция создаётся с dim из schema (768).
+OLLAMA_MODEL = "nomic-embed-text"
+VECTOR_DIM = 768
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -232,3 +232,204 @@ async def test_connect_error_returns_russian_message(conn_error_client):
     """ConnectError должен возвращать сообщение на русском."""
     with pytest.raises(RuntimeError, match="Сервер недоступен"):
         await conn_error_client.initialize()
+
+
+# ── Tests: get_progress (Фаза 13.9) ───────────────────────────
+
+
+@pytest.fixture
+def progress_transport():
+    """Транспорт с поддержкой GET /imports/{id}/progress."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "/imports/" in str(request.url) and "/progress" in str(request.url):
+            import_id = str(request.url).split("/imports/")[1].split("/progress")[0]
+            if import_id == "unknown":
+                return httpx.Response(404, json={"detail": "unknown import_id"})
+            return httpx.Response(
+                200,
+                json={
+                    "import_id": import_id,
+                    "status": "running",
+                    "phase": "writing",
+                    "imported": 52,
+                    "total": 100,
+                    "failed": 1,
+                    "messages": [
+                        {"t": "22:34:05", "level": "info", "text": "import_content: 50/100 sections written, git commit"},
+                    ],
+                    "started_at": "2026-08-06T22:30:00+00:00",
+                    "updated_at": "2026-08-06T22:34:05+00:00",
+                },
+            )
+        # Fallback to mock transport behavior for /mcp
+        body = json.loads(request.content) if request.content else {}
+        method = body.get("method", "")
+        rid = body.get("id", 1)
+        if method == "initialize":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2024-11-05"}})
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": rid, "result": {"ok": True}})
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.fixture
+def progress_client(progress_transport):
+    """MCPClient с progress-транспортом."""
+    c = httpx.AsyncClient(transport=progress_transport, base_url="http://test")
+    return MCPClient(base_url="http://test", client=c)
+
+
+@pytest.mark.asyncio
+async def test_get_progress_parses_json(progress_client):
+    """get_progress возвращает распарсенный JSON-снапшот."""
+    snap = await progress_client.get_progress("test-id")
+    assert snap is not None
+    assert snap["import_id"] == "test-id"
+    assert snap["status"] == "running"
+    assert snap["imported"] == 52
+    assert snap["total"] == 100
+    assert snap["failed"] == 1
+    assert len(snap["messages"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_progress_returns_none_on_404(progress_client):
+    """get_progress возвращает None при 404 (неизвестный import_id)."""
+    snap = await progress_client.get_progress("unknown")
+    assert snap is None
+
+
+@pytest.mark.asyncio
+async def test_get_progress_sends_api_key(progress_transport):
+    """get_progress с api_key шлёт заголовок X-API-Key."""
+
+    captured_headers = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_headers.update(dict(request.headers))
+        return httpx.Response(200, json={"import_id": "x", "status": "done", "imported": 1, "total": 1, "failed": 0, "messages": [], "started_at": "", "updated_at": ""})
+
+    transport = httpx.MockTransport(handler)
+    c = httpx.AsyncClient(transport=transport, base_url="http://test")
+    client = MCPClient(base_url="http://test", api_key="key-123", client=c)
+    await client.get_progress("x")
+    assert "x-api-key" in {k.lower() for k in captured_headers}
+
+
+# ── Tests: helper methods (Variant A: Surface & Enrich) ───────
+
+
+@pytest.fixture
+def enriched_transport():
+    """Транспорт с реалистичными ответами для get_entry, search_knowledge, list_collections."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        method = body.get("method", "")
+        rid = body.get("id", 1)
+
+        if method == "tools/call":
+            params = body.get("params", {})
+            tool_name = params.get("name", "")
+            args = params.get("arguments", {})
+
+            if tool_name == "get_entry":
+                kid = args.get("knowledge_id", "")
+                inner = {
+                    "knowledge_id": kid,
+                    "domain": "engineering",
+                    "subject": "testing",
+                    "title": "Test Book",
+                    "content_type": "collection",
+                    "parent_knowledge_id": None,
+                    "sequence_number": None,
+                    "children": [
+                        {"knowledge_id": "eng-test-ch01", "title": "Chapter 1", "sequence_number": 1},
+                    ],
+                    "content": "# Test Book\n\nContent.",
+                }
+            elif tool_name == "search_knowledge":
+                inner = {
+                    "query": args.get("query", ""),
+                    "results": [
+                        {
+                            "knowledge_id": "eng-test-ch01",
+                            "chunk_id": "chunk-1",
+                            "content": "Test content",
+                            "score": 0.95,
+                            "section_header": "# Chapter 1",
+                            "domain": "engineering",
+                            "subject": "testing",
+                            "tags": ["test"],
+                            "title": "Chapter 1",
+                            "parent_knowledge_id": "eng-test-collection",
+                            "content_type": "book",
+                        },
+                    ],
+                    "total": 1,
+                }
+            elif tool_name == "list_collections":
+                inner = {
+                    "results": [
+                        {
+                            "collection_id": "eng-test-book-collection",
+                            "title": "Test Book",
+                            "domain": "engineering",
+                            "subject": "testing",
+                            "project": "test-project",
+                            "tags": ["test"],
+                            "section_count": 2,
+                            "updated_at": "2026-01-01T00:00:00+00:00",
+                        },
+                    ],
+                    "next_cursor": None,
+                    "total": 1,
+                }
+            else:
+                inner = {"ok": True}
+
+            wrapped = {"content": [{"type": "text", "text": json.dumps(inner)}]}
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": rid, "result": wrapped})
+
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": rid, "result": {"ok": True}})
+
+    return httpx.MockTransport(handler)
+
+
+@pytest.fixture
+def enriched_client(enriched_transport):
+    """MCPClient с enriched-транспортом (реалистичные ответы)."""
+    c = httpx.AsyncClient(transport=enriched_transport, base_url="http://test")
+    return MCPClient(base_url="http://test", client=c)
+
+
+@pytest.mark.asyncio
+async def test_get_entry_helper_unwraps(enriched_client):
+    """get_entry helper возвращает распарсенный dict."""
+    result = await enriched_client.get_entry("eng-test-book-collection")
+    assert isinstance(result, dict)
+    assert result["knowledge_id"] == "eng-test-book-collection"
+    assert result["title"] == "Test Book"
+    assert result["content_type"] == "collection"
+    assert len(result["children"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_search_knowledge_helper_unwraps(enriched_client):
+    """search_knowledge helper возвращает results list."""
+    result = await enriched_client.search_knowledge("test query", top_k=3)
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0]["title"] == "Chapter 1"
+    assert result[0]["parent_knowledge_id"] == "eng-test-collection"
+
+
+@pytest.mark.asyncio
+async def test_list_collections_helper_unwraps(enriched_client):
+    """list_collections helper возвращает results list."""
+    result = await enriched_client.list_collections(domain="engineering")
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0]["collection_id"] == "eng-test-book-collection"
+    assert result[0]["section_count"] == 2

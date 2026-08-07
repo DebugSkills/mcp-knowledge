@@ -2,13 +2,32 @@
 
 get_entry: store.read(knowledge_id) → полная запись (frontmatter + content).
 get_knowledge_map: knowledge_index.get_map(domain?) → структурная карта (root или per-section).
+
+Variant A (13.10): get_entry возвращает также title (из markdown-заголовка),
+content_type, parent_knowledge_id, sequence_number и children (TOC для коллекций).
 """
 
 from __future__ import annotations
 
 import logging
+import re
 
 logger = logging.getLogger("mcp_knowledge.tools.read")
+
+_HEADING_RE = re.compile(r"^#{1,6}\s+(.+)$", re.MULTILINE)
+
+
+def _derive_title(content: str, fallback: str) -> str:
+    """Извлечь title из первого markdown-заголовка контента.
+
+    Работает для корневых коллекций (`# {title}` в теле) и секций
+    (заголовок секции в теле). Fallback — на переданное значение.
+    """
+    if content:
+        m = _HEADING_RE.search(content)
+        if m:
+            return m.group(1).strip()
+    return fallback
 
 
 async def get_entry(params: dict, app_state) -> dict:
@@ -24,6 +43,13 @@ async def get_entry(params: dict, app_state) -> dict:
         return {"error": f"Knowledge entry not found: '{knowledge_id}'"}
 
     fm = entry.frontmatter
+    children = []
+    for child in fm.children or []:
+        children.append({
+            "knowledge_id": child.get("knowledge_id", ""),
+            "title": child.get("title", ""),
+            "sequence_number": child.get("sequence_number"),
+        })
     return {
         "knowledge_id": fm.knowledge_id,
         "domain": fm.domain,
@@ -35,6 +61,12 @@ async def get_entry(params: dict, app_state) -> dict:
         "created_at": fm.created_at.isoformat(),
         "updated_at": fm.updated_at.isoformat(),
         "content": entry.content,
+        # Variant A (13.10): информативные поля для UI (список книг + поиск)
+        "title": _derive_title(entry.content, fm.knowledge_id),
+        "content_type": getattr(fm, "content_type", None),
+        "parent_knowledge_id": getattr(fm, "parent_knowledge_id", None),
+        "sequence_number": getattr(fm, "sequence_number", None),
+        "children": children,
     }
 
 

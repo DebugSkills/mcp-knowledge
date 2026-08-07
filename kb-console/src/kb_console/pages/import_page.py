@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -22,13 +23,15 @@ from ..core.mcp_client import MCPClient
 SUPPORTED_EXTENSIONS = {".md", ".markdown", ".txt"}
 # Максимальный размер файла для импорта, байт (50 МБ — учебники).
 MAX_FILE_SIZE = 52_428_800
-# Таймаут HTTP для вызова import_content (5 минут — большой файл/учебник).
-IMPORT_TIMEOUT = 300.0
+# Таймаут HTTP для вызова import_content (30 минут — крупные учебники; 7032 секций ≈ 14 мин).
+IMPORT_TIMEOUT = 1800.0
 # Таймаут для вызова analyze_content (60 секунд — LLM).
 ANALYZE_TIMEOUT = 60.0
 # Фрагмент для AI-анализа (синхронизирован с серверным ANALYZE_FRAGMENT_CHARS) —
 # полный контент не отправляется: и скорость, и размер запроса.
 ANALYZE_FRAGMENT_CHARS = 8000
+# Интервал опроса прогресса импорта (сек).
+PROGRESS_POLL_INTERVAL = 1.0
 
 
 def _read_uploaded_file(name: str, data: bytes) -> tuple[str | None, str | None]:
@@ -171,6 +174,8 @@ def build_import() -> None:
     timer_label = ui.label("").classes("text-caption text-grey")
     timer_label.visible = False
     _timer: ui.timer | None = None
+    # 13.9: таймер опроса живого прогресса импорта
+    _progress_timer: ui.timer | None = None
 
     def _start_timer() -> None:
         """Живой секундомер: ⏱ N с, обновляется каждую секунду."""
@@ -178,7 +183,16 @@ def build_import() -> None:
         start = time.monotonic()
         timer_label.visible = True
         timer_label.set_text("⏱ 0 с")
-        _timer = ui.timer(1.0, lambda: timer_label.set_text(f"⏱ {time.monotonic() - start:.0f} с"))
+
+        def _tick() -> None:
+            # Defensive: при навигации/перезагрузке вкладки parent slot может
+            # быть удалён — проглатываем, чтобы не плодить RuntimeError в логах.
+            try:
+                timer_label.set_text(f"⏱ {time.monotonic() - start:.0f} с")
+            except Exception:
+                pass
+
+        _timer = ui.timer(1.0, _tick)
 
     def _stop_timer() -> None:
         nonlocal _timer
@@ -190,13 +204,64 @@ def build_import() -> None:
     def _cleanup_timer() -> None:
         """Отмена секундомера при закрытии/перезагрузке вкладки
         (иначе RuntimeError: parent slot deleted в логах)."""
-        nonlocal _timer
+        nonlocal _timer, _progress_timer
         if _timer is not None:
             _timer.cancel()
             _timer = None
+        if _progress_timer is not None:
+            _progress_timer.cancel()
+            _progress_timer = None
     ui.context.client.on_disconnect(_cleanup_timer)
 
     result_container = ui.column().classes("w-full")
+
+    # 13.9: контейнер живого прогресса импорта (прогресс-бар % + панель логов)
+    progress_container = ui.column().classes("w-full q-mb-md")
+    progress_container.visible = False
+
+    def _stop_progress_poll() -> None:
+        """Остановить опрос прогресса и скрыть контейнер."""
+        nonlocal _progress_timer
+        if _progress_timer is not None:
+            _progress_timer.cancel()
+            _progress_timer = None
+        progress_container.visible = False
+        progress_container.clear()
+
+    _LEVEL_COLORS = {
+        "info": "text-grey",
+        "warning": "text-orange",
+        "error": "text-negative",
+    }
+
+    def _render_progress(snapshot: dict) -> None:
+        """Отрисовать прогресс-бар % и панель логов (реальные серверные строки)."""
+        progress_container.clear()
+        imported = snapshot.get("imported", 0)
+        total = snapshot.get("total", 0)
+        failed = snapshot.get("failed", 0)
+        status = snapshot.get("status", "running")
+        percent = (imported / total * 100) if total else 0
+        done = status in ("done", "error")
+        with progress_container:
+            ui.label(
+                f"📊 Секция {imported}/{total} ({percent:.0f}%)"
+                + (f"  ·  ошибок: {failed}" if failed else "")
+                + (f"  ·  {status}" if done else "")
+            ).classes("text-body2")
+            ui.linear_progress(
+                value=(imported / total) if total else 0,
+            ).props('rounded').classes("w-full")
+            msgs = snapshot.get("messages", [])
+            if msgs:
+                with ui.column().classes("w-full q-mt-xs gap-0"):
+                    for m in msgs[-8:]:
+                        level = m.get("level", "info")
+                        color = _LEVEL_COLORS.get(level, "text-grey")
+                        ui.label(
+                            f"[{m.get('t', '')}] {m.get('text', '')}"
+                        ).classes(f"text-caption font-mono {color}")
+
 
     # ── Analyze handler (НОВЫЙ) ───────────────────────────
     async def do_analyze() -> None:
@@ -248,7 +313,7 @@ def build_import() -> None:
 
     # ── Import handler ────────────────────────────────────
     async def do_import() -> None:
-        nonlocal pending_file
+        nonlocal pending_file, _progress_timer
 
         # Контент: из pending_file или textarea
         if pending_file is not None:
@@ -278,6 +343,9 @@ def build_import() -> None:
         }
         if tags:
             params["tags"] = tags
+        # 13.9: идентификатор импорта для живого прогресса (poll GET /imports/{id}/progress)
+        import_id = str(uuid.uuid4())
+        params["import_id"] = import_id
 
         # Блокируем кнопки, показываем спиннер
         import_btn.disable()
@@ -292,6 +360,21 @@ def build_import() -> None:
             api_key=MCP_API_KEY,
             timeout=IMPORT_TIMEOUT,
         )
+        # 13.9: старт живого прогресса — поллинг GET /imports/{id}/progress
+        progress_container.visible = True
+        progress_container.clear()
+
+        async def _poll_once() -> None:
+            nonlocal _progress_timer
+            try:
+                snapshot = await client.get_progress(import_id)
+                if snapshot is not None:
+                    _render_progress(snapshot)
+            except Exception:
+                pass  # graceful: no crash on transient poll error
+
+        _progress_timer = ui.timer(PROGRESS_POLL_INTERVAL, _poll_once)
+
         try:
             result = await client.tools_call("import_content", params)
 
@@ -355,6 +438,7 @@ def build_import() -> None:
             analyze_btn.enable()
             spinner.visible = False
             _stop_timer()
+            _stop_progress_poll()
             await client.close()
 
     import_btn.on_click(do_import)

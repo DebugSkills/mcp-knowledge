@@ -253,3 +253,119 @@ Functions should be small. They should do one thing and do it well.
             app_state,
         )
         assert "error" in result
+
+
+# ═══════════════════════════════════════════════════════════════
+# Фаза 13.9: ImportProgressTracker integration
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestImportWithProgressTracker:
+    """Интеграционные тесты: import_content с ImportProgressTracker."""
+
+    SAMPLE_BOOK = """# Test Book
+
+## Chapter 1: Start
+Content of chapter one.
+
+## Chapter 2: Middle
+Content of chapter two.
+
+## Chapter 3: End
+Content of chapter three.
+"""
+
+    @pytest.mark.asyncio
+    async def test_import_with_tracker_records_progress(
+        self, real_store, mock_pipeline_integ, mock_token_counter
+    ):
+        """import_content с import_id записывает прогресс в tracker."""
+        from mcp_server.progress import ImportProgressTracker
+        from mcp_server.tools.content import import_content
+
+        tracker = ImportProgressTracker()
+        app_state = MagicMock()
+        app_state.store = real_store
+        app_state.pipeline = mock_pipeline_integ
+        app_state.knowledge_index = MagicMock()
+        app_state.knowledge_index.update_section = MagicMock()
+        app_state.import_progress = tracker
+
+        import_id = "test-progress-001"
+        result = await import_content(
+            {
+                "content": self.SAMPLE_BOOK,
+                "content_type": "book",
+                "domain": "test",
+                "subject": "progress",
+                "title": "Progress Test",
+                "import_id": import_id,
+            },
+            app_state,
+        )
+
+        assert result["imported"] >= 2
+        snap = tracker.get(import_id)
+        assert snap is not None
+        assert snap["status"] == "done"
+        assert snap["imported"] == result["imported"]
+        assert snap["total"] >= result["imported"]
+        # Должна быть хотя бы одна log-строка с "sections written"
+        assert len(snap["messages"]) > 0
+        sections_msg = [m for m in snap["messages"] if "sections written" in m.get("text", "")]
+        assert len(sections_msg) >= 1, f"Expected 'sections written' in messages: {snap['messages']}"
+
+    @pytest.mark.asyncio
+    async def test_import_without_import_id_does_not_crash(
+        self, real_store, mock_pipeline_integ, mock_token_counter
+    ):
+        """import_content без import_id НЕ падает (tracker — опциональный)."""
+        from mcp_server.tools.content import import_content
+
+        app_state = MagicMock()
+        app_state.store = real_store
+        app_state.pipeline = mock_pipeline_integ
+        app_state.knowledge_index = MagicMock()
+        app_state.knowledge_index.update_section = MagicMock()
+
+        result = await import_content(
+            {
+                "content": self.SAMPLE_BOOK,
+                "content_type": "book",
+                "domain": "test",
+                "subject": "no-progress",
+                "title": "No Progress Test",
+            },
+            app_state,
+        )
+
+        assert result["imported"] >= 2
+        assert result["failed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_import_with_tracker_but_no_import_progress_on_state(
+        self, real_store, mock_pipeline_integ, mock_token_counter
+    ):
+        """import_content с import_id но без tracker на app_state → не падает."""
+        from mcp_server.tools.content import import_content
+
+        app_state = MagicMock()
+        app_state.store = real_store
+        app_state.pipeline = mock_pipeline_integ
+        app_state.knowledge_index = MagicMock()
+        app_state.knowledge_index.update_section = MagicMock()
+        # НЕ устанавливаем app_state.import_progress
+
+        result = await import_content(
+            {
+                "content": self.SAMPLE_BOOK,
+                "content_type": "book",
+                "domain": "test",
+                "subject": "no-tracker",
+                "title": "No Tracker Test",
+                "import_id": "no-tracker-001",
+            },
+            app_state,
+        )
+
+        assert result["imported"] >= 2

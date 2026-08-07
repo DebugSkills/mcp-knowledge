@@ -36,7 +36,7 @@ faulthandler.enable()
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 
 from .auth import AuthMiddleware
 from .config import settings
@@ -51,6 +51,7 @@ from .health import (
 from .indexing import IndexingPipeline, MarkdownChunker
 from .mcp_handler import handle_mcp_request
 from .metrics import metrics_endpoint, set_embed_backend
+from .progress import ImportProgressTracker
 from .rate_limit import TokenBucketLimiter
 from .storage import MarkdownStore, QdrantClient
 
@@ -258,6 +259,10 @@ async def lifespan(app: FastAPI):
                  app.state.rate_limiter_read.burst_size,
                  app.state.rate_limiter_write.burst_size)
 
+    # 13.9: In-memory progress tracker for live import progress (polling)
+    app.state.import_progress = ImportProgressTracker()
+    logger.info("📊 ImportProgressTracker initialized (max_messages=50, ttl=600s)")
+
     elapsed = _time.monotonic() - _start_ts
     rss_end = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     logger.info("[START] ready backend=%s elapsed=%.1fs rss=%.0f MB",
@@ -303,3 +308,26 @@ async def mcp_endpoint(request: Request):
 async def metrics_route(request: Request):
     """Prometheus /metrics endpoint — метрики MCP Knowledge Server."""
     return await metrics_endpoint(request)
+
+
+# 13.9: Live import progress polling endpoint
+@app.get("/imports/{import_id}/progress")
+async def import_progress(import_id: str, request: Request):
+    """GET /imports/{import_id}/progress — снапшот прогресса импорта.
+
+    Возвращает JSON с полями: import_id, status, phase, imported, total,
+    failed, messages[], started_at, updated_at.
+
+    Auth: defence-in-depth — проверяет request.state.auth (установлен
+    AuthMiddleware). GET-запросы пропускаются middleware, но мы проверяем
+    здесь для консистентности с /mcp.
+    """
+    auth = getattr(request.state, "auth", None)
+    if auth is None or not getattr(auth, "authenticated", False):
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    tracker = getattr(request.app.state, "import_progress", None)
+    snapshot = tracker.get(import_id) if tracker else None
+    if snapshot is None:
+        raise HTTPException(404, "unknown import_id")
+    return snapshot

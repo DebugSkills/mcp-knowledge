@@ -1,4 +1,9 @@
-"""Страница «Поиск» — семантический поиск по базе знаний."""
+"""Страница «Поиск» — семантический поиск по базе знаний.
+
+Variant A (13.10): информативные результаты — Title (не slug), Книга (parent
+коллекция), Score, сниппет контента, кнопка «Открыть книгу» (диалог с TOC).
+Кэш названий книг: один list_collections на первую выдачу (без N+1).
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,24 @@ from nicegui import ui
 
 from ..config import MCP_API_KEY, MCP_SERVER_URL
 from ..core.mcp_client import MCPClient
+from .books import show_book_dialog
+
+# Модульный кэш: collection_id → title книги (лениво заполняется list_collections).
+_book_title_cache: dict[str, str] = {}
+
+
+async def _ensure_book_cache(client: MCPClient) -> None:
+    """Заполнить кэш названий книг один раз (если ещё пуст)."""
+    if _book_title_cache:
+        return
+    try:
+        books = await client.list_collections()
+        for b in books:
+            cid = b.get("collection_id")
+            if cid:
+                _book_title_cache[cid] = b.get("title") or cid
+    except Exception:
+        pass  # кэш опционален — результаты покажутся и без него
 
 
 def build_search() -> None:
@@ -37,6 +60,7 @@ def build_search() -> None:
 
         client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
         try:
+            await _ensure_book_cache(client)
             result = await client.tools_call(
                 "search_knowledge",
                 {"query": query, "top_k": int(top_k_input.value or 5)},
@@ -57,22 +81,29 @@ def build_search() -> None:
 
                 ui.label(f"Найдено результатов: {len(items)}").classes("text-subtitle1 q-mt-md")
 
-                columns = [
-                    {"name": "title", "label": "Заголовок", "field": "title", "sortable": True, "align": "left"},
-                    {"name": "score", "label": "Score", "field": "score", "sortable": True, "align": "left"},
-                    {"name": "domain", "label": "Домен", "field": "domain", "sortable": True, "align": "left"},
-                    {"name": "subject", "label": "Предмет", "field": "subject", "sortable": True, "align": "left"},
-                ]
-                rows = [
-                    {
-                        "title": it.get("title", it.get("knowledge_id", "—")),
-                        "score": round(it.get("score", 0), 4) if "score" in it else "—",
-                        "domain": it.get("domain", "—"),
-                        "subject": it.get("subject", "—"),
-                    }
-                    for it in items
-                ]
-                ui.table(columns=columns, rows=rows, row_key="title").classes("w-full")
+                for it in items:
+                    title = it.get("title") or it.get("section_header") or it.get("knowledge_id", "—")
+                    book_id = it.get("parent_knowledge_id")
+                    book = _book_title_cache.get(book_id, "—") if book_id else "—"
+                    score = round(it.get("score", 0), 4) if "score" in it else "—"
+                    excerpt = (it.get("content") or "")[:200].strip()
+
+                    async def _open(cid: str = book_id, btitle: str = book) -> None:
+                        if cid:
+                            await show_book_dialog(cid, btitle)
+                        else:
+                            ui.notify("Секция не привязана к книге", type="warning")
+
+                    with ui.card().classes("w-full q-mt-sm"), ui.row().classes("items-center w-full no-wrap"), ui.column().classes("flex-1"):
+                        ui.label(title).classes("text-subtitle1")
+                        ui.label(
+                            f"📖 {book}  ·  {it.get('domain', '—')}/{it.get('subject', '—')}"
+                            f"  ·  score: {score}"
+                        ).classes("text-caption text-grey")
+                        if excerpt:
+                            ui.label(f"…{excerpt}…").classes("text-caption text-grey-7")
+                        if book_id:
+                            ui.button("Открыть книгу", on_click=_open, icon="menu_book").props("flat")
 
         except Exception as exc:
             ui.notify(f"Ошибка поиска: {exc}", type="negative")

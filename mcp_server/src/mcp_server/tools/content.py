@@ -29,7 +29,22 @@ logger = logging.getLogger("mcp_knowledge.tools.content")
 
 # ── Конфигурация ──────────────────────────────────────────
 
-IMPORT_BATCH_COMMIT = 10  # 1 git-коммит на N секций
+# Частота прогресс-строк «N/M sections written» в логе/tracker (НЕ git-коммитов!).
+# Git-коммит делается ОДИН на книгу в конце импорта — иначе на 7000-секционную книгу
+# уходило ~700 коммитов (batch #1..#700) и кеш .git переполнялся.
+IMPORT_BATCH_COMMIT = 10
+
+
+# ── Progress tracker helper (Фаза 13.9) ───────────────────
+
+def _p(tracker, import_id: str, method: str, *args) -> None:  # type: ignore[no-untyped-def]
+    """Best-effort вызов метода tracker'а — никогда не падает."""
+    if tracker is None or not import_id:
+        return
+    try:
+        getattr(tracker, method)(import_id, *args)
+    except Exception:
+        pass
 
 
 async def _collect_quality_report(
@@ -128,9 +143,13 @@ async def import_content(params: dict, app_state) -> dict:
     tags = params.get("tags", [])
     cross_subjects = params.get("cross_subjects", [])
     
+    import_id = params.get("import_id", "")
     wait_for_index = params.get("wait_for_index", False)
     cleanup_orphans = params.get("cleanup_orphans", False)
     quality_checks = params.get("quality_checks", True)  # 6.4: опциональное отключение для mass-import
+
+    # ── Progress tracker (Фаза 13.9) ────────────────────────
+    tracker = getattr(app_state, "import_progress", None)
 
     # ── Валидация обязательных параметров ──────────────────
     quality_issues: list[dict] = []
@@ -183,6 +202,12 @@ async def import_content(params: dict, app_state) -> dict:
         content_type, domain, subject, len(content.encode("utf-8")) / 1024, len(sections),
     )
 
+    # ── Progress tracker: start (Фаза 13.9) ─────────────────
+    _p(tracker, import_id, "start", len(sections), {"file": params.get("title", ""), "content_type": content_type})
+    _p(tracker, import_id, "log", "info",
+       f"import_content: decomposition -> {len(sections)} sections (type={content_type})")
+    _p(tracker, import_id, "set_phase", "collection_created")
+
     # ── Создание коллекции (linking) ────────────────────────
     section_titles = [s.title for s in sections]
     section_ids = [s.meta["knowledge_id"] for s in sections]
@@ -222,11 +247,15 @@ async def import_content(params: dict, app_state) -> dict:
         await store.write_entry(root_entry)
         await pipeline.enqueue(root_entry, wait_for_index=False)
         logger.info("import_content: root collection %s created", collection.knowledge_id)
+        _p(tracker, import_id, "log", "info",
+           f"import_content: root collection {collection.knowledge_id} created")
     except Exception as e:
         logger.error("Failed to write collection root: %s", e)
+        _p(tracker, import_id, "error", f"Failed to create collection root: {e}")
         return {"error": f"Failed to create collection root: {e}"}
 
     # Batch write детей
+    _p(tracker, import_id, "set_phase", "writing")
     for i, section in enumerate(sections):
         try:
             meta = section.meta
@@ -274,16 +303,17 @@ async def import_content(params: dict, app_state) -> dict:
                     logger.debug("Quality report collection skipped: %s", qe)
 
             imported += 1
+            _p(tracker, import_id, "section_done", section.sequence_number, section.title)
 
-            # Batch git-commit каждые IMPORT_BATCH_COMMIT секций
+            # Прогресс-строка каждые IMPORT_BATCH_COMMIT секций (лог + tracker).
+            # Без git-коммита: коммит ОДИН на книгу в конце (см. финальный flush ниже).
             if imported % IMPORT_BATCH_COMMIT == 0:
-                await store.flush(
-                    f"import_content: batch #{imported // IMPORT_BATCH_COMMIT}"
-                )
                 logger.info(
-                    "import_content: %d/%d sections written, git commit",
+                    "import_content: %d/%d sections written",
                     imported, len(sections),
                 )
+                _p(tracker, import_id, "log", "info",
+                   f"import_content: {imported}/{len(sections)} sections written")
 
         except Exception as e:
             failed += 1
@@ -296,16 +326,20 @@ async def import_content(params: dict, app_state) -> dict:
                 "import_content: section %d '%s' failed: %s",
                 section.sequence_number, section.title, e,
             )
+            _p(tracker, import_id, "section_failed", section.sequence_number, section.title, str(e))
             # Продолжаем best-effort
 
-    # Финальный git-коммит для оставшихся
-    if imported % IMPORT_BATCH_COMMIT != 0:
-        try:
-            await store.flush(
-                f"import_content: final batch (total {imported} sections)"
-            )
-        except Exception:
-            pass  # non-fatal
+    # Финальный git-коммит — ОДИН на книгу (всегда, независимо от числа секций).
+    # Ранее: по flush на каждые 10 секций → ~700 коммитов на большой импорт.
+    try:
+        await store.flush(
+            f"import_content: {collection.knowledge_id} ({imported} sections)"
+        )
+    except Exception:
+        pass  # non-fatal (пустой коммит при imported=0 — GitCommandError, не роняем)
+    # Итоговая строка прогресса (для малых импортов, где промежуточные строки не срабатывали)
+    _p(tracker, import_id, "log", "info",
+       f"import_content: {imported}/{len(sections)} sections written")
 
     # ── INDEX.gen.yaml update (best-effort) ─────────────────
     if knowledge_index:
@@ -386,4 +420,9 @@ async def import_content(params: dict, app_state) -> dict:
         "[IMPORT] done collection=%s imported=%d failed=%d partial=%s indexed=%s",
         collection.knowledge_id, imported, failed, partial_success, indexed,
     )
+    _p(tracker, import_id, "done", {
+        "collection_id": collection.knowledge_id,
+        "imported": imported,
+        "failed": failed,
+    })
     return result

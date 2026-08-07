@@ -35,6 +35,7 @@ READ_TOOLS: set[str] = {
     "list_domains",
     "list_subjects",
     "list_projects",
+    "list_collections",  # read-only: список книг/коллекций (Фаза 13.10)
     "analyze_content",  # read-only: LLM/TF-IDF анализ без записи в хранилище (Фаза 13.8)
     "resources/list",
     "resources/read",
