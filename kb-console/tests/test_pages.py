@@ -9,11 +9,13 @@
 from __future__ import annotations
 
 import json
+from typing import ClassVar
 
 import httpx
 import pytest
 
 from kb_console.core.mcp_client import MCPClient
+from kb_console.pages.books import _find_section_child
 
 # ── Sanitize title (чистая функция, импортируется из реализации) ──
 
@@ -161,3 +163,38 @@ def test_components_init_exports():
     """components/__init__.py должен экспортировать render_header."""
     from kb_console.components import render_header
     assert callable(render_header)
+
+
+# ── _find_section_child (чистая функция, unit-тестируема) ──
+
+
+class TestFindSectionChild:
+    """Тесты функции поиска child в TOC по knowledge_id (Фаза 13.13)."""
+
+    CHILDREN: ClassVar[list[dict]] = [
+        {"knowledge_id": "sec-1", "title": "Section 1", "sequence_number": 0},
+        {"knowledge_id": "sec-2", "title": "Section 2", "sequence_number": 1},
+        {"knowledge_id": "sec-3", "title": "Section 3", "sequence_number": 2},
+    ]
+
+    def test_found(self):
+        """Возвращает child с matching knowledge_id."""
+        result = _find_section_child(self.CHILDREN, "sec-2")
+        assert result is not None
+        assert result["knowledge_id"] == "sec-2"
+        assert result["title"] == "Section 2"
+
+    def test_not_found(self):
+        """Возвращает None, если section_id отсутствует в children."""
+        result = _find_section_child(self.CHILDREN, "sec-nonexistent")
+        assert result is None
+
+    def test_none_section_id(self):
+        """section_id=None → None (backward-compat: Books-страница без фрагмента)."""
+        result = _find_section_child(self.CHILDREN, None)
+        assert result is None
+
+    def test_empty_children(self):
+        """Пустой список → None."""
+        result = _find_section_child([], "sec-1")
+        assert result is None

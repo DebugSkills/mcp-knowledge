@@ -27,19 +27,42 @@ from ..core.utils import _sanitize_title
 TOC_PAGE_SIZE = 100
 
 
+# ── Вспомогательные чистые функции ──
+
+def _find_section_child(children: list[dict], section_id: str | None) -> dict | None:
+    """Найти child в списке children по knowledge_id.
+
+    Вынесена из замыкания для unit-тестируемости (ui.* требует page-context).
+    Чистая функция, без зависимостей от NiceGUI.
+
+    Args:
+        children: Список children (dict с полем knowledge_id).
+        section_id: Искомый knowledge_id секции (или None).
+
+    Returns:
+        Найденный child-dict или None.
+    """
+    if section_id is None:
+        return None
+    return next((c for c in children if c.get("knowledge_id") == section_id), None)
+
+
 # ── Переиспользуемый рендер детали книги (для «Книги» и диалога «Поиска») ──
 
 async def render_book_detail(
     container: ui.element,
     client: MCPClient,
     collection_id: str,
+    initial_section_id: str | None = None,
 ) -> None:
-    """Отрисовать в container: заголовок книги + TOC (children, постранично) → контент секции.
+    """Отрисовать в container: TOC книги (постранично) или контент найденной секции.
 
     Args:
         container: Контейнер NiceGUI для рендера.
         client: MCPClient (собственный, не переиспользуемый).
         collection_id: knowledge_id коллекции.
+        initial_section_id: Если задан — открыть эту секцию вместо TOC
+            (Фаза 13.13: кнопка «Открыть фрагмент» в поиске).
     """
     container.clear()
     try:
@@ -120,14 +143,41 @@ async def render_book_detail(
                 ui.button("След. →", on_click=lambda: _render_toc_page(min(pages_count - 1, page + 1))) \
                     .props("flat dense").set_enabled(page < pages_count - 1)
 
-    _render_toc_page(0)
+    if initial_section_id:
+        child = _find_section_child(children, initial_section_id)
+        if child:
+            await _show_section(child)
+        else:
+            # Фрагмент может отсутствовать в TOC (импортирован отдельно, не в frontmatter.children).
+            # Грузим его напрямую по knowledge_id — иначе «Открыть фрагмент» покажет TOC (баг 13.13).
+            sec = None
+            try:
+                sec = await client.get_entry(initial_section_id)
+            except Exception:
+                sec = None
+            if sec and "error" not in sec:
+                await _show_section({
+                    "knowledge_id": initial_section_id,
+                    "title": sec.get("title", "Фрагмент"),
+                })
+            else:
+                _render_toc_page(0)
+                ui.notify("Фрагмент не найден в оглавлении — показана книга", type="warning")
+    else:
+        _render_toc_page(0)
 
 
-async def show_book_dialog(collection_id: str, title: str | None = None) -> None:
-    """Открыть модальный диалог с содержимым книги.
+async def show_book_dialog(collection_id: str, title: str | None = None, initial_section_id: str | None = None) -> None:
+    """Открыть модальный диалог с содержимым книги или конкретной секции.
 
     Диалог создаётся прямо здесь (как в search.py — проверенный паттерн).
     Non-persistent: крестик, Esc, клик по фону.
+
+    Args:
+        collection_id: knowledge_id коллекции (книги).
+        title: Заголовок диалога (опционально, fallback на collection_id).
+        initial_section_id: Если задан — открыть эту секцию вместо TOC
+            (Фаза 13.13: кнопка «Открыть фрагмент» в поиске).
     """
     import asyncio
     client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
@@ -173,7 +223,7 @@ async def show_book_dialog(collection_id: str, title: str | None = None) -> None
         with ui.row().classes("q-mt-md"):
             ui.button("Закрыть", on_click=_close).props("flat")
     dialog.on("hide", lambda: asyncio.create_task(client.close()))
-    await render_book_detail(detail_container, client, collection_id)
+    await render_book_detail(detail_container, client, collection_id, initial_section_id=initial_section_id)
     dialog.open()
 
 

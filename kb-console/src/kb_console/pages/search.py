@@ -1,7 +1,8 @@
 """Страница «Поиск» — семантический поиск по базе знаний.
 
-Variant A (13.10): информативные результаты — Title (не slug), Книга (parent
-коллекция), Score, сниппет контента, кнопка «Открыть книгу» (диалог с TOC).
+Variant A (13.10 → 13.13): информативные результаты — Title (не slug), Книга
+(parent коллекция), Score, сниппет контента, теги (ui.chip), кнопка
+«Открыть фрагмент» (диалог с секцией, не TOC).
 Кэш названий книг: один list_collections на первую выдачу (без N+1).
 """
 
@@ -83,14 +84,16 @@ def build_search() -> None:
 
                 for it in items:
                     title = it.get("title") or it.get("section_header") or it.get("knowledge_id", "—")
+                    knowledge_id = it.get("knowledge_id")          # ID найденного ФРАГМЕНТА (секции)
                     book_id = it.get("parent_knowledge_id")
                     book = _book_title_cache.get(book_id, "—") if book_id else "—"
                     score = round(it.get("score", 0), 4) if "score" in it else "—"
                     excerpt = (it.get("content") or "")[:200].strip()
+                    tags = it.get("tags") or []
 
-                    async def _open(cid: str = book_id, btitle: str = book) -> None:
+                    async def _open(cid: str = book_id, btitle: str = book, sid: str = knowledge_id) -> None:
                         if cid:
-                            await show_book_dialog(cid, btitle)
+                            await show_book_dialog(cid, btitle, initial_section_id=sid)
                         else:
                             ui.notify("Секция не привязана к книге", type="warning")
 
@@ -100,10 +103,16 @@ def build_search() -> None:
                             f"📖 {book}  ·  {it.get('domain', '—')}/{it.get('subject', '—')}"
                             f"  ·  score: {score}"
                         ).classes("text-caption text-grey")
+                        if tags:
+                            with ui.row().classes("wrap q-mt-xs"):
+                                for tag in tags[:8]:
+                                    ui.chip(tag).props("outline dense")
+                                if len(tags) > 8:
+                                    ui.label(f"+{len(tags) - 8}").classes("text-caption text-grey self-center")
                         if excerpt:
                             ui.label(f"…{excerpt}…").classes("text-caption text-grey-7")
                         if book_id:
-                            ui.button("Открыть книгу", on_click=_open, icon="menu_book").props("flat")
+                            ui.button("Открыть фрагмент", on_click=_open, icon="article").props("flat")
 
         except Exception as exc:
             ui.notify(f"Ошибка поиска: {exc}", type="negative")
