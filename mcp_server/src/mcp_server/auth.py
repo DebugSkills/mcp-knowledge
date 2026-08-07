@@ -37,6 +37,9 @@ READ_TOOLS: set[str] = {
     "list_projects",
     "list_collections",  # read-only: список книг/коллекций (Фаза 13.10)
     "analyze_content",  # read-only: LLM/TF-IDF анализ без записи в хранилище (Фаза 13.8)
+    "review_queue",  # read-only: топ устаревших секций (Фаза 13.14)
+    "review_queue_books",  # read-only: агрегат книг (Фаза 13.14)
+    "list_quality_issues",  # read-only: список quality issues (Фаза 13.14)
     "resources/list",
     "resources/read",
     "prompts/list",
@@ -49,6 +52,8 @@ WRITE_TOOLS: set[str] = {
     "update_entry",
     "delete_entry",
     "reindex",
+    "resolve_quality_issue",  # Фаза 13.14: мутирует Qdrant payload (deprecate/restore/merge)
+    "run_quality_scan",  # Фаза 13.14: скан + запись issues в БД
 }
 
 # ── Import tools (MCP_IMPORT_KEYS: read + import_content, без delete/reindex) ──

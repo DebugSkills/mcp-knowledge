@@ -255,3 +255,77 @@ class MCPClient:
         """Получить список MCP-промптов."""
         result = await self._call("prompts/list")
         return result.get("prompts", [])
+
+    # ── Quality tools (Фаза 13.14) ────────────────────────────
+
+    async def review_queue_books(
+        self, domain: str | None = None, subject: str | None = None, limit: int = 20
+    ) -> dict[str, Any]:
+        """Топ устаревших КНИГ (агрегат по parent_knowledge_id).
+
+        Returns:
+            {"books": [...], "total_books": N, "total_stale_sections": M}
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if domain:
+            params["domain"] = domain
+        if subject:
+            params["subject"] = subject
+        return await self.tools_call("review_queue_books", params)
+
+    async def run_quality_scan(self, domain: str | None = None) -> dict[str, Any]:
+        """Запустить quality scan.
+
+        Returns:
+            {"scanned": True, "metrics": {...}}
+        """
+        params: dict[str, Any] = {}
+        if domain:
+            params["domain"] = domain
+        return await self.tools_call("run_quality_scan", params)
+
+    async def resolve_quality_issue(
+        self,
+        action: str,
+        issue_id: str = "",
+        knowledge_id: str | None = None,
+        cascade: bool = False,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Разрешить quality issue (resolve/deprecate/restore/merge/ignore).
+
+        Args:
+            action: merge | deprecate | restore | resolve | ignore
+            issue_id: ID issue (опционально, если указан knowledge_id)
+            knowledge_id: прямая операция на запись (Фаза 13.14)
+            cascade: применить к дочерним секциям книги
+            reason: причина решения
+
+        Returns:
+            {"resolved": True/False, "cascade_affected": N, "side_effects": [...]}
+        """
+        params: dict[str, Any] = {"action": action, "reason": reason}
+        if issue_id:
+            params["issue_id"] = issue_id
+        if knowledge_id:
+            params["knowledge_id"] = knowledge_id
+        if cascade:
+            params["cascade"] = cascade
+        return await self.tools_call("resolve_quality_issue", params)
+
+    async def delete_entry(
+        self, knowledge_id: str, cascade: bool = False
+    ) -> dict[str, Any]:
+        """Удалить запись (soft-delete → .trash/ + Qdrant).
+
+        Args:
+            knowledge_id: ID записи
+            cascade: удалить также дочерние секции книги
+
+        Returns:
+            {"knowledge_id": ..., "deleted": True, "cascade_deleted": N}
+        """
+        params: dict[str, Any] = {"knowledge_id": knowledge_id}
+        if cascade:
+            params["cascade"] = cascade
+        return await self.tools_call("delete_entry", params)

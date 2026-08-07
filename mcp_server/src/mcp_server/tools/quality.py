@@ -1,8 +1,11 @@
 # ruff: noqa: BLE001
-"""Quality MCP Tools — review_queue, list_quality_issues, resolve_quality_issue, run_quality_scan (4.6+4.8).
+"""Quality MCP Tools — review_queue, review_queue_books, list_quality_issues, resolve_quality_issue, run_quality_scan (4.6+4.8+13.14).
 
 Thin wrappers: делегируют доменную логику в quality/ пакет.
 Регистрируются в tools/__init__.py → TOOLS + TOOL_HANDLERS.
+
+Фаза 13.14: +review_queue_books (агрегация по книгам), resolve_quality_issue
+расширен параметрами knowledge_id + cascade.
 """
 
 from __future__ import annotations
@@ -16,6 +19,10 @@ logger = logging.getLogger("mcp_knowledge.tools.quality")
 
 # ── Допустимые action для resolve_quality_issue ──────────────────────────────
 VALID_ACTIONS: frozenset[str] = frozenset({"merge", "deprecate", "restore", "resolve", "ignore"})
+
+# ── Константы пагинации ──────────────────────────────────────────────────────
+_SCROLL_BATCH = 1000  # точек за один scroll
+_MAX_BOOKS = 100  # макс. книг в ответе
 
 
 async def review_queue(params: dict, app_state) -> dict:
@@ -35,7 +42,7 @@ async def review_queue(params: dict, app_state) -> dict:
     limit = min(params.get("limit", 20), 100)
 
     try:
-        client = app_state.qdrant_client
+        client = app_state.qdrant
         # Qdrant scroll с фильтром и сортировкой по payload.staleness_score DESC
         from qdrant_client.models import FieldCondition, Filter, MatchValue, Range
 
@@ -61,7 +68,6 @@ async def review_queue(params: dict, app_state) -> dict:
 
         # Scroll все точки с staleness_score, затем сортируем в Python
         points, _ = client.scroll(
-            collection_name="knowledge",
             scroll_filter=scroll_filter,
             limit=limit * 3,  # берём с запасом для сортировки
             with_payload=True,
@@ -91,6 +97,166 @@ async def review_queue(params: dict, app_state) -> dict:
     except Exception as exc:
         logger.error("review_queue failed: %s", exc)
         return {"queue": [], "error": str(exc)}
+
+
+async def review_queue_books(params: dict, app_state) -> dict:
+    """Топ устаревших КНИГ (агрегат по parent_knowledge_id).
+
+    Фаза 13.14: paginated scroll всех точек с staleness_score,
+    группировка по parent_knowledge_id → per-book агрегат:
+    title, domain/subject, stale_fraction, max_score, total_sections, status.
+
+    В отличие от review_queue (индивидуальные секции), этот tool
+    возвращает КНИГИ — коллекции семантически связанных записей.
+
+    Args:
+        params:
+            domain (optional): фильтр по домену
+            subject (optional): фильтр по subject
+            limit (default 20): макс. число книг
+    """
+    domain = params.get("domain")
+    subject = params.get("subject")
+    limit = min(params.get("limit", 20), _MAX_BOOKS)
+
+    try:
+        client = app_state.qdrant
+        from qdrant_client.models import FieldCondition, Filter, MatchValue, Range
+
+        must_conditions: list[FieldCondition] = []
+        if domain:
+            must_conditions.append(
+                FieldCondition(key="domain", match=MatchValue(value=domain))
+            )
+        if subject:
+            must_conditions.append(
+                FieldCondition(key="subject", match=MatchValue(value=subject))
+            )
+
+        # Только точки с staleness_score
+        must_conditions.append(
+            FieldCondition(
+                key="staleness_score",
+                range=Range(gte=0.0),
+            )
+        )
+
+        scroll_filter = Filter(must=must_conditions) if must_conditions else None
+
+        # Paginated scroll — все точки с staleness_score (не limit*3!)
+        all_points: list = []
+        offset = None
+        while True:
+            points, next_offset = client.scroll(
+                scroll_filter=scroll_filter,
+                limit=_SCROLL_BATCH,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            all_points.extend(points)
+            if next_offset is None or len(points) == 0:
+                break
+            offset = next_offset
+
+        # Группировка по parent_knowledge_id
+        from collections import defaultdict
+
+        books: dict[str, dict] = defaultdict(lambda: {
+            "book_id": "",
+            "title": "",
+            "domain": "",
+            "subject": "",
+            "status": "published",
+            "total_sections": 0,
+            "stale_sections": 0,
+            "max_score": 0.0,
+            "top_sections": [],
+        })
+
+        for point in all_points:
+            payload = point.payload or {}
+            parent_id = payload.get("parent_knowledge_id")
+            if not parent_id:
+                # Точки без parent — самостоятельные записи (не секции книг)
+                continue
+
+            score = payload.get("staleness_score", 0.0)
+            kid = payload.get("knowledge_id", str(point.id))
+            section_title = (
+                payload.get("section_header")
+                or payload.get("title", "")
+                or kid
+            )
+
+            book = books[parent_id]
+            if not book["book_id"]:
+                book["book_id"] = parent_id
+                book["domain"] = payload.get("domain", "")
+                book["subject"] = payload.get("subject", "")
+                book["status"] = payload.get("status", "published")
+                # Title книги — из payload родительской записи (если есть)
+                # или subject/kid как fallback
+                book["title"] = (
+                    payload.get("book_title")
+                    or payload.get("subject", "")
+                    or parent_id
+                )
+
+            book["total_sections"] += 1
+            if score >= REVIEW_THRESHOLD:
+                book["stale_sections"] += 1
+                book["max_score"] = max(book["max_score"], score)
+                # Top-5 наиболее устаревших секций
+                book["top_sections"].append({
+                    "knowledge_id": kid,
+                    "title": section_title,
+                    "staleness_score": score,
+                    "reasons": payload.get("quality_flags", []),
+                    "updated_at": payload.get("updated_at", ""),
+                })
+
+        # Сортируем top_sections по score DESC и обрезаем до 5
+        for book in books.values():
+            book["top_sections"].sort(key=lambda s: s["staleness_score"], reverse=True)
+            book["top_sections"] = book["top_sections"][:5]
+            # Вычисляем долю
+            total = book["total_sections"]
+            book["stale_fraction"] = round(book["stale_sections"] / total, 3) if total > 0 else 0.0
+            # Title книги — получаем из первой секции или Qdrant
+            if not book["title"] or book["title"] == book["book_id"]:
+                # Пытаемся получить title из payload секции
+                for s in book["top_sections"]:
+                    if s.get("title"):
+                        book["title"] = book.get("domain", "") or book["book_id"]
+                        break
+
+        # Сортируем книги: сначала по stale_fraction DESC, затем по max_score DESC
+        sorted_books = sorted(
+            books.values(),
+            key=lambda b: (b["stale_fraction"], b["max_score"]),
+            reverse=True,
+        )
+
+        # Обрезаем до limit
+        result_books = sorted_books[:limit]
+
+        # Считаем total_stale_sections по ВСЕМ книгам (не только в выдаче)
+        total_stale = sum(b["stale_sections"] for b in books.values())
+
+        logger.info(
+            "[REVIEW] review_queue_books: %d books found, %d returned, %d stale sections total",
+            len(books), len(result_books), total_stale,
+        )
+        return {
+            "books": result_books,
+            "total_books": len(books),
+            "total_stale_sections": total_stale,
+        }
+
+    except Exception as exc:
+        logger.error("[REVIEW] review_queue_books failed: %s", exc)
+        return {"books": [], "error": str(exc)}
 
 
 async def list_quality_issues(params: dict, app_state) -> dict:
@@ -133,21 +299,28 @@ async def list_quality_issues(params: dict, app_state) -> dict:
 async def resolve_quality_issue(params: dict, app_state) -> dict:
     """Разрешить quality issue: resolve/ignore/merge/deprecate/restore.
 
+    Фаза 13.14: +knowledge_id (прямая операция без issue-lookup) + cascade
+    (применить ко всем секциям книги по parent_knowledge_id).
+
     Args:
         params:
-            issue_id (str): ID issue для разрешения
+            issue_id (str): ID issue для разрешения (или knowledge_id для прямой операции)
             action (str): merge | deprecate | restore | resolve | ignore
+            knowledge_id (optional str): прямая операция на запись (вместо issue_id)
             target_id (optional str): target knowledge_id для merge
             reason (optional str): причина решения
+            cascade (optional bool): применить к дочерним секциям (deprecate/restore)
     """
     issue_id = params.get("issue_id", "")
     action = params.get("action", "")
     target_id = params.get("target_id")
     reason = params.get("reason", "")
+    knowledge_id = params.get("knowledge_id")  # Фаза 13.14: прямая операция
+    cascade = params.get("cascade", False)      # Фаза 13.14: каскад на секции
 
     # Валидация
-    if not issue_id:
-        return {"resolved": False, "error": "issue_id is required"}
+    if not issue_id and not knowledge_id:
+        return {"resolved": False, "error": "Either issue_id or knowledge_id is required"}
 
     if action not in VALID_ACTIONS:
         return {
@@ -156,10 +329,14 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
         }
 
     side_effects: list[str] = []
+    cascade_affected = 0
 
     try:
-        # Look up issue to get knowledge_id for lifecycle actions (deprecate/restore/merge)
-        if action in ("deprecate", "restore", "merge"):
+        # Определяем knowledge_id: прямая передача ИЛИ lookup через issue
+        if knowledge_id:
+            # Прямая операция (Фаза 13.14) — без issue lookup
+            pass
+        elif action in ("deprecate", "restore", "merge"):
             all_issues = list_issues(limit=None)
             issue_entry = next((i for i in all_issues if i.issue_id == issue_id), None)
             if not issue_entry:
@@ -167,17 +344,21 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
             knowledge_id = issue_entry.knowledge_id
 
         if action == "resolve":
+            if not issue_id:
+                return {"resolved": False, "error": "issue_id is required for resolve action"}
             update_issue_status(issue_id, "resolved", reason)
             return {"resolved": True, "issue_id": issue_id, "status": "resolved", "side_effects": side_effects}
 
         elif action == "ignore":
+            if not issue_id:
+                return {"resolved": False, "error": "issue_id is required for ignore action"}
             update_issue_status(issue_id, "ignored", reason)
             return {"resolved": True, "issue_id": issue_id, "status": "ignored", "side_effects": side_effects}
 
         elif action == "deprecate":
             # Lifecycle: установить status=deprecated в Qdrant payload
             try:
-                qdrant = getattr(app_state, 'qdrant_client', None)
+                qdrant = getattr(app_state, 'qdrant', None)
                 if qdrant:
                     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
@@ -186,15 +367,36 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
                     )
                     payload = make_deprecation_payload_update()
                     qdrant.set_payload(
-                        collection_name="knowledge",
                         payload=payload,
                         points_filter=Filter(
                             must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
                         ),
                     )
                     side_effects.append(f"Qdrant payload status set to 'deprecated' for knowledge_id={knowledge_id}")
-                update_issue_status(issue_id, "resolved", reason or "deprecated")
-                return {"resolved": True, "issue_id": issue_id, "status": "resolved", "side_effects": side_effects}
+
+                    # Cascade: deprecate все дочерние секции (Фаза 13.14)
+                    if cascade:
+                        cascade_affected = _cascade_set_payload(
+                            qdrant, knowledge_id, payload, "deprecated"
+                        )
+                        side_effects.append(
+                            f"LIFECYCLE cascade: {cascade_affected} child sections set to 'deprecated' for book {knowledge_id}"
+                        )
+                        logger.info(
+                            "[LIFECYCLE] cascade deprecate: %d sections for book %s",
+                            cascade_affected, knowledge_id,
+                        )
+
+                if issue_id:
+                    update_issue_status(issue_id, "resolved", reason or "deprecated")
+                return {
+                    "resolved": True,
+                    "issue_id": issue_id,
+                    "knowledge_id": knowledge_id,
+                    "status": "resolved",
+                    "cascade_affected": cascade_affected,
+                    "side_effects": side_effects,
+                }
             except Exception as exc:
                 logger.error("deprecate lifecycle failed for %s: %s", knowledge_id, exc)
                 return {"resolved": False, "error": f"Deprecate failed: {exc}"}
@@ -202,22 +404,43 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
         elif action == "restore":
             # Lifecycle: установить status=published в Qdrant payload (reversibility)
             try:
-                qdrant = getattr(app_state, 'qdrant_client', None)
+                qdrant = getattr(app_state, 'qdrant', None)
                 if qdrant:
                     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
                     from mcp_server.quality.lifecycle import make_restore_payload_update
                     payload = make_restore_payload_update()
                     qdrant.set_payload(
-                        collection_name="knowledge",
                         payload=payload,
                         points_filter=Filter(
                             must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
                         ),
                     )
                     side_effects.append(f"Qdrant payload status set to 'published' for knowledge_id={knowledge_id}")
-                update_issue_status(issue_id, "resolved", reason or "restored")
-                return {"resolved": True, "issue_id": issue_id, "status": "resolved", "side_effects": side_effects}
+
+                    # Cascade: restore все дочерние секции (Фаза 13.14)
+                    if cascade:
+                        cascade_affected = _cascade_set_payload(
+                            qdrant, knowledge_id, payload, "published"
+                        )
+                        side_effects.append(
+                            f"LIFECYCLE cascade: {cascade_affected} child sections set to 'published' for book {knowledge_id}"
+                        )
+                        logger.info(
+                            "[LIFECYCLE] cascade restore: %d sections for book %s",
+                            cascade_affected, knowledge_id,
+                        )
+
+                if issue_id:
+                    update_issue_status(issue_id, "resolved", reason or "restored")
+                return {
+                    "resolved": True,
+                    "issue_id": issue_id,
+                    "knowledge_id": knowledge_id,
+                    "status": "resolved",
+                    "cascade_affected": cascade_affected,
+                    "side_effects": side_effects,
+                }
             except Exception as exc:
                 logger.error("restore lifecycle failed for %s: %s", knowledge_id, exc)
                 return {"resolved": False, "error": f"Restore failed: {exc}"}
@@ -227,7 +450,7 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
                 return {"resolved": False, "error": "target_id is required for merge action"}
             # Merge: deprecate source + update issue (content merge — future)
             try:
-                qdrant = getattr(app_state, 'qdrant_client', None)
+                qdrant = getattr(app_state, 'qdrant', None)
                 if qdrant:
                     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
@@ -236,7 +459,6 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
                     )
                     payload = make_deprecation_payload_update()
                     qdrant.set_payload(
-                        collection_name="knowledge",
                         payload=payload,
                         points_filter=Filter(
                             must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
@@ -262,6 +484,54 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
     return {"resolved": False, "error": f"Unknown action: {action}"}
 
 
+def _cascade_set_payload(
+    qdrant,
+    parent_knowledge_id: str,
+    payload: dict,
+    new_status: str,
+) -> int:
+    """Фаза 13.14: применить set_payload ко всем дочерним секциям книги.
+
+    Scroll по parent_knowledge_id → set_payload на каждую секцию.
+    Возвращает число затронутых секций.
+    """
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+    affected = 0
+    offset = None
+    while True:
+        points, next_offset = qdrant.scroll(
+            scroll_filter=Filter(
+                must=[FieldCondition(key="parent_knowledge_id", match=MatchValue(value=parent_knowledge_id))]
+            ),
+            limit=1000,
+            offset=offset,
+            with_payload=["knowledge_id"],
+            with_vectors=False,
+        )
+        for point in points:
+            kid = point.payload.get("knowledge_id") if point.payload else None
+            if kid:
+                try:
+                    qdrant.set_payload(
+                        payload=payload,
+                        points_filter=Filter(
+                            must=[FieldCondition(key="knowledge_id", match=MatchValue(value=kid))]
+                        ),
+                    )
+                    affected += 1
+                except Exception as exc:
+                    logger.warning(
+                        "[LIFECYCLE] cascade set_payload failed for child %s (parent=%s): %s",
+                        kid, parent_knowledge_id, exc,
+                    )
+        if next_offset is None or len(points) == 0:
+            break
+        offset = next_offset
+
+    return affected
+
+
 # ── 4.8: Cron-triggered scan ─────────────────────────────────
 
 async def run_quality_scan(params: dict, app_state) -> dict:
@@ -279,8 +549,8 @@ async def run_quality_scan(params: dict, app_state) -> dict:
     
 
     try:
-        knowledge_dir = app_state.settings.knowledge_dir if hasattr(app_state, 'settings') else None
-        qdrant_client = getattr(app_state, 'qdrant_client', None)
+        knowledge_dir = app_state.settings.KNOWLEDGE_DIR if hasattr(app_state, 'settings') else None
+        qdrant_client = getattr(app_state, 'qdrant', None)
 
         metrics = await run_scan(
             knowledge_dir=knowledge_dir,

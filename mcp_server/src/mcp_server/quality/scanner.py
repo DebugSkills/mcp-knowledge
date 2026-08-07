@@ -62,7 +62,7 @@ async def run_scan(
         settings = Settings()
 
     if knowledge_dir is None:
-        knowledge_dir = Path(settings.knowledge_dir)
+        knowledge_dir = Path(settings.KNOWLEDGE_DIR)
 
     if not knowledge_dir.exists():
         logger.warning("Knowledge dir %s not found, scan skipped", knowledge_dir)
@@ -221,7 +221,6 @@ async def _update_qdrant_payloads(
 
         try:
             client.set_payload(
-                collection_name="knowledge",
                 payload=payload_update,
                 points_filter=Filter(
                     must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
@@ -257,6 +256,10 @@ def _scan_dup_pairs(
             for j in range(i + 1, n):
                 _, fm_i, _ = entries[i]
                 _, fm_j, _ = entries[j]
+                # Структурные TOC-секции («Table of Content (part N)») почти идентичны
+                # по subject+tags → массовые false-positive дубли. Пропускаем их.
+                if _is_toc_section(fm_i) or _is_toc_section(fm_j):
+                    continue
                 if _are_dup_candidates(fm_i, fm_j):
                     dup_count += 1
                     # Создаём issue для дубликата
@@ -267,6 +270,14 @@ def _scan_dup_pairs(
                         detail=f"Possible duplicate of {fm_j.knowledge_id} (same subject={fm_i.subject}, tag overlap)",
                     )
     return dup_count
+
+
+def _is_toc_section(fm: KnowledgeFrontmatter) -> bool:
+    """Структурная TOC-секция (оглавление книги) — не содержательный дубликат.
+
+    Heuristic: knowledge_id содержит 'table-of-content' (паттерн импорта книг).
+    """
+    return "table-of-content" in (fm.knowledge_id or "")
 
 
 def _are_dup_candidates(

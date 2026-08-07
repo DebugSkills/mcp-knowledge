@@ -227,6 +227,21 @@ class QdrantClient:
             wait=True,
         )
 
+    def set_payload(self, payload: dict, points_filter: qmodels.Filter | None = None) -> None:
+        """Обновить payload для точек по фильтру (lifecycle: deprecated|published).
+
+        Обёртка над raw set_payload — collection_name захардкожен (как в scroll).
+        Используется quality-инструментами (resolve_quality_issue: deprecate/restore).
+
+        ВАЖНО: raw SDK (qdrant-client 1.18) принимает selector позиционным
+        аргументом `points` (Filter/FilterSelector/PointIdsList), НЕ `points_filter`.
+        """
+        self._client.set_payload(
+            collection_name=COLLECTION_NAME,
+            payload=payload,
+            points=points_filter,
+        )
+
     def delete_all(self) -> None:
         """Удалить все точки (для сине-зелёного reindex)."""
         self._client.delete(
@@ -247,6 +262,7 @@ class QdrantClient:
         score_threshold: float = 0.0,
         with_vectors: bool = False,
         exclude_content_types: list[str] | None = None,
+        exclude_statuses: list[str] | None = None,
     ) -> list[qmodels.ScoredPoint]:
         """Семантический поиск по вектору.
 
@@ -258,6 +274,8 @@ class QdrantClient:
             with_vectors: вернуть векторы в результатах (для dup-gate).
             exclude_content_types: исключить точки с этими content_type
                 (например ["collection"] — root-заглушки книг из результатов поиска).
+            exclude_statuses: исключить точки с этими статусами (например ["deprecated"]).
+                Фаза 13.14: добавлен must_not по полю status для lifecycle-фильтрации.
 
         Returns:
             list[qmodels.ScoredPoint] с payload (и векторами если with_vectors=True).
@@ -288,6 +306,14 @@ class QdrantClient:
                     match=qmodels.MatchValue(value=ct),
                 )
                 for ct in exclude_content_types
+            )
+        if exclude_statuses:
+            must_not_conditions.extend(
+                qmodels.FieldCondition(
+                    key="status",
+                    match=qmodels.MatchValue(value=st),
+                )
+                for st in exclude_statuses
             )
         if must_conditions or must_not_conditions:
             query_filter = qmodels.Filter(

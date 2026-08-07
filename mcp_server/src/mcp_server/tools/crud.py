@@ -329,14 +329,66 @@ async def update_entry(params: dict, app_state) -> dict:
 
 
 async def delete_entry(params: dict, app_state) -> dict:
-    """Удалить запись: soft-delete (→ .trash/) + удаление из Qdrant."""
+    """Удалить запись: soft-delete (→ .trash/) + удаление из Qdrant.
+
+    Фаза 13.14: +cascade param — при cascade=True удалить также все
+    дочерние секции по parent_knowledge_id (рекурсивно через scroll).
+    """
     knowledge_id = params.get("knowledge_id", "")
+    cascade = params.get("cascade", False)
 
     if not knowledge_id:
         return {"error": "Missing required parameter: 'knowledge_id'"}
 
-    # Шаг 1: Soft-delete Markdown SSOT
+    cascade_deleted = 0
+
+    # Получаем зависимости (до cascade — нужны для удаления детей)
     store = app_state.store
+    qdrant = app_state.qdrant
+    loop = asyncio.get_running_loop()
+
+    # Шаг 0 (cascade): найти и удалить дочерние секции
+    if cascade:
+        try:
+            from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+            qdrant_raw = _get_qdrant(app_state)
+            # Scroll все точки где parent_knowledge_id = knowledge_id
+            child_ids: list[str] = []
+            offset = None
+            while True:
+                points, next_offset = qdrant_raw.scroll(
+                    collection_name="knowledge",
+                    scroll_filter=Filter(
+                        must=[FieldCondition(key="parent_knowledge_id", match=MatchValue(value=knowledge_id))]
+                    ),
+                    limit=1000,
+                    offset=offset,
+                    with_payload=["knowledge_id"],
+                    with_vectors=False,
+                )
+                for point in points:
+                    kid = point.payload.get("knowledge_id") if point.payload else None
+                    if kid:
+                        child_ids.append(kid)
+                if next_offset is None or len(points) == 0:
+                    break
+                offset = next_offset
+
+            # Удаляем каждую секцию: store.delete (→ .trash/) + qdrant.delete_by_knowledge_id
+            for child_id in child_ids:
+                try:
+                    await store.delete(child_id)
+                    await loop.run_in_executor(None, qdrant.delete_by_knowledge_id, child_id)
+                    cascade_deleted += 1
+                except Exception as exc:
+                    logger.warning("[DELETE] cascade: failed to delete child %s: %s", child_id, exc)
+
+            logger.info("[DELETE] cascade: %d child sections deleted for book %s", cascade_deleted, knowledge_id)
+        except Exception as exc:
+            logger.error("[DELETE] cascade scroll failed for %s: %s", knowledge_id, exc)
+
+    # Шаг 1: Soft-delete Markdown SSOT
     entry = await store.read(knowledge_id)
     domain = entry.frontmatter.domain if entry else None
 
@@ -345,8 +397,6 @@ async def delete_entry(params: dict, app_state) -> dict:
         return {"error": f"Knowledge entry not found: '{knowledge_id}'"}
 
     # Шаг 2: Удаление из Qdrant
-    qdrant = app_state.qdrant
-    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, qdrant.delete_by_knowledge_id, knowledge_id)
 
     # Шаг 3: INDEX update (best-effort)
@@ -357,9 +407,14 @@ async def delete_entry(params: dict, app_state) -> dict:
         except Exception as exc:
             logger.warning("INDEX update failed for domain=%s: %s", domain, exc)
 
-    logger.info("delete_entry: %s → .trash/ + Qdrant removed", knowledge_id)
+    logger.info(
+        "[DELETE] delete_entry: %s → .trash/ + Qdrant removed (cascade_deleted=%d)",
+        knowledge_id, cascade_deleted,
+    )
     return {
         "knowledge_id": knowledge_id,
         "deleted": True,
-        "message": f"Entry '{knowledge_id}' moved to .trash/ and removed from Qdrant",
+        "cascade_deleted": cascade_deleted,
+        "message": f"Entry '{knowledge_id}' moved to .trash/ and removed from Qdrant"
+                   + (f" (+{cascade_deleted} child sections)" if cascade_deleted else ""),
     }

@@ -78,6 +78,7 @@ def mock_qdrant() -> MagicMock:
         filters: dict | None = None,
         score_threshold: float = 0.0,
         exclude_content_types: list[str] | None = None,
+        exclude_statuses: list[str] | None = None,
     ):
         point = MagicMock()
         point.id = 1
@@ -92,6 +93,7 @@ def mock_qdrant() -> MagicMock:
             "tags": ["test", "mock"],
         }
         client._last_search_exclude = exclude_content_types
+        client._last_search_exclude_statuses = exclude_statuses
         return [point]
 
     client.search = _fake_search

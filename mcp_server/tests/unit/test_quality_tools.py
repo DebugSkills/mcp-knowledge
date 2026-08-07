@@ -3,6 +3,9 @@
 Фаза 13 (v1.0): закрывает gap-анализ — quality tools (list_quality_issues, resolve_quality_issue, run_quality_scan)
 были 0 coverage; review_queue unit-only (scroll() missing в QdrantClient-обёртке).
 
+Фаза 13.14: +review_queue_books (агрегация книг), resolve_quality_issue cascade, delete_entry cascade,
+search_knowledge exclude_deprecated.
+
 Все тесты не требуют Qdrant/Ollama — используют tempdir + mocks.
 """
 
@@ -15,9 +18,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from mcp_server.quality.issues import create_issue, set_store_dir
 from mcp_server.tools.quality import (
+    _cascade_set_payload,
     list_quality_issues,
     resolve_quality_issue,
     review_queue,
+    review_queue_books,
     run_quality_scan,
 )
 
@@ -36,7 +41,7 @@ def quality_tempdir():
 def mock_app_state():
     """Minimal app_state mock для quality tools."""
     state = MagicMock()
-    state.qdrant_client = MagicMock()
+    state.qdrant = MagicMock()
     state.store = MagicMock()
     return state
 
@@ -45,9 +50,9 @@ def mock_app_state():
 def mock_app_state_with_settings():
     """app_state mock с settings.knowledge_dir."""
     state = MagicMock()
-    state.qdrant_client = MagicMock()
+    state.qdrant = MagicMock()
     state.store = MagicMock()
-    state.settings = SimpleNamespace(knowledge_dir="/tmp/test-knowledge")
+    state.settings = SimpleNamespace(KNOWLEDGE_DIR="/tmp/test-knowledge")
     return state
 
 
@@ -187,7 +192,7 @@ class TestResolveQualityIssue:
     async def test_deprecate_action_with_mock_qdrant(self, quality_tempdir, mock_app_state):
         """action=deprecate → вызывает qdrant_client.set_payload."""
         issue = create_issue("duplicate", "kid-1", "warn", "Test deprecate")
-        mock_app_state.qdrant_client.set_payload = MagicMock()
+        mock_app_state.qdrant.set_payload = MagicMock()
 
         result = await resolve_quality_issue(
             {"issue_id": issue.issue_id, "action": "deprecate", "reason": "Obsolete"},
@@ -197,7 +202,7 @@ class TestResolveQualityIssue:
         assert result["resolved"] is True
         assert result["status"] == "resolved"
         # set_payload должен быть вызван
-        mock_app_state.qdrant_client.set_payload.assert_called_once()
+        mock_app_state.qdrant.set_payload.assert_called_once()
         # side_effects содержит упоминание deprecated
         assert len(result["side_effects"]) >= 1
         assert any("deprecated" in se.lower() for se in result["side_effects"])
@@ -205,7 +210,7 @@ class TestResolveQualityIssue:
     async def test_merge_action_requires_target_id(self, quality_tempdir, mock_app_state):
         """action=merge без target_id → error."""
         issue = create_issue("duplicate", "kid-1", "warn", "Test merge")
-        mock_app_state.qdrant_client.set_payload = MagicMock()
+        mock_app_state.qdrant.set_payload = MagicMock()
 
         result = await resolve_quality_issue(
             {"issue_id": issue.issue_id, "action": "merge", "reason": "Dup"},
@@ -218,7 +223,7 @@ class TestResolveQualityIssue:
     async def test_merge_action_with_target_id(self, quality_tempdir, mock_app_state):
         """action=merge с target_id → success."""
         issue = create_issue("duplicate", "kid-1", "warn", "Test merge ok")
-        mock_app_state.qdrant_client.set_payload = MagicMock()
+        mock_app_state.qdrant.set_payload = MagicMock()
 
         result = await resolve_quality_issue(
             {
@@ -236,7 +241,7 @@ class TestResolveQualityIssue:
 
     async def test_nonexistent_issue_returns_error(self, quality_tempdir, mock_app_state):
         """Несуществующий issue_id для deprecate → error."""
-        mock_app_state.qdrant_client.set_payload = MagicMock()
+        mock_app_state.qdrant.set_payload = MagicMock()
 
         result = await resolve_quality_issue(
             {"issue_id": "iss_nonexistent12345", "action": "deprecate", "reason": "Test"},
@@ -315,9 +320,9 @@ class TestRunQualityScan:
 
 
 class TestReviewQueue:
-    """review_queue — unit-only (mock qdrant_client.scroll).
+    """review_queue — unit-only (mock qdrant.scroll wrapper)..
 
-    QdrantClient-обёртка НЕ имеет scroll() (только scroll_unique_values) → E2E невозможен.
+    Обёртка имеет scroll() → unit-тесты через mock.
     """
 
     async def test_review_queue_sorts_desc_by_staleness(self, mock_app_state):
@@ -340,7 +345,7 @@ class TestReviewQueue:
             _make_point("kid-mid", 0.55),
         ]
 
-        mock_app_state.qdrant_client.scroll = MagicMock(return_value=(points, None))
+        mock_app_state.qdrant.scroll = MagicMock(return_value=(points, None))
 
         result = await review_queue({"limit": 10}, mock_app_state)
 
@@ -372,7 +377,7 @@ class TestReviewQueue:
             _make_point("kid-border", 0.45),
         ]
 
-        mock_app_state.qdrant_client.scroll = MagicMock(return_value=(points, None))
+        mock_app_state.qdrant.scroll = MagicMock(return_value=(points, None))
 
         result = await review_queue({"limit": 10}, mock_app_state)
 
@@ -404,7 +409,7 @@ class TestReviewQueue:
             _make_point("kid-c", 0.7),
         ]
 
-        mock_app_state.qdrant_client.scroll = MagicMock(return_value=(points, None))
+        mock_app_state.qdrant.scroll = MagicMock(return_value=(points, None))
 
         result = await review_queue({"limit": 1}, mock_app_state)
         assert len(result["queue"]) == 1
@@ -412,17 +417,17 @@ class TestReviewQueue:
 
     async def test_review_queue_with_domain_filter(self, mock_app_state):
         """Фильтр domain → scroll вызывается с domain-условием."""
-        mock_app_state.qdrant_client.scroll = MagicMock(return_value=([], None))
+        mock_app_state.qdrant.scroll = MagicMock(return_value=([], None))
 
         result = await review_queue({"domain": "engineering", "limit": 5}, mock_app_state)
 
         assert result["queue"] == []
         # Проверяем что scroll был вызван
-        mock_app_state.qdrant_client.scroll.assert_called_once()
+        mock_app_state.qdrant.scroll.assert_called_once()
 
     async def test_review_queue_handles_exception(self, mock_app_state):
         """qdrant_client.scroll бросает исключение → error, пустая queue."""
-        mock_app_state.qdrant_client.scroll = MagicMock(
+        mock_app_state.qdrant.scroll = MagicMock(
             side_effect=ConnectionError("Qdrant down")
         )
 
@@ -434,9 +439,304 @@ class TestReviewQueue:
 
     async def test_review_queue_empty_scroll(self, mock_app_state):
         """Пустой scroll → пустая queue."""
-        mock_app_state.qdrant_client.scroll = MagicMock(return_value=([], None))
+        mock_app_state.qdrant.scroll = MagicMock(return_value=([], None))
 
         result = await review_queue({"limit": 10}, mock_app_state)
 
         assert result["queue"] == []
         assert result["total_in_queue"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# Фаза 13.14: review_queue_books — агрегация книг
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestReviewQueueBooks:
+    """review_queue_books — агрегация по parent_knowledge_id, пагинация scroll."""
+
+    def _make_point(self, kid, parent_id, score, domain="eng", subject="python",
+                    section_header="", quality_flags=None, status="published"):
+        pt = MagicMock()
+        pt.id = kid
+        pt.payload = {
+            "knowledge_id": kid,
+            "parent_knowledge_id": parent_id,
+            "staleness_score": score,
+            "quality_flags": quality_flags or ["stale"],
+            "domain": domain,
+            "subject": subject,
+            "section_header": section_header,
+            "status": status,
+            "updated_at": "2026-01-01T00:00:00Z",
+        }
+        return pt
+
+    async def test_groups_by_parent(self, mock_app_state):
+        """Точки с разными parent_knowledge_id → отдельные книги."""
+        points = [
+            self._make_point("kid-1", "book-a", 0.6),
+            self._make_point("kid-2", "book-a", 0.7),
+            self._make_point("kid-3", "book-b", 0.8),
+        ]
+        mock_app_state.qdrant.scroll = MagicMock(return_value=(points, None))
+
+        result = await review_queue_books({"limit": 10}, mock_app_state)
+
+        assert "error" not in result
+        books = result["books"]
+        assert result["total_books"] == 2
+        assert len(books) == 2
+        book_ids = {b["book_id"] for b in books}
+        assert book_ids == {"book-a", "book-b"}
+
+    async def test_computes_stale_fraction(self, mock_app_state):
+        """stale_fraction = stale_sections (>=0.45) / total_sections."""
+        points = [
+            self._make_point("kid-1", "book-x", 0.9),
+            self._make_point("kid-2", "book-x", 0.8),
+            self._make_point("kid-3", "book-x", 0.1),  # below threshold
+        ]
+        mock_app_state.qdrant.scroll = MagicMock(return_value=(points, None))
+
+        result = await review_queue_books({"limit": 10}, mock_app_state)
+
+        books = result["books"]
+        assert len(books) == 1
+        book = books[0]
+        assert book["total_sections"] == 3
+        assert book["stale_sections"] == 2
+        assert book["stale_fraction"] == pytest.approx(2 / 3, rel=0.01)
+        assert book["max_score"] == 0.9
+
+    async def test_sorts_books_by_fraction_then_score(self, mock_app_state):
+        """Книги сортируются: сначала по stale_fraction DESC, затем max_score DESC."""
+        points = [
+            # book-a: 3 из 3 = 1.0, max 0.9
+            self._make_point("a1", "book-a", 0.9),
+            self._make_point("a2", "book-a", 0.6),
+            self._make_point("a3", "book-a", 0.5),
+            # book-b: 2 из 3 = 0.67, max 0.8
+            self._make_point("b1", "book-b", 0.8),
+            self._make_point("b2", "book-b", 0.5),
+            self._make_point("b3", "book-b", 0.1),
+            # book-c: 1 из 3 = 0.33, max 0.95
+            self._make_point("c1", "book-c", 0.95),
+            self._make_point("c2", "book-c", 0.1),
+            self._make_point("c3", "book-c", 0.0),
+        ]
+        mock_app_state.qdrant.scroll = MagicMock(return_value=(points, None))
+
+        result = await review_queue_books({"limit": 10}, mock_app_state)
+
+        books = result["books"]
+        assert len(books) == 3
+        # Порядок: book-a (1.0) > book-b (0.67) > book-c (0.33)
+        assert books[0]["book_id"] == "book-a"
+        assert books[1]["book_id"] == "book-b"
+        assert books[2]["book_id"] == "book-c"
+
+    async def test_excludes_points_without_parent(self, mock_app_state):
+        """Точки без parent_knowledge_id — не включаются в агрегат."""
+        points = [
+            self._make_point("kid-orphan", None, 0.8),  # no parent → skip
+            self._make_point("kid-1", "book-x", 0.8),
+        ]
+        mock_app_state.qdrant.scroll = MagicMock(return_value=(points, None))
+
+        result = await review_queue_books({"limit": 10}, mock_app_state)
+
+        assert result["total_books"] == 1
+
+    async def test_respects_limit(self, mock_app_state):
+        """limit=1 → только 1 книга."""
+        points = [
+            self._make_point("a1", "book-a", 0.9),
+            self._make_point("b1", "book-b", 0.85),
+        ]
+        mock_app_state.qdrant.scroll = MagicMock(return_value=(points, None))
+
+        result = await review_queue_books({"limit": 1}, mock_app_state)
+
+        assert len(result["books"]) == 1
+
+    async def test_top_sections_limited_to_5(self, mock_app_state):
+        """top_sections содержит не более 5 секций."""
+        points = []
+        for i in range(10):
+            points.append(self._make_point(f"kid-{i}", "book-x", 0.9 - i * 0.05))
+        mock_app_state.qdrant.scroll = MagicMock(return_value=(points, None))
+
+        result = await review_queue_books({"limit": 10}, mock_app_state)
+
+        book = result["books"][0]
+        assert len(book["top_sections"]) <= 5
+
+    async def test_paginated_scroll(self, mock_app_state):
+        """scroll вызывается с пагинацией (offset-based)."""
+        batch1_pts = [self._make_point("a1", "book-a", 0.9)]
+        batch2_pts = [self._make_point("b1", "book-b", 0.8)]
+
+        call_count = 0
+
+        def mock_scroll(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (batch1_pts, "offset-1")
+            return (batch2_pts, None)
+
+        mock_app_state.qdrant.scroll = mock_scroll
+        result = await review_queue_books({"limit": 10}, mock_app_state)
+
+        assert call_count == 2
+        assert result["total_books"] == 2
+
+    async def test_handles_exception(self, mock_app_state):
+        """qdrant_client.scroll бросает исключение → error."""
+        mock_app_state.qdrant.scroll = MagicMock(
+            side_effect=ConnectionError("Qdrant down")
+        )
+        result = await review_queue_books({"limit": 10}, mock_app_state)
+        assert result["books"] == []
+        assert "error" in result
+
+
+# ═══════════════════════════════════════════════════════════════
+# Фаза 13.14: resolve_quality_issue + knowledge_id + cascade
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestResolveQualityIssueCascade:
+    """resolve_quality_issue с knowledge_id и cascade."""
+
+    async def test_direct_knowledge_id_deprecate(self, mock_app_state):
+        """knowledge_id без issue_id → прямая операция."""
+        mock_app_state.qdrant.set_payload = MagicMock()
+
+        result = await resolve_quality_issue(
+            {"knowledge_id": "book-123", "action": "deprecate", "reason": "test"},
+            mock_app_state,
+        )
+
+        assert result["resolved"] is True
+        assert result["knowledge_id"] == "book-123"
+        mock_app_state.qdrant.set_payload.assert_called_once()
+
+    async def test_direct_knowledge_id_restore(self, mock_app_state):
+        """knowledge_id + action=restore → прямая операция."""
+        mock_app_state.qdrant.set_payload = MagicMock()
+
+        result = await resolve_quality_issue(
+            {"knowledge_id": "book-123", "action": "restore", "reason": "test"},
+            mock_app_state,
+        )
+
+        assert result["resolved"] is True
+        mock_app_state.qdrant.set_payload.assert_called_once()
+
+    async def test_deprecate_cascade_calls_cascade_set_payload(self, mock_app_state):
+        """cascade=True → _cascade_set_payload вызывается через scroll+set_payload."""
+        mock_app_state.qdrant.set_payload = MagicMock()
+        # Mock scroll для cascade — возвращает 2 дочерние секции
+        def _make_child(kid):
+            pt = MagicMock()
+            pt.payload = {"knowledge_id": kid}
+            return pt
+
+        scroll_calls = 0
+
+        def mock_scroll(**kwargs):
+            nonlocal scroll_calls
+            scroll_calls += 1
+            if scroll_calls == 1:
+                return ([_make_child("kid-sec-1"), _make_child("kid-sec-2")], None)
+            return ([], None)
+
+        mock_app_state.qdrant.scroll = mock_scroll
+
+        result = await resolve_quality_issue(
+            {"knowledge_id": "book-123", "action": "deprecate", "cascade": True, "reason": "test"},
+            mock_app_state,
+        )
+
+        assert result["resolved"] is True
+        assert result["cascade_affected"] == 2
+        assert "LIFECYCLE cascade" in str(result["side_effects"])
+
+    async def test_either_issue_id_or_knowledge_id_required(self, mock_app_state):
+        """Без issue_id и knowledge_id → ошибка."""
+        result = await resolve_quality_issue(
+            {"action": "deprecate"}, mock_app_state,
+        )
+        assert result["resolved"] is False
+        assert "issue_id or knowledge_id" in result["error"].lower()
+
+    async def test_resolve_still_requires_issue_id(self, mock_app_state):
+        """action=resolve всё ещё требует issue_id."""
+        result = await resolve_quality_issue(
+            {"knowledge_id": "book-123", "action": "resolve"}, mock_app_state,
+        )
+        assert result["resolved"] is False
+
+
+# ═══════════════════════════════════════════════════════════════
+# Фаза 13.14: _cascade_set_payload helper
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestCascadeSetPayload:
+    """_cascade_set_payload — scroll по parent + set_payload на секции."""
+
+    def test_sets_payload_on_all_children(self):
+        """Дочерние секции получают set_payload с переданным payload."""
+        mock_qdrant = MagicMock()
+        mock_qdrant.set_payload = MagicMock()
+
+        child1 = MagicMock()
+        child1.payload = {"knowledge_id": "sec-1"}
+        child2 = MagicMock()
+        child2.payload = {"knowledge_id": "sec-2"}
+
+        mock_qdrant.scroll = MagicMock(return_value=([child1, child2], None))
+
+        payload = {"status": "deprecated"}
+        affected = _cascade_set_payload(mock_qdrant, "book-x", payload, "deprecated")
+
+        assert affected == 2
+        assert mock_qdrant.set_payload.call_count == 2
+
+    def test_handles_empty_children(self):
+        """Нет дочерних секций → affected=0."""
+        mock_qdrant = MagicMock()
+        mock_qdrant.set_payload = MagicMock()
+        mock_qdrant.scroll = MagicMock(return_value=([], None))
+
+        payload = {"status": "deprecated"}
+        affected = _cascade_set_payload(mock_qdrant, "book-x", payload, "deprecated")
+
+        assert affected == 0
+        mock_qdrant.set_payload.assert_not_called()
+
+    def test_paginated_scroll_for_many_children(self):
+        """Пагинированный scroll при >1000 секций."""
+        mock_qdrant = MagicMock()
+        mock_qdrant.set_payload = MagicMock()
+
+        def _child(kid):
+            c = MagicMock()
+            c.payload = {"knowledge_id": kid}
+            return c
+
+        batch1 = [_child(f"sec-{i}") for i in range(5)]
+        batch2 = [_child(f"sec-{i}") for i in range(5, 8)]
+        mock_qdrant.scroll = MagicMock(side_effect=[
+            (batch1, "offset-2"),
+            (batch2, None),
+        ])
+
+        payload = {"status": "deprecated"}
+        affected = _cascade_set_payload(mock_qdrant, "book-x", payload, "deprecated")
+
+        assert affected == 8
+        assert mock_qdrant.set_payload.call_count == 8

@@ -69,6 +69,14 @@ def page_search() -> None:
     build_search()
 
 
+@ui.page("/quality")
+def page_quality() -> None:
+    """Страница «Качество» — review-очередь книг, каскадные действия, удаление."""
+    render_header("quality")
+    from .pages.quality import build_quality
+    build_quality()
+
+
 # ── Start ───────────────────────────────────────────────────
 
 # Глобальный request logger для отладки upload.

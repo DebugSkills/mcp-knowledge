@@ -34,7 +34,7 @@ def mock_transport():
                 },
             )
         elif method == "tools/list":
-            tools = [{"name": f"tool_{i}", "description": f"Tool {i}"} for i in range(1, 18)]
+            tools = [{"name": f"tool_{i}", "description": f"Tool {i}"} for i in range(1, 20)]
             return httpx.Response(
                 200,
                 json={"jsonrpc": "2.0", "id": rid, "result": {"tools": tools}},
@@ -153,7 +153,7 @@ async def test_initialize_returns_protocol_version(client):
 async def test_tools_list_returns_17_tools(client):
     """tools_list должен вернуть 17 инструментов (после добавления analyze_content)."""
     tools = await client.tools_list()
-    assert len(tools) == 17
+    assert len(tools) == 19
     assert tools[0]["name"] == "tool_1"
 
 

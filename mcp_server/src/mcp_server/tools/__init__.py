@@ -1,9 +1,10 @@
-"""MCP Tools registry — 18 tools с JSON Schema (Блок A).
+"""MCP Tools registry — 19 tools с JSON Schema (Блок A).
 
 Реальные реализации в модулях: search.py, read.py, crud.py, browse.py, admin.py, content.py, collections.py.
 
 G1-fix: list_subjects + list_projects зарегистрированы (ранее были импортированы, но не добавлены в TOOLS/TOOL_HANDLERS).
 Variant A (13.10): +list_collections (список книг); search_knowledge обогащён (collection_id/content_type фильтры).
+Фаза 13.14: +review_queue_books (агрегация книг по parent_knowledge_id).
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from .quality import (
     list_quality_issues,
     resolve_quality_issue,
     review_queue,
+    review_queue_books,
     run_quality_scan,
 )
 from .read import get_entry, get_knowledge_map
@@ -39,6 +41,7 @@ _SEARCH_QUERY_SCHEMA: dict[str, Any] = {
         "score_threshold": {"type": "number", "default": 0.0, "minimum": 0.0, "maximum": 1.0},
         "collection_id": {"type": "string", "description": "Поиск внутри книги (фильтр по parent_knowledge_id)"},
         "content_type": {"type": "string", "description": "Фильтр по типу контента (book, collection)"},
+        "include_deprecated": {"type": "boolean", "default": False, "description": "Показывать deprecated-записи в результатах (Фаза 13.14)"},
     },
     "required": ["query"],
 }
@@ -106,6 +109,7 @@ _DELETE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "knowledge_id": {"type": "string"},
+        "cascade": {"type": "boolean", "default": False, "description": "Удалить также все дочерние секции по parent_knowledge_id (Фаза 13.14)"},
     },
     "required": ["knowledge_id"],
 }
@@ -138,6 +142,15 @@ _REVIEW_QUEUE_SCHEMA: dict[str, Any] = {
     },
 }
 
+_REVIEW_QUEUE_BOOKS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "domain": {"type": "string", "description": "Фильтр по домену"},
+        "subject": {"type": "string", "description": "Фильтр по предмету"},
+        "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100, "description": "Макс. число книг в ответе"},
+    },
+}
+
 _LIST_QUALITY_ISSUES_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -154,16 +167,18 @@ _LIST_QUALITY_ISSUES_SCHEMA: dict[str, Any] = {
 _RESOLVE_QUALITY_ISSUE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "issue_id": {"type": "string", "description": "ID issue для разрешения"},
+        "issue_id": {"type": "string", "description": "ID issue для разрешения (или knowledge_id для прямой операции — Фаза 13.14)"},
         "action": {
             "type": "string",
             "enum": ["merge", "deprecate", "restore", "resolve", "ignore"],
             "description": "Действие: merge (слить), deprecate (скрыть), restore (вернуть), resolve (исправлено), ignore (пропустить)",
         },
+        "knowledge_id": {"type": "string", "description": "Прямая операция на запись без issue-lookup (Фаза 13.14)"},
         "target_id": {"type": "string", "description": "target knowledge_id (для merge)"},
         "reason": {"type": "string", "description": "Причина решения"},
+        "cascade": {"type": "boolean", "default": False, "description": "Применить к дочерним секциям книги (Фаза 13.14)"},
     },
-    "required": ["issue_id", "action"],
+    "required": ["action"],
 }
 
 _RUN_QUALITY_SCAN_SCHEMA: dict[str, Any] = {
@@ -274,6 +289,11 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _REVIEW_QUEUE_SCHEMA,
     },
     {
+        "name": "review_queue_books",
+        "description": "Топ устаревших КНИГ (агрегат по parent_knowledge_id). Возвращает книги с долей устаревших секций, максимальным staleness_score и top-5 секций. Фильтры domain/subject. (Фаза 13.14)",
+        "inputSchema": _REVIEW_QUEUE_BOOKS_SCHEMA,
+    },
+    {
         "name": "list_quality_issues",
         "description": "Список проблем качества: дубликаты, отсутствующие поля, edit-wars, битые ссылки. Фильтрация по типу и статусу.",
         "inputSchema": _LIST_QUALITY_ISSUES_SCHEMA,
@@ -318,6 +338,7 @@ TOOL_HANDLERS = {
     "reindex": reindex,
     # Quality tools (Фаза 4)
     "review_queue": review_queue,
+    "review_queue_books": review_queue_books,
     "list_quality_issues": list_quality_issues,
     "resolve_quality_issue": resolve_quality_issue,
     "run_quality_scan": run_quality_scan,

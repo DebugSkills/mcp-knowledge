@@ -6,6 +6,8 @@ Uses mock fixtures from conftest.py — no Qdrant/embedding/filesystem required.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 from mcp_server.tools.admin import reindex
 from mcp_server.tools.browse import list_domains, list_projects, list_subjects
@@ -36,6 +38,29 @@ async def test_search_knowledge_missing_query(app_state):
     """A1: empty query returns error."""
     result = await search_knowledge({"query": ""}, app_state)
     assert "error" in result
+
+
+# ── Фаза 13.14: deprecated exclusion from search ──────────
+
+async def test_search_knowledge_excludes_deprecated_by_default(app_state):
+    """По умолчанию exclude_statuses=["deprecated"] передаётся в qdrant.search()."""
+    result = await search_knowledge({"query": "test", "top_k": 3}, app_state)
+    assert "error" not in result
+    # Проверяем что exclude_statuses=["deprecated"] передано в mock
+    exclude_statuses = getattr(app_state.qdrant, "_last_search_exclude_statuses", None)
+    assert exclude_statuses == ["deprecated"], (
+        f"Expected ['deprecated'], got {exclude_statuses}"
+    )
+
+
+async def test_search_knowledge_include_deprecated_skips_filter(app_state):
+    """include_deprecated=True → exclude_statuses=None (все записи видны)."""
+    result = await search_knowledge({"query": "test", "include_deprecated": True, "top_k": 3}, app_state)
+    assert "error" not in result
+    exclude_statuses = getattr(app_state.qdrant, "_last_search_exclude_statuses", None)
+    assert exclude_statuses is None, (
+        f"Expected None (no filter), got {exclude_statuses}"
+    )
 
 
 async def test_search_by_tags_and(app_state):
@@ -193,6 +218,51 @@ async def test_delete_entry_not_found(app_state):
         app_state,
     )
     assert "error" in result
+
+
+# ── Фаза 13.14: delete_entry cascade ────────────────────
+
+async def test_delete_entry_cascade_deletes_children(app_state):
+    """cascade=True → scroll children, delete each + root."""
+    from unittest.mock import AsyncMock
+
+    # Fix: MagicMock auto-attribute — ensure _get_qdrant falls back to qdrant
+    app_state.qdrant_client = None
+
+    def _make_child(kid: str):
+        pt = MagicMock()
+        pt.payload = {"knowledge_id": kid}
+        return pt
+    children = [_make_child("kid-sec-1"), _make_child("kid-sec-2")]
+
+    app_state.qdrant.scroll = MagicMock(return_value=(children, None))
+    app_state.store.delete = AsyncMock(return_value=True)
+
+    result = await delete_entry(
+        {"knowledge_id": "ru-test-entry", "cascade": True},
+        app_state,
+    )
+    assert "error" not in result
+    assert result["deleted"] is True
+    assert result["cascade_deleted"] == 2
+    assert app_state.qdrant.delete_by_knowledge_id.call_count >= 2
+
+
+async def test_delete_entry_cascade_no_children(app_state):
+    """cascade=True, но scroll возвращает 0 children → cascade_deleted=0."""
+    from unittest.mock import AsyncMock
+
+    app_state.qdrant_client = None
+    app_state.qdrant.scroll = MagicMock(return_value=([], None))
+    app_state.store.delete = AsyncMock(return_value=True)
+
+    result = await delete_entry(
+        {"knowledge_id": "ru-test-entry", "cascade": True},
+        app_state,
+    )
+    assert result["deleted"] is True
+    assert result["cascade_deleted"] == 0
+    assert app_state.qdrant.delete_by_knowledge_id.call_count == 1
 
 
 # ── Browse tools ────────────────────────────────────────────

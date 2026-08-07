@@ -129,11 +129,11 @@ def test_routes_registry_exists():
     """ROUTES должен существовать в pages/__init__.py после реализации."""
     from kb_console.pages import ROUTES
     assert isinstance(ROUTES, list)
-    assert len(ROUTES) == 4
+    assert len(ROUTES) == 5
     paths = {r[0] for r in ROUTES}
-    assert paths == {"/status", "/books", "/import", "/search"}
+    assert paths == {"/status", "/books", "/import", "/search", "/quality"}
     labels = {r[1] for r in ROUTES}
-    assert labels == {"Статус", "Книги", "Импорт", "Поиск"}
+    assert labels == {"Статус", "Книги", "Импорт", "Поиск", "Качество"}
 
 
 def test_routes_builders_are_callable():
@@ -198,3 +198,104 @@ class TestFindSectionChild:
         """Пустой список → None."""
         result = _find_section_child([], "sec-1")
         assert result is None
+
+
+# ── Quality page (Фаза 13.14) ──
+
+
+class TestQualityPageImports:
+    """Проверка импортов страницы качества."""
+
+    def test_quality_module_imports(self):
+        """Модуль pages.quality должен импортироваться."""
+        from kb_console.pages import quality
+        assert hasattr(quality, "build_quality")
+        assert callable(quality.build_quality)
+
+    def test_quality_in_routes(self):
+        """/quality должен быть в ROUTES."""
+        from kb_console.pages import ROUTES
+        quality_routes = [r for r in ROUTES if r[0] == "/quality"]
+        assert len(quality_routes) == 1
+        assert quality_routes[0][1] == "Качество"
+        assert callable(quality_routes[0][2])
+
+
+class TestMCPClientQualityMethods:
+    """Тесты новых методов MCPClient для quality tools (Фаза 13.14)."""
+
+    @pytest.fixture
+    def quality_transport(self):
+        """Транспорт для quality-вызовов."""
+        captured = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content) if request.content else {}
+            method = body.get("method", "")
+            rid = body.get("id", 1)
+
+            if method == "tools/call":
+                params = body.get("params", {})
+                tool_name = params.get("name", "")
+                args = params.get("arguments", {})
+                captured.append({"tool": tool_name, "args": dict(args)})
+
+                inner = {"ok": True, "tool": tool_name}
+                wrapped = {"content": [{"type": "text", "text": json.dumps(inner)}]}
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": rid, "result": wrapped})
+
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": rid, "result": {"ok": True}})
+
+        transport = httpx.MockTransport(handler)
+        transport.captured = captured
+        return transport
+
+    @pytest.fixture
+    def quality_client(self, quality_transport):
+        """MCPClient для quality-тестов."""
+        c = httpx.AsyncClient(transport=quality_transport, base_url="http://test")
+        client = MCPClient(base_url="http://test", client=c)
+        client._captured = quality_transport.captured
+        return client
+
+    @pytest.mark.asyncio
+    async def test_review_queue_books_call(self, quality_client):
+        """review_queue_books должен вызывать tools/call с review_queue_books."""
+        result = await quality_client.review_queue_books(domain="eng", limit=20)
+        assert result["ok"] is True
+        assert len(quality_client._captured) == 1
+        call = quality_client._captured[0]
+        assert call["tool"] == "review_queue_books"
+        assert call["args"]["domain"] == "eng"
+        assert call["args"]["limit"] == 20
+
+    @pytest.mark.asyncio
+    async def test_resolve_quality_issue_call(self, quality_client):
+        """resolve_quality_issue с knowledge_id + cascade."""
+        result = await quality_client.resolve_quality_issue(
+            action="deprecate", knowledge_id="book-x", cascade=True, reason="test",
+        )
+        assert result["ok"] is True
+        call = quality_client._captured[0]
+        assert call["tool"] == "resolve_quality_issue"
+        assert call["args"]["knowledge_id"] == "book-x"
+        assert call["args"]["cascade"] is True
+        assert call["args"]["action"] == "deprecate"
+
+    @pytest.mark.asyncio
+    async def test_delete_entry_cascade_call(self, quality_client):
+        """delete_entry с cascade=True."""
+        result = await quality_client.delete_entry("book-x", cascade=True)
+        assert result["ok"] is True
+        call = quality_client._captured[0]
+        assert call["tool"] == "delete_entry"
+        assert call["args"]["knowledge_id"] == "book-x"
+        assert call["args"]["cascade"] is True
+
+    @pytest.mark.asyncio
+    async def test_run_quality_scan_call(self, quality_client):
+        """run_quality_scan вызывает tools/call."""
+        result = await quality_client.run_quality_scan()
+        assert result["ok"] is True
+        call = quality_client._captured[0]
+        assert call["tool"] == "run_quality_scan"

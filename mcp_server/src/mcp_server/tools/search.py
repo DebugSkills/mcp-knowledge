@@ -24,6 +24,10 @@ async def search_knowledge(params: dict, app_state) -> dict:
     """Семантический поиск по базе знаний.
 
     Flow: query → embed (run_in_executor) → Qdrant search → форматирование результатов.
+
+    Фаза 13.14: deprecated-записи исключаются из поиска по умолчанию
+    (include_deprecated=False). Использует exclude_statuses=["deprecated"]
+    в qdrant.search() через must_not по полю status.
     """
     query = params.get("query", "")
     if not query:
@@ -54,6 +58,10 @@ async def search_knowledge(params: dict, app_state) -> dict:
     # исключаем по умолчанию, если пользователь явно не ищет коллекции.
     exclude_content_types = None if content_type == "collection" else ["collection"]
 
+    # Фаза 13.14: исключаем deprecated-записи из поиска по умолчанию
+    include_deprecated = params.get("include_deprecated", False)
+    exclude_statuses = None if include_deprecated else ["deprecated"]
+
     # Embedding (CPU-bound → run_in_executor)
     embedder = app_state.embedder
     loop = asyncio.get_running_loop()
@@ -71,6 +79,7 @@ async def search_knowledge(params: dict, app_state) -> dict:
             filters=filter_dict,
             score_threshold=score_threshold,
             exclude_content_types=exclude_content_types,
+            exclude_statuses=exclude_statuses,
         ),
     )
 
