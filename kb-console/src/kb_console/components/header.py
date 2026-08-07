@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from nicegui import ui
 
-from ..pages import ROUTES
-
 
 def render_header(active: str) -> None:
     """Отрисовать навигационный хедер с кнопками-ссылками.
@@ -18,6 +16,8 @@ def render_header(active: str) -> None:
         active: slug активной страницы ("status", "books", "import", "search").
                 Соответствует последнему сегменту пути (без /).
     """
+    from ..pages import ROUTES  # lazy import: ломает circular chain pages↔components
+
     with ui.row().classes("items-center gap-2 q-mb-md w-full") as _header:
         for path, label, _builder in ROUTES:
             slug = path.lstrip("/")

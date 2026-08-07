@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -433,3 +434,58 @@ async def test_list_collections_helper_unwraps(enriched_client):
     assert len(result) == 1
     assert result[0]["collection_id"] == "eng-test-book-collection"
     assert result[0]["section_count"] == 2
+
+
+# ── Tests: update_entry timeout (Фаза 13.16) ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_update_entry_passes_per_call_timeout():
+    """update_entry должен передавать timeout=60.0 в _call (per-call override).
+
+    Серверный update_entry может занимать >10s (git commit большого YAML),
+    клиентский таймаут по умолчанию 10s → ReadTimeout при успешном rename.
+    Фикс: per-call timeout 60s для update_entry.
+    """
+    client = MCPClient(base_url="http://test")
+    mock_call = AsyncMock(return_value={"ok": True})
+    client._call = mock_call
+
+    await client.update_entry("kid-1", content="# Test")
+
+    # Проверяем, что _call получил timeout=60.0
+    assert mock_call.call_count == 1
+    call_kwargs = mock_call.call_args.kwargs
+    assert call_kwargs.get("timeout") == 60.0, (
+        f"update_entry должен передавать timeout=60.0 в _call, "
+        f"получено: {call_kwargs.get('timeout')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_tools_call_default_timeout_is_none():
+    """tools_call без явного timeout передаёт timeout=None (client-level default)."""
+    client = MCPClient(base_url="http://test")
+    mock_call = AsyncMock(return_value={"ok": True})
+    client._call = mock_call
+
+    await client.tools_call("search_knowledge", {"query": "test"})
+
+    call_kwargs = mock_call.call_args.kwargs
+    assert call_kwargs.get("timeout") is None, (
+        f"tools_call без timeout должен передавать None, "
+        f"получено: {call_kwargs.get('timeout')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_tools_call_passes_explicit_timeout():
+    """tools_call с явным timeout должен пробрасывать его в _call."""
+    client = MCPClient(base_url="http://test")
+    mock_call = AsyncMock(return_value={"ok": True})
+    client._call = mock_call
+
+    await client.tools_call("slow_tool", {}, timeout=30.0)
+
+    call_kwargs = mock_call.call_args.kwargs
+    assert call_kwargs.get("timeout") == 30.0

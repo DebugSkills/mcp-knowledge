@@ -67,8 +67,19 @@ class MCPClient:
             headers["X-API-Key"] = self.api_key
         return headers
 
-    async def _call(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    async def _call(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
         """Выполнить JSON-RPC 2.0 вызов.
+
+        Args:
+            method: JSON-RPC метод.
+            params: Параметры вызова.
+            timeout: Per-call таймаут в секундах (переопределяет client-level).
+                     None = использовать client-level таймаут.
 
         Returns:
             result из ответа.
@@ -86,7 +97,10 @@ class MCPClient:
         url = f"{self.base_url}/mcp"
 
         try:
-            response = await self._client.post(url, json=payload, headers=self._headers())
+            kwargs: dict[str, Any] = {"json": payload, "headers": self._headers()}
+            if timeout is not None:
+                kwargs["timeout"] = httpx.Timeout(timeout)
+            response = await self._client.post(url, **kwargs)
         except httpx.ConnectError as e:
             msg = f"Сервер недоступен: {e}"
             logger.error(msg)
@@ -172,19 +186,27 @@ class MCPClient:
         return result.get("tools", [])
 
     async def tools_call(
-        self, name: str, params: dict[str, Any] | None = None
+        self,
+        name: str,
+        params: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> Any:
         """Вызвать MCP-инструмент.
 
         Args:
             name: Имя инструмента (search_knowledge, import_content, ...).
             params: Параметры вызова.
+            timeout: Per-call таймаут в секундах (None = client-level).
 
         Returns:
             Результат выполнения инструмента (автоматически разворачивает
             MCP content envelope).
         """
-        raw = await self._call("tools/call", {"name": name, "arguments": params or {}})
+        raw = await self._call(
+            "tools/call",
+            {"name": name, "arguments": params or {}},
+            timeout=timeout,
+        )
         return self._unwrap_result(raw)
 
     async def get_progress(self, import_id: str) -> dict[str, Any] | None:
@@ -240,10 +262,15 @@ class MCPClient:
 
         Returns:
             Результат update_entry (словарь с knowledge_id, title и др.).
+
+        Note:
+            Использует per-call timeout 60s — серверный update_entry может
+            занимать >10s на больших книгах (git commit YAML с 7032 children).
         """
         return await self.tools_call(
             "update_entry",
             {"knowledge_id": knowledge_id, "content": content},
+            timeout=60.0,
         )
 
     async def resources_list(self) -> list[dict[str, Any]]:

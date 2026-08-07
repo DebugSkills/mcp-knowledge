@@ -195,6 +195,7 @@ async def show_book_dialog(collection_id: str, title: str | None = None, initial
                 async def _do_rename() -> None:
                     nonlocal current_title
                     _rename_input = None
+                    _save_btn_ref = None
                     async def _confirm_rename() -> None:
                         nonlocal current_title
                         raw = _rename_input.value or ""
@@ -202,6 +203,9 @@ async def show_book_dialog(collection_id: str, title: str | None = None, initial
                         if not sanitized:
                             ui.notify("Название не может быть пустым", type="warning")
                             return
+                        if _save_btn_ref is not None:
+                            _save_btn_ref.disable()
+                        ui.notify("Переименовываю книгу…", type="info")
                         try:
                             await client.update_entry(collection_id, content=f"# {sanitized}\n\nКоллекция импортированных секций. Оглавление — в frontmatter.children.")
                             current_title = sanitized
@@ -209,12 +213,19 @@ async def show_book_dialog(collection_id: str, title: str | None = None, initial
                             ui.notify(f"Книга переименована в «{sanitized}»", type="positive")
                             rename_dialog.close()
                         except Exception as exc:
-                            ui.notify(f"Ошибка переименования: {exc}", type="negative")
+                            ui.notify(
+                                f"Ошибка переименования: {exc}\n\n"
+                                f"Книга могла быть переименована — обновите список.",
+                                type="negative",
+                            )
+                        finally:
+                            if _save_btn_ref is not None:
+                                _save_btn_ref.enable()
                     with ui.dialog() as rename_dialog, ui.card():
                         ui.label("Переименовать книгу").classes("text-h6")
                         _rename_input = ui.input(label="Новое название", value=current_title).classes("w-full")
                         with ui.row().classes("gap-2 q-mt-md"):
-                            ui.button("Сохранить", on_click=_confirm_rename, icon="save").props("color=primary")
+                            _save_btn_ref = ui.button("Сохранить", on_click=_confirm_rename, icon="save").props("color=primary")
                             ui.button("Отмена", on_click=rename_dialog.close).props("flat")
                     rename_dialog.open()
                 rename_btn.on("click", _do_rename)

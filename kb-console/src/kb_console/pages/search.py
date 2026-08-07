@@ -4,12 +4,16 @@ Variant A (13.10 → 13.13): информативные результаты —
 (parent коллекция), Score, сниппет контента, теги (ui.chip), кнопка
 «Открыть фрагмент» (диалог с секцией, не TOC).
 Кэш названий книг: один list_collections на первую выдачу (без N+1).
+
+Фаза 13.16: блок прогресса quality scan в начале страницы (общий компонент
+progress_panel.py), авто-скрытие при отсутствии активного скана.
 """
 
 from __future__ import annotations
 
 from nicegui import ui
 
+from ..components.progress_panel import build_scan_progress
 from ..config import MCP_API_KEY, MCP_SERVER_URL
 from ..core.mcp_client import MCPClient
 from .books import show_book_dialog
@@ -36,6 +40,15 @@ def build_search() -> None:
     """Построить страницу «Поиск»."""
 
     ui.label("Поиск по базе знаний").classes("text-h4 q-mb-md")
+
+    # 13.16: Блок прогресса quality scan (общий компонент, авто-скрытие)
+    _scan_client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+    build_scan_progress(client=_scan_client)
+
+    def _cleanup_scan_client() -> None:
+        import asyncio
+        asyncio.create_task(_scan_client.close())
+    ui.context.client.on_disconnect(_cleanup_scan_client)
 
     with ui.row().classes("gap-4"):
         query_input = ui.input(

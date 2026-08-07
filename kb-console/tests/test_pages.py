@@ -159,10 +159,26 @@ def test_header_module_imports():
     assert callable(render_header)
 
 
+def test_progress_panel_module_imports():
+    """Модуль components.progress_panel должен импортироваться и содержать build_scan_progress."""
+    from kb_console.components.progress_panel import (
+        _LEVEL_COLORS,
+        SCAN_POLL_INTERVAL,
+        build_scan_progress,
+    )
+    assert callable(build_scan_progress)
+    assert isinstance(SCAN_POLL_INTERVAL, float)
+    assert isinstance(_LEVEL_COLORS, dict)
+    assert "info" in _LEVEL_COLORS
+    assert "warning" in _LEVEL_COLORS
+    assert "error" in _LEVEL_COLORS
+
+
 def test_components_init_exports():
-    """components/__init__.py должен экспортировать render_header."""
-    from kb_console.components import render_header
+    """components/__init__.py должен экспортировать render_header и build_scan_progress."""
+    from kb_console.components import build_scan_progress, render_header
     assert callable(render_header)
+    assert callable(build_scan_progress)
 
 
 # ── _find_section_child (чистая функция, unit-тестируема) ──
