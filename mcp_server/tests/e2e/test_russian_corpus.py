@@ -195,6 +195,10 @@ S4_CONTENT = "# Reconcile Test\n\nЗапись для проверки reconcili
 
 @pytest.mark.e2e
 @pytest.mark.asyncio
+@pytest.mark.skip(
+    reason="skip_orphan_detection=True в конфиге (после OOM-фикса 2026-08-06, коммит 352b54d) "
+           "— orphan-детекция отключена, тест ожидает её работу. Включить вместе с фичой."
+)
 async def test_s4_reconcile_orphan_delete(e2e_app_state, real_qdrant, e2e_store,
                                           e2e_pipeline, e2e_knowledge_index):
     """S4: reconcile удаляет orphan-точку, реальная запись сохранена."""
