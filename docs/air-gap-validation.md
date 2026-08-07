@@ -40,7 +40,7 @@ cd staging
 
 В bundle входит **kb-console** — отдельный NiceGUI-клиент (порт **8085**) для проверки и обслуживания системы:
 
-- **Статус** — жив ли сервер (liveness/readiness: Qdrant, Embedding, Pipeline, DLQ), ключевые метрики, таблица всех 16 MCP-инструментов (auto-refresh 10 c).
+- **Статус** — жив ли сервер (liveness/readiness: Qdrant, Embedding, Pipeline, DLQ), ключевые метрики, таблица всех 18 MCP-инструментов (auto-refresh 10 c).
 - **Импорт** — загрузка материалов (Markdown) через `import_content` (поля: content, content_type, domain, subject, tags).
 - **Поиск** — пробный поиск по корпусу (`search_knowledge`) с результатами (title/score/domain/subject).
 
@@ -313,9 +313,11 @@ curl -s -X POST http://localhost:8000/mcp \
   -d '{"jsonrpc":"2.0","id":"list-1","method":"tools/list"}' \
   | python3 -c "import sys, json; tools=json.load(sys.stdin)['result']['tools']; print(f'{len(tools)} tools'); [print(f'  - {t[\"name\"]}') for t in tools]"
 
-# Expected: 11 tools listed (search_knowledge, search_by_tags, get_entry, get_knowledge_map,
-#                           list_domains, list_subjects, list_projects,
-#                           write_knowledge, update_entry, delete_entry, reindex)
+# Expected: 18 tools (search_knowledge, search_by_tags, get_entry, get_knowledge_map,
+#                           list_collections, write_knowledge, update_entry, delete_entry,
+#                           list_domains, list_subjects, list_projects, reindex,
+#                           review_queue, list_quality_issues, resolve_quality_issue,
+#                           run_quality_scan, import_content, analyze_content)
 
 # 6. Search (requires some data in knowledge/ dir)
 curl -s -X POST http://localhost:8000/mcp \
@@ -394,7 +396,7 @@ echo "Cold start: ${DURATION}s"
 - [ ] `/health/live` → HTTP 200
 - [ ] `/health` → HTTP 200, `"status":"healthy"`
 - [ ] `/health` checks: qdrant connected, embed loaded, pipeline alive, DLQ empty
-- [ ] `tools/list` → returns 11 tools
+- [ ] `tools/list` → returns 18 tools
 - [ ] `search_knowledge` → returns results (or empty array if no data)
 - [ ] `get_knowledge_map` → returns valid structure
 - [ ] `tcpdump` → **0 outbound packets**

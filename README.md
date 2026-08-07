@@ -2,26 +2,29 @@
 
 MCP Knowledge Server — семантическая база знаний для AI-агентов по протоколу MCP (Model Context Protocol). Проект сообщества DebugSkills.
 
-Хранение: Markdown SSOT → chunk → Ollama embed (mxbai-embed-large) → Qdrant vector search. **16 MCP Tools**, air-gap совместимость (одноархивный deploy-bundle), production-ready (health, rate-limit, blue-green reindex, quality system). Веб-консоль **kb-console** (NiceGUI, :8085) для диагностики и обслуживания.
+Хранение: Markdown SSOT → chunk → Ollama embed (nomic-embed-text) → Qdrant vector search. **18 MCP Tools**, air-gap совместимость (одноархивный deploy-bundle), production-ready (health, rate-limit, blue-green reindex, quality system). Веб-консоль **kb-console** (NiceGUI, :8085) для диагностики и обслуживания. Подключение AI-агентов (Kilo/Claude/Cline) — через **stdio-мост** (`mcp-stdio/bridge.py`, см. `docs/mcp-client-guide.md`).
 
 ## Архитектура
 
 ```
-MCP Client (Claude/Cline/Kilo) ─── kb-console (NiceGUI, :8085)
-    │ JSON-RPC 2.0 over HTTP           │  диаг. :8085 → :8000
-    ▼                                  ▼  (или с клиентского хоста)
+Kilo/Claude/Cline ──┐
+(stdio-мост)        │  kb-console (NiceGUI, :8085)
+mcp-stdio/bridge.py │    │  диаг. :8085 → :8000
+    │ POST /mcp     │    │  (или с клиентского хоста)
+    ▼               ▼    ▼
 ┌────────────────────────────────────────────────────┐
 │  FastAPI + MCP Handler (v0.1.0)                    │
-│  Auth: multi-key (read/write, X-API-Key)           │
+│  Auth: multi-key (read/import/write, X-API-Key)    │
 │  Rate-limit: token bucket (REST, 429)              │
-│  Endpoints: POST /mcp · /health · /health/live · /metrics │
+│  Endpoints: POST /mcp · /health · /health/live ·   │
+│             /metrics · /imports/{id}/progress      │
 ├────────────────────────────────────────────────────┤
-│  Tools (16)                                        │
-│  search read crud browse admin quality import      │
+│  Tools (18)                                        │
+│  search read crud browse admin quality import analyze │
 ├────────────────────────────────────────────────────┤
 │  Pipeline: chunk → embed → upsert (async worker)   │
 │  Qdrant (vector DB, REST 6333 / gRPC 6334)         │
-│  Ollama (mxbai-embed-large 1024d, системный сервис)│
+│  Ollama (nomic-embed-text 768d, системный сервис)   │
 ├────────────────────────────────────────────────────┤
 │  Quality System (Фаза 4)                           │
 │  gates scoring scanner lifecycle dup-gate issues   │
@@ -31,7 +34,7 @@ MCP Client (Claude/Cline/Kilo) ─── kb-console (NiceGUI, :8085)
 └────────────────────────────────────────────────────┘
 ```
 
-**kb-console** — отдельный самодостаточный контейнер (образ `kb-console:prod`): страницы **Статус** (health-карточки, метрики, 16 инструментов), **Импорт** (загрузка материалов через `import_content`), **Поиск** (по корпусу). Может жить на клиентских хостах (`MCP_SERVER_URL` из env). Руководство: `kb-console/USER_GUIDE.md`.
+**kb-console** — отдельный самодостаточный контейнер (образ `kb-console:prod`): страницы **Статус** (health-карточки, метрики, 18 инструментов), **Книги** (список коллекций + оглавление), **Импорт** (загрузка материалов через `import_content`), **Поиск** (по корпусу). Может жить на клиентских хостах (`MCP_SERVER_URL` из env). Руководство: `kb-console/USER_GUIDE.md`.
 
 ## Быстрый старт
 
@@ -46,8 +49,9 @@ docker compose up -d kb-console      # → http://localhost:8085
 
 # Тесты (нужны запущенные Qdrant :6333 и Ollama :11434)
 make e2e-slow                        # E2E S1-S20 (32 + S20 4/4)
-.venv/bin/python -m pytest mcp_server/tests -q   # полный suite (428)
-make console-test                    # unit + smoke kb-console (8)
+.venv/bin/python -m pytest mcp_server/tests -q   # полный suite (482)
+make console-test                    # unit + smoke kb-console (33)
+.venv/bin/python -m pytest mcp-stdio/tests -q    # stdio-мост (19)
 ```
 
 ## Продовый деплой (air-gap, одноархивный bundle)
@@ -62,7 +66,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 ```
 Подробности: `docs/air-gap-validation.md` (в bundle — `DEPLOYMENT.md`), руководство консоли — `USER_GUIDE.md`.
 
-## MCP Tools (16)
+## MCP Tools (18)
 
 ### Search & Read
 | # | Tool | Назначение |
@@ -82,32 +86,36 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 ### Browse
 | # | Tool | Назначение |
 |---|------|-----------|
-| 8 | `list_domains` | Список доменов (пагинация) |
-| 9 | `list_subjects` | Список тем в домене |
-| 10 | `list_projects` | Список проектов (domain/subject опционально) |
+| 5 | `list_collections` | Список книг/коллекций с метаданными (title, domain/subject, tags, section_count) |
+| 9 | `list_domains` | Список доменов (пагинация) |
+| 10 | `list_subjects` | Список тем в домене |
+| 11 | `list_projects` | Список проектов (domain/subject опционально) |
 
 ### Admin
 | # | Tool | Назначение |
 |---|------|-----------|
-| 11 | `reindex` | Перестроить индекс: все .md → Qdrant (blue-green, zero-downtime) |
+| 12 | `reindex` | Перестроить индекс: все .md → Qdrant (blue-green, zero-downtime) |
 
 ### Quality (Фаза 4)
 | # | Tool | Назначение |
 |---|------|-----------|
-| 12 | `review_queue` | Топ устаревших записей (staleness_score DESC) |
-| 13 | `list_quality_issues` | Проблемы: дубликаты, edit-wars, битые ссылки |
-| 14 | `resolve_quality_issue` | Разрешить: merge/deprecate/restore/resolve/ignore |
-| 15 | `run_quality_scan` | Периодический scan (для cron, daily) |
+| 13 | `review_queue` | Топ устаревших записей (staleness_score DESC) |
+| 14 | `list_quality_issues` | Проблемы: дубликаты, edit-wars, битые ссылки |
+| 15 | `resolve_quality_issue` | Разрешить: merge/deprecate/restore/resolve/ignore |
+| 16 | `run_quality_scan` | Периодический scan (для cron, daily) |
 
-### Import (Фаза 5)
+### Import (Фаза 5 + 13.8)
 | # | Tool | Назначение |
 |---|------|-----------|
-| 16 | `import_content` | Декомпозиция + batch запись: content → collection (book, cross_subjects, wait_for_index) |
+| 17 | `import_content` | Декомпозиция + batch запись: content → collection (book, cross_subjects, wait_for_index) |
+| 18 | `analyze_content` | AI-анализ контента: рекомендации content_type/domain/subject/tags (Ollama LLM + TF-IDF) |
 
 ## MCP Prompts
 
 | Prompt | Назначение |
 |--------|-----------|
+| `how-to-structure-knowledge` | Рекомендации по структурированию знаний в Markdown (SSOT, frontmatter, теги) |
+| `best-practice-write` | Best-practice для write_knowledge: SSOT, YAML frontmatter, теги, кросс-ссылки |
 | `periodic_quality_cleanup` | Пошаговая инструкция для AI-агента: review_queue → list_issues → resolve |
 
 ## Quality System (Фаза 4)
@@ -131,8 +139,11 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | `QDRANT_URL` / `QDRANT_PREFER_GRPC` | `http://localhost:6333` / `true` | Qdrant (REST; gRPC при контейнерной сети) |
 | `KNOWLEDGE_DIR` | `knowledge/` | Markdown SSOT |
 | `MCP_READ_KEYS` / `MCP_WRITE_KEYS` | `[]` | API-ключи (read/write; пусто = без auth) |
-| `MCP_API_KEY` | — | Ключ kb-console (должен входить в read/write keys) |
+| `MCP_IMPORT_KEYS` | `[]` | Import-ключи (read + import_content, без delete/reindex) |
+| `MCP_API_KEY` | — | Ключ kb-console (должен входить в read/import/write keys) |
 | `MCP_SERVER_URL` / `CONSOLE_PORT` | `http://localhost:8000` / `8085` | kb-console: адрес сервера / порт UI |
+| `OLLAMA_CHAT_MODEL` | `qwen2.5:7b` | LLM для analyze_content (рекомендации) |
+| `ANALYZE_FRAGMENT_CHARS` / `ANALYZE_TIMEOUT` | `8000` / `60s` | Лимиты анализа контента |
 | `RATE_LIMIT_READ_PER_MIN` / `RATE_LIMIT_WRITE_PER_MIN` | `100` / `20` | Rate-limit (429) |
 | `REVIEW_THRESHOLD` | 0.45 | Порог для review-очереди |
 | `DUP_SIMILARITY_THRESHOLD` | 0.92 | Cosine-порог для дублей |
@@ -141,13 +152,17 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 
 | Фаза | Статус | Ключевой результат |
 |------|:------:|-------------------|
-| 0-4 | ✅ | Scaffolding → Quality System (16 tools, промпт, gates) |
+| 0-4 | ✅ | Scaffolding → Quality System (18 tools, 3 промпта, gates) |
 | 9 | ✅ | Idempotent E2E-сьют (S1-S8), фикс latent dup-gate бага |
 | 12 | ✅ | HTTP-level E2E (S9-S12: health/metrics/429/409/503) + observability-метрики |
 | 13 | ✅ | Полное E2E-покрытие (S13-S19) + 24 quality unit-теста + 2 прод-фикса |
 | 13.5 | ✅ | Ollama как прод-embedder + лёгкий Docker-образ (без torch, 424 passed) |
 | 13.6 | ✅ | Air-gap deploy bundle: один архив (образы + Ollama-модели), deploy/verify/import |
 | 13.7 | ✅ | kb-console (NiceGUI :8085): диагностика, импорт, поиск; E2E S20; bundle с 3 образами |
+| 13.8 | ✅ | analyze_content (AI-рекомендации через Ollama + TF-IDF), unwrap-фикс kb-console |
+| 13.9 | ✅ | Прогресс импорта (GET /imports/{id}/progress) + 1 коммит на книгу |
+| 13.10 | ✅ | list_collections + enriched search (фильтры collection_id/content_type) |
+| 13.11 | ✅ | kb-console UX: модалка, прелоадер, редактируемый title, отдельные эндпоинты |
 
 ## Тесты (актуальные цифры)
 
@@ -156,8 +171,9 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | Unit + integration (сервер) | 393 passed |
 | E2E S1-S19 (реальные Qdrant+Ollama) | 32/32 (S8 — e2e_slow) |
 | E2E S20 (kb-console MCPClient ↔ сервер) | 4/4 (в контейнере mcp-server — skip, exit 0) |
-| kb-console unit + smoke | 8/8 |
-| Полный suite (локально) | **428 passed**, 1 deselected |
+| kb-console unit + smoke | 33/33 |
+| mcp-stdio bridge tests | 19/19 (unit 18 + smoke 1) |
+| Полный suite (`make test`) | **482 passed**, 2 skipped, 1 deselected |
 | Docker (в контейнере mcp-server) | 424 passed / E2E 31 passed |
 | Ruff | 0 ошибок |
 
@@ -184,4 +200,4 @@ a2e6479 feat(phase12): HTTP-level E2E S9-S12 + 5 observability metrics
 
 ---
 
-*Актуально на 2026-08-05. 16 MCP Tools, 428 тестов, kb-console :8085, air-gap bundle 1.2 GB.*
+*Актуально на 2026-08-07. 18 MCP Tools, 482 тестов (+ mcp-stdio: 19), kb-console :8085, stdio-мост для Kilo/Claude/Cline, air-gap bundle 1.1 GB.*

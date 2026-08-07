@@ -37,7 +37,8 @@
 
 | Key Level | Access | `.env` Variable |
 |-----------|--------|-----------------|
-| **read-key** | `search_knowledge`, `search_by_tags`, `get_entry`, `get_knowledge_map`, `list_*`, resources, prompts | `MCP_READ_KEYS=["..."]` |
+| **read-key** | `search_knowledge`, `search_by_tags`, `get_entry`, `get_knowledge_map`, `list_*`, `list_collections`, `analyze_content`, resources, prompts | `MCP_READ_KEYS=["..."]` |
+| **import-key** | All read tools + `import_content` (без delete/reindex/write) | `MCP_IMPORT_KEYS=["..."]` |
 | **write-key** | All read tools + `write_knowledge`, `update_entry`, `delete_entry`, `reindex` | `MCP_WRITE_KEYS=["..."]` |
 
 ### 2.2 Key Format
@@ -120,7 +121,7 @@ curl -s -X POST http://localhost:8000/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools | length'
 ```
 
-Both should return the tool count (11 tools as of Phase 3).
+Both should return the tool count (18 tools as of Phase 13).
 
 ---
 
@@ -198,7 +199,7 @@ curl -s -X POST http://localhost:8000/mcp \
   -H "X-API-Key: new-key-def456..." \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools | length'
-# Expected: 11
+# Expected: 18
 ```
 
 ---
