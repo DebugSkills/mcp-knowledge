@@ -39,6 +39,9 @@ PAYLOAD_STATUS = "status"
 # ── Конфигурация dup-scan ────────────────────────────────────
 DUP_SIMILARITY_THRESHOLD: float = 0.92  # cosine-порог для дублей
 MAX_PAIRS_PER_BUCKET: int = 500  # макс пар для проверки в одном domain
+# Лимит dup-issues на одну запись (13.14): книга на 15K секций даёт тысячи пар
+# с одинаковым fm_i → 15K+ issues на один knowledge_id (засорение issues + CPU 120%).
+MAX_ISSUES_PER_KNOWLEDGE: int = 10
 
 
 async def run_scan(
@@ -252,16 +255,22 @@ def _scan_dup_pairs(
             continue
         # Ограничиваем число пар для производительности
         n = min(len(entries), MAX_PAIRS_PER_BUCKET)
+        # Лимит dup-issues на одну запись: книга на 15K секций даёт тысячи пар
+        # с одинаковым fm_i → тысячи issues на один knowledge_id (засорение + CPU).
+        issue_counts: dict[str, int] = {}
         for i in range(n):
             for j in range(i + 1, n):
                 _, fm_i, _ = entries[i]
                 _, fm_j, _ = entries[j]
+                if issue_counts.get(fm_i.knowledge_id, 0) >= MAX_ISSUES_PER_KNOWLEDGE:
+                    continue  # запись уже имеет достаточно dup-issues
                 # Структурные TOC-секции («Table of Content (part N)») почти идентичны
                 # по subject+tags → массовые false-positive дубли. Пропускаем их.
                 if _is_toc_section(fm_i) or _is_toc_section(fm_j):
                     continue
                 if _are_dup_candidates(fm_i, fm_j):
                     dup_count += 1
+                    issue_counts[fm_i.knowledge_id] = issue_counts.get(fm_i.knowledge_id, 0) + 1
                     # Создаём issue для дубликата
                     create_issue(
                         issue_type="duplicate",
