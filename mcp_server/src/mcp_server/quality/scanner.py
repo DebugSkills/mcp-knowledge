@@ -1,4 +1,4 @@
-"""Quality scanner — периодический обход базы знаний (4.5).
+"""Quality scanner — периодический обход базы знаний (4.5+13.15).
 
 Сканер:
 1. Обходит knowledge/**/*.md (паттерн reconcile #19)
@@ -9,7 +9,8 @@
 6. Создаёт issues для обнаруженных проблем
 7. Наполняет review-очередь (top-N по staleness_score DESC)
 
-Зависимости: qdrant-client (лёгкий), scoring.py, issues.py, models.py.
+Фаза 13.15: все sync Qdrant/FS вызовы — через run_in_executor.
+Опциональный progress-трекер для live-отслеживания прогресса скана.
 """
 
 from __future__ import annotations
@@ -49,6 +50,8 @@ async def run_scan(
     *,
     qdrant_client=None,
     settings: Settings | None = None,
+    progress=None,            # 13.15: ImportProgressTracker (опционально)
+    progress_id: str | None = None,  # 13.15: id для трекера
 ) -> dict:
     """Запускает полный quality scan базы знаний.
 
@@ -56,6 +59,8 @@ async def run_scan(
         knowledge_dir: путь к knowledge/ (по умолчанию из settings).
         qdrant_client: экземпляр QdrantClient (если None — только scoring, без записи).
         settings: настройки (если None — загружаются из env).
+        progress: опциональный ImportProgressTracker для live-отслеживания.
+        progress_id: id записи в трекере (если progress задан).
 
     Returns:
         dict с метриками сканирования:
@@ -80,33 +85,69 @@ async def run_scan(
         "review_queue_size": 0,
     }
 
+    pid = progress_id
+
     # Шаг 1: обход knowledge/**/*.md
+    if progress and pid:
+        progress.set_phase(pid, "scanning_fs", "Обход файлов knowledge/...")
     entries = await _scan_filesystem(knowledge_dir)
     metrics["files_scanned"] = len(entries)
 
+    if progress and pid:
+        progress.start(pid, total=len(entries))  # actual total after walk
+
     if not entries:
+        if progress and pid:
+            progress.done(pid, {"metrics": metrics})
         return metrics
 
     # Шаг 2: вычисление staleness_score для каждой записи
-    scored: list[tuple[Path, KnowledgeFrontmatter, float]] = []
-    for filepath, frontmatter in entries:
-        score = _compute_score(frontmatter, now, filepath)
-        scored.append((filepath, frontmatter, score))
-        if score >= REVIEW_THRESHOLD:
-            metrics["review_queue_size"] += 1
+    if progress and pid:
+        progress.set_phase(pid, "scoring", f"Вычисление staleness_score для {len(entries)} записей...")
+
+    def _compute_all_scores(
+        entries: list[tuple[Path, KnowledgeFrontmatter]],
+        now_dt: datetime,
+    ) -> tuple[list[tuple[Path, KnowledgeFrontmatter, float]], int]:
+        """CPU + git-интенсивный scoring (detect_edit_war → git log на файл) в executor.
+
+        13.15 fix 2: _compute_score вызывает detect_edit_war (синхронный git-вызов
+        gitpython на КАЖДЫЙ файл) — цикл 15K записей в event loop блокировал
+        однопоточный uvicorn (повтор инцидента 2026-08-07 при live-smoke).
+        """
+        scored: list[tuple[Path, KnowledgeFrontmatter, float]] = []
+        review_queue_size = 0
+        for filepath, frontmatter in entries:
+            score = _compute_score(frontmatter, now_dt, filepath)
+            scored.append((filepath, frontmatter, score))
+            if score >= REVIEW_THRESHOLD:
+                review_queue_size += 1
+        return scored, review_queue_size
+
+    scoring_loop = asyncio.get_running_loop()
+    scored, review_queue_size = await scoring_loop.run_in_executor(
+        None, _compute_all_scores, entries, now,
+    )
+    metrics["review_queue_size"] = review_queue_size
 
     # Шаг 3: запись scores в Qdrant payload
     if qdrant_client is not None:
-        await _update_qdrant_payloads(qdrant_client, scored)
+        if progress and pid:
+            progress.set_phase(pid, "updating_qdrant", "Запись scores в Qdrant payload...")
+        await _update_qdrant_payloads(qdrant_client, scored, progress=progress, progress_id=pid)
         metrics["scores_updated"] = len(scored)
 
     # Шаг 4: dup-pair scan по domain-бакетам
+    if progress and pid:
+        progress.set_phase(pid, "dup_scan", "Сканирование дубликатов...")
     loop = asyncio.get_running_loop()
     dup_count = await loop.run_in_executor(None, _scan_dup_pairs, scored)
     metrics["duplicates_detected"] = dup_count
 
     # Шаг 5: создание issues для проблемных записей
-    issue_count = _create_issues_for_problems(scored)
+    if progress and pid:
+        progress.set_phase(pid, "issues", "Создание quality issues...")
+    issue_count = await loop.run_in_executor(None, _create_issues_for_problems, scored)
     metrics["issues_created"] = issue_count
 
     logger.info(
@@ -203,34 +244,86 @@ def _compute_score(
 async def _update_qdrant_payloads(
     client,  # QdrantClient
     scored: list[tuple[Path, KnowledgeFrontmatter, float]],
+    *,
+    progress=None,
+    progress_id: str | None = None,
 ) -> None:
     """Обновляет staleness_score + quality_flags в Qdrant payload через set_payload.
 
     Использует set_payload (не upsert) — обновляет существующие chunk-точки
     по фильтру knowledge_id, не создавая новых non-vector точек в коллекции.
+
+    13.15: sync set_payload вынесен в run_in_executor батчами по ~200;
+    между батчами — asyncio.sleep(0) (yield event loop).
+    Опциональный progress.section_done() каждые ~200 записей.
     """
     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-    for filepath, frontmatter, score in scored:
+    BATCH_SIZE = 200
+    loop = asyncio.get_running_loop()
+    pid = progress_id
+
+    def _do_batch(batch: list[tuple[str, dict]]) -> list[str]:
+        """Синхронный set_payload для батча (выполняется в executor)."""
+        errors: list[str] = []
+        for knowledge_id, payload_update in batch:
+            try:
+                client.set_payload(
+                    payload=payload_update,
+                    points_filter=Filter(
+                        must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                msg = f"Failed to set_payload for {knowledge_id}: {exc}"
+                logger.error(msg)
+                errors.append(msg)
+        return errors
+
+    # Подготовка батчей
+    batches: list[list[tuple[str, dict]]] = []
+    current_batch: list[tuple[str, dict]] = []
+    for _filepath, frontmatter, score in scored:
         knowledge_id = frontmatter.knowledge_id
         flags: list[str] = []
         if score >= REVIEW_THRESHOLD:
             flags.append("needs_review")
-
         payload_update = {
             PAYLOAD_STALENESS_SCORE: score,
             PAYLOAD_QUALITY_FLAGS: flags,
         }
+        current_batch.append((knowledge_id, payload_update))
+        if len(current_batch) >= BATCH_SIZE:
+            batches.append(current_batch)
+            current_batch = []
+    if current_batch:
+        batches.append(current_batch)
 
-        try:
-            client.set_payload(
-                payload=payload_update,
-                points_filter=Filter(
-                    must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to set_payload for %s: %s", knowledge_id, exc)
+    processed = 0
+    for batch in batches:
+        # Выполняем sync-работу в executor (не блокирует event loop)
+        batch_errors = await loop.run_in_executor(None, _do_batch, batch)
+        if batch_errors:
+            logger.warning("_update_qdrant_payloads: %d set_payload errors in batch", len(batch_errors))
+
+        processed += len(batch)
+
+        # Прогресс: section_done для каждой записи в батче
+        if progress and pid:
+            for _ in batch:
+                try:
+                    progress.section_done(pid, 0, "")
+                except Exception:  # noqa: S110, BLE001
+                    pass  # best-effort progress
+
+        # Yield event loop между батчами
+        if len(batches) > 1:
+            await asyncio.sleep(0)
+
+        if processed % 1000 == 0:
+            logger.info("_update_qdrant_payloads: %d/%d scores written", processed, len(scored))
+
+    logger.info("_update_qdrant_payloads: completed %d/%d scores", processed, len(scored))
 
 
 def _scan_dup_pairs(

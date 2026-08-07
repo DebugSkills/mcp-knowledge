@@ -173,3 +173,84 @@ async def test_s9d_metrics_after_write_and_search(e2e_http_app):
     # перезапишет точку ПОСЛЕ delete → мусор в коллекции) → удаляем из Qdrant
     await e2e_http_app.app.state.pipeline.wait_for_index(S9D_KNOWLEDGE_ID, timeout=10.0)
     e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S9D_KNOWLEDGE_ID)
+
+
+# ═══════════════════════════════════════════════════════════════
+# S9e: 13.15 регрессия инцидента — /health/live отвечает во время скана
+# ═══════════════════════════════════════════════════════════════
+
+@pytest.mark.e2e
+async def test_s9e_health_responsive_during_quality_scan(e2e_http_app):
+    """Регрессия инцидента 2026-08-07: run_quality_scan НЕ блокирует event loop.
+
+    Инцидент: scanner._update_qdrant_payloads делал ~15K sync set_payload
+    прямо в event loop → /health/live таймаутил (ReadTimeout в kb-console).
+    13.15: скан — фоновая задача, sync-вызовы в run_in_executor.
+
+    Проверка: во время активного фонового скана GET /health/live отвечает
+    <100ms, а GET /quality/scan/progress возвращает прогресс.
+    """
+    import asyncio
+    import time
+    from unittest.mock import AsyncMock, patch
+
+    headers = {"X-API-Key": "e2e-write-key"}
+
+    async def slow_scan(**kwargs):
+        """Имитация долгого скана: 10 итераций × 50ms (loop должен дышать)."""
+        for _ in range(10):
+            await asyncio.sleep(0.05)
+        return {
+            "files_scanned": 0,
+            "review_queue_size": 0,
+            "duplicates_detected": 0,
+            "issues_created": 0,
+        }
+
+    with patch("mcp_server.quality.scanner.run_scan", new=AsyncMock(side_effect=slow_scan)):
+        resp = await e2e_http_app.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "run_quality_scan", "arguments": {}},
+                "id": 1,
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "result" in body, f"run_quality_scan failed: {body}"
+        data = json.loads(body["result"]["content"][0]["text"])
+        assert data["status"] == "started", f"Expected started, got: {data}"
+        assert len(data["scan_id"]) == 16
+
+        # 1) /health/live отвечает быстро во время активного скана
+        t0 = time.monotonic()
+        h = await e2e_http_app.get("/health/live")
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        assert h.status_code == 200
+        assert h.json() == {"status": "alive"}
+        assert elapsed_ms < 100, f"/health/live took {elapsed_ms:.1f}ms during scan (event loop blocked!)"
+
+        # 2) прогресс-эндпоинт отдаёт данные скана
+        p = await e2e_http_app.get("/quality/scan/progress")
+        assert p.status_code == 200
+        progress = p.json()
+        # ImportProgressTracker хранит запись под ключом import_id == scan_id
+        assert progress.get("import_id") == data["scan_id"]
+        assert progress["status"] in ("running", "done", "error")
+
+        # 3) даём фону завершиться → прогресс в терминальном статусе
+        await asyncio.sleep(0.7)
+        p2 = await e2e_http_app.get("/quality/scan/progress")
+        progress2 = p2.json()
+        assert progress2["status"] in ("done", "error")
+
+        # 4) ждём фоновую задачу (иначе «Task was destroyed but it is pending»)
+        scan_task = e2e_http_app.app.state.scan_task
+        if scan_task is not None:
+            try:
+                await asyncio.wait_for(scan_task, timeout=3.0)
+            except (asyncio.CancelledError, TimeoutError):
+                pass

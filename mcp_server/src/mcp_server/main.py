@@ -263,6 +263,13 @@ async def lifespan(app: FastAPI):
     app.state.import_progress = ImportProgressTracker()
     logger.info("📊 ImportProgressTracker initialized (max_messages=50, ttl=600s)")
 
+    # 13.15: Scan state — background task + lock (root-фикс зависания event loop)
+    app.state.scan_lock = asyncio.Lock()
+    app.state.scan_task = None
+    app.state.scan_progress = ImportProgressTracker()
+    app.state.scan_id: str | None = None
+    logger.info("🔒 Scan lock + progress tracker initialized (phase 13.15)")
+
     elapsed = _time.monotonic() - _start_ts
     rss_end = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     logger.info("[START] ready backend=%s elapsed=%.1fs rss=%.0f MB",
@@ -272,6 +279,18 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ──────────────────────────────────────────
     logger.info("[START] shutdown")
+
+    # 13.15: Cancel background scan task if running (graceful shutdown)
+    if app.state.scan_task is not None and not app.state.scan_task.done():
+        logger.info("[START] cancelling background scan task...")
+        app.state.scan_task.cancel()
+        try:
+            await asyncio.wait_for(app.state.scan_task, timeout=5.0)
+        except (asyncio.CancelledError, TimeoutError):
+            logger.warning("[START] scan task did not finish in 5s (forced)")
+        finally:
+            app.state.scan_task = None
+
     await pipeline.stop()
     qdrant.close()
     logger.info("[START] shutdown_done")
@@ -330,4 +349,30 @@ async def import_progress(import_id: str, request: Request):
     snapshot = tracker.get(import_id) if tracker else None
     if snapshot is None:
         raise HTTPException(404, "unknown import_id")
+    return snapshot
+
+
+# 13.15: Live scan progress polling endpoint
+@app.get("/quality/scan/progress")
+async def scan_progress(request: Request):
+    """GET /quality/scan/progress — снапшот прогресса quality scan.
+
+    Возвращает JSON с полями: scan_id, status, phase, done, total,
+    messages[], started_at, updated_at, metrics? (при status=done).
+
+    Без path-параметра: всегда возвращает текущий/последний скан.
+    Если скана нет — 404.
+    """
+    auth = getattr(request.state, "auth", None)
+    if auth is None or not getattr(auth, "authenticated", False):
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    scan_id = getattr(request.app.state, "scan_id", None)
+    if not scan_id:
+        raise HTTPException(404, "no scan has been started")
+
+    tracker = getattr(request.app.state, "scan_progress", None)
+    snapshot = tracker.get(scan_id) if tracker else None
+    if snapshot is None:
+        raise HTTPException(404, f"scan {scan_id} not found or expired")
     return snapshot

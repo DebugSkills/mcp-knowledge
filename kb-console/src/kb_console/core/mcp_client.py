@@ -256,6 +256,29 @@ class MCPClient:
         result = await self._call("prompts/list")
         return result.get("prompts", [])
 
+    # ── Scan progress (Фаза 13.15) ───────────────────────────
+
+    async def get_scan_progress(self) -> dict[str, Any] | None:
+        """GET /quality/scan/progress — снапшот живого прогресса quality scan.
+
+        Returns:
+            Словарь прогресса (scan_id, status, phase, imported, total,
+            messages[], started_at, updated_at, summary{metrics?}) или None
+            при любой ошибке (404 / endpoint отсутствует / сеть) —
+            никогда не бросает.
+        """
+        url = f"{self.base_url}/quality/scan/progress"
+        try:
+            response = await self._client.get(url, headers=self._headers(), timeout=5.0)
+        except httpx.HTTPError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            return response.json()
+        except (json.JSONDecodeError, ValueError):
+            return None
+
     # ── Quality tools (Фаза 13.14) ────────────────────────────
 
     async def review_queue_books(
@@ -274,10 +297,14 @@ class MCPClient:
         return await self.tools_call("review_queue_books", params)
 
     async def run_quality_scan(self, domain: str | None = None) -> dict[str, Any]:
-        """Запустить quality scan.
+        """Запустить quality scan (13.15: фоновая задача, мгновенный ответ).
 
-        Returns:
-            {"scanned": True, "metrics": {...}}
+        Новый контракт (13.15):
+            {"scanned": true, "status": "started", "scan_id": "..."}
+            {"scanned": false, "status": "already_running", "scan_id": "..."}
+            {"scanned": false, "status": "error", "error": "..."}
+
+        Прогресс: get_scan_progress() → GET /quality/scan/progress.
         """
         params: dict[str, Any] = {}
         if domain:

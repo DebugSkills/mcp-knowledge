@@ -1,16 +1,21 @@
 # ruff: noqa: BLE001
-"""Quality MCP Tools — review_queue, review_queue_books, list_quality_issues, resolve_quality_issue, run_quality_scan (4.6+4.8+13.14).
+"""Quality MCP Tools — review_queue, review_queue_books, list_quality_issues, resolve_quality_issue, run_quality_scan (4.6+4.8+13.14+13.15).
 
 Thin wrappers: делегируют доменную логику в quality/ пакет.
 Регистрируются в tools/__init__.py → TOOLS + TOOL_HANDLERS.
 
 Фаза 13.14: +review_queue_books (агрегация по книгам), resolve_quality_issue
 расширен параметрами knowledge_id + cascade.
+
+Фаза 13.15: run_quality_scan → фоновая задача (asyncio.create_task) + lock
+(root-фикс зависания event loop); run_in_executor для sync Qdrant-вызовов.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
 
 from mcp_server.quality import REVIEW_THRESHOLD
 from mcp_server.quality.issues import list_issues, update_issue_status
@@ -43,6 +48,7 @@ async def review_queue(params: dict, app_state) -> dict:
 
     try:
         client = app_state.qdrant
+        loop = asyncio.get_running_loop()
         # Qdrant scroll с фильтром и сортировкой по payload.staleness_score DESC
         from qdrant_client.models import FieldCondition, Filter, MatchValue, Range
 
@@ -67,11 +73,15 @@ async def review_queue(params: dict, app_state) -> dict:
         scroll_filter = Filter(must=must_conditions) if must_conditions else None
 
         # Scroll все точки с staleness_score, затем сортируем в Python
-        points, _ = client.scroll(
-            scroll_filter=scroll_filter,
-            limit=limit * 3,  # берём с запасом для сортировки
-            with_payload=True,
-            with_vectors=False,
+        # 13.15: run_in_executor — не блокируем event loop
+        points, _ = await loop.run_in_executor(
+            None,
+            lambda: client.scroll(
+                scroll_filter=scroll_filter,
+                limit=limit * 3,  # берём с запасом для сортировки
+                with_payload=True,
+                with_vectors=False,
+            ),
         )
 
         # Сортируем DESC по staleness_score
@@ -121,6 +131,7 @@ async def review_queue_books(params: dict, app_state) -> dict:
 
     try:
         client = app_state.qdrant
+        loop = asyncio.get_running_loop()
         from qdrant_client.models import FieldCondition, Filter, MatchValue, Range
 
         must_conditions: list[FieldCondition] = []
@@ -144,15 +155,21 @@ async def review_queue_books(params: dict, app_state) -> dict:
         scroll_filter = Filter(must=must_conditions) if must_conditions else None
 
         # Paginated scroll — все точки с staleness_score (не limit*3!)
+        # 13.15: run_in_executor — не блокируем event loop
         all_points: list = []
         offset = None
         while True:
-            points, next_offset = client.scroll(
-                scroll_filter=scroll_filter,
-                limit=_SCROLL_BATCH,
-                offset=offset,
-                with_payload=True,
-                with_vectors=False,
+            _filt = scroll_filter
+            _off = offset
+            points, next_offset = await loop.run_in_executor(
+                None,
+                lambda f=_filt, o=_off: client.scroll(
+                    scroll_filter=f,
+                    limit=_SCROLL_BATCH,
+                    offset=o,
+                    with_payload=True,
+                    with_vectors=False,
+                ),
             )
             all_points.extend(points)
             if next_offset is None or len(points) == 0:
@@ -360,23 +377,27 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
             try:
                 qdrant = getattr(app_state, 'qdrant', None)
                 if qdrant:
+                    loop = asyncio.get_running_loop()
                     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
                     from mcp_server.quality.lifecycle import (
                         make_deprecation_payload_update,
                     )
                     payload = make_deprecation_payload_update()
-                    qdrant.set_payload(
-                        payload=payload,
-                        points_filter=Filter(
-                            must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
+                    await loop.run_in_executor(
+                        None,
+                        lambda: qdrant.set_payload(
+                            payload=payload,
+                            points_filter=Filter(
+                                must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
+                            ),
                         ),
                     )
                     side_effects.append(f"Qdrant payload status set to 'deprecated' for knowledge_id={knowledge_id}")
 
                     # Cascade: deprecate все дочерние секции (Фаза 13.14)
                     if cascade:
-                        cascade_affected = _cascade_set_payload(
+                        cascade_affected = await _cascade_set_payload(
                             qdrant, knowledge_id, payload, "deprecated"
                         )
                         side_effects.append(
@@ -406,21 +427,25 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
             try:
                 qdrant = getattr(app_state, 'qdrant', None)
                 if qdrant:
+                    loop = asyncio.get_running_loop()
                     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
                     from mcp_server.quality.lifecycle import make_restore_payload_update
                     payload = make_restore_payload_update()
-                    qdrant.set_payload(
-                        payload=payload,
-                        points_filter=Filter(
-                            must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
+                    await loop.run_in_executor(
+                        None,
+                        lambda: qdrant.set_payload(
+                            payload=payload,
+                            points_filter=Filter(
+                                must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
+                            ),
                         ),
                     )
                     side_effects.append(f"Qdrant payload status set to 'published' for knowledge_id={knowledge_id}")
 
                     # Cascade: restore все дочерние секции (Фаза 13.14)
                     if cascade:
-                        cascade_affected = _cascade_set_payload(
+                        cascade_affected = await _cascade_set_payload(
                             qdrant, knowledge_id, payload, "published"
                         )
                         side_effects.append(
@@ -452,16 +477,20 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
             try:
                 qdrant = getattr(app_state, 'qdrant', None)
                 if qdrant:
+                    loop = asyncio.get_running_loop()
                     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
                     from mcp_server.quality.lifecycle import (
                         make_deprecation_payload_update,
                     )
                     payload = make_deprecation_payload_update()
-                    qdrant.set_payload(
-                        payload=payload,
-                        points_filter=Filter(
-                            must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
+                    await loop.run_in_executor(
+                        None,
+                        lambda: qdrant.set_payload(
+                            payload=payload,
+                            points_filter=Filter(
+                                must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
+                            ),
                         ),
                     )
                     side_effects.append(f"Source '{knowledge_id}' deprecated via Qdrant payload")
@@ -484,39 +513,48 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
     return {"resolved": False, "error": f"Unknown action: {action}"}
 
 
-def _cascade_set_payload(
+async def _cascade_set_payload(
     qdrant,
     parent_knowledge_id: str,
     payload: dict,
     new_status: str,
 ) -> int:
-    """Фаза 13.14: применить set_payload ко всем дочерним секциям книги.
+    """Фаза 13.14+13.15: применить set_payload ко всем дочерним секциям книги.
 
     Scroll по parent_knowledge_id → set_payload на каждую секцию.
+    Все Qdrant-вызовы — через run_in_executor (не блокируют event loop).
     Возвращает число затронутых секций.
     """
     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
+    loop = asyncio.get_running_loop()
     affected = 0
     offset = None
     while True:
-        points, next_offset = qdrant.scroll(
-            scroll_filter=Filter(
-                must=[FieldCondition(key="parent_knowledge_id", match=MatchValue(value=parent_knowledge_id))]
+        _off = offset
+        points, next_offset = await loop.run_in_executor(
+            None,
+            lambda o=_off: qdrant.scroll(
+                scroll_filter=Filter(
+                    must=[FieldCondition(key="parent_knowledge_id", match=MatchValue(value=parent_knowledge_id))]
+                ),
+                limit=1000,
+                offset=o,
+                with_payload=["knowledge_id"],
+                with_vectors=False,
             ),
-            limit=1000,
-            offset=offset,
-            with_payload=["knowledge_id"],
-            with_vectors=False,
         )
         for point in points:
             kid = point.payload.get("knowledge_id") if point.payload else None
             if kid:
                 try:
-                    qdrant.set_payload(
-                        payload=payload,
-                        points_filter=Filter(
-                            must=[FieldCondition(key="knowledge_id", match=MatchValue(value=kid))]
+                    await loop.run_in_executor(
+                        None,
+                        lambda k=kid, p=payload: qdrant.set_payload(
+                            payload=p,
+                            points_filter=Filter(
+                                must=[FieldCondition(key="knowledge_id", match=MatchValue(value=k))]
+                            ),
                         ),
                     )
                     affected += 1
@@ -532,44 +570,114 @@ def _cascade_set_payload(
     return affected
 
 
-# ── 4.8: Cron-triggered scan ─────────────────────────────────
+# ── 4.8/13.15: Background quality scan ────────────────────────
+
+
+async def _bg_scan(
+    scan_id: str,
+    knowledge_dir,
+    qdrant_client,
+    scan_progress,
+    scan_state: dict,
+) -> None:
+    """Фоновая задача quality scan (13.15).
+
+    Выполняет run_scan под scan_lock, обновляет прогресс через
+    scan_progress. При ошибке — scan_progress.error().
+    scan_task очищается в finally.
+    """
+    from mcp_server.quality.scanner import run_scan
+
+    try:
+        async with scan_state["lock"]:
+            scan_progress.set_phase(scan_id, "scanning_fs", "Обход файлов...")
+            metrics = await run_scan(
+                knowledge_dir=knowledge_dir,
+                qdrant_client=qdrant_client,
+                progress=scan_progress,
+                progress_id=scan_id,
+            )
+            scan_progress.done(scan_id, {"metrics": metrics})
+            logger.info(
+                "Background scan %s complete: %d files, %d in review queue, %d dups, %d issues",
+                scan_id,
+                metrics["files_scanned"],
+                metrics["review_queue_size"],
+                metrics["duplicates_detected"],
+                metrics["issues_created"],
+            )
+    except asyncio.CancelledError:
+        logger.info("Background scan %s cancelled (shutdown)", scan_id)
+        scan_progress.error(scan_id, "scan cancelled (server shutdown)")
+        raise
+    except Exception as exc:
+        logger.exception("Background scan %s failed", scan_id)
+        scan_progress.error(scan_id, str(exc))
+        scan_progress.error(scan_id, str(exc))
+    finally:
+        scan_state["task_ref"][0] = None
+
 
 async def run_quality_scan(params: dict, app_state) -> dict:
-    """Запускает периодический quality scan (для cron, 4.8).
+    """Запускает quality scan как фоновую задачу (13.15).
 
-    Вызывает scanner.run_scan() — обход knowledge/**, вычисление
-    staleness_score, dup-pair detection, запись в Qdrant + issues.
+    Возвращает мгновенный ответ — скан выполняется асинхронно.
+    Прогресс: GET /quality/scan/progress.
+
+    Новый контракт (13.15):
+        {"scanned": true, "status": "started", "scan_id": "..."}  — скан запущен
+        {"scanned": false, "status": "already_running", "scan_id": "..."}  — уже идёт
+        {"scanned": false, "status": "error", "error": "..."}  — сбой старта
 
     Args:
         params:
             domain (optional): скан только одного домена
     """
-    from mcp_server.quality.scanner import run_scan
-
-    
-
     try:
-        knowledge_dir = app_state.settings.KNOWLEDGE_DIR if hasattr(app_state, 'settings') else None
-        qdrant_client = getattr(app_state, 'qdrant', None)
+        # Проверяем lock — если уже залочен, скан активен
+        scan_lock = app_state.scan_lock
+        if scan_lock.locked():
+            return {
+                "scanned": False,
+                "status": "already_running",
+                "scan_id": getattr(app_state, "scan_id", None),
+            }
 
-        metrics = await run_scan(
-            knowledge_dir=knowledge_dir,
-            qdrant_client=qdrant_client,
+        knowledge_dir = (
+            app_state.settings.KNOWLEDGE_DIR
+            if hasattr(app_state, "settings") and app_state.settings
+            else None
         )
+        qdrant_client = getattr(app_state, "qdrant", None)
+        scan_progress = getattr(app_state, "scan_progress", None)
 
-        logger.info(
-            "Quality scan: %d files, %d in review queue, %d dups, %d issues",
-            metrics["files_scanned"],
-            metrics["review_queue_size"],
-            metrics["duplicates_detected"],
-            metrics["issues_created"],
+        if scan_progress is None:
+            return {"scanned": False, "status": "error", "error": "scan_progress not initialized"}
+
+        scan_id = uuid.uuid4().hex[:16]
+        app_state.scan_id = scan_id
+
+        # Инициализируем прогресс (total — неизвестен до обхода, ставим 0)
+        scan_progress.start(scan_id, total=0)
+
+        # task_ref: list чтобы _bg_scan мог мутировать app_state.scan_task
+        task_ref: list = [None]
+
+        task = asyncio.create_task(
+            _bg_scan(
+                scan_id=scan_id,
+                knowledge_dir=knowledge_dir,
+                qdrant_client=qdrant_client,
+                scan_progress=scan_progress,
+                scan_state={"lock": scan_lock, "task_ref": task_ref},
+            )
         )
+        task_ref[0] = task
+        app_state.scan_task = task
 
-        return {
-            "scanned": True,
-            "metrics": metrics,
-        }
+        logger.info("Quality scan %s started (background task)", scan_id)
+        return {"scanned": True, "status": "started", "scan_id": scan_id}
 
     except Exception as exc:
-        logger.error("run_quality_scan failed: %s", exc)
-        return {"scanned": False, "error": str(exc)}
+        logger.exception("run_quality_scan failed to start")
+        return {"scanned": False, "status": "error", "error": str(exc)}

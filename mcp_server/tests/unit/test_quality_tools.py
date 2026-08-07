@@ -11,11 +11,13 @@ search_knowledge exclude_deprecated.
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
 from mcp_server.quality.issues import create_issue, set_store_dir
 from mcp_server.tools.quality import (
     _cascade_set_payload,
@@ -48,11 +50,17 @@ def mock_app_state():
 
 @pytest.fixture
 def mock_app_state_with_settings():
-    """app_state mock с settings.knowledge_dir."""
+    """app_state mock с settings.knowledge_dir + 13.15 scan state."""
     state = MagicMock()
     state.qdrant = MagicMock()
     state.store = MagicMock()
     state.settings = SimpleNamespace(KNOWLEDGE_DIR="/tmp/test-knowledge")
+    # 13.15: scan_lock должен быть разлочен (locked() → False)
+    state.scan_lock = MagicMock()
+    state.scan_lock.locked = MagicMock(return_value=False)
+    state.scan_progress = MagicMock()
+    state.scan_id = None
+    state.scan_task = None
     return state
 
 
@@ -258,11 +266,17 @@ class TestResolveQualityIssue:
 
 
 class TestRunQualityScan:
-    """run_quality_scan — unit+integration: mock run_scan, проверка проброса metrics."""
+    """run_quality_scan (13.15) — новый контракт: фоновая задача, мгновенный ответ.
+
+    Новый контракт:
+        {"scanned": true, "status": "started", "scan_id": "..."} — скан запущен
+        {"scanned": false, "status": "already_running", "scan_id": "..."} — уже идёт
+        {"scanned": false, "status": "error", "error": "..."} — сбой
+    """
 
     @pytest.mark.asyncio
-    async def test_run_scan_calls_scanner_with_mock(self, mock_app_state_with_settings):
-        """Mock run_scan → verify scanned=True, metrics проброшены."""
+    async def test_run_scan_returns_started_with_scan_id(self, mock_app_state_with_settings):
+        """mock run_scan → return {"scanned": true, "status": "started", "scan_id": "..."}."""
         mock_metrics = {
             "files_scanned": 10,
             "review_queue_size": 3,
@@ -274,44 +288,74 @@ class TestRunQualityScan:
             result = await run_quality_scan({}, mock_app_state_with_settings)
 
         assert result["scanned"] is True
-        assert result["metrics"] == mock_metrics
+        assert result["status"] == "started"
+        assert "scan_id" in result
+        assert len(result["scan_id"]) == 16  # uuid4 hex[:16]
+        # 13.15: НЕТ inline metrics — metrics только через progress poll
+        assert "metrics" not in result
 
     @pytest.mark.asyncio
-    async def test_run_scan_with_domain_param(self, mock_app_state_with_settings):
-        """Параметр domain пробрасывается (не фильтруется tools-уровнем)."""
+    async def test_run_scan_creates_background_task(self, mock_app_state_with_settings):
+        """run_quality_scan → create_task → scan_task установлена."""
         mock_metrics = {"files_scanned": 2, "review_queue_size": 1, "duplicates_detected": 0, "issues_created": 1}
 
-        with patch("mcp_server.quality.scanner.run_scan", new=AsyncMock(return_value=mock_metrics)) as mock_run:
+        with patch("mcp_server.quality.scanner.run_scan", new=AsyncMock(return_value=mock_metrics)):
             result = await run_quality_scan({"domain": "engineering"}, mock_app_state_with_settings)
 
         assert result["scanned"] is True
-        mock_run.assert_awaited_once()
-        # run_scan вызывается с knowledge_dir
-        call_kwargs = mock_run.call_args.kwargs
-        assert call_kwargs["knowledge_dir"] == "/tmp/test-knowledge"
+        # Проверяем, что scan_task был установлен
+        # (в тестовом окружении create_task выполнится в текущем event loop)
+        task = mock_app_state_with_settings.scan_task
+        assert task is not None, "scan_task should be set by run_quality_scan"
+        # 13.15: отменяем фоновую задачу — иначе «Task was destroyed but it is pending»
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    @pytest.mark.asyncio
+    async def test_run_scan_already_running(self, mock_app_state_with_settings):
+        """scan_lock уже залочен → {"status": "already_running"}."""
+        # Симулируем залоченный lock
+        mock_app_state_with_settings.scan_lock.locked.return_value = True
+        mock_app_state_with_settings.scan_id = "existing-scan-12"
+
+        result = await run_quality_scan({}, mock_app_state_with_settings)
+
+        assert result["scanned"] is False
+        assert result["status"] == "already_running"
+        assert result["scan_id"] == "existing-scan-12"
 
     @pytest.mark.asyncio
     async def test_run_scan_no_settings_graceful(self, mock_app_state):
-        """app_state без settings → knowledge_dir=None, run_scan всё равно вызывается."""
+        """app_state без settings → knowledge_dir=None, но скан всё равно стартует."""
         mock_metrics = {"files_scanned": 0, "review_queue_size": 0, "duplicates_detected": 0, "issues_created": 0}
+
+        # minimal 13.15 state для mock_app_state
+        mock_app_state.scan_lock = MagicMock()
+        mock_app_state.scan_lock.locked = MagicMock(return_value=False)
+        mock_app_state.scan_progress = MagicMock()
+        mock_app_state.scan_id = None
 
         with patch("mcp_server.quality.scanner.run_scan", new=AsyncMock(return_value=mock_metrics)):
             result = await run_quality_scan({}, mock_app_state)
 
         assert result["scanned"] is True
+        assert result["status"] == "started"
 
     @pytest.mark.asyncio
-    async def test_run_scan_handles_exception(self, mock_app_state_with_settings):
-        """Scanner бросает исключение → scanned=False, error."""
-        with patch(
-            "mcp_server.quality.scanner.run_scan",
-            new=AsyncMock(side_effect=RuntimeError("Disk full")),
-        ):
-            result = await run_quality_scan({}, mock_app_state_with_settings)
+    async def test_run_scan_no_progress_returns_error(self, mock_app_state):
+        """app_state без scan_progress → scanned=false, error."""
+        mock_app_state.scan_lock = MagicMock()
+        mock_app_state.scan_lock.locked = MagicMock(return_value=False)
+        mock_app_state.scan_progress = None  # не инициализирован
+
+        result = await run_quality_scan({}, mock_app_state)
 
         assert result["scanned"] is False
-        assert "error" in result
-        assert "Disk full" in result["error"]
+        assert result["status"] == "error"
+        assert "scan_progress" in result.get("error", "").lower()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -686,9 +730,10 @@ class TestResolveQualityIssueCascade:
 
 
 class TestCascadeSetPayload:
-    """_cascade_set_payload — scroll по parent + set_payload на секции."""
+    """_cascade_set_payload — scroll по parent + set_payload на секции (13.15: async)."""
 
-    def test_sets_payload_on_all_children(self):
+    @pytest.mark.asyncio
+    async def test_sets_payload_on_all_children(self):
         """Дочерние секции получают set_payload с переданным payload."""
         mock_qdrant = MagicMock()
         mock_qdrant.set_payload = MagicMock()
@@ -701,24 +746,26 @@ class TestCascadeSetPayload:
         mock_qdrant.scroll = MagicMock(return_value=([child1, child2], None))
 
         payload = {"status": "deprecated"}
-        affected = _cascade_set_payload(mock_qdrant, "book-x", payload, "deprecated")
+        affected = await _cascade_set_payload(mock_qdrant, "book-x", payload, "deprecated")
 
         assert affected == 2
         assert mock_qdrant.set_payload.call_count == 2
 
-    def test_handles_empty_children(self):
+    @pytest.mark.asyncio
+    async def test_handles_empty_children(self):
         """Нет дочерних секций → affected=0."""
         mock_qdrant = MagicMock()
         mock_qdrant.set_payload = MagicMock()
         mock_qdrant.scroll = MagicMock(return_value=([], None))
 
         payload = {"status": "deprecated"}
-        affected = _cascade_set_payload(mock_qdrant, "book-x", payload, "deprecated")
+        affected = await _cascade_set_payload(mock_qdrant, "book-x", payload, "deprecated")
 
         assert affected == 0
         mock_qdrant.set_payload.assert_not_called()
 
-    def test_paginated_scroll_for_many_children(self):
+    @pytest.mark.asyncio
+    async def test_paginated_scroll_for_many_children(self):
         """Пагинированный scroll при >1000 секций."""
         mock_qdrant = MagicMock()
         mock_qdrant.set_payload = MagicMock()
@@ -736,7 +783,7 @@ class TestCascadeSetPayload:
         ])
 
         payload = {"status": "deprecated"}
-        affected = _cascade_set_payload(mock_qdrant, "book-x", payload, "deprecated")
+        affected = await _cascade_set_payload(mock_qdrant, "book-x", payload, "deprecated")
 
         assert affected == 8
         assert mock_qdrant.set_payload.call_count == 8

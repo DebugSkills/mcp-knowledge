@@ -328,6 +328,24 @@ async def e2e_http_app(real_qdrant, real_embedder, e2e_store, e2e_pipeline,
     )
     app.state.rate_limiter = app.state.rate_limiter_read
 
+    # 13.15: фоновый quality scan — lock/task/progress (для S9e health-during-scan)
+    import asyncio
+
+    from mcp_server.progress import ImportProgressTracker
+
+    app.state.scan_lock = asyncio.Lock()
+    app.state.scan_task = None
+    app.state.scan_progress = ImportProgressTracker()
+    app.state.scan_id = None
+
+    @app.get("/quality/scan/progress")
+    async def scan_progress_route():
+        """13.15: прогресс фонового quality scan (зеркало /imports/{id}/progress)."""
+        entry = app.state.scan_progress.get(app.state.scan_id)
+        if entry is None:
+            return {"scan_id": app.state.scan_id, "status": "not_found", "messages": []}
+        return entry
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         # Тесты используют e2e_http_app.app.state.* (cleanup, rate limiter)
