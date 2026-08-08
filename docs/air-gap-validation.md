@@ -40,7 +40,7 @@ cd staging
 
 В bundle входит **kb-console** — отдельный NiceGUI-клиент (порт **8085**) для проверки и обслуживания системы:
 
-- **Статус** — жив ли сервер (liveness/readiness: Qdrant, Embedding, Pipeline, DLQ), ключевые метрики, таблица всех 18 MCP-инструментов (auto-refresh 10 c).
+- **Статус** — жив ли сервер (liveness/readiness: Qdrant, Embedding, Pipeline, DLQ), ключевые метрики, таблица всех 20 MCP-инструментов (auto-refresh 10 c).
 - **Импорт** — загрузка материалов (Markdown) через `import_content` (поля: content, content_type, domain, subject, tags).
 - **Поиск** — пробный поиск по корпусу (`search_knowledge`) с результатами (title/score/domain/subject).
 

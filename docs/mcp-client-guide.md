@@ -1,8 +1,8 @@
 # 🔌 MCP Client Guide — подключение AI-агентов к mcp-knowledge
 
-> **trace_id:** `code-2026-08-07-905` | **Фаза:** 13.12 | **Дата:** 2026-08-07
+> **trace_id:** `code-2026-08-08-912` | **Фаза:** 13.21 | **Дата:** 2026-08-08
 > **Аудитория:** AI-агенты (Kilo Code, Claude Desktop, Cline), DevOps-инженеры.
-> **Связанные документы:** `README.md`, `mcp-stdio/bridge.py`, `.kilo/kilo.jsonc`
+> **Связанные документы:** `README.md`, `mcp-stdio/bridge.py`, глобальный конфиг `~/.config/kilo/kilo.jsonc`
 
 ---
 
@@ -14,9 +14,9 @@
    # → http://localhost:8000 (POST /mcp, GET /health)
    ```
 
-2. **Добавьте секцию `mcp-knowledge` в конфиг вашего MCP-клиента** (Kilo/Claude/Cline):
+2. **Добавьте секцию `mcp-knowledge` в глобальный конфиг Kilo** (`~/.config/kilo/kilo.jsonc`) — сервер станет доступен **во всех проектах пользователя** (не только в mcp-knowledge):
    - Тип: `local` process
-   - Команда: `python3 mcp-stdio/bridge.py`
+   - Команда: `python3 /kvm/mcp-knowledge/mcp-knowledge/mcp-stdio/bridge.py` (абсолютный путь!)
    - Env: `MCP_SERVER_URL`, `MCP_API_KEY`
 
 3. **Проверьте подключение:**
@@ -50,7 +50,9 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 
 ## 3. Конфигурация Kilo Code
 
-Добавьте в `.kilo/kilo.jsonc` (или `~/.config/kilo/kilo.jsonc`) в секцию `"mcp"`:
+### 3.1 Глобальный конфиг (рекомендуется — доступен во ВСЕХ проектах)
+
+Секция `mcp-knowledge` добавляется в **`~/.config/kilo/kilo.jsonc`** — сервер подключается в каждом проекте пользователя автоматически:
 
 ```jsonc
 "mcp": {
@@ -60,7 +62,37 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
     "type": "local",
     "command": [
       "python3",
-      "mcp-stdio/bridge.py"
+      "/kvm/mcp-knowledge/mcp-knowledge/mcp-stdio/bridge.py"   // АБСОЛЮТНЫЙ путь — работает из любого проекта
+    ],
+    "environment": {
+      "MCP_SERVER_URL": "http://localhost:8000",
+      "MCP_API_KEY": "<read-key из mcp-knowledge/.env → MCP_READ_KEYS[0]>"
+    },
+    "timeout": 60000,                            // мс (импорт книг может идти долго)
+    "enabled": true
+  }
+}
+```
+
+**Важно (глобальный конфиг):**
+- `command` — **абсолютный** путь к `bridge.py` (относительный путь работает только внутри проекта mcp-knowledge)
+- После добавления — `chmod 600 ~/.config/kilo/kilo.jsonc` (ключ в открытом виде, защита от других пользователей)
+- Перезапустите Kilo — MCP-серверы подхватываются при старте сессии
+- Не дублируйте секцию в проектном `.kilo/kilo.jsonc` (SSOT — только глобальный конфиг)
+
+### 3.2 Проектный конфиг (для одного проекта)
+
+Добавьте в `.kilo/kilo.jsonc` этого проекта в секцию `"mcp"`:
+
+```jsonc
+"mcp": {
+  // ... другие серверы (context7, playwright, ...)
+
+  "mcp-knowledge": {
+    "type": "local",
+    "command": [
+      "python3",
+      "mcp-stdio/bridge.py"                      // относительный путь — только внутри проекта mcp-knowledge
     ],
     "environment": {
       "MCP_SERVER_URL": "http://localhost:8000",
@@ -164,11 +196,37 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 | 11 | `list_projects` | read | Список проектов |
 | 12 | `reindex` | write | Перестроить индекс: все .md → Qdrant (blue-green) |
 | 13 | `review_queue` | read | Топ устаревших записей (staleness_score DESC) |
-| 14 | `list_quality_issues` | read | Проблемы: дубликаты, edit-wars, битые ссылки |
-| 15 | `resolve_quality_issue` | write | Разрешить: merge/deprecate/restore/resolve/ignore |
-| 16 | `run_quality_scan` | write | Периодический quality scan (для cron) |
-| 17 | `import_content` | import | Декомпозиция + batch запись: content → book collection |
-| 18 | `analyze_content` | read | AI-анализ контента (Ollama LLM + TF-IDF fallback) |
+| 14 | `review_queue_books` | read | Топ устаревших КНИГ (агрегат по parent, доля устаревших секций) |
+| 15 | `list_quality_issues` | read | Проблемы: дубликаты, edit-wars, битые ссылки |
+| 16 | `resolve_quality_issue` | write | Разрешить: merge/deprecate/restore/resolve/ignore (cascade) |
+| 17 | `run_quality_scan` | write | Периодический quality scan (для cron, фоновая задача с lock) |
+| 18 | `cancel_quality_scan` | write | Отменить активный scan, освободить lock |
+| 19 | `import_content` | import | Декомпозиция + batch запись: content → book collection |
+| 20 | `analyze_content` | read | AI-анализ контента (Ollama LLM + TF-IDF fallback) |
+
+---
+
+## 7.1 MCP-протокол: ping и notifications (Фаза 13.21)
+
+Сервер реализует JSON-RPC 2.0 over HTTP с MCP-совместимыми методами:
+
+| Метод | Ответ | Примечание |
+|-------|-------|------------|
+| `initialize` | `{"result": {protocolVersion, serverInfo, capabilities}}` | Handshake, protocolVersion `2024-11-05` |
+| `ping` | `{"result": {}}` (пустой объект) | Keepalive — используется MCP-клиентами |
+| `notifications/initialized` | **HTTP 204** (без тела) | Notification (без `id`) — клиент шлёт после initialize |
+| `tools/list` | `{"result": {"tools": [...20 инструментов]}}` | Schemas для автогенерации permission |
+| `tools/call` | `{"result": {"content": [...]}}` | Вызов инструмента |
+
+**Правила:**
+- Notification-методы (`notifications/*`) принимаются **без поля `id`** (`_validate_jsonrpc`, Фаза 13.21) — строго по JSON-RPC 2.0 §4.1
+- Неизвестные `notifications/*` → HTTP 204 (не -32601)
+- Обычные методы БЕЗ `id` → ошибка -32600 (валидация сохранена)
+- Bridge: HTTP 204 → **не пишет ответ в stdout** (клиент не ждёт ответа на notification)
+
+**Лимит запроса:** `MCP_MAX_REQUEST_SIZE` (default 128 МБ, настраивается в `config.py` Settings) — замена старого хардкода 64 МБ. Книги до ~100 МБ импортируются без изменения конфига. Лимит клиента kb-console (`MAX_FILE_SIZE` 50 МБ) согласован формулой `MAX_FILE_SIZE ≤ MCP_MAX_REQUEST_SIZE − 20%` (буфер на JSON-overhead).
+
+**Big-book safety (Фаза 13.21):** при импорте книг >500 секций `quality_checks` автоматически отключается (вдвое быстрее импорт); батчинг эмбеддингов — `CLUSTER_BATCH_SIZE=64`.
 
 ---
 
@@ -276,6 +334,14 @@ grep MCP_WRITE_KEYS .env
 
 Мост пишет диагностику в **stderr** (не stdout). В конфиге Kilo это нормально — Kilo читает только stdout для JSON-RPC. Если вы запускаете мост вручную и видите строки `[bridge]` — они идут в stderr, перенаправляйте: `2>/dev/null`.
 
+### 9.7 Bridge пишет ошибку «Некорректный JSON-ответ» при notifications
+
+**Симптом:** после `initialize` клиент шлёт `notifications/initialized`, а bridge в stderr пишет `-32000 Некорректный JSON-ответ от сервера`.
+
+**Причина:** старая версия bridge пыталась парсить пустое тело HTTP 204 (сервер отвечает 204 на notification — тела нет).
+
+**Решение:** обновите `mcp-stdio/bridge.py` (Фаза 13.21): HTTP 204 → `_post_json` возвращает `None` → ответ в stdout НЕ пишется. Проверка: `git log -1 --oneline mcp-stdio/bridge.py` → должен быть `5191f53`.
+
 ---
 
 ## 10. Ресурсы kb:// и промпты
@@ -318,11 +384,11 @@ grep MCP_WRITE_KEYS .env
 ## 12. Ссылки
 
 - **README проекта:** [`../README.md`](../README.md) — архитектура, быстрый старт, все фазы
-- **Исходный код моста:** [`../mcp-stdio/bridge.py`](../mcp-stdio/bridge.py) — ~130 строк stdlib Python
+- **Исходный код моста:** [`../mcp-stdio/bridge.py`](../mcp-stdio/bridge.py) — ~290 строк stdlib Python (v1.1: HTTP 204 → без ответа)
 - **Руководство kb-console:** [`../kb-console/USER_GUIDE.md`](../kb-console/USER_GUIDE.md)
 - **Key rotation runbook:** [`key-rotation.md`](key-rotation.md) — процедура смены ключей
 - **Air-gap deployment:** [`air-gap-validation.md`](air-gap-validation.md) — деплой на изолированные хосты
 
 ---
 
-*Актуально на 2026-08-08. 20 MCP Tools, 3 промпта, 3 ресурса kb://, stdio-мост v1.0.*
+*Актуально на 2026-08-08. 20 MCP Tools, 3 промпта, 3 ресурса kb://, stdio-мост v1.1 (HTTP 204 → без ответа), ping/notifications по MCP spec, MCP_MAX_REQUEST_SIZE 128 МБ.*

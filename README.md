@@ -2,7 +2,7 @@
 
 MCP Knowledge Server — семантическая база знаний для AI-агентов по протоколу MCP (Model Context Protocol). Проект сообщества DebugSkills.
 
-Хранение: Markdown SSOT → chunk → Ollama embed (nomic-embed-text) → Qdrant vector search. **18 MCP Tools**, air-gap совместимость (одноархивный deploy-bundle), production-ready (health, rate-limit, blue-green reindex, quality system). Веб-консоль **kb-console** (NiceGUI, :8085) для диагностики и обслуживания. Подключение AI-агентов (Kilo/Claude/Cline) — через **stdio-мост** (`mcp-stdio/bridge.py`, см. `docs/mcp-client-guide.md`).
+Хранение: Markdown SSOT → chunk → Ollama embed (nomic-embed-text) → Qdrant vector search. **20 MCP Tools**, air-gap совместимость (одноархивный deploy-bundle), production-ready (health, rate-limit, blue-green reindex, quality system). Веб-консоль **kb-console** (NiceGUI, :8085) для диагностики и обслуживания. Подключение AI-агентов (Kilo/Claude/Cline) — через **stdio-мост** (`mcp-stdio/bridge.py`, см. `docs/mcp-client-guide.md`). MCP-протокол: JSON-RPC 2.0 over HTTP (`POST /mcp`), `ping` → `{"result":{}}`, `notifications/initialized` → 204 (Фаза 13.21).
 
 ## Архитектура
 
@@ -34,7 +34,7 @@ mcp-stdio/bridge.py │    │  диаг. :8085 → :8000
 └────────────────────────────────────────────────────┘
 ```
 
-**kb-console** — отдельный самодостаточный контейнер (образ `kb-console:prod`): страницы **Статус** (health-карточки, метрики, 18 инструментов), **Книги** (список коллекций + оглавление), **Импорт** (загрузка материалов через `import_content`), **Поиск** (по корпусу). Может жить на клиентских хостах (`MCP_SERVER_URL` из env). Руководство: `kb-console/USER_GUIDE.md`.
+**kb-console** — отдельный самодостаточный контейнер (образ `kb-console:prod`): страницы **Статус** (health-карточки, метрики, 20 инструментов), **Книги** (список коллекций + оглавление), **Импорт** (загрузка материалов через `import_content`), **Поиск** (по корпусу). Может жить на клиентских хостах (`MCP_SERVER_URL` из env). Руководство: `kb-console/USER_GUIDE.md`.
 
 ## Быстрый старт
 
@@ -66,7 +66,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 ```
 Подробности: `docs/air-gap-validation.md` (в bundle — `DEPLOYMENT.md`), руководство консоли — `USER_GUIDE.md`.
 
-## MCP Tools (18)
+## MCP Tools (20)
 
 ### Search & Read
 | # | Tool | Назначение |
@@ -96,19 +96,21 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 |---|------|-----------|
 | 12 | `reindex` | Перестроить индекс: все .md → Qdrant (blue-green, zero-downtime) |
 
-### Quality (Фаза 4)
+### Quality (Фаза 4 + 13.14)
 | # | Tool | Назначение |
 |---|------|-----------|
 | 13 | `review_queue` | Топ устаревших записей (staleness_score DESC) |
-| 14 | `list_quality_issues` | Проблемы: дубликаты, edit-wars, битые ссылки |
-| 15 | `resolve_quality_issue` | Разрешить: merge/deprecate/restore/resolve/ignore |
-| 16 | `run_quality_scan` | Периодический scan (для cron, daily) |
+| 14 | `review_queue_books` | Топ устаревших КНИГ (агрегат по parent, доля устаревших секций) |
+| 15 | `list_quality_issues` | Проблемы: дубликаты, edit-wars, битые ссылки |
+| 16 | `resolve_quality_issue` | Разрешить: merge/deprecate/restore/resolve/ignore (cascade для книг) |
+| 17 | `run_quality_scan` | Периодический scan (для cron, daily; фоновая задача с lock) |
+| 18 | `cancel_quality_scan` | Отменить активный scan, освободить lock (Фаза 13.18) |
 
 ### Import (Фаза 5 + 13.8)
 | # | Tool | Назначение |
 |---|------|-----------|
-| 17 | `import_content` | Декомпозиция + batch запись: content → collection (book, cross_subjects, wait_for_index) |
-| 18 | `analyze_content` | AI-анализ контента: рекомендации content_type/domain/subject/tags (Ollama LLM + TF-IDF) |
+| 19 | `import_content` | Декомпозиция + batch запись: content → collection (book, cross_subjects, wait_for_index) |
+| 20 | `analyze_content` | AI-анализ контента: рекомендации content_type/domain/subject/tags (Ollama LLM + TF-IDF) |
 
 ## MCP Prompts
 
@@ -200,4 +202,4 @@ a2e6479 feat(phase12): HTTP-level E2E S9-S12 + 5 observability metrics
 
 ---
 
-*Актуально на 2026-08-07. 18 MCP Tools, 482 тестов (+ mcp-stdio: 19), kb-console :8085, stdio-мост для Kilo/Claude/Cline, air-gap bundle 1.1 GB.*
+*Актуально на 2026-08-08. 20 MCP Tools, 565 тестов mcp_server + 56 kb-console + 21 mcp-stdio, kb-console :8085, stdio-мост v1.1 (ping/notifications по MCP spec, HTTP 204 → без ответа), MCP_MAX_REQUEST_SIZE 128 МБ, qdrant ulimits 65535.*
