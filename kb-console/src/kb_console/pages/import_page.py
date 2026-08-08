@@ -178,6 +178,38 @@ def build_import() -> None:
         placeholder="python, tutorial, basics",
     ).classes("w-full q-mb-md")
 
+    replace_select = ui.select(
+        label="Заменить существующую книгу (опционально)",
+        options={},
+        value=None,
+        with_input=True,
+    ).classes("w-full q-mb-md")
+
+    # ── Асинхронная загрузка опций для replace_select ──────
+    async def _load_replace_options() -> None:
+        """Загрузить список коллекций для replace-дропдауна."""
+        try:
+            client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+            books = await client.list_collections()
+            opts: dict[str, str] = {}
+            for b in books:
+                cid = b.get("collection_id", "")
+                if not cid:
+                    continue
+                label = (
+                    f"{b.get('title', cid)} "
+                    f"({b.get('domain', '—')}/{b.get('subject', '—')}, "
+                    f"{b.get('section_count', 0)} сек.)"
+                )
+                opts[label] = cid
+            replace_select.options = opts
+            replace_select.update()
+            await client.close()
+        except Exception:
+            pass  # не критично — можно ввести ID вручную через with_input=True
+
+    ui.timer(0.0, lambda: _load_replace_options(), once=True)
+
     # ── Кнопки + спиннер ─────────────────────────────────
     with ui.row().classes("gap-4 items-center"):
         import_btn = ui.button("Добавить", icon="save").props("color=primary")
@@ -321,44 +353,9 @@ def build_import() -> None:
     analyze_btn.on_click(do_analyze)
 
     # ── Import handler ────────────────────────────────────
-    async def do_import() -> None:
+    async def _run_import(params: dict, domain: str, subject: str) -> None:
+        """Выполнить импорт (без валидаций — они уже сделаны в do_import)."""
         nonlocal pending_file, _progress_timer
-
-        # Контент: из pending_file или textarea
-        if pending_file is not None:
-            content = pending_file["content"]
-        else:
-            content = content_input.value
-
-        if not content.strip():
-            ui.notify("Введите контент для импорта", type="warning")
-            return
-
-        domain = domain_input.value.strip()
-        subject = subject_input.value.strip()
-        if not domain or not subject:
-            ui.notify("Заполните домен и предмет", type="warning")
-            return
-
-        # Парсим теги
-        tags_text = tags_input.value or ""
-        tags = [t.strip() for t in tags_text.split(",") if t.strip()]
-
-        params = {
-            "content": content,
-            "content_type": content_type.value,
-            "domain": domain,
-            "subject": subject,
-        }
-        # Санитизированный title (пустой → сервер генерит авто)
-        title = _sanitize_title(title_input.value or "")
-        if title:
-            params["title"] = title
-        if tags:
-            params["tags"] = tags
-        # 13.9: идентификатор импорта для живого прогресса (poll GET /imports/{id}/progress)
-        import_id = str(uuid.uuid4())
-        params["import_id"] = import_id
 
         # Блокируем кнопки, показываем спиннер
         import_btn.disable()
@@ -376,6 +373,8 @@ def build_import() -> None:
         # 13.9: старт живого прогресса — поллинг GET /imports/{id}/progress
         progress_container.visible = True
         progress_container.clear()
+
+        import_id = params.get("import_id", "")
 
         async def _poll_once() -> None:
             nonlocal _progress_timer
@@ -395,7 +394,7 @@ def build_import() -> None:
             imported = result.get("imported", 0)
             failed = result.get("failed", 0)
             collection_id = result.get("collection_id", "—")
-            title = result.get("title", f"{domain}/{subject}")
+            result_title = result.get("title", f"{domain}/{subject}")
 
             # ── Показ результата ──────────────────────────
             result_container.clear()
@@ -406,6 +405,19 @@ def build_import() -> None:
                 ui.label(f"Время обработки: {elapsed:.1f} сек").classes("text-caption text-grey")
                 if failed > 0:
                     ui.label(f"Ошибок: {failed}").classes("text-negative text-body2")
+
+                # ── Replace result (Фаза 13.22) ──────────────
+                if result.get("replaced"):
+                    replaced_id = result.get("replaced_collection_id", "—")
+                    cascade_del = result.get("cascade_deleted", 0)
+                    ui.label(
+                        f"♻️ Заменена книга: {replaced_id} (удалено старых секций: {cascade_del})"
+                    ).classes("text-warning text-body2")
+                elif result.get("replace_skipped_reason"):
+                    reason = result["replace_skipped_reason"]
+                    ui.label(
+                        f"⚠️ Замена отменена: {reason}"
+                    ).classes("text-negative text-body2")
 
                 failed_sections = result.get("failed_sections", [])
                 if failed_sections:
@@ -424,8 +436,9 @@ def build_import() -> None:
                 "failed": failed,
                 "domain": domain,
                 "subject": subject,
-                "title": title,
+                "title": result_title,
                 "elapsed": elapsed,
+                "replaced": result.get("replaced", False),
                 "_time": datetime.now(UTC).strftime("%H:%M:%S"),
             })
             _render_history()
@@ -453,6 +466,77 @@ def build_import() -> None:
             _stop_timer()
             _stop_progress_poll()
             await client.close()
+
+    async def do_import() -> None:
+        """Валидация + HITL-диалог при замене → _run_import."""
+        nonlocal pending_file
+
+        # Контент: из pending_file или textarea
+        if pending_file is not None:
+            content = pending_file["content"]
+        else:
+            content = content_input.value
+
+        if not content.strip():
+            ui.notify("Введите контент для импорта", type="warning")
+            return
+
+        domain = domain_input.value.strip()
+        subject = subject_input.value.strip()
+        if not domain or not subject:
+            ui.notify("Заполните домен и предмет", type="warning")
+            return
+
+        # Парсим теги
+        tags_text = tags_input.value or ""
+        tags = [t.strip() for t in tags_text.split(",") if t.strip()]
+
+        params: dict = {
+            "content": content,
+            "content_type": content_type.value,
+            "domain": domain,
+            "subject": subject,
+        }
+        # Санитизированный title (пустой → сервер генерит авто)
+        title = _sanitize_title(title_input.value or "")
+        if title:
+            params["title"] = title
+        if tags:
+            params["tags"] = tags
+        # 13.9: идентификатор импорта для живого прогресса (poll GET /imports/{id}/progress)
+        import_id = str(uuid.uuid4())
+        params["import_id"] = import_id
+
+        # replace_collection_id
+        if replace_select.value:
+            params["replace_collection_id"] = replace_select.value
+
+        # HITL-диалог при замене
+        if replace_select.value:
+            replace_label = replace_select.value
+            # Ищем человекочитаемое название в опциях
+            for lbl, val in (replace_select.options or {}).items():
+                if val == replace_select.value:
+                    replace_label = lbl
+                    break
+
+            async def _confirm_and_run() -> None:
+                dialog.close()
+                await _run_import(params, domain, subject)
+
+            with ui.dialog() as dialog, ui.card():
+                ui.label(
+                    f"⚠️ Книга «{replace_label}» ({replace_select.value}) будет "
+                    f"УДАЛЕНА после успешного импорта новой. "
+                    f"Старая версия сохранится в .trash/."
+                ).classes("text-body2 q-mb-md")
+                ui.label("Продолжить?").classes("text-body2 q-mb-md")
+                with ui.row().classes("justify-end"):
+                    ui.button("Отмена", on_click=lambda: dialog.close()).props("flat")
+                    ui.button("Заменить", on_click=_confirm_and_run).props("color=warning")
+            dialog.open()
+        else:
+            await _run_import(params, domain, subject)
 
     import_btn.on_click(do_import)
 

@@ -212,6 +212,8 @@ _IMPORT_CONTENT_SCHEMA: dict[str, Any] = {
         "max_chunk_tokens": {"type": "integer", "default": 512, "minimum": 64, "maximum": 2048},
         "wait_for_index": {"type": "boolean", "default": False},
         "cleanup_orphans": {"type": "boolean", "default": False},
+        "replace_collection_id": {"type": "string", "description": "ID коллекции для ЗАМЕНЫ: после успешного импорта старая книга удаляется (cascade). Import-first: старая цела до подтверждения успеха новой."},
+        "replace_on_partial": {"type": "boolean", "default": False, "description": "Удалить старую книгу даже при partial_success импорта (failed>0). Default False — безопасно."},
     },
     "required": ["content", "domain", "subject"],
 }

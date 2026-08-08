@@ -119,6 +119,9 @@ async def import_content(params: dict, app_state) -> dict:
             wait_for_index? (bool): ждать индексации (default false)
             cleanup_orphans? (bool): удалить orphan-детей при failure (default false)
             quality_checks? (bool): включить quality gates (default true, отключить для массового импорта)
+            replace_collection_id? (str): ID коллекции для ЗАМЕНЫ — после успешного импорта
+                старая книга удаляется (cascade). Import-first: старая цела до успеха новой.
+            replace_on_partial? (bool): удалить старую книгу даже при partial_success (default false)
         }
         app_state: Application state (store, pipeline, embedder, qdrant, ...)
 
@@ -132,6 +135,10 @@ async def import_content(params: dict, app_state) -> dict:
             indexed: bool,
             pending: bool,
             quality_report?: dict,
+            replaced: bool,
+            replaced_collection_id: str | None,
+            cascade_deleted: int,
+            replace_skipped_reason: str,
         }
     """
     # ── Параметры ──────────────────────────────────────────
@@ -149,6 +156,10 @@ async def import_content(params: dict, app_state) -> dict:
     cleanup_orphans = params.get("cleanup_orphans", False)
     quality_checks = params.get("quality_checks", True)  # 6.4: опциональное отключение для mass-import
 
+    # ── Replace params (Фаза 13.x) ──────────────────────────
+    replace_collection_id = params.get("replace_collection_id", "")
+    replace_on_partial = params.get("replace_on_partial", False)
+
     # ── Progress tracker (Фаза 13.9) ────────────────────────
     tracker = getattr(app_state, "import_progress", None)
 
@@ -162,6 +173,22 @@ async def import_content(params: dict, app_state) -> dict:
         return {"error": "Missing required parameter: 'domain'"}
     if not subject:
         return {"error": "Missing required parameter: 'subject'"}
+
+    # ── Early validation: replace_collection_id ──────────────
+    # Проверяем существование и тип ДО декомпозиции (экономия ресурсов).
+    if replace_collection_id:
+        store = app_state.store
+        try:
+            existing = await store.read(replace_collection_id)
+        except Exception as e:
+            return {"error": f"replace_collection_id read failed: {e}"}
+        if existing is None:
+            return {"error": f"replace_collection_id not found: {replace_collection_id}"}
+        if existing.frontmatter.content_type != "collection":
+            return {
+                "error": f"replace_collection_id is not a collection: "
+                f"{replace_collection_id} (type={existing.frontmatter.content_type})"
+            }
 
     # Registry lookup
     try:
@@ -235,6 +262,14 @@ async def import_content(params: dict, app_state) -> dict:
         tags=tags,
         cross_subjects=cross_subjects,
     )
+
+    # ── Self-replace guard ───────────────────────────────────
+    # После build_collection: новый collection_id не должен совпадать с заменяемым.
+    if replace_collection_id and replace_collection_id == collection.knowledge_id:
+        return {
+            "error": f"Self-replace detected: new collection_id '{collection.knowledge_id}' "
+            f"equals replace_collection_id. Use update_entry or change the title."
+        }
 
     # ── Batch write: по секциям ─────────────────────────────
     store = app_state.store
@@ -438,6 +473,47 @@ async def import_content(params: dict, app_state) -> dict:
             "duplicates": quality_duplicates,
         },
     }
+
+    # ── Replace old collection (Фаза 13.22) ────────────────────
+    replaced = False
+    replaced_collection_id_val = None
+    cascade_deleted = 0
+    replace_skipped_reason = ""
+    if replace_collection_id:
+        should_replace = (failed == 0) or (replace_on_partial and imported > 0)
+        if should_replace:
+            _p(tracker, import_id, "set_phase", "replacing")
+            logger.info("[REPLACE] deleting old collection %s (cascade)", replace_collection_id)
+            from .crud import (
+                delete_entry as _delete_entry,  # локальный import — без циклов
+            )
+            del_result = await _delete_entry(
+                {"knowledge_id": replace_collection_id, "cascade": True}, app_state,
+            )
+            if not del_result.get("error"):
+                replaced = True
+                replaced_collection_id_val = replace_collection_id
+                cascade_deleted = del_result.get("cascade_deleted", 0)
+                logger.info(
+                    "[REPLACE] old collection %s deleted (+%d children)",
+                    replace_collection_id, cascade_deleted,
+                )
+            else:
+                replace_skipped_reason = f"delete failed: {del_result.get('error')}"
+                logger.warning(
+                    "[REPLACE] delete of %s failed: %s",
+                    replace_collection_id, del_result.get("error"),
+                )
+        else:
+            replace_skipped_reason = "import_partial" if failed > 0 else "import_failed"
+            logger.info(
+                "[REPLACE] skipped: %s (imported=%d failed=%d)",
+                replace_skipped_reason, imported, failed,
+            )
+    result["replaced"] = replaced
+    result["replaced_collection_id"] = replaced_collection_id_val
+    result["cascade_deleted"] = cascade_deleted
+    result["replace_skipped_reason"] = replace_skipped_reason
 
     logger.info(
         "[IMPORT] done collection=%s imported=%d failed=%d partial=%s indexed=%s",

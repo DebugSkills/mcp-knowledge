@@ -358,12 +358,16 @@ async def delete_entry(params: dict, app_state) -> dict:
             from qdrant_client.models import FieldCondition, Filter, MatchValue
 
             qdrant_raw = _get_qdrant(app_state)
+            # Обёртка QdrantClient сама подставляет collection_name (хардкод),
+            # raw qdrant-client SDK требует его как kwarg. Определяем по признаку обёртки.
+            scroll_kwargs: dict = {}
+            if not hasattr(qdrant_raw, "_client"):
+                scroll_kwargs["collection_name"] = "knowledge"
             # Scroll все точки где parent_knowledge_id = knowledge_id
             child_ids: list[str] = []
             offset = None
             while True:
                 points, next_offset = qdrant_raw.scroll(
-                    collection_name="knowledge",
                     scroll_filter=Filter(
                         must=[FieldCondition(key="parent_knowledge_id", match=MatchValue(value=knowledge_id))]
                     ),
@@ -371,6 +375,7 @@ async def delete_entry(params: dict, app_state) -> dict:
                     offset=offset,
                     with_payload=["knowledge_id"],
                     with_vectors=False,
+                    **scroll_kwargs,
                 )
                 for point in points:
                     kid = point.payload.get("knowledge_id") if point.payload else None
