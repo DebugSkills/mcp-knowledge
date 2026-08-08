@@ -60,6 +60,13 @@ class Settings(BaseSettings):
     # Quality (Фаза 4)
     QUALITY_DIR: str = "/app/data/quality"
 
+    # Quality scan scheduler (13.19) — ночной периодический скан ВНУТРИ контейнера
+    QUALITY_SCAN_CRON_ENABLED: bool = True
+    QUALITY_SCAN_CRON_HOUR: int = 3
+    QUALITY_SCAN_CRON_MINUTE: int = 0
+    # Лог сканирования (13.19) — файл в /app/data/logs (volume → хост)
+    QUALITY_SCAN_LOG_DIR: str = "/app/data/logs"
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         if self.WORKERS != 1:

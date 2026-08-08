@@ -224,3 +224,61 @@ class TestImportProgressTracker:
         t.error("error-job", "fail")
         time.sleep(0.01)  # ttl истёк
         assert t.get("error-job") is None
+
+    # ── 13.19: prune_finished ───────────────────────────────
+
+    def test_prune_finished_removes_done_keeps_running(self):
+        """prune_finished удаляет done/error записи, оставляет running, возвращает счётчик."""
+        t = ImportProgressTracker()
+        t.start("scan-old-done", total=5)
+        t.done("scan-old-done", summary={})
+        t.start("scan-old-error", total=5)
+        t.error("scan-old-error", "fail")
+        t.start("scan-current", total=10)  # running
+
+        removed = t.prune_finished()
+        assert removed == 2  # done + error удалены
+        assert t.get("scan-old-done") is None
+        assert t.get("scan-old-error") is None
+        assert t.get("scan-current") is not None
+        assert t.get("scan-current")["status"] == "running"
+
+    def test_prune_finished_keep_id_preserves_specific(self):
+        """keep_id сохраняет указанную запись даже если она done/error."""
+        t = ImportProgressTracker()
+        t.start("scan-keep", total=5)
+        t.done("scan-keep", summary={})
+        t.start("scan-delete", total=5)
+        t.done("scan-delete", summary={})
+
+        removed = t.prune_finished(keep_id="scan-keep")
+        assert removed == 1  # только scan-delete удалён
+        assert t.get("scan-keep") is not None  # сохранён
+        assert t.get("scan-delete") is None
+
+    def test_prune_finished_empty_store_returns_zero(self):
+        """prune_finished на пустом store возвращает 0."""
+        t = ImportProgressTracker()
+        assert t.prune_finished() == 0
+
+    def test_prune_finished_all_running_returns_zero(self):
+        """Все записи running → prune_finished возвращает 0, ничего не удаляет."""
+        t = ImportProgressTracker()
+        t.start("scan-a", total=5)
+        t.start("scan-b", total=10)
+
+        removed = t.prune_finished()
+        assert removed == 0
+        assert t.get("scan-a") is not None
+        assert t.get("scan-b") is not None
+
+    def test_prune_finished_never_raises(self):
+        """prune_finished — best-effort: не кидает исключений."""
+        t = ImportProgressTracker()
+        # Повреждаем внутренние данные
+        t._data["corrupt"] = None  # type: ignore[dict-item]
+        # Не должно упасть
+        try:
+            t.prune_finished()
+        except Exception:
+            pytest.fail("prune_finished should never raise")

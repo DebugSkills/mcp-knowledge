@@ -34,7 +34,7 @@ logging.basicConfig(
 )
 faulthandler.enable()
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Request
 
@@ -275,6 +275,61 @@ async def lifespan(app: FastAPI):
     app.state.data_version = 0
     logger.info("📊 data_version initialized (0)")
 
+    # ── 13.19: Лог сканирования → /app/data/logs (volume → хост) ──
+    # Логи quality-скана (scanner + tools.quality) дублируются в файл,
+    # проброшенный на хост через docker volume — для изучения после скана.
+    try:
+        from pathlib import Path
+
+        scan_log_dir = Path(settings.QUALITY_SCAN_LOG_DIR)
+        scan_log_dir.mkdir(parents=True, exist_ok=True)
+        scan_log_path = scan_log_dir / f"quality-scan-{datetime.now(timezone.utc).astimezone().strftime('%Y%m%d')}.log"
+        _scan_fh = logging.FileHandler(scan_log_path, encoding="utf-8")
+        _scan_fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        ))
+        for _logger_name in ("mcp_knowledge.quality.scanner", "mcp_knowledge.tools.quality"):
+            logging.getLogger(_logger_name).addHandler(_scan_fh)
+        logger.info("📁 Scan log file: %s", scan_log_path)
+    except Exception as exc:
+        logger.warning("Scan log file setup failed (non-fatal): %s", exc)
+
+    # ── 13.19: Ночной планировщик quality-скана (внутри контейнера) ──
+    async def _scan_scheduler() -> None:
+        """Периодический (ежедневный) quality scan в заданный час локального времени."""
+        if not settings.QUALITY_SCAN_CRON_ENABLED:
+            logger.info("📅 Quality scan scheduler DISABLED (QUALITY_SCAN_CRON_ENABLED=false)")
+            return
+        logger.info(
+            "📅 Quality scan scheduler started: daily %02d:%02d (container TZ)",
+            settings.QUALITY_SCAN_CRON_HOUR,
+            settings.QUALITY_SCAN_CRON_MINUTE,
+        )
+        while True:
+            now = datetime.now().astimezone()
+            target = now.replace(
+                hour=settings.QUALITY_SCAN_CRON_HOUR,
+                minute=settings.QUALITY_SCAN_CRON_MINUTE,
+                second=0,
+                microsecond=0,
+            )
+            if target <= now:
+                target += timedelta(days=1)
+            delay = (target - now).total_seconds()
+            logger.info("📅 Next scheduled quality scan at %s (in %.0f min)",
+                        target.isoformat(), delay / 60)
+            await asyncio.sleep(delay)
+            try:
+                from .tools.quality import run_quality_scan
+
+                result = await run_quality_scan({}, app.state)
+                logger.info("📅 Scheduled quality scan: %s", result.get("status", result))
+            except Exception:
+                logger.exception("📅 Scheduled quality scan failed")
+            # Следующая итерация пересчитает следующий день
+
+    app.state.scan_scheduler_task = asyncio.create_task(_scan_scheduler())
+
     elapsed = _time.monotonic() - _start_ts
     rss_end = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     logger.info("[START] ready backend=%s elapsed=%.1fs rss=%.0f MB",
@@ -284,6 +339,17 @@ async def lifespan(app: FastAPI):
 
     # ── Shutdown ──────────────────────────────────────────
     logger.info("[START] shutdown")
+
+    # 13.19: Cancel scheduled scan task (graceful shutdown)
+    scheduler_task = getattr(app.state, "scan_scheduler_task", None)
+    if scheduler_task is not None and not scheduler_task.done():
+        scheduler_task.cancel()
+        try:
+            await asyncio.wait_for(scheduler_task, timeout=3.0)
+        except (asyncio.CancelledError, TimeoutError):
+            logger.warning("[START] scan scheduler did not finish in 3s (forced)")
+        finally:
+            app.state.scan_scheduler_task = None
 
     # 13.15: Cancel background scan task if running (graceful shutdown)
     if app.state.scan_task is not None and not app.state.scan_task.done():

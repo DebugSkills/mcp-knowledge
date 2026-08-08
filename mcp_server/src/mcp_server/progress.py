@@ -142,6 +142,31 @@ class ImportProgressTracker:
         except Exception:
             pass
 
+    # ── 13.19: Prune finished entries ──────────────────────
+
+    def prune_finished(self, keep_id: str | None = None) -> int:
+        """Удалить все записи со статусом done/error, кроме keep_id.
+
+        Best-effort: никогда не кидает исключений.
+        Возвращает число удалённых записей.
+
+        Args:
+            keep_id: если передан, запись с этим import_id не удаляется.
+        """
+        try:
+            to_remove = [
+                import_id
+                for import_id, entry in self._data.items()
+                if isinstance(entry, dict)
+                and entry.get("status") in ("done", "error")
+                and import_id != keep_id
+            ]
+            for import_id in to_remove:
+                del self._data[import_id]
+            return len(to_remove)
+        except Exception:
+            return 0
+
     def error(self, import_id: str, error: str) -> None:
         """Пометить импорт как ошибочный."""
         entry = self._ensure(import_id)

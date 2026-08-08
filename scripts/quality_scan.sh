@@ -51,7 +51,7 @@ RESPONSE=$(curl -s -X POST "$MCP_URL" \
     -H "Content-Type: application/json" \
     -H "X-API-Key: $API_KEY" \
     --max-time "$TIMEOUT" \
-    -d "{\"method\": \"tools/call\", \"params\": {\"name\": \"run_quality_scan\", \"arguments\": $ARGS}}" 2>&1) || {
+    -d "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/call\", \"params\": {\"name\": \"run_quality_scan\", \"arguments\": $ARGS}}" 2>&1) || {
     echo "ERROR: curl failed (exit=$?). MCP server may not be running."
     echo "  URL: $MCP_URL"
     exit 2

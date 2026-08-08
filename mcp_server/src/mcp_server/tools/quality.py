@@ -678,6 +678,14 @@ async def run_quality_scan(params: dict, app_state) -> dict:
         if scan_progress is None:
             return {"scanned": False, "status": "error", "error": "scan_progress not initialized"}
 
+        # 13.19: удаляем завершённые записи прошлых сканов — оставляем только текущий
+        try:
+            removed = scan_progress.prune_finished()
+            if removed:
+                logger.info("Pruned %d finished scan progress record(s)", removed)
+        except Exception as exc:
+            logger.warning("prune_finished failed (non-fatal): %s", exc)
+
         scan_id = uuid.uuid4().hex[:16]
         app_state.scan_id = scan_id
 

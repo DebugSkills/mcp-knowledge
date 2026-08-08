@@ -322,12 +322,42 @@ class TestRunQualityScan:
         # Симулируем залоченный lock
         mock_app_state_with_settings.scan_lock.locked.return_value = True
         mock_app_state_with_settings.scan_id = "existing-scan-12"
-
         result = await run_quality_scan({}, mock_app_state_with_settings)
 
         assert result["scanned"] is False
         assert result["status"] == "already_running"
         assert result["scan_id"] == "existing-scan-12"
+
+    @pytest.mark.asyncio
+    async def test_run_scan_prunes_old_finished(self, mock_app_state_with_settings):
+        """13.19: при старте нового скана prune_finished() удаляет старые done/error записи."""
+        mock_metrics = {
+            "files_scanned": 2,
+            "review_queue_size": 1,
+            "duplicates_detected": 0,
+            "issues_created": 1,
+        }
+        # Старые завершённые записи в трекере (реальный трекер — проверяем prune)
+        from mcp_server.progress import ImportProgressTracker
+
+        tracker = ImportProgressTracker()
+        tracker.start("scan-old-1", total=5)
+        tracker.done("scan-old-1", {"metrics": {}})
+        tracker.start("scan-old-2", total=5)
+        tracker.error("scan-old-2", "boom")
+        mock_app_state_with_settings.scan_progress = tracker
+
+        with patch("mcp_server.tools.quality._bg_scan", new=AsyncMock()) as mock_bg:
+            result = await run_quality_scan({}, mock_app_state_with_settings)
+
+        assert result["scanned"] is True
+        assert mock_bg.called
+        # Обе старые записи удалены prune_finished, новая (текущий scan_id) осталась
+        remaining = list(mock_app_state_with_settings.scan_progress._data.keys())
+        assert "scan-old-1" not in remaining
+        assert "scan-old-2" not in remaining
+        assert len(remaining) == 1
+        assert remaining[0] == result["scan_id"]
 
     @pytest.mark.asyncio
     async def test_run_scan_no_settings_graceful(self, mock_app_state):
