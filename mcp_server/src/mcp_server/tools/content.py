@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from ..config import settings
 from ..content.linking import build_collection
 from ..content.preprocessor import ImportMeta
 from ..content.registry import get as get_preprocessor
@@ -315,7 +316,6 @@ async def import_content(params: dict, app_state) -> dict:
             _p(tracker, import_id, "section_done", section.sequence_number, section.title)
 
             # Прогресс-строка каждые IMPORT_BATCH_COMMIT секций (лог + tracker).
-            # Без git-коммита: коммит ОДИН на книгу в конце (см. финальный flush ниже).
             if imported % IMPORT_BATCH_COMMIT == 0:
                 logger.info(
                     "import_content: %d/%d sections written",
@@ -323,6 +323,20 @@ async def import_content(params: dict, app_state) -> dict:
                 )
                 _p(tracker, import_id, "log", "info",
                    f"import_content: {imported}/{len(sections)} sections written")
+
+            # Фаза 13.21 P1-5: периодический git-коммит каждые IMPORT_PERIODIC_COMMIT секций.
+            # При git-ошибке: warning и продолжение без коммита (non-fatal).
+            # Финальный flush в конце — всегда (стр. ~343).
+            if imported % settings.IMPORT_PERIODIC_COMMIT == 0:
+                try:
+                    await store.flush(
+                        f"import_content: {collection.knowledge_id} "
+                        f"periodic commit ({imported}/{len(sections)})"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[IMPORT] periodic git-commit failed (non-fatal): %s", e
+                    )
 
         except Exception as e:
             failed += 1

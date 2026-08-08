@@ -580,3 +580,137 @@ class TestImportContentCoverageGaps:
         assert result["failed"] == 0
         assert result["indexed"] is True
         assert result["pending"] is False
+
+
+# ── 13.21 Phase 2: Periodic git-commit during import ────────
+
+
+class TestPeriodicGitCommit:
+    """P1-5 (13.21): periodic git-commit каждые IMPORT_PERIODIC_COMMIT секций."""
+
+    @pytest.mark.asyncio
+    async def test_flush_called_periodically_during_large_import(self, store_no_git, pipeline_ok):
+        """P1-5: import с >IMPORT_PERIODIC_COMMIT секций → flush вызывается несколько раз."""
+        from mcp_server.config import settings
+
+        # Override на маленькое значение для теста
+        original_periodic = getattr(settings, "IMPORT_PERIODIC_COMMIT", 100)
+        settings.IMPORT_PERIODIC_COMMIT = 5
+
+        try:
+            # Подменяем store.flush на AsyncMock для подсчёта вызовов
+            flush_mock = AsyncMock()
+            store_no_git.flush = flush_mock
+
+            # Генерируем контент с 12+ секциями (> 2 * IMPORT_PERIODIC_COMMIT=5)
+            sections = []
+            for i in range(1, 14):
+                sections.append(
+                    f"## Section {i}\nContent of section {i}.\n\n"
+                    f"Paragraph text here for section {i}."
+                )
+            big_content = "# Big Book\n\n" + "\n\n".join(sections)
+
+            app_state = MagicMock()
+            app_state.store = store_no_git
+            app_state.pipeline = pipeline_ok
+            app_state.knowledge_index = MagicMock()
+            app_state.knowledge_index.update_section = MagicMock()
+
+            from mcp_server.tools.content import import_content
+            result = await import_content(
+                {
+                    "content": big_content,
+                    "content_type": "book",
+                    "domain": "periodic",
+                    "subject": "test",
+                    "title": "Periodic Commit Test",
+                },
+                app_state,
+            )
+
+            assert "error" not in result
+            assert result["imported"] >= 12
+            assert result["failed"] == 0
+
+            # Должно быть минимум 2 промежуточных + 1 финальный flush = 3+
+            assert flush_mock.call_count >= 3, (
+                f"Expected ≥3 flush calls (2 periodic + 1 final), got {flush_mock.call_count}"
+            )
+        finally:
+            settings.IMPORT_PERIODIC_COMMIT = original_periodic
+
+    @pytest.mark.asyncio
+    async def test_periodic_commit_error_non_fatal(self, store_no_git, pipeline_ok):
+        """P1-5: git-ошибка при периодическом commit → warning, импорт продолжается."""
+        import logging
+
+        from mcp_server.config import settings
+
+        # Override для теста
+        original_periodic = getattr(settings, "IMPORT_PERIODIC_COMMIT", 100)
+        settings.IMPORT_PERIODIC_COMMIT = 5
+
+        try:
+            # flush бросает исключение при 1-м периодическом вызове, ок при финальном
+            flush_call_count = [0]
+
+            async def _intermittent_flush(msg):
+                flush_call_count[0] += 1
+                # Падаем только на первом периодическом вызове (не финальном)
+                if flush_call_count[0] == 1:
+                    raise RuntimeError("Simulated periodic git error")
+
+            store_no_git.flush = _intermittent_flush
+
+            # Генерируем контент с 7 секциями (>=1 периодический commit при пороге 5)
+            sections = []
+            for i in range(1, 8):
+                sections.append(
+                    f"## Section {i}\nContent of section {i}.\n\n"
+                    f"Paragraph text here for section {i}."
+                )
+            big_content = "# Book\n\n" + "\n\n".join(sections)
+
+            app_state = MagicMock()
+            app_state.store = store_no_git
+            app_state.pipeline = pipeline_ok
+            app_state.knowledge_index = MagicMock()
+            app_state.knowledge_index.update_section = MagicMock()
+
+            from mcp_server.tools.content import import_content
+
+            # Перехватываем warning-лог через caplog
+            logger_name = "mcp_knowledge.tools.content"
+            mcp_logger = logging.getLogger(logger_name)
+            old_level = mcp_logger.level
+            mcp_logger.setLevel(logging.WARNING)
+            try:
+                result = await import_content(
+                    {
+                        "content": big_content,
+                        "content_type": "book",
+                        "domain": "flush-err-periodic",
+                        "subject": "test",
+                        "title": "Periodic Error Test",
+                    },
+                    app_state,
+                )
+            finally:
+                mcp_logger.setLevel(old_level)
+
+            # Импорт должен завершиться успешно несмотря на ошибку периодического flush
+            assert "error" not in result
+            assert result["imported"] >= 7
+            assert result["failed"] == 0
+            assert result["partial_success"] is False
+
+            # Финальный flush должен был вызваться (call_count >= 2: 1 periodic fail + 1 final)
+            assert flush_call_count[0] >= 2, (
+                f"Expected ≥2 flush calls, got {flush_call_count[0]}"
+            )
+        finally:
+            settings.IMPORT_PERIODIC_COMMIT = original_periodic
+
+
+# ── End of 13.21 Phase 2 tests ─────────────────────────────

@@ -280,6 +280,94 @@ Another paragraph with more words here for testing coverage.
 
         assert len(chunks) >= 1
 
+    @pytest.mark.asyncio
+    async def test_clustering_skipped_with_many_paragraphs(self):
+        """P1-2 (13.21): >CLUSTER_MAX_PARAGRAPHS → skip clustering, recursive_split."""
+        from unittest.mock import patch
+
+        from mcp_server.content.splitting import (
+            CLUSTER_MAX_PARAGRAPHS,
+            hybrid_split,
+        )
+
+        # Генерируем контент с >CLUSTER_MAX_PARAGRAPHS параграфов
+        paragraphs = []
+        for i in range(CLUSTER_MAX_PARAGRAPHS + 10):
+            paragraphs.append(f"Paragraph {i}: This is sentence one. This is sentence two.")
+        content = "\n\n".join(paragraphs)
+
+        embedder = MagicMock()
+        embedder.embed_sync = MagicMock()
+
+        token_counter = MagicMock()
+        token_counter.count_tokens = lambda text: max(1, len(text.split()))
+        token_counter.truncate_to_tokens = lambda text, n: " ".join(text.split()[:n])
+
+        # Патчим _cosine_clustering — убеждаемся, что НЕ вызывается
+        with patch(
+            "mcp_server.content.splitting._cosine_clustering"
+        ) as mock_cosine:
+            chunks = await hybrid_split(
+                content=content,
+                embedder=embedder,
+                token_counter=token_counter,
+                max_tokens=512,
+            )
+
+            # _cosine_clustering НЕ должен вызываться (пропуск из-за >CLUSTER_MAX_PARAGRAPHS)
+            mock_cosine.assert_not_called()
+
+        # Секции должны быть сгенерированы (recursive_split на основе structural)
+        assert len(chunks) >= 1
+        for ch in chunks:
+            assert ch.title
+            assert ch.body.strip()
+
+    @pytest.mark.asyncio
+    async def test_clustering_not_skipped_with_few_paragraphs(self):
+        """P1-2 (13.21): ≤CLUSTER_MAX_PARAGRAPHS → clustering НОРМАЛЬНО вызывается."""
+        from unittest.mock import patch
+
+        from mcp_server.content.splitting import (
+            CLUSTER_MAX_PARAGRAPHS,
+            hybrid_split,
+        )
+
+        # Генерируем контент с ≤CLUSTER_MAX_PARAGRAPHS параграфов + 1 секция (< MIN_SECTIONS)
+        paragraphs = []
+        for i in range(5):
+            paragraphs.append(f"Paragraph {i}: This is sentence one. This is sentence two.")
+        content = "\n\n".join(paragraphs)
+
+        embedder = MagicMock()
+        embedder.embed_sync = MagicMock()
+        embedder.embed_sync.return_value = [[0.1] * 8] * 5
+
+        token_counter = MagicMock()
+        token_counter.count_tokens = lambda text: max(1, len(text.split()))
+        token_counter.truncate_to_tokens = lambda text, n: " ".join(text.split()[:n])
+
+        # Патчим _cosine_clustering — должен вызываться (параграфов мало)
+        with patch(
+            "mcp_server.content.splitting._cosine_clustering",
+            return_value=[0, 0, 1, 1, 2],
+        ) as mock_cosine:
+            chunks = await hybrid_split(
+                content=content,
+                embedder=embedder,
+                token_counter=token_counter,
+                max_tokens=512,
+            )
+
+            # _cosine_clustering ДОЛЖЕН вызываться
+            mock_cosine.assert_called_once()
+
+        # Секции должны быть сгенерированы
+        assert len(chunks) >= 1
+        for ch in chunks:
+            assert ch.title
+            assert ch.body.strip()
+
 
 # ── 6.1: DI XlmRobertaTokenizer — глобальный синглтон (F4 fix) ────
 

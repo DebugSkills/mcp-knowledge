@@ -27,6 +27,8 @@ MIN_SECTIONS = 2             # если structural дал <2 → fallback cluste
 CLUSTER_COSINE = 0.75        # порог cosine для Agglomerative clustering
 CLUSTER_BATCH_SIZE = 64      # Фаза 13.21 P2-5: размер батча для embed_paragraphs_async
                               # (64 параграфа за вызов Ollama — хардкод для первой итерации)
+CLUSTER_MAX_PARAGRAPHS = 2000  # Фаза 13.21 P1-2: максимальное число параграфов для clustering
+                               # (>2000 → skip clustering, fallback на recursive_split во избежание OOM)
 
 
 @dataclass
@@ -354,7 +356,15 @@ async def hybrid_split(
             len(chunks), min_sections,
         )
         paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
-        if len(paragraphs) >= 2 and embedder is not None:
+        if len(paragraphs) > CLUSTER_MAX_PARAGRAPHS:
+            # Фаза 13.21 P1-2: OOM guard — при >2000 параграфов skip clustering,
+            # сразу переходим к recursive_split (без построения N×N матрицы).
+            logger.warning(
+                "Hybrid split: %d paragraphs > CLUSTER_MAX_PARAGRAPHS=%d — "
+                "skipping clustering fallback, using structural result",
+                len(paragraphs), CLUSTER_MAX_PARAGRAPHS,
+            )
+        elif len(paragraphs) >= 2 and embedder is not None:
             try:
                 embeddings = await embed_paragraphs_async(paragraphs, embedder)
                 chunks = clustering_split(content, embeddings)

@@ -73,6 +73,12 @@ class Settings(BaseSettings):
     # 256MB было бы рискованно (~1220MB пик при concurrent embedding).
     MCP_MAX_REQUEST_SIZE: int = 134_217_728  # 128 МБ
 
+    # Periodic git-commit during import (Фаза 13.21 P1-5)
+    # Каждые N секций — промежуточный git-commit через store.flush().
+    # При git-ошибке: warning и продолжение без коммита (non-fatal).
+    # Финальный flush ВСЕГДА в конце импорта.
+    IMPORT_PERIODIC_COMMIT: int = 100
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         if self.WORKERS != 1:
