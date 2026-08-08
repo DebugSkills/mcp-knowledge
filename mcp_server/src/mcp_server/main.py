@@ -457,6 +457,10 @@ async def data_version(request: Request):
     Используется kb-console DataCache для гибридной инвалидации
     (TTL + version check). Возвращает {"data_version": N}.
 
+    Инвариант: single-worker + await-free increment → race-free.
+    При изменении workers или выносе инкремента за await —
+    обновить guard-тесты в test_data_version.py.
+
     Auth: defence-in-depth — проверяет request.state.auth.
     """
     auth = getattr(request.state, "auth", None)

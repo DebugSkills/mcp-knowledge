@@ -19,7 +19,7 @@ RUN git config --global --add safe.directory /app/knowledge
 # Python-зависимости (runtime, БЕЗ torch/transformers — embedder = Ollama;
 # sklearn — TF-IDF для keywords.py, без torch)
 COPY pyproject.toml .
-RUN pip install --no-cache-dir --index-url ${PIP_INDEX_URL} fastmcp fastapi "uvicorn[standard]" qdrant-client pydantic pydantic-settings pyyaml prometheus-client gitpython python-dotenv httpx scikit-learn
+RUN pip install --no-cache-dir --index-url ${PIP_INDEX_URL} fastmcp fastapi "uvicorn[standard]" "qdrant-client>=1.13.0,<1.15" pydantic pydantic-settings pyyaml prometheus-client gitpython python-dotenv httpx scikit-learn
 RUN pip install --no-cache-dir --index-url ${PIP_INDEX_URL} ruff pytest pytest-asyncio pytest-cov
 # editable install ПОСЛЕ COPY src/ — setuptools должен видеть src-layout при установке
 COPY src/ ./src/

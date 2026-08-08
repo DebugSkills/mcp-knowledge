@@ -1,6 +1,22 @@
 version: "3.8"
 
 services:
+  qdrant:
+    image: qdrant/qdrant:v1.13.4
+    container_name: mcp-qdrant-dev
+    ports:
+      - "6333:6333"   # REST (gRPC 6334 наружу не пробрасываем — как в текущем dev)
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    # В образе v1.13.4 НЕТ curl/wget → healthcheck через bash /dev/tcp
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
   mcp-server:
     build:
       context: ./mcp_server
@@ -8,8 +24,9 @@ services:
     container_name: mcp-knowledge-server
     # host-сеть: Ollama на хосте слушает ТОЛЬКО 127.0.0.1:11434 (loopback),
     # host.docker.internal недоступен без OLLAMA_HOST=0.0.0.0 (требует sudo на хосте).
-    # host-сеть даёт прямой доступ к loopback хоста: localhost:11434 + localhost:6333.
-    # Альтернатива для удалённых окружений: OLLAMA_HOST=0.0.0.0 + host.docker.internal.
+    # host-сеть даёт прямой доступ к loopback хоста: localhost:11434.
+    # Qdrant — контейнерный (qdrant/qdrant:v1.13.4, dev==prod), порт 6333 опубликован
+    # на хост → при host-сети сервер обращается localhost:6333 (DNS-имя qdrant недоступно).
     network_mode: host
     volumes:
       - ../knowledge:/app/knowledge           # SSOT (read-write: write_knowledge + git commit)
@@ -26,9 +43,12 @@ services:
       - OLLAMA_MODEL=nomic-embed-text
       # EMBEDDING_MODEL — имя HF-токенизатора для chunker (не Ollama-модель!)
       - EMBEDDING_MODEL=BAAI/bge-m3
-      # Хостовый qdrant (gRPC 6334 наружу не проброшен → REST 6333)
+      # Контейнерный qdrant v1.13.4 (dev==prod), опубликован на хост 6333
       - QDRANT_URL=http://localhost:6333
       - QDRANT_PREFER_GRPC=false
+    depends_on:
+      qdrant:
+        condition: service_healthy
     healthcheck:
       # E1 (P1-1 fix): /health/live — всегда 200 пока процесс жив → NO restart storm
       # Было: /health → при embed degraded 503 → Docker перезапускает → бесконечный цикл
