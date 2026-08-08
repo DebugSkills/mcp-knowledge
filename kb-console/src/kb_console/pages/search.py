@@ -15,25 +15,25 @@ from nicegui import ui
 
 from ..components.progress_panel import build_scan_progress
 from ..config import MCP_API_KEY, MCP_SERVER_URL
+from ..core.data_cache import cache
 from ..core.mcp_client import MCPClient
 from .books import show_book_dialog
 
-# Модульный кэш: collection_id → title книги (лениво заполняется list_collections).
-_book_title_cache: dict[str, str] = {}
 
-
-async def _ensure_book_cache(client: MCPClient) -> None:
-    """Заполнить кэш названий книг один раз (если ещё пуст)."""
-    if _book_title_cache:
-        return
+async def _load_book_titles(client: MCPClient) -> dict[str, str]:
+    """Загрузить словарь collection_id → title через DataCache."""
+    # Task 1: version check → инвалидация при внешних мутациях (rename/delete из API)
     try:
-        books = await client.list_collections()
-        for b in books:
-            cid = b.get("collection_id")
-            if cid:
-                _book_title_cache[cid] = b.get("title") or cid
+        await cache.check_version(client)
     except Exception:
-        pass  # кэш опционален — результаты покажутся и без него
+        pass
+    books = await cache.get("book_titles", lambda: client.list_collections(), ttl=300)
+    result: dict[str, str] = {}
+    for b in books:
+        cid = b.get("collection_id")
+        if cid:
+            result[cid] = b.get("title") or cid
+    return result
 
 
 def build_search() -> None:
@@ -74,7 +74,7 @@ def build_search() -> None:
 
         client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
         try:
-            await _ensure_book_cache(client)
+            book_titles = await _load_book_titles(client)
             result = await client.tools_call(
                 "search_knowledge",
                 {"query": query, "top_k": int(top_k_input.value or 5)},
@@ -99,7 +99,7 @@ def build_search() -> None:
                     title = it.get("title") or it.get("section_header") or it.get("knowledge_id", "—")
                     knowledge_id = it.get("knowledge_id")          # ID найденного ФРАГМЕНТА (секции)
                     book_id = it.get("parent_knowledge_id")
-                    book = _book_title_cache.get(book_id, "—") if book_id else "—"
+                    book = book_titles.get(book_id, "—") if book_id else "—"
                     score = round(it.get("score", 0), 4) if "score" in it else "—"
                     excerpt = (it.get("content") or "")[:200].strip()
                     tags = it.get("tags") or []

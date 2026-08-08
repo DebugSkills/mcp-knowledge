@@ -266,9 +266,14 @@ async def lifespan(app: FastAPI):
     # 13.15: Scan state — background task + lock (root-фикс зависания event loop)
     app.state.scan_lock = asyncio.Lock()
     app.state.scan_task = None
-    app.state.scan_progress = ImportProgressTracker()
+    app.state.scan_progress = ImportProgressTracker(max_messages=200)
     app.state.scan_id: str | None = None
-    logger.info("🔒 Scan lock + progress tracker initialized (phase 13.15)")
+    app.state.scan_cancel_event = None  # 13.18: asyncio.Event для отмены скана
+    logger.info("🔒 Scan lock + progress tracker + cancel event initialized (phase 13.15+13.18)")
+
+    # Task 1: data_version для кеш-инвалидации kb-console
+    app.state.data_version = 0
+    logger.info("📊 data_version initialized (0)")
 
     elapsed = _time.monotonic() - _start_ts
     rss_end = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
@@ -376,3 +381,20 @@ async def scan_progress(request: Request):
     if snapshot is None:
         raise HTTPException(404, f"scan {scan_id} not found or expired")
     return snapshot
+
+
+# Task 1: Data version endpoint (cache invalidation for kb-console)
+@app.get("/data-version")
+async def data_version(request: Request):
+    """GET /data-version — монотонно возрастающий счётчик мутаций данных.
+
+    Используется kb-console DataCache для гибридной инвалидации
+    (TTL + version check). Возвращает {"data_version": N}.
+
+    Auth: defence-in-depth — проверяет request.state.auth.
+    """
+    auth = getattr(request.state, "auth", None)
+    if auth is None or not getattr(auth, "authenticated", False):
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    return {"data_version": getattr(request.app.state, "data_version", 0)}

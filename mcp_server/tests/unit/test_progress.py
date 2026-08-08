@@ -128,11 +128,12 @@ class TestImportProgressTracker:
     # ── TTL prune ───────────────────────────────────────────
 
     def test_get_prunes_expired_entries(self):
-        """get удаляет записи старше ttl_seconds (ttl=0 для мгновенного истечения)."""
+        """get удаляет done/error записи старше ttl_seconds (ttl=0 для мгновенного истечения)."""
         t = ImportProgressTracker(ttl_seconds=0)
         t.start("expired", total=1)
+        t.done("expired", summary={})  # помечаем done — только так ttl сработает
         time.sleep(0.01)  # гарантируем, что ttl истёк
-        assert t.get("expired") is None  # просроченная запись удалена
+        assert t.get("expired") is None  # просроченная done-запись удалена
 
     # ── Robustness: mutators never raise ─────────────────────
 
@@ -196,3 +197,30 @@ class TestImportProgressTracker:
         """max_messages по умолчанию — 50."""
         t = ImportProgressTracker()
         assert t._max_messages == 50
+
+    # ── Task 2: TTL running vs done/error ─────────────────────
+
+    def test_progress_ttl_running_not_deleted(self):
+        """running-запись старше TTL НЕ удаляется (Task 2 fix)."""
+        t = ImportProgressTracker(ttl_seconds=0)
+        t.start("running-job", total=10)
+        time.sleep(0.01)  # ttl истёк
+        snap = t.get("running-job")
+        assert snap is not None
+        assert snap["status"] == "running"
+
+    def test_progress_ttl_done_deleted(self):
+        """done-запись старше TTL удаляется."""
+        t = ImportProgressTracker(ttl_seconds=0)
+        t.start("done-job", total=10)
+        t.done("done-job", summary={})
+        time.sleep(0.01)  # ttl истёк
+        assert t.get("done-job") is None
+
+    def test_progress_ttl_error_deleted(self):
+        """error-запись старше TTL удаляется."""
+        t = ImportProgressTracker(ttl_seconds=0)
+        t.start("error-job", total=10)
+        t.error("error-job", "fail")
+        time.sleep(0.01)  # ttl истёк
+        assert t.get("error-job") is None

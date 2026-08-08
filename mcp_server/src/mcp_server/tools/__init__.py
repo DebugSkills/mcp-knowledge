@@ -18,6 +18,7 @@ from .collections import list_collections
 from .content import import_content
 from .crud import delete_entry, update_entry, write_knowledge
 from .quality import (
+    cancel_quality_scan,
     list_quality_issues,
     resolve_quality_issue,
     review_queue,
@@ -188,6 +189,13 @@ _RUN_QUALITY_SCAN_SCHEMA: dict[str, Any] = {
     },
 }
 
+# ── 13.18: cancel_quality_scan schema ───────────────────────
+
+_CANCEL_QUALITY_SCAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+}
+
 # ── import_content schema (Фаза 5) ─────────────────────────
 
 _IMPORT_CONTENT_SCHEMA: dict[str, Any] = {
@@ -308,6 +316,12 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Запустить периодический quality scan: обход всех .md → staleness_score → dup-pair detection → issues + review_queue. Для cron (4.8).",
         "inputSchema": _RUN_QUALITY_SCAN_SCHEMA,
     },
+    # ── 13.18: cancel quality scan ──────────────────────────
+    {
+        "name": "cancel_quality_scan",
+        "description": "Отменить активный quality scan. Возвращает частичные метрики, освобождает lock для нового скана.",
+        "inputSchema": _CANCEL_QUALITY_SCAN_SCHEMA,
+    },
     # ── import_content (Фаза 5) ──────────────────────────────
     {
         "name": "import_content",
@@ -342,6 +356,7 @@ TOOL_HANDLERS = {
     "list_quality_issues": list_quality_issues,
     "resolve_quality_issue": resolve_quality_issue,
     "run_quality_scan": run_quality_scan,
+    "cancel_quality_scan": cancel_quality_scan,
     "import_content": import_content,
     "analyze_content": analyze_content,
 }

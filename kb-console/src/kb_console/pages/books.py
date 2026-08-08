@@ -19,6 +19,7 @@ from __future__ import annotations
 from nicegui import ui
 
 from ..config import MCP_API_KEY, MCP_SERVER_URL
+from ..core.data_cache import cache
 from ..core.mcp_client import MCPClient
 from ..core.utils import _sanitize_title
 
@@ -258,7 +259,16 @@ def build_books() -> None:
             ui.label("Загрузка списка книг…").classes("text-grey")
 
         try:
-            books = await _client.list_collections()
+            # Task 1: server-side version check → инвалидация при внешних мутациях
+            try:
+                await cache.check_version(_client)
+            except Exception:
+                pass  # version-check не должен ломать загрузку списка
+            books = await cache.get(
+                "books",
+                lambda: _client.list_collections(),
+                ttl=60,
+            )
         except Exception as exc:
             view_container.clear()
             with view_container:

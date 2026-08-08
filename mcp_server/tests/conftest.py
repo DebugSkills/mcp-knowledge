@@ -71,6 +71,22 @@ def mock_qdrant() -> MagicMock:
     """Mock QdrantClient — search, scroll, upsert, delete."""
     client = MagicMock()
 
+    # Multi-point store for search dedup/offset tests
+    _search_points_store: list[dict] = [
+        {
+            "id": 1, "score": 0.95,
+            "payload": {
+                "knowledge_id": "ru-test-entry",
+                "chunk_id": "chunk-1",
+                "content": "Test content",
+                "section_header": "# Test Entry",
+                "domain": "engineering",
+                "subject": "testing",
+                "tags": ["test", "mock"],
+            },
+        },
+    ]
+
     # search() returns scored points
     def _fake_search(
         vector=None,
@@ -79,23 +95,27 @@ def mock_qdrant() -> MagicMock:
         score_threshold: float = 0.0,
         exclude_content_types: list[str] | None = None,
         exclude_statuses: list[str] | None = None,
+        offset: int = 0,
     ):
-        point = MagicMock()
-        point.id = 1
-        point.score = 0.95
-        point.payload = {
-            "knowledge_id": "ru-test-entry",
-            "chunk_id": "chunk-1",
-            "content": "Test content",
-            "section_header": "# Test Entry",
-            "domain": "engineering",
-            "subject": "testing",
-            "tags": ["test", "mock"],
-        }
+        points = _search_points_store[offset:offset + top_k]
+        results = []
+        for p in points:
+            point = MagicMock()
+            point.id = p["id"]
+            point.score = p["score"]
+            point.payload = p["payload"]
+            results.append(point)
         client._last_search_exclude = exclude_content_types
         client._last_search_exclude_statuses = exclude_statuses
-        return [point]
+        client._last_search_offset = offset
+        client._last_search_top_k = top_k
+        return results
 
+    def _set_search_points(points: list[dict]) -> None:
+        _search_points_store.clear()
+        _search_points_store.extend(points)
+
+    client._set_search_points = _set_search_points
     client.search = _fake_search
 
     # search_by_tags()
@@ -304,4 +324,9 @@ def app_state(
     state.store = mock_store
     state.pipeline = mock_pipeline
     state.knowledge_index = mock_knowledge_index
+    state.data_version = 0  # Task 1
+    # scan_lock (for quality scan tests)
+    _scan_lock = MagicMock()
+    _scan_lock.locked.return_value = False
+    state.scan_lock = _scan_lock
     return state

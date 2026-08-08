@@ -410,6 +410,11 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
 
                 if issue_id:
                     update_issue_status(issue_id, "resolved", reason or "deprecated")
+                # Task 1: инкремент data_version после мутации
+                try:
+                    app_state.data_version += 1
+                except Exception:  # noqa: S110
+                    pass  # best-effort
                 return {
                     "resolved": True,
                     "issue_id": issue_id,
@@ -458,6 +463,11 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
 
                 if issue_id:
                     update_issue_status(issue_id, "resolved", reason or "restored")
+                # Task 1: инкремент data_version после мутации
+                try:
+                    app_state.data_version += 1
+                except Exception:  # noqa: S110
+                    pass  # best-effort
                 return {
                     "resolved": True,
                     "issue_id": issue_id,
@@ -499,6 +509,11 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
                 return {"resolved": False, "error": f"Merge failed: {exc}"}
             update_issue_status(issue_id, "resolved", f"merged into {target_id}. {reason}")
             side_effects.append(f"Content merge into '{target_id}' pending — markdown merge not yet implemented")
+            # Task 1: инкремент data_version после мутации
+            try:
+                app_state.data_version += 1
+            except Exception:  # noqa: S110
+                pass  # best-effort
             return {
                 "resolved": True,
                 "issue_id": issue_id,
@@ -579,12 +594,15 @@ async def _bg_scan(
     qdrant_client,
     scan_progress,
     scan_state: dict,
+    cancel_event: asyncio.Event | None = None,  # 13.18: отмена скана
 ) -> None:
-    """Фоновая задача quality scan (13.15).
+    """Фоновая задача quality scan (13.15 + 13.18).
 
     Выполняет run_scan под scan_lock, обновляет прогресс через
     scan_progress. При ошибке — scan_progress.error().
     scan_task очищается в finally.
+
+    13.18: принимает cancel_event и пробрасывает в run_scan.
     """
     from mcp_server.quality.scanner import run_scan
 
@@ -596,7 +614,10 @@ async def _bg_scan(
                 qdrant_client=qdrant_client,
                 progress=scan_progress,
                 progress_id=scan_id,
+                cancel_event=cancel_event,
             )
+            # run_scan сам вызывает progress.done() в нормальном потоке (13.18)
+            # но если он НЕ вызвал (cancel без progress), делаем здесь
             scan_progress.done(scan_id, {"metrics": metrics})
             logger.info(
                 "Background scan %s complete: %d files, %d in review queue, %d dups, %d issues",
@@ -613,16 +634,19 @@ async def _bg_scan(
     except Exception as exc:
         logger.exception("Background scan %s failed", scan_id)
         scan_progress.error(scan_id, str(exc))
-        scan_progress.error(scan_id, str(exc))
     finally:
         scan_state["task_ref"][0] = None
 
 
 async def run_quality_scan(params: dict, app_state) -> dict:
-    """Запускает quality scan как фоновую задачу (13.15).
+    """Запускает quality scan как фоновую задачу (13.15 + 13.18).
 
     Возвращает мгновенный ответ — скан выполняется асинхронно.
     Прогресс: GET /quality/scan/progress.
+
+    13.18: при старте — создаёт новый asyncio.Event() для отмены (сброс),
+    прокидывает в _bg_scan. Параметр domain пока не используется
+    (run_scan не фильтрует по домену).
 
     Новый контракт (13.15):
         {"scanned": true, "status": "started", "scan_id": "..."}  — скан запущен
@@ -657,6 +681,9 @@ async def run_quality_scan(params: dict, app_state) -> dict:
         scan_id = uuid.uuid4().hex[:16]
         app_state.scan_id = scan_id
 
+        # 13.18: Новый cancel_event на каждый скан (сброс от предыдущего)
+        app_state.scan_cancel_event = asyncio.Event()
+
         # Инициализируем прогресс (total — неизвестен до обхода, ставим 0)
         scan_progress.start(scan_id, total=0)
 
@@ -670,6 +697,7 @@ async def run_quality_scan(params: dict, app_state) -> dict:
                 qdrant_client=qdrant_client,
                 scan_progress=scan_progress,
                 scan_state={"lock": scan_lock, "task_ref": task_ref},
+                cancel_event=app_state.scan_cancel_event,
             )
         )
         task_ref[0] = task
@@ -681,3 +709,32 @@ async def run_quality_scan(params: dict, app_state) -> dict:
     except Exception as exc:
         logger.exception("run_quality_scan failed to start")
         return {"scanned": False, "status": "error", "error": str(exc)}
+
+
+async def cancel_quality_scan(params: dict, app_state) -> dict:
+    """Отменить активный quality scan (13.18).
+
+    Устанавливает scan_cancel_event → run_scan проверяет между фазами
+    и возвращает частичные метрики. Lock освобождается автоматически
+    при выходе из async with scan_state["lock"] в _bg_scan.
+
+    Returns:
+        {"cancelled": True, "scan_id": "..."}  — отмена отправлена
+        {"cancelled": False, "reason": "no active scan"}  — нечего отменять
+    """
+    scan_lock = getattr(app_state, "scan_lock", None)
+    if scan_lock is None or not scan_lock.locked():
+        return {"cancelled": False, "reason": "no active scan"}
+
+    cancel_event = getattr(app_state, "scan_cancel_event", None)
+    if cancel_event is None:
+        # Активный скан, но cancel_event не создан (edge case) — создаём и ставим
+        app_state.scan_cancel_event = asyncio.Event()
+        cancel_event = app_state.scan_cancel_event
+
+    cancel_event.set()
+    logger.info("Cancel signal sent for scan %s", getattr(app_state, "scan_id", "?"))
+    return {
+        "cancelled": True,
+        "scan_id": getattr(app_state, "scan_id", None),
+    }

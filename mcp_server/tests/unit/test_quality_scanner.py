@@ -1,15 +1,21 @@
-"""Unit-тесты для quality/scanner.py — pure functions (4.5)."""
+"""Unit-тесты для quality/scanner.py — pure functions + .trash filter + cancel (4.5+13.18)."""
 
 from __future__ import annotations
 
+import asyncio
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 
+import pytest
 import yaml
 from mcp_server.models import KnowledgeFrontmatter
 from mcp_server.quality.scanner import (
     _are_dup_candidates,
     _empty_result,
     _parse_frontmatter,
+    _scan_filesystem,
+    run_scan,
 )
 
 
@@ -111,3 +117,131 @@ class TestEmptyResult:
             "review_queue_size",
         }
         assert set(result.keys()) == expected_keys
+
+
+# ═══════════════════════════════════════════════════════════════
+# 13.18: _scan_filesystem skips .trash/
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestScanFilesystemSkipsTrash:
+    """_scan_filesystem — исключает файлы из .trash/."""
+
+    @pytest.mark.asyncio
+    async def test_scan_filesystem_skips_trash(self):
+        """knowledge/x.md — возвращается; knowledge/.trash/stale.md — НЕТ."""
+        with tempfile.TemporaryDirectory() as tmp:
+            knowledge_dir = Path(tmp) / "knowledge"
+            knowledge_dir.mkdir()
+            trash_dir = knowledge_dir / ".trash"
+            trash_dir.mkdir()
+
+            # Создаём валидный .md файл в корне knowledge/
+            (knowledge_dir / "valid_entry.md").write_text(
+                "---\nknowledge_id: kid-1\ndomain: eng\nsubject: test\ntags: [t]\n"
+                "created_at: 2026-08-01T10:00:00+03:00\n"
+                "updated_at: 2026-08-03T10:00:00+03:00\n---\n# Valid\n"
+            )
+
+            # Создаём .md файл в .trash/ (должен быть пропущен)
+            (trash_dir / "deleted_entry.md").write_text(
+                "---\nknowledge_id: kid-2\ndomain: eng\nsubject: test\ntags: [t]\n"
+                "created_at: 2026-08-01T10:00:00+03:00\n"
+                "updated_at: 2026-08-03T10:00:00+03:00\n---\n# Deleted\n"
+            )
+
+            # Создаём другой подкаталог (не .trash) — файлы должны быть видны
+            sub_dir = knowledge_dir / "engineering"
+            sub_dir.mkdir()
+            (sub_dir / "nested_entry.md").write_text(
+                "---\nknowledge_id: kid-3\ndomain: eng\nsubject: test\ntags: [t]\n"
+                "created_at: 2026-08-01T10:00:00+03:00\n"
+                "updated_at: 2026-08-03T10:00:00+03:00\n---\n# Nested\n"
+            )
+
+            # Создаём .trash/ внутри подкаталога (имитация soft-delete вложенной записи)
+            nested_trash = sub_dir / ".trash"
+            nested_trash.mkdir()
+            (nested_trash / "nested_deleted.md").write_text(
+                "---\nknowledge_id: kid-4\ndomain: eng\nsubject: test\ntags: [t]\n"
+                "created_at: 2026-08-01T10:00:00+03:00\n"
+                "updated_at: 2026-08-03T10:00:00+03:00\n---\n# NestedDeleted\n"
+            )
+
+            entries = await _scan_filesystem(knowledge_dir)
+
+            knowledge_ids = {entry[1].knowledge_id for entry in entries}
+            assert "kid-1" in knowledge_ids, "valid_entry.md should be scanned"
+            assert "kid-3" in knowledge_ids, "nested_entry.md should be scanned"
+            assert "kid-2" not in knowledge_ids, ".trash/deleted_entry.md should be skipped"
+            assert "kid-4" not in knowledge_ids, "engineering/.trash/nested_deleted.md should be skipped"
+            assert len(entries) == 2
+
+
+# ═══════════════════════════════════════════════════════════════
+# 13.18: run_scan cancel_event — прерывание при отмене
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestRunScanCancel:
+    """run_scan — проверка cancel_event между фазами (13.18)."""
+
+    @pytest.mark.asyncio
+    async def test_run_scan_cancel_event_returns_partial_metrics(self):
+        """cancel_event установлен → run_scan прерывается рано, возвращает partial metrics."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            knowledge_dir = Path(tmp)
+            # Создаём несколько валидных .md файлов
+            for i in range(5):
+                (knowledge_dir / f"entry_{i}.md").write_text(
+                    "---\nknowledge_id: kid-%d\ndomain: eng\nsubject: test\ntags: [t]\n"
+                    "created_at: 2026-08-01T10:00:00+03:00\n"
+                    "updated_at: 2026-08-03T10:00:00+03:00\n---\n# Entry %d\n" % (i, i)
+                )
+
+            # Устанавливаем cancel_event ДО запуска — скан должен прерваться после _scan_filesystem
+            cancel_event = asyncio.Event()
+            cancel_event.set()
+
+            result = await run_scan(
+                knowledge_dir=knowledge_dir,
+                qdrant_client=None,  # без Qdrant — только scoring
+                cancel_event=cancel_event,
+            )
+
+            # _scan_filesystem успел выполниться (files_scanned = 5)
+            assert result["files_scanned"] == 5
+            # scoring должен быть пропущен (cancel после _scan_filesystem)
+            assert result["scores_updated"] == 0
+            assert result["review_queue_size"] == 0
+
+    @pytest.mark.asyncio
+    async def test_run_scan_no_cancel_event_runs_fully(self):
+        """Без cancel_event → run_scan проходит все фазы."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            knowledge_dir = Path(tmp)
+            for i in range(3):
+                (knowledge_dir / f"entry_{i}.md").write_text(
+                    "---\nknowledge_id: kid-%d\ndomain: eng\nsubject: test\ntags: [t]\n"
+                    "created_at: 2026-08-01T10:00:00+03:00\n"
+                    "updated_at: 2026-08-03T10:00:00+03:00\n---\n# Entry %d\n" % (i, i)
+                )
+
+            result = await run_scan(
+                knowledge_dir=knowledge_dir,
+                qdrant_client=None,
+                cancel_event=None,  # без отмены
+            )
+
+            assert result["files_scanned"] == 3
+            # Без Qdrant — scores не пишутся, но scoring выполнен
+            assert result["scores_updated"] == 0  # qdrant_client=None
+            # dup_scan и issues должны отработать
+            assert isinstance(result["duplicates_detected"], int)
+            assert isinstance(result["issues_created"], int)

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from nicegui import ui
 
+from ..components.progress_panel import _LEVEL_COLORS
 from ..config import MCP_API_KEY, MCP_SERVER_URL
 from ..core.mcp_client import MCPClient
 from ..core.utils import _sanitize_title
@@ -239,12 +240,6 @@ def build_import() -> None:
             _progress_timer = None
         progress_container.visible = False
         progress_container.clear()
-
-    _LEVEL_COLORS = {
-        "info": "text-grey",
-        "warning": "text-orange",
-        "error": "text-negative",
-    }
 
     def _render_progress(snapshot: dict) -> None:
         """Отрисовать прогресс-бар % и панель логов (реальные серверные строки)."""

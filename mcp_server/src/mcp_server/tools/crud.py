@@ -314,6 +314,11 @@ async def update_entry(params: dict, app_state) -> dict:
         logger.warning("INDEX update failed for %s: %s", knowledge_id, exc)
 
     logger.info("update_entry: %s v%d", knowledge_id, entry.frontmatter.version)
+    # Task 1: инкремент data_version после мутации
+    try:
+        app_state.data_version += 1
+    except Exception:  # noqa: S110
+        pass  # best-effort
     return {
         "knowledge_id": knowledge_id,
         "version": entry.frontmatter.version,
@@ -411,6 +416,11 @@ async def delete_entry(params: dict, app_state) -> dict:
         "[DELETE] delete_entry: %s → .trash/ + Qdrant removed (cascade_deleted=%d)",
         knowledge_id, cascade_deleted,
     )
+    # Task 1: инкремент data_version после мутации
+    try:
+        app_state.data_version += 1
+    except Exception:  # noqa: S110
+        pass  # best-effort
     return {
         "knowledge_id": knowledge_id,
         "deleted": True,

@@ -285,6 +285,26 @@ class MCPClient:
 
     # ── Scan progress (Фаза 13.15) ───────────────────────────
 
+    async def get_data_version(self) -> int:
+        """GET /data-version — монотонный счётчик мутаций данных (Task 1).
+
+        Используется DataCache для гибридной инвалидации (TTL + version check).
+
+        Returns:
+            Текущая версия данных (0 если ошибка).
+        """
+        url = f"{self.base_url}/data-version"
+        try:
+            response = await self._client.get(url, headers=self._headers(), timeout=5.0)
+        except httpx.HTTPError:
+            return 0
+        if response.status_code != 200:
+            return 0
+        try:
+            return response.json().get("data_version", 0)
+        except (json.JSONDecodeError, ValueError):
+            return 0
+
     async def get_scan_progress(self) -> dict[str, Any] | None:
         """GET /quality/scan/progress — снапшот живого прогресса quality scan.
 
@@ -337,6 +357,15 @@ class MCPClient:
         if domain:
             params["domain"] = domain
         return await self.tools_call("run_quality_scan", params)
+
+    async def cancel_quality_scan(self) -> dict[str, Any]:
+        """Отменить активный quality scan (13.18).
+
+        Returns:
+            {"cancelled": True, "scan_id": "..."}  — отмена отправлена
+            {"cancelled": False, "reason": "no active scan"}  — нечего отменять
+        """
+        return await self.tools_call("cancel_quality_scan", {})
 
     async def resolve_quality_issue(
         self,

@@ -52,6 +52,7 @@ async def run_scan(
     settings: Settings | None = None,
     progress=None,            # 13.15: ImportProgressTracker (опционально)
     progress_id: str | None = None,  # 13.15: id для трекера
+    cancel_event: asyncio.Event | None = None,  # 13.18: отмена скана
 ) -> dict:
     """Запускает полный quality scan базы знаний.
 
@@ -61,9 +62,10 @@ async def run_scan(
         settings: настройки (если None — загружаются из env).
         progress: опциональный ImportProgressTracker для live-отслеживания.
         progress_id: id записи в трекере (если progress задан).
+        cancel_event: asyncio.Event для отмены скана (13.18).
 
     Returns:
-        dict с метриками сканирования:
+        dict с метриками сканирования (частичные при отмене):
             files_scanned, scores_updated, duplicates_detected, issues_created, review_queue_size
     """
     if settings is None:
@@ -87,6 +89,9 @@ async def run_scan(
 
     pid = progress_id
 
+    def _is_cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
     # Шаг 1: обход knowledge/**/*.md
     if progress and pid:
         progress.set_phase(pid, "scanning_fs", "Обход файлов knowledge/...")
@@ -95,6 +100,14 @@ async def run_scan(
 
     if progress and pid:
         progress.start(pid, total=len(entries))  # actual total after walk
+
+    # 13.18: проверка отмены после _scan_filesystem
+    if _is_cancelled():
+        logger.info("Quality scan %s cancelled after filesystem walk (%d files)", pid, len(entries))
+        if progress and pid:
+            progress.log(pid, "warning", "scan cancelled by user")
+            progress.error(pid, "cancelled by user")
+        return metrics
 
     if not entries:
         if progress and pid:
@@ -108,46 +121,103 @@ async def run_scan(
     def _compute_all_scores(
         entries: list[tuple[Path, KnowledgeFrontmatter]],
         now_dt: datetime,
-    ) -> tuple[list[tuple[Path, KnowledgeFrontmatter, float]], int]:
+        cancel: asyncio.Event | None = None,
+    ) -> tuple[list[tuple[Path, KnowledgeFrontmatter, float]], int, bool]:
         """CPU + git-интенсивный scoring (detect_edit_war → git log на файл) в executor.
 
         13.15 fix 2: _compute_score вызывает detect_edit_war (синхронный git-вызов
         gitpython на КАЖДЫЙ файл) — цикл 15K записей в event loop блокировал
         однопоточный uvicorn (повтор инцидента 2026-08-07 при live-smoke).
+
+        Task 2: разбит на батчи ~500 записей с progress-обновлением между батчами.
+        13.18: проверка cancel_event между батчами (asyncio.Event.is_set() thread-safe).
         """
+        BATCH_SIZE = 500
         scored: list[tuple[Path, KnowledgeFrontmatter, float]] = []
         review_queue_size = 0
-        for filepath, frontmatter in entries:
-            score = _compute_score(frontmatter, now_dt, filepath)
-            scored.append((filepath, frontmatter, score))
-            if score >= REVIEW_THRESHOLD:
-                review_queue_size += 1
-        return scored, review_queue_size
+        total_entries = len(entries)
+        cancelled = False
+
+        for batch_start in range(0, total_entries, BATCH_SIZE):
+            # 13.18: проверка отмены между батчами
+            if cancel is not None and cancel.is_set():
+                cancelled = True
+                break
+
+            batch = entries[batch_start:batch_start + BATCH_SIZE]
+            for filepath, frontmatter in batch:
+                score = _compute_score(frontmatter, now_dt, filepath)
+                scored.append((filepath, frontmatter, score))
+                if score >= REVIEW_THRESHOLD:
+                    review_queue_size += 1
+
+            # Batch progress log (Task 2)
+            if progress and pid:
+                batch_end = min(batch_start + BATCH_SIZE, total_entries)
+                progress.set_phase(
+                    pid, "scoring",
+                    f"Scoring {batch_end}/{total_entries} entries...",
+                )
+
+        return scored, review_queue_size, cancelled
 
     scoring_loop = asyncio.get_running_loop()
-    scored, review_queue_size = await scoring_loop.run_in_executor(
-        None, _compute_all_scores, entries, now,
+    scored, review_queue_size, scoring_cancelled = await scoring_loop.run_in_executor(
+        None, _compute_all_scores, entries, now, cancel_event,
     )
     metrics["review_queue_size"] = review_queue_size
 
+    # 13.18: проверка отмены после scoring executor
+    if scoring_cancelled or _is_cancelled():
+        logger.info("Quality scan %s cancelled during scoring phase", pid)
+        if progress and pid:
+            progress.log(pid, "warning", "scan cancelled by user (during scoring)")
+            progress.error(pid, "cancelled by user")
+        return metrics
+
     # Шаг 3: запись scores в Qdrant payload
     if qdrant_client is not None:
+        if _is_cancelled():
+            if progress and pid:
+                progress.log(pid, "warning", "scan cancelled — skipping Qdrant update")
+                progress.error(pid, "cancelled by user")
+            return metrics
         if progress and pid:
             progress.set_phase(pid, "updating_qdrant", "Запись scores в Qdrant payload...")
         await _update_qdrant_payloads(qdrant_client, scored, progress=progress, progress_id=pid)
         metrics["scores_updated"] = len(scored)
 
+    # 13.18: проверка после Qdrant update
+    if _is_cancelled():
+        logger.info("Quality scan %s cancelled after Qdrant update", pid)
+        if progress and pid:
+            progress.log(pid, "warning", "scan cancelled by user")
+            progress.error(pid, "cancelled by user")
+        return metrics
+
     # Шаг 4: dup-pair scan по domain-бакетам
     if progress and pid:
         progress.set_phase(pid, "dup_scan", "Сканирование дубликатов...")
     loop = asyncio.get_running_loop()
-    dup_count = await loop.run_in_executor(None, _scan_dup_pairs, scored)
+    dup_count = await loop.run_in_executor(
+        None, _scan_dup_pairs, scored, progress, pid, cancel_event,
+    )
     metrics["duplicates_detected"] = dup_count
+
+    # 13.18: проверка после dup_scan
+    if _is_cancelled():
+        logger.info("Quality scan %s cancelled after dup_scan", pid)
+        if progress and pid:
+            progress.log(pid, "warning", "scan cancelled by user")
+            progress.error(pid, "cancelled by user")
+        return metrics
 
     # Шаг 5: создание issues для проблемных записей
     if progress and pid:
         progress.set_phase(pid, "issues", "Создание quality issues...")
-    issue_count = await loop.run_in_executor(None, _create_issues_for_problems, scored)
+    issue_count = await loop.run_in_executor(
+        None, _create_issues_for_problems, scored, progress, pid, cancel_event,
+    )
     metrics["issues_created"] = issue_count
 
     logger.info(
@@ -157,6 +227,8 @@ async def run_scan(
         metrics["duplicates_detected"],
         metrics["issues_created"],
     )
+    if progress and pid:
+        progress.done(pid, {"metrics": metrics})
     return metrics
 
 
@@ -177,6 +249,9 @@ async def _scan_filesystem(
     def _walk() -> list[tuple[Path, KnowledgeFrontmatter]]:
         results: list[tuple[Path, KnowledgeFrontmatter]] = []
         for md_file in knowledge_dir.rglob("*.md"):
+            # 13.18: пропуск файлов из .trash/ (как markdown_store.py:191,204)
+            if ".trash" in md_file.parts:
+                continue
             try:
                 content = md_file.read_text(encoding="utf-8")
                 fm = _parse_frontmatter(content, yaml)
@@ -328,11 +403,23 @@ async def _update_qdrant_payloads(
 
 def _scan_dup_pairs(
     scored: list[tuple[Path, KnowledgeFrontmatter, float]],
+    progress=None,
+    progress_id: str | None = None,
+    cancel_event=None,  # 13.18: asyncio.Event для отмены (проверяется между domain-бакетами)
 ) -> int:
     """Сканирует dup-пары внутри domain-бакетов.
 
     Без BGE-M3 эмбеддера использует упрощённую эвристику:
     одинаковый subject + пересечение tags ≥50% → кандидат в дубли.
+
+    Task 2: логирует прогресс по domain-бакетам.
+    13.18: проверка cancel_event между domain-бакетами.
+
+    Args:
+        scored: список (filepath, frontmatter, score).
+        progress: опциональный ImportProgressTracker.
+        progress_id: id записи в трекере.
+        cancel_event: asyncio.Event для отмены (13.18).
 
     Returns:
         количество обнаруженных dup-пар.
@@ -343,9 +430,21 @@ def _scan_dup_pairs(
         by_domain.setdefault(fm.domain, []).append((filepath, fm, score))
 
     dup_count = 0
+    total_domains = len(by_domain)
+    domain_idx = 0
     for entries in by_domain.values():
+        domain_idx += 1
+        # 13.18: проверка отмены между domain-бакетами
+        if cancel_event is not None and cancel_event.is_set():
+            break
         if len(entries) < 2:
             continue
+        # Прогресс по domain-бакетам (Task 2)
+        if progress and progress_id:
+            progress.log(
+                progress_id, "info",
+                f"dup_scan: {domain_idx}/{total_domains} domain buckets",
+            )
         # Ограничиваем число пар для производительности
         n = min(len(entries), MAX_PAIRS_PER_BUCKET)
         # Лимит dup-issues на одну запись: книга на 15K секций даёт тысячи пар
@@ -403,19 +502,40 @@ def _are_dup_candidates(
 
 def _create_issues_for_problems(
     scored: list[tuple[Path, KnowledgeFrontmatter, float]],
+    progress=None,
+    progress_id: str | None = None,
+    cancel_event=None,  # 13.18: asyncio.Event для отмены (проверяется между батчами)
 ) -> int:
-    """Создаёт issues для проблемных записей (высокий score, edit_war, etc.)."""
+    """Создаёт issues для проблемных записей (высокий score, edit_war, etc.).
+
+    Task 2: логирует прогресс по батчам ~500 записей.
+    13.18: проверка cancel_event между батчами.
+    """
+    BATCH_SIZE = 500
     count = 0
-    for _, frontmatter, score in scored:
-        if score >= REVIEW_THRESHOLD:
-            # Проверяем — не создан ли уже issue для этой записи
-            create_issue(
-                issue_type="missing_field",
-                knowledge_id=frontmatter.knowledge_id,
-                severity="warn",
-                detail=f"Staleness score {score} >= {REVIEW_THRESHOLD} — needs review",
+    total = len(scored)
+    for batch_start in range(0, total, BATCH_SIZE):
+        # 13.18: проверка отмены между батчами
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        batch = scored[batch_start:batch_start + BATCH_SIZE]
+        for _, frontmatter, score in batch:
+            if score >= REVIEW_THRESHOLD:
+                # Проверяем — не создан ли уже issue для этой записи
+                create_issue(
+                    issue_type="missing_field",
+                    knowledge_id=frontmatter.knowledge_id,
+                    severity="warn",
+                    detail=f"Staleness score {score} >= {REVIEW_THRESHOLD} — needs review",
+                )
+                count += 1
+        # Batch progress log
+        if progress and progress_id:
+            batch_end = min(batch_start + BATCH_SIZE, total)
+            progress.log(
+                progress_id, "info",
+                f"issues: {batch_end}/{total} entries processed, {count} issues",
             )
-            count += 1
     return count
 
 

@@ -263,6 +263,7 @@ class QdrantClient:
         with_vectors: bool = False,
         exclude_content_types: list[str] | None = None,
         exclude_statuses: list[str] | None = None,
+        offset: int = 0,
     ) -> list[qmodels.ScoredPoint]:
         """Семантический поиск по вектору.
 
@@ -325,6 +326,7 @@ class QdrantClient:
             collection_name=COLLECTION_NAME,
             query=vector,
             limit=top_k,
+            offset=offset,
             query_filter=query_filter,
             score_threshold=score_threshold,
             with_payload=True,

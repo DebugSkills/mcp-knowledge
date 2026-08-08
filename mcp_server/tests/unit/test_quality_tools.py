@@ -20,7 +20,9 @@ import pytest
 
 from mcp_server.quality.issues import create_issue, set_store_dir
 from mcp_server.tools.quality import (
+    _bg_scan,
     _cascade_set_payload,
+    cancel_quality_scan,
     list_quality_issues,
     resolve_quality_issue,
     review_queue,
@@ -787,3 +789,87 @@ class TestCascadeSetPayload:
 
         assert affected == 8
         assert mock_qdrant.set_payload.call_count == 8
+
+
+# ═══════════════════════════════════════════════════════════════
+# 13.18: cancel_quality_scan — отмена активного quality scan
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestCancelQualityScan:
+    """cancel_quality_scan — отмена активного скана (13.18)."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_no_active_scan_returns_false(self, mock_app_state_with_settings):
+        """Нет активного скана (lock не залочен) → cancelled=False."""
+        mock_app_state_with_settings.scan_lock.locked.return_value = False
+
+        result = await cancel_quality_scan({}, mock_app_state_with_settings)
+
+        assert result["cancelled"] is False
+        assert "no active scan" in result.get("reason", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_cancel_active_scan_returns_true(self, mock_app_state_with_settings):
+        """Активный скан (lock залочен + scan_cancel_event есть) → cancelled=True."""
+        mock_app_state_with_settings.scan_lock.locked.return_value = True
+        mock_app_state_with_settings.scan_cancel_event = asyncio.Event()
+
+        result = await cancel_quality_scan({}, mock_app_state_with_settings)
+
+        assert result["cancelled"] is True
+        assert mock_app_state_with_settings.scan_cancel_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_cancel_active_scan_creates_event_if_missing(self, mock_app_state_with_settings):
+        """Активный скан, но scan_cancel_event=None → создаётся и устанавливается."""
+        mock_app_state_with_settings.scan_lock.locked.return_value = True
+        mock_app_state_with_settings.scan_cancel_event = None
+
+        result = await cancel_quality_scan({}, mock_app_state_with_settings)
+
+        assert result["cancelled"] is True
+        assert mock_app_state_with_settings.scan_cancel_event is not None
+        assert mock_app_state_with_settings.scan_cancel_event.is_set()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 13.18: _bg_scan с cancel_event — прокидывание в run_scan
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestBgScanCancel:
+    """_bg_scan — прокидывает cancel_event в run_scan (13.18)."""
+
+    @pytest.mark.asyncio
+    async def test_bg_scan_passes_cancel_event_to_run_scan(self, tmp_path):
+        """_bg_scan создаёт cancel_event и передаёт его в run_scan."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        scan_lock = asyncio.Lock()
+        cancel_event = asyncio.Event()
+        scan_progress = MagicMock()
+        scan_state = {"lock": scan_lock, "task_ref": [None]}
+
+        with patch("mcp_server.quality.scanner.run_scan", new=AsyncMock(return_value={
+            "files_scanned": 0, "scores_updated": 0,
+            "duplicates_detected": 0, "issues_created": 0,
+            "review_queue_size": 0,
+        })) as mock_run_scan:
+            task = asyncio.create_task(
+                _bg_scan(
+                    scan_id="test-scan-1",
+                    knowledge_dir=tmp_path,
+                    qdrant_client=None,
+                    scan_progress=scan_progress,
+                    scan_state=scan_state,
+                    cancel_event=cancel_event,
+                )
+            )
+            await task
+
+            # Проверяем, что cancel_event был передан в run_scan
+            call_kwargs = mock_run_scan.call_args.kwargs
+            assert "cancel_event" in call_kwargs
+            assert call_kwargs["cancel_event"] is cancel_event

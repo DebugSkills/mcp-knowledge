@@ -489,3 +489,23 @@ async def test_tools_call_passes_explicit_timeout():
 
     call_kwargs = mock_call.call_args.kwargs
     assert call_kwargs.get("timeout") == 30.0
+
+
+# ── Tests: cancel_quality_scan (13.18) ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cancel_quality_scan_calls_tool(client):
+    """cancel_quality_scan вызывает tools_call('cancel_quality_scan', {})."""
+    result = await client.cancel_quality_scan()
+    # Mock handler возвращает {"ok": True, "tool": "cancel_quality_scan", ...}
+    assert result.get("ok") is True
+    assert result.get("tool") == "cancel_quality_scan"
+
+
+@pytest.mark.asyncio
+async def test_run_quality_scan_calls_tool(client):
+    """run_quality_scan вызывает tools_call('run_quality_scan', {})."""
+    result = await client.run_quality_scan()
+    assert result.get("ok") is True
+    assert result.get("tool") == "run_quality_scan"

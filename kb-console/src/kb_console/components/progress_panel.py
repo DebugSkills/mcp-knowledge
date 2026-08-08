@@ -13,12 +13,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from nicegui import ui
 
 from ..core.mcp_client import MCPClient
+
+_log = logging.getLogger(__name__)
 
 # Интервал опроса прогресса скана (сек)
 SCAN_POLL_INTERVAL = 1.0
@@ -104,6 +107,13 @@ def build_scan_progress(
                 value=(done_val / total_val) if total_val else 0,
             ).props("rounded").classes("w-full")
 
+            # 13.18: Кнопка отмены (только когда скан running)
+            if not is_done:
+                cancel_btn = ui.button(
+                    "⏹ Отменить скан",
+                    on_click=lambda: _cancel_scan(cancel_btn),
+                ).props("flat dense").classes("text-negative")
+
             # Последние ~5 лог-сообщений (моноширинный, цвет по level)
             msgs: list[dict[str, Any]] = snapshot.get("messages", [])
             if msgs:
@@ -141,6 +151,15 @@ def build_scan_progress(
                 if on_done is not None and not _done_called:
                     _done_called = True
                     await on_done()
+
+    async def _cancel_scan(btn: ui.button) -> None:
+        """13.18: Отправить запрос на отмену скана."""
+        btn.props("disabled")
+        btn.text = "⏳ Отмена..."
+        try:
+            await client.cancel_quality_scan()
+        except Exception as exc:  # noqa: BLE001 — best-effort, след. poll покажет
+            _log.warning("cancel_quality_scan failed: %s", exc)
 
     # Запуск таймера
     _poll_timer = ui.timer(poll_interval, _poll)

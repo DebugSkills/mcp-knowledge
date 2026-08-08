@@ -165,21 +165,25 @@ class ImportProgressTracker:
 
         try:
             entry = self._data[import_id]
-            # TTL prune: удаляем записи старше ttl по updated_at.
+            # TTL prune: удаляем ТОЛЬКО записи со status in ("done", "error").
+            # running-записи НЕ удаляем по TTL — даже если фаза застряла
+            # (останутся, пока не перезапишутся новым сканом).
             # Активные импорты постоянно трогают updated_at (на каждой секции/батче),
             # поэтому не старше ttl — никогда не удаляются живьём. Удаляются только
             # зависшие или завершённые (после ttl после последнего обновления).
-            now_ts = _time.time()
-            updated_at = entry.get("updated_at", "")
-            if updated_at:
-                try:
-                    updated_dt = datetime.fromisoformat(updated_at)
-                    age = now_ts - updated_dt.timestamp()
-                    if age > self._ttl_seconds:
-                        del self._data[import_id]
-                        return None
-                except (ValueError, OSError):
-                    pass  # невалидный timestamp — не удаляем
+            status = entry.get("status", "running")
+            if status in ("done", "error"):
+                now_ts = _time.time()
+                updated_at = entry.get("updated_at", "")
+                if updated_at:
+                    try:
+                        updated_dt = datetime.fromisoformat(updated_at)
+                        age = now_ts - updated_dt.timestamp()
+                        if age > self._ttl_seconds:
+                            del self._data[import_id]
+                            return None
+                    except (ValueError, OSError):
+                        pass  # невалидный timestamp — не удаляем
 
             # Возвращаем копию (snapshot, не ссылку)
             return dict(entry)

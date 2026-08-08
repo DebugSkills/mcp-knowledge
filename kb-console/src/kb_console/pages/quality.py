@@ -7,8 +7,8 @@ run_quality_scan, delete_entry (cascade).
 Фаза 13.15: root-фикс зависания сервера — run_quality_scan теперь возвращает
 мгновенный ответ {"status": "started", "scan_id": "..."}; прогресс отслеживается
 через poll GET /quality/scan/progress с прогресс-баром и счётчиками.
-_refreshing флаг (≤1 in-flight refresh), блокировка кнопки скана при running.
-
+Фаза 13.16: DRY — build_scan_progress + _LEVEL_COLORS из components/progress_panel.py.
+_scanned флаг для однократного on_done обновления очереди.
 Паттерны:
 - Авто-обновление: @ui.refreshable + ui.timer (status.py)
 - Спиннер: ui.spinner visible toggle (import_page.py)
@@ -22,7 +22,9 @@ from typing import Any
 
 from nicegui import ui
 
+from ..components.progress_panel import build_scan_progress
 from ..config import MCP_API_KEY, MCP_SERVER_URL, REFRESH_SECONDS
+from ..core.data_cache import cache
 from ..core.mcp_client import MCPClient
 
 # Интервал автообновления для quality (дольше, чем статус — данные тяжелее).
@@ -64,11 +66,17 @@ def build_quality() -> None:
         try:
             client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
             try:
+                # Task 1: check version before cache fetch
+                await cache.check_version(client)
                 filters = latest.get("filters", {})
-                data = await client.review_queue_books(
-                    domain=filters.get("domain"),
-                    subject=filters.get("subject"),
-                    limit=50,
+                data = await cache.get(
+                    "quality",
+                    lambda c=client, f=filters: c.review_queue_books(
+                        domain=f.get("domain"),
+                        subject=f.get("subject"),
+                        limit=50,
+                    ),
+                    ttl=30,
                 )
                 latest["data"] = data
             finally:
@@ -107,9 +115,8 @@ def build_quality() -> None:
     global_spinner = ui.spinner("dots", size="lg").classes("q-mb-md")
     global_spinner.visible = False
 
-    # 13.15: контейнер прогресса скана
+    # 13.16: прогресс скана через build_scan_progress (DRY)
     scan_progress_container = ui.column().classes("w-full q-mb-md")
-    scan_progress_container.visible = False
 
     # Refreshable-блок очереди
     render_queue()
@@ -118,15 +125,8 @@ def build_quality() -> None:
     refresh_timer = ui.timer(QUALITY_REFRESH_SECONDS, refresh)
     ui.timer(0.1, refresh, once=True)
 
-    # 13.15: таймер опроса прогресса скана
-    _scan_poll_timer: ui.timer | None = None
-
     def _cleanup_timers() -> None:
         refresh_timer.cancel()
-        nonlocal _scan_poll_timer
-        if _scan_poll_timer is not None:
-            _scan_poll_timer.cancel()
-            _scan_poll_timer = None
     ui.context.client.on_disconnect(_cleanup_timers)
 
 
@@ -134,19 +134,16 @@ def build_quality() -> None:
 
 
 async def _run_scan(on_done, scan_state: dict, progress_container, scan_btn) -> None:
-    """Запустить quality scan с live-прогрессом (13.15).
+    """Запустить quality scan с live-прогрессом (13.15, DRY 13.16).
 
-    После старта: poll GET /quality/scan/progress раз в ~1 сек,
-    рендер прогресс-бара + фазы + счётчика N/M.
-    При done/error — остановка poll, показ финальных metrics.
+    Использует build_scan_progress из progress_panel.py для поллинга
+    и рендера прогресс-бара (вместо дублирующего кода).
     Кнопка скана блокируется пока status=started/running.
     """
-    # Блокируем кнопку на время скана
     scan_btn.disable()
 
     try:
         client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
-        # Шаг 1: запуск скана (мгновенный ответ)
         result = await client.run_quality_scan()
         if result.get("status") == "already_running":
             ui.notify(
@@ -163,107 +160,28 @@ async def _run_scan(on_done, scan_state: dict, progress_container, scan_btn) -> 
             scan_btn.enable()
             return
 
-        scan_id = result["scan_id"]
         scan_state["status"] = "running"
-        scan_state["scan_id"] = scan_id
-        ui.notify(f"Скан {scan_id} запущен", type="info")
+        scan_state["scan_id"] = result["scan_id"]
+        ui.notify(f"Скан {result['scan_id']} запущен", type="info")
 
-        # Показываем контейнер прогресса
-        progress_container.visible = True
-        progress_container.clear()
-
-        # Шаг 2: poll прогресса
-        def stop_poll():
-            if scan_state.get("poll_timer") is not None:
-                scan_state["poll_timer"].cancel()
-                scan_state["poll_timer"] = None
-
-        async def _poll_progress() -> None:
-            try:
-                snapshot = await client.get_scan_progress()
-                if snapshot is None:
-                    return
-                # Рендер прогресса
-                progress_container.clear()
-                with progress_container:
-                    status = snapshot.get("status", "running")
-                    phase = snapshot.get("phase", "?")
-                    done_val = snapshot.get("imported", 0)
-                    total_val = snapshot.get("total", 0)
-                    percent = (done_val / total_val * 100) if total_val else 0
-                    is_done = status in ("done", "error")
-
-                    ui.label(
-                        f"📊 Скан: {phase}  ·  {done_val}/{total_val} ({percent:.0f}%)"
-                        + (f"  ·  {status}" if is_done else "")
-                    ).classes("text-body2")
-                    ui.linear_progress(
-                        value=(done_val / total_val) if total_val else 0,
-                    ).props("rounded").classes("w-full")
-
-                    msgs = snapshot.get("messages", [])
-                    if msgs:
-                        with ui.column().classes("w-full q-mt-xs gap-0"):
-                            for m in msgs[-5:]:
-                                level = m.get("level", "info")
-                                color = _LEVEL_COLORS.get(level, "text-grey")
-                                ui.label(
-                                    f"[{m.get('t', '')}] {m.get('text', '')}"
-                                ).classes(f"text-caption font-mono {color}")
-
-                    # Показ финальных metrics при done
-                    if is_done:
-                        summary = snapshot.get("summary", {})
-                        metrics = summary.get("metrics", {}) if isinstance(summary, dict) else {}
-                        if metrics:
-                            with ui.row().classes("gap-4 q-mt-sm"):
-                                ui.label(
-                                    f"Файлов: {metrics.get('files_scanned', 0)}"
-                                ).classes("text-caption")
-                                ui.label(
-                                    f"В очереди: {metrics.get('review_queue_size', 0)}"
-                                ).classes("text-caption")
-                                ui.label(
-                                    f"Дублей: {metrics.get('duplicates_detected', 0)}"
-                                ).classes("text-caption")
-                                ui.label(
-                                    f"Issues: {metrics.get('issues_created', 0)}"
-                                ).classes("text-caption")
-
-                        scan_state["status"] = status
-                        scan_btn.enable()
-                        stop_poll()
-                        await on_done()  # обновляем очередь
-
-                        if status == "error":
-                            error_text = ""
-                            for m in msgs:
-                                if m.get("level") == "error":
-                                    error_text = m.get("text", "")
-                            ui.notify(
-                                f"Скан завершился с ошибкой: {error_text or 'неизвестно'}",
-                                type="negative",
-                            )
-                        else:
-                            ui.notify("Скан завершён", type="positive")
-            except Exception:
-                pass  # best-effort poll
-
-        scan_state["poll_timer"] = ui.timer(SCAN_POLL_INTERVAL, _poll_progress)
-
-        # client живёт в замыкании _poll_progress — закрывается при stop_poll()
+        # 13.16: DRY — build_scan_progress вместо дублирующего _poll_progress
+        scan_client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+        build_scan_progress(
+            client=scan_client,
+            on_done=lambda: _on_scan_done(scan_btn, scan_state, on_done),
+        )
 
     except Exception as exc:
         scan_btn.enable()
         ui.notify(f"Ошибка: {exc}", type="negative")
 
 
-# Уровни логов → CSS-классы (переиспользовано из import_page.py)
-_LEVEL_COLORS = {
-    "info": "text-grey",
-    "warning": "text-orange",
-    "error": "text-negative",
-}
+async def _on_scan_done(scan_btn, scan_state: dict, on_done) -> None:
+    """Callback при завершении скана: разблокировка кнопки + обновление очереди."""
+    scan_btn.enable()
+    scan_state["status"] = None
+    scan_state["scan_id"] = None
+    await on_done()
 
 
 def _apply_filters(domain: str, subject: str, latest: dict, refresh_fn) -> None:

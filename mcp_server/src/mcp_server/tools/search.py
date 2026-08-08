@@ -12,12 +12,45 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 
 from ..metrics import search_latency, tag_search_latency
 from .read import _derive_title
 
 logger = logging.getLogger("mcp_knowledge.tools.search")
+
+_ALNUM_RE = re.compile(r"[A-Za-zА-Яа-я0-9]")
+
+
+def _is_meaningful_content(content: str) -> bool:
+    """Отсечь «мусорные» фрагменты: пустые, только разделители/спецсимволы
+    (артефакты markdown-таблиц: "|", "---") и т.п. — без буквенно-цифровых символов.
+    """
+    stripped = (content or "").strip()
+    if not stripped:
+        return False
+    return _ALNUM_RE.search(stripped) is not None
+
+
+def _format_point(point, payload: dict) -> dict:
+    """Форматировать одну точку Qdrant в результат поиска."""
+    return {
+        "knowledge_id": payload.get("knowledge_id", ""),
+        "chunk_id": payload.get("chunk_id", str(point.id)),
+        "content": payload.get("content", ""),
+        "score": round(point.score, 4),
+        "section_header": payload.get("section_header", ""),
+        "domain": payload.get("domain", ""),
+        "subject": payload.get("subject", ""),
+        "tags": payload.get("tags", []),
+        "title": (
+            payload.get("section_header")
+            or _derive_title(payload.get("content", ""), payload.get("knowledge_id", ""))
+        ),
+        "parent_knowledge_id": payload.get("parent_knowledge_id"),
+        "content_type": payload.get("content_type"),
+    }
 
 
 async def search_knowledge(params: dict, app_state) -> dict:
@@ -67,43 +100,65 @@ async def search_knowledge(params: dict, app_state) -> dict:
     loop = asyncio.get_running_loop()
     vector = await loop.run_in_executor(None, embedder.embed_sync, query)
 
-    # Qdrant search (Issue-#5-fix: latency tracking)
+    # Qdrant search с over-fetch + dedup + refetch (Task 3)
     t0 = time.monotonic()
     qdrant = app_state.qdrant
     filter_dict = filters if filters else None
-    results = await loop.run_in_executor(
-        None,
-        lambda: qdrant.search(
-            vector=vector,
-            top_k=top_k,
-            filters=filter_dict,
-            score_threshold=score_threshold,
-            exclude_content_types=exclude_content_types,
-            exclude_statuses=exclude_statuses,
-        ),
-    )
 
-    # Форматирование результатов
-    formatted = []
-    for point in results:
-        payload = point.payload or {}
-        formatted.append({
-            "knowledge_id": payload.get("knowledge_id", ""),
-            "chunk_id": payload.get("chunk_id", str(point.id)),
-            "content": payload.get("content", ""),
-            "score": round(point.score, 4),
-            "section_header": payload.get("section_header", ""),
-            "domain": payload.get("domain", ""),
-            "subject": payload.get("subject", ""),
-            "tags": payload.get("tags", []),
-            # Variant A (13.10): title + какая книга (parent) + тип
-            "title": (
-                payload.get("section_header")
-                or _derive_title(payload.get("content", ""), payload.get("knowledge_id", ""))
+    # Over-fetch: запрашиваем top_k*3 для учёта дубликатов, cap 200
+    fetch_k = min(top_k * 3, 200)
+    seen: dict[str, dict] = {}  # knowledge_id → formatted
+    offset = 0
+    max_iterations = 2
+
+    for _ in range(max_iterations):
+        batch = await loop.run_in_executor(
+            None,
+            lambda off=offset: qdrant.search(
+                vector=vector,
+                top_k=fetch_k,
+                filters=filter_dict,
+                score_threshold=score_threshold,
+                exclude_content_types=exclude_content_types,
+                exclude_statuses=exclude_statuses,
+                offset=off,
             ),
-            "parent_knowledge_id": payload.get("parent_knowledge_id"),
-            "content_type": payload.get("content_type"),
-        })
+        )
+
+        if not batch:
+            break
+
+        for point in batch:
+            payload = point.payload or {}
+            content = (payload.get("content") or "").strip()
+            if not _is_meaningful_content(content):
+                continue  # фильтр пустых/мусорных фрагментов
+
+            kid = payload.get("knowledge_id", "")
+            if kid in seen:
+                # Дедуп: сохраняем с максимальным score
+                if point.score > seen[kid].get("_raw_score", 0):
+                    seen[kid] = _format_point(point, payload)
+                    seen[kid]["_raw_score"] = point.score
+                continue
+
+            seen[kid] = _format_point(point, payload)
+            seen[kid]["_raw_score"] = point.score
+
+            if len(seen) >= top_k:
+                break
+
+        if len(seen) >= top_k:
+            break
+
+        offset += len(batch)
+        if offset >= fetch_k * 2:  # безопасный limit
+            break
+
+    # Убираем _raw_score из результатов и берём top_k
+    formatted = list(seen.values())[:top_k]
+    for item in formatted:
+        item.pop("_raw_score", None)
 
     search_elapsed = time.monotonic() - t0
     search_latency.observe(search_elapsed)
@@ -141,12 +196,22 @@ async def search_by_tags(params: dict, app_state) -> dict:
     )
 
     formatted = []
+    seen: set[str] = set()
     for point in results:
         payload = point.payload or {}
+        kid = payload.get("knowledge_id", "")
+        content = (payload.get("content") or "").strip()
+        # Фильтр пустых/мусорных
+        if not _is_meaningful_content(content):
+            continue
+        # Дедуп по knowledge_id
+        if kid in seen:
+            continue
+        seen.add(kid)
         formatted.append({
-            "knowledge_id": payload.get("knowledge_id", ""),
+            "knowledge_id": kid,
             "chunk_id": payload.get("chunk_id", str(point.id)),
-            "content": payload.get("content", ""),
+            "content": content,
             "domain": payload.get("domain", ""),
             "subject": payload.get("subject", ""),
             "tags": payload.get("tags", []),

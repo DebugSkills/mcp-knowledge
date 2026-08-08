@@ -47,7 +47,7 @@ class TestMCPClientE2E:
             await client.close()
 
     async def test_tools_list_17_tools(self, e2e_http_app):
-        """tools_list должен вернуть 19 инструментов (с auth)."""
+        """tools_list должен вернуть 20 инструментов (с auth)."""
         from kb_console.core.mcp_client import MCPClient
 
         client = MCPClient(
@@ -57,13 +57,14 @@ class TestMCPClientE2E:
         )
         try:
             tools = await client.tools_list()
-            assert len(tools) == 19, f"Expected 19 tools, got {len(tools)}"
+            assert len(tools) == 20, f"Expected 20 tools, got {len(tools)}"
             tool_names = {t["name"] for t in tools}
             assert "search_knowledge" in tool_names
             assert "import_content" in tool_names
             assert "analyze_content" in tool_names
             assert "write_knowledge" in tool_names
             assert "reindex" in tool_names
+            assert "cancel_quality_scan" in tool_names  # 13.18
         finally:
             await client.close()
 

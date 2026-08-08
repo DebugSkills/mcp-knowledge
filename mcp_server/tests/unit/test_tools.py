@@ -429,3 +429,187 @@ async def test_list_collections_default_limit(app_state):
     # next_cursor and total present
     assert "next_cursor" in result
     assert "total" in result
+
+
+# ── Task 3: search_knowledge dedup + empty filter + refetch ──
+
+
+async def test_search_knowledge_dedup_by_knowledge_id(app_state):
+    """2 чанка с одним knowledge_id → 1 результат (высокий score сохраняется)."""
+    app_state.qdrant._set_search_points([
+        {"id": 1, "score": 0.95, "payload": {
+            "knowledge_id": "kid-dup", "chunk_id": "ch-1",
+            "content": "Alpha", "domain": "eng", "subject": "test",
+            "section_header": "", "tags": [],
+        }},
+        {"id": 2, "score": 0.85, "payload": {
+            "knowledge_id": "kid-dup", "chunk_id": "ch-2",
+            "content": "Beta", "domain": "eng", "subject": "test",
+            "section_header": "", "tags": [],
+        }},
+    ])
+    result = await search_knowledge({"query": "test", "top_k": 5}, app_state)
+    assert "error" not in result
+    assert result["total"] == 1
+    assert result["results"][0]["knowledge_id"] == "kid-dup"
+    assert result["results"][0]["score"] == 0.95  # максимальный score
+
+
+async def test_search_knowledge_filters_empty_content(app_state):
+    """Пустой content (или только пробелы) → отфильтрован."""
+    app_state.qdrant._set_search_points([
+        {"id": 1, "score": 0.99, "payload": {
+            "knowledge_id": "kid-empty", "chunk_id": "ch-1",
+            "content": "", "domain": "eng", "subject": "test",
+            "section_header": "", "tags": [],
+        }},
+        {"id": 2, "score": 0.95, "payload": {
+            "knowledge_id": "kid-valid", "chunk_id": "ch-2",
+            "content": "Valid content", "domain": "eng", "subject": "test",
+            "section_header": "", "tags": [],
+        }},
+        {"id": 3, "score": 0.90, "payload": {
+            "knowledge_id": "kid-spaces", "chunk_id": "ch-3",
+            "content": "   ", "domain": "eng", "subject": "test",
+            "section_header": "", "tags": [],
+        }},
+    ])
+    result = await search_knowledge({"query": "test", "top_k": 5}, app_state)
+    assert "error" not in result
+    assert result["total"] == 1
+    assert result["results"][0]["knowledge_id"] == "kid-valid"
+
+
+async def test_search_knowledge_filters_junk_content(app_state):
+    """Мусорные фрагменты (разделители таблиц "|", "---") → отфильтрованы."""
+    app_state.qdrant._set_search_points([
+        {"id": 1, "score": 0.99, "payload": {
+            "knowledge_id": "kid-pipe", "chunk_id": "ch-1",
+            "content": "|", "domain": "universal", "subject": "fpf",
+            "section_header": "", "tags": [],
+        }},
+        {"id": 2, "score": 0.98, "payload": {
+            "knowledge_id": "kid-dashes", "chunk_id": "ch-2",
+            "content": "---|---", "domain": "universal", "subject": "fpf",
+            "section_header": "", "tags": [],
+        }},
+        {"id": 3, "score": 0.97, "payload": {
+            "knowledge_id": "kid-punct", "chunk_id": "ch-3",
+            "content": "| | |", "domain": "universal", "subject": "fpf",
+            "section_header": "", "tags": [],
+        }},
+        {"id": 4, "score": 0.95, "payload": {
+            "knowledge_id": "kid-valid", "chunk_id": "ch-4",
+            "content": "## Трёхуровневый реестр знаний", "domain": "universal", "subject": "fpf",
+            "section_header": "", "tags": [],
+        }},
+    ])
+    result = await search_knowledge({"query": "test", "top_k": 5}, app_state)
+    assert "error" not in result
+    assert result["total"] == 1
+    assert result["results"][0]["knowledge_id"] == "kid-valid"
+
+
+async def test_search_knowledge_pagination_refetch(app_state):
+    """top_k=3, 6 дубликатов → дозапрос с offset → 3 уникальных результата."""
+    # Первые 3 (offset=0): kid-A, kid-A (dup), kid-B
+    # Следующие 3 (offset=3): kid-C, kid-C (dup), kid-D
+    app_state.qdrant._set_search_points([
+        {"id": 1, "score": 0.95, "payload": {"knowledge_id": "kid-A", "chunk_id": "a1", "content": "A1", "domain": "e", "subject": "s", "section_header": "", "tags": []}},
+        {"id": 2, "score": 0.85, "payload": {"knowledge_id": "kid-A", "chunk_id": "a2", "content": "A2", "domain": "e", "subject": "s", "section_header": "", "tags": []}},
+        {"id": 3, "score": 0.75, "payload": {"knowledge_id": "kid-B", "chunk_id": "b1", "content": "B1", "domain": "e", "subject": "s", "section_header": "", "tags": []}},
+        {"id": 4, "score": 0.65, "payload": {"knowledge_id": "kid-C", "chunk_id": "c1", "content": "C1", "domain": "e", "subject": "s", "section_header": "", "tags": []}},
+        {"id": 5, "score": 0.55, "payload": {"knowledge_id": "kid-C", "chunk_id": "c2", "content": "C2", "domain": "e", "subject": "s", "section_header": "", "tags": []}},
+        {"id": 6, "score": 0.45, "payload": {"knowledge_id": "kid-D", "chunk_id": "d1", "content": "D1", "domain": "e", "subject": "s", "section_header": "", "tags": []}},
+    ])
+    result = await search_knowledge({"query": "test", "top_k": 3}, app_state)
+    assert "error" not in result
+    assert result["total"] == 3
+    kids = [r["knowledge_id"] for r in result["results"]]
+    assert "kid-A" in kids
+    assert "kid-B" in kids
+    assert "kid-D" in kids or "kid-C" in kids  # дозапрос добрал
+    assert len(set(kids)) == 3  # все уникальные
+
+
+async def test_search_knowledge_returns_fewer_when_not_enough_unique(app_state):
+    """top_k=5, всего 2 уникальных → 2 результата без ошибки."""
+    app_state.qdrant._set_search_points([
+        {"id": 1, "score": 0.95, "payload": {"knowledge_id": "kid-A", "chunk_id": "a1", "content": "A1", "domain": "e", "subject": "s", "section_header": "", "tags": []}},
+        {"id": 2, "score": 0.85, "payload": {"knowledge_id": "kid-A", "chunk_id": "a2", "content": "A2", "domain": "e", "subject": "s", "section_header": "", "tags": []}},
+        {"id": 3, "score": 0.75, "payload": {"knowledge_id": "kid-B", "chunk_id": "b1", "content": "B1", "domain": "e", "subject": "s", "section_header": "", "tags": []}},
+    ])
+    result = await search_knowledge({"query": "test", "top_k": 5}, app_state)
+    assert "error" not in result
+    assert result["total"] == 2
+
+
+async def test_search_by_tags_dedup(app_state):
+    """search_by_tags дедуплицирует по knowledge_id."""
+    from unittest.mock import MagicMock
+
+    app_state.qdrant.search_by_tags = MagicMock(return_value=[
+        MagicMock(id=1, score=1.0, payload={
+            "knowledge_id": "kid-dup", "chunk_id": "ch-1",
+            "content": "Tagged content", "domain": "e",
+            "subject": "s", "tags": ["docker"],
+            "section_header": "",
+        }),
+        MagicMock(id=2, score=1.0, payload={
+            "knowledge_id": "kid-dup", "chunk_id": "ch-2",
+            "content": "More tagged", "domain": "e",
+            "subject": "s", "tags": ["docker"],
+            "section_header": "",
+        }),
+    ])
+    result = await search_by_tags({"tags": ["docker"], "match_all": True}, app_state)
+    assert "error" not in result
+    assert result["total"] == 1
+
+
+async def test_search_by_tags_filters_empty(app_state):
+    """search_by_tags фильтрует пустой content."""
+    from unittest.mock import MagicMock
+
+    app_state.qdrant.search_by_tags = MagicMock(return_value=[
+        MagicMock(id=1, score=1.0, payload={
+            "knowledge_id": "kid-empty", "chunk_id": "ch-1",
+            "content": "   ", "domain": "e",
+            "subject": "s", "tags": ["docker"],
+            "section_header": "",
+        }),
+        MagicMock(id=2, score=1.0, payload={
+            "knowledge_id": "kid-valid", "chunk_id": "ch-2",
+            "content": "Valid", "domain": "e",
+            "subject": "s", "tags": ["docker"],
+            "section_header": "",
+        }),
+    ])
+    result = await search_by_tags({"tags": ["docker"], "match_all": True}, app_state)
+    assert "error" not in result
+    assert result["total"] == 1
+    assert result["results"][0]["knowledge_id"] == "kid-valid"
+
+
+async def test_search_by_tags_filters_junk_content(app_state):
+    """search_by_tags: мусорные фрагменты (разделители таблиц) → отфильтрованы."""
+    from unittest.mock import MagicMock
+
+    app_state.qdrant.search_by_tags = MagicMock(return_value=[
+        MagicMock(id=1, score=1.0, payload={
+            "knowledge_id": "kid-pipe", "chunk_id": "ch-1",
+            "content": "|", "domain": "e",
+            "subject": "s", "tags": ["docker"],
+            "section_header": "",
+        }),
+        MagicMock(id=2, score=1.0, payload={
+            "knowledge_id": "kid-valid", "chunk_id": "ch-2",
+            "content": "Valid content here", "domain": "e",
+            "subject": "s", "tags": ["docker"],
+            "section_header": "",
+        }),
+    ])
+    result = await search_by_tags({"tags": ["docker"], "match_all": True}, app_state)
+    assert "error" not in result
+    assert result["total"] == 1
+    assert result["results"][0]["knowledge_id"] == "kid-valid"

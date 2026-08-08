@@ -425,4 +425,9 @@ async def import_content(params: dict, app_state) -> dict:
         "imported": imported,
         "failed": failed,
     })
+    # Task 1: инкремент data_version после мутации данных
+    try:
+        app_state.data_version += 1
+    except Exception:
+        pass  # best-effort
     return result
