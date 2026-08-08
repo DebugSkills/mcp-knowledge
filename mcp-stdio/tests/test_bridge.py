@@ -270,6 +270,57 @@ class TestBridgeErrors(unittest.TestCase):
             self.assertEqual(data["error"]["code"], -32000)
             self.assertIn("Некорректный JSON", data["error"]["message"])
 
+    def test_notification_204_returns_none(self):
+        """Сервер ответил 204 (notification) → None, ошибки нет (Фаза 13.21)."""
+        with patch("urllib.request.urlopen") as mock_open:
+            mock = MagicMock()
+            mock.__enter__ = MagicMock(return_value=mock)
+            mock.__exit__ = MagicMock(return_value=False)
+            mock.status = 204
+            mock.read.return_value = b""
+            mock_open.return_value = mock
+
+            result = bridge_mod._process_line(
+                '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+                self.server_url,
+                "",
+            )
+            self.assertIsNone(result)
+
+    def test_notification_204_no_stdout_output(self):
+        """main(): notification (204) → в stdout ничего не пишется (Фаза 13.21)."""
+        stdin_data = (
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}\n'
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}\n'
+        )
+
+        def fake_urlopen(req, **kwargs):
+            mock = MagicMock()
+            mock.__enter__ = MagicMock(return_value=mock)
+            mock.__exit__ = MagicMock(return_value=False)
+            if "notifications/initialized" in req.data.decode("utf-8", errors="replace"):
+                mock.status = 204
+                mock.read.return_value = b""
+            else:
+                mock.status = 200
+                mock.read.return_value = json.dumps(
+                    {"jsonrpc": "2.0", "result": {"protocolVersion": "2024-11-05"}, "id": 1}
+                ).encode("utf-8")
+            return mock
+
+        with patch("sys.stdin", io.StringIO(stdin_data)), \
+             patch("sys.stdout", io.StringIO()) as mock_stdout, \
+             patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            try:
+                bridge_mod.main()
+            except SystemExit:
+                pass
+            lines = mock_stdout.getvalue().strip().split("\n")
+            # Только 1 ответ (initialize); notification не порождает строки
+            self.assertEqual(len(lines), 1)
+            data = json.loads(lines[0])
+            self.assertEqual(data["result"]["protocolVersion"], "2024-11-05")
+
 
 class TestBridgeMain(unittest.TestCase):
     """E4: main() — EOF → exit 0, stdin loop."""

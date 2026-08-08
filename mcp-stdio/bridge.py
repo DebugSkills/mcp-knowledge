@@ -73,7 +73,7 @@ def _post_json(
     payload: bytes,
     api_key: str,
     timeout: int = _DEFAULT_TIMEOUT,
-) -> dict:
+) -> dict | None:
     """POST JSON на сервер, вернуть распарсенный ответ.
 
     Args:
@@ -83,12 +83,13 @@ def _post_json(
         timeout: Таймаут в секундах.
 
     Returns:
-        Распарсенный JSON-ответ от сервера (dict).
+        Распарсенный JSON-ответ от сервера (dict), или None при HTTP 204
+        (JSON-RPC notification — сервер не возвращает тело ответа).
 
     Raises:
         urllib.error.URLError: при проблемах сети.
         urllib.error.HTTPError: при HTTP-ошибках (4xx, 5xx).
-        json.JSONDecodeError: если сервер вернул не-JSON.
+        json.JSONDecodeError: если сервер вернул не-JSON (не 204).
     """
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -96,6 +97,8 @@ def _post_json(
 
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
+        if resp.status == 204:
+            return None  # notification: тела нет, ответ клиенту не нужен
         raw = resp.read()
     return json.loads(raw)
 
@@ -108,7 +111,7 @@ def _process_line(
     server_url: str,
     api_key: str,
     timeout: int = _DEFAULT_TIMEOUT,
-) -> str:
+) -> str | None:
     """Обработать одну строку JSON-RPC запроса.
 
     Выполняет:
@@ -120,6 +123,7 @@ def _process_line(
     Ошибки парсинга → JSON-RPC error -32700.
     Ошибки сети/HTTP → JSON-RPC error -32000.
     Ответ сервера → пробрасывается как есть.
+    HTTP 204 (notification) → возвращает None (ответ клиенту не пишется).
 
     Args:
         line: Одна строка JSON-RPC запроса.
@@ -128,7 +132,8 @@ def _process_line(
         timeout: Таймаут HTTP-запроса в секундах.
 
     Returns:
-        JSON-строка с ответом (всегда валидный JSON-RPC 2.0).
+        JSON-строка с ответом (всегда валидный JSON-RPC 2.0),
+        или None для notification (сервер ответил 204).
     """
     # 1. Парсинг JSON
     try:
@@ -213,7 +218,9 @@ def _process_line(
             "id": request_id,
         })
 
-    # 4. Возврат ответа (пробрасываем как есть)
+    # 4. Возврат ответа (пробрасываем как есть), None для notification
+    if server_response is None:
+        return None
     return json.dumps(server_response, ensure_ascii=False)
 
 
@@ -275,8 +282,9 @@ def main() -> None:
             continue  # пропускаем пустые строки
 
         response = _process_line(line, server_url, api_key, timeout)
-        print(response, file=sys.stdout)
-        sys.stdout.flush()
+        if response is not None:  # notification (204) — ответ в stdout не пишем
+            print(response, file=sys.stdout)
+            sys.stdout.flush()
 
     # EOF — чистый выход
     print("[bridge] EOF, exiting", file=sys.stderr)
