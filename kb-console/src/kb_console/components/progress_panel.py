@@ -26,6 +26,9 @@ _log = logging.getLogger(__name__)
 # Интервал опроса прогресса скана (сек)
 SCAN_POLL_INTERVAL = 1.0
 
+# Интервал опроса в idle/done (сек) — снижаем нагрузку, когда скан неактивен
+SCAN_IDLE_POLL_INTERVAL = 5.0
+
 # Уровни логов → CSS-классы
 _LEVEL_COLORS: dict[str, str] = {
     "info": "text-grey",
@@ -65,7 +68,7 @@ def build_scan_progress(
     container.visible = False
 
     _poll_timer: ui.timer | None = None
-    _done_called: bool = False
+    _last_scan_id: str | None = None
 
     def _stop_poll() -> None:
         nonlocal _poll_timer
@@ -74,7 +77,7 @@ def build_scan_progress(
             _poll_timer = None
 
     async def _poll() -> None:
-        nonlocal _done_called
+        nonlocal _last_scan_id, _poll_timer
 
         snapshot = await client.get_scan_progress()
         if snapshot is None:
@@ -83,6 +86,10 @@ def build_scan_progress(
             # начаться позже (например, с вкладки «Качество»), и панель
             # должна появиться автоматически (13.16 UX).
             container.visible = False
+            _last_scan_id = None  # сброс — следующий скан снова вызовет on_done
+            # Адаптивный интервал: idle → 5с
+            if _poll_timer is not None and _poll_timer.interval != SCAN_IDLE_POLL_INTERVAL:
+                _poll_timer.interval = SCAN_IDLE_POLL_INTERVAL
             return
 
         container.visible = True
@@ -95,6 +102,7 @@ def build_scan_progress(
             total_val: int = snapshot.get("total", 0)
             percent: float = (done_val / total_val * 100) if total_val else 0
             is_done: bool = status in ("done", "error")
+            scan_id: str = snapshot.get("scan_id", "")
 
             # Заголовок: фаза + счётчик + процент
             ui.label(
@@ -146,11 +154,17 @@ def build_scan_progress(
                             f"Issues: {metrics.get('issues_created', 0)}"
                         ).classes("text-caption")
 
-                _stop_poll()
-
-                if on_done is not None and not _done_called:
-                    _done_called = True
+                # НЕ останавливаем poll — панель должна быть живой для
+                # отображения новых сканов. on_done вызываем однократно
+                # на НОВЫЙ завершённый скан (по scan_id).
+                if on_done is not None and scan_id != _last_scan_id:
+                    _last_scan_id = scan_id
                     await on_done()
+
+            # Адаптивный интервал: running → 1с, done/idle → 5с
+            new_interval = SCAN_POLL_INTERVAL if (not is_done) else SCAN_IDLE_POLL_INTERVAL
+            if _poll_timer is not None and _poll_timer.interval != new_interval:
+                _poll_timer.interval = new_interval
 
     async def _cancel_scan(btn: ui.button) -> None:
         """13.18: Отправить запрос на отмену скана."""

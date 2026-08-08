@@ -47,13 +47,15 @@ def build_quality() -> None:
     latest: dict[str, Any] = {}
     # Кэш развёрнутых книг (book_id → list[section])
     expanded_cache: dict[str, list[dict]] = {}
+    # Пагинация секций: book_id → текущая страница (0-based)
+    section_pages: dict[str, int] = {}
 
     # 13.15: состояние скана для блокировки кнопки и прогресс-бара
     scan_state: dict[str, Any] = {"status": None, "scan_id": None}
 
     @ui.refreshable
     def render_queue() -> None:
-        _render_queue(latest.get("data", {}), latest.get("filters", {}), expanded_cache)
+        _render_queue(latest.get("data", {}), latest.get("filters", {}), expanded_cache, render_queue.refresh, section_pages)
 
     # 13.15: _refreshing флаг — ≤1 in-flight refresh
     _refreshing = False
@@ -184,29 +186,31 @@ async def _on_scan_done(scan_btn, scan_state: dict, on_done) -> None:
     await on_done()
 
 
-def _apply_filters(domain: str, subject: str, latest: dict, refresh_fn) -> None:
+async def _apply_filters(domain: str, subject: str, latest: dict, refresh_fn) -> None:
     """Применить фильтры и обновить очередь."""
     latest["filters"] = {
         "domain": domain.strip() if domain else None,
         "subject": subject.strip() if subject else None,
     }
     ui.notify("Фильтры применены", type="info")
-    refresh_fn()
+    await refresh_fn()
 
 
-def _reset_filters(domain_input, subject_input, latest: dict, refresh_fn) -> None:
+async def _reset_filters(domain_input, subject_input, latest: dict, refresh_fn) -> None:
     """Сбросить фильтры и обновить очередь."""
     domain_input.value = ""
     subject_input.value = ""
     latest["filters"] = {}
     ui.notify("Фильтры сброшены", type="info")
-    refresh_fn()
+    await refresh_fn()
 
 
 def _render_queue(
     data: dict,
     filters: dict,
     expanded_cache: dict[str, list[dict]],
+    refresh_fn,
+    section_pages: dict[str, int],
 ) -> None:
     """Отрисовать очередь книг (review_queue_books).
 
@@ -214,6 +218,8 @@ def _render_queue(
         data: результат review_queue_books (books[], total_books, total_stale_sections)
         filters: текущие фильтры
         expanded_cache: кэш развёрнутых книг
+        refresh_fn: callable для перерисовки refreshable-блока
+        section_pages: book_id → текущая страница пагинации секций
     """
     books = data.get("books", [])
     total_books = data.get("total_books", 0)
@@ -241,10 +247,10 @@ def _render_queue(
 
     # Карточки книг
     for book in books:
-        _render_book_card(book, expanded_cache)
+        _render_book_card(book, expanded_cache, refresh_fn, section_pages)
 
 
-def _render_book_card(book: dict, expanded_cache: dict[str, list[dict]]) -> None:
+def _render_book_card(book: dict, expanded_cache: dict[str, list[dict]], refresh_fn, section_pages: dict[str, int]) -> None:
     """Отрисовать карточку одной книги."""
     book_id = book.get("book_id", "")
     title = book.get("title", book_id)
@@ -285,7 +291,7 @@ def _render_book_card(book: dict, expanded_cache: dict[str, list[dict]]) -> None
             is_expanded = book_id in expanded_cache
             ui.button(
                 "▾ Секции" if is_expanded else "▸ Развернуть",
-                on_click=lambda bid=book_id, secs=top_sections: _toggle_expand(bid, secs, expanded_cache),
+                on_click=lambda bid=book_id, secs=top_sections: _toggle_expand(bid, secs, expanded_cache, section_pages, refresh_fn),
             ).props("flat dense")
 
             ui.space()
@@ -319,15 +325,21 @@ def _render_book_card(book: dict, expanded_cache: dict[str, list[dict]]) -> None
         # Развёрнутые секции книги
         if is_expanded:
             sections = expanded_cache.get(book_id, [])
-            _render_sections(sections, book_id)
+            _render_sections(sections, book_id, section_pages, refresh_fn)
 
 
-def _render_sections(sections: list[dict], parent_book_id: str, page: int = 0) -> None:
-    """Отрисовать секции книги с пагинацией."""
+def _render_sections(sections: list[dict], parent_book_id: str, section_pages: dict[str, int], refresh_fn) -> None:
+    """Отрисовать секции книги с пагинацией.
+
+    Страница хранится в section_pages (closure-переменная build_quality),
+    чтобы кнопки пагинации вызывали перерисовку всей очереди, а не
+    рендерили элементы в слот кнопки.
+    """
     if not sections:
         ui.label("Нет устаревших секций").classes("text-grey q-ml-lg")
         return
 
+    page = section_pages.get(parent_book_id, 0)
     start = page * SECTIONS_PER_PAGE
     page_sections = sections[start:start + SECTIONS_PER_PAGE]
     total_pages = (len(sections) - 1) // SECTIONS_PER_PAGE + 1
@@ -361,19 +373,19 @@ def _render_sections(sections: list[dict], parent_book_id: str, page: int = 0) -
                         "♻️", on_click=lambda kid=sec_kid: _restore_single(kid),
                     ).props("flat dense size=sm").tooltip("Восстановить")
 
-    # Пагинация секций
+    # Пагинация секций: через set_page → refresh_fn (перерисовка всей очереди)
     if total_pages > 1:
         with ui.row().classes("gap-2 q-ml-xl q-mt-sm"):
             if page > 0:
                 ui.button(
                     "← Пред.",
-                    on_click=lambda p=page-1, s=sections: _render_sections(s, parent_book_id, p),
+                    on_click=lambda p=page-1, bid=parent_book_id: _set_section_page(bid, p, section_pages, refresh_fn),
                 ).props("flat dense")
             ui.label(f"Стр. {page + 1}/{total_pages}").classes("text-caption text-grey")
             if page < total_pages - 1:
                 ui.button(
                     "След. →",
-                    on_click=lambda p=page+1, s=sections: _render_sections(s, parent_book_id, p),
+                    on_click=lambda p=page+1, bid=parent_book_id: _set_section_page(bid, p, section_pages, refresh_fn),
                 ).props("flat dense")
 
 
@@ -532,16 +544,23 @@ async def _do_delete(dialog, book_id: str) -> None:
         ui.notify(f"Ошибка: {exc}", type="negative")
 
 
+def _set_section_page(book_id: str, page: int, section_pages: dict[str, int], refresh_fn) -> None:
+    """Установить страницу пагинации секций и перерисовать очередь."""
+    section_pages[book_id] = page
+    refresh_fn()
+
+
 def _toggle_expand(
     book_id: str,
     top_sections: list[dict],
     expanded_cache: dict[str, list[dict]],
+    section_pages: dict[str, int],
+    refresh_fn,
 ) -> None:
     """Развернуть/свернуть секции книги."""
     if book_id in expanded_cache:
         del expanded_cache[book_id]
+        section_pages.pop(book_id, None)  # Сброс страницы при сворачивании
     else:
         expanded_cache[book_id] = top_sections
-    # Перерисовать очередь (refreshable не подхватывает изменение кэша автоматически)
-    # Но кэш — это module-level dict, он сохраняется
-    ui.notify("Обновите страницу для перерисовки секций", type="info")
+    refresh_fn()
