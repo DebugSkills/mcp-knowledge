@@ -690,3 +690,67 @@ class TestR9CascadeScrollWrapper:
             )
         # delete_by_knowledge_id вызывался для каждого ребёнка + root (N+1)
         assert wrapper.delete_by_knowledge_id.call_count == len(child_ids) + 1
+
+
+# ═══════════════════════════════════════════════════════════
+# R10: batch-delete — каскад делает ОДИН git-flush, не N+1
+# ═══════════════════════════════════════════════════════════
+# Фаза 13.22 P1: до delete_many каскад на книгу с N секциями делал N+1 git-коммитов
+# (store.delete → flush на каждый) — блокировал event loop. Теперь: 1 flush на
+# delete_many + 1 flush на root delete = 2, независимо от N.
+
+class TestR10BatchDeleteSingleFlush:
+    @pytest.mark.asyncio
+    async def test_cascade_makes_single_batch_flush(
+        self, store_no_git, pipeline_ok, qdrant_mock, monkeypatch
+    ):
+        """delete_entry(cascade=True) с delete_many: flush-вызовы = 2 (root + batch)."""
+        from mcp_server.tools.content import import_content
+        from mcp_server.tools.crud import delete_entry
+
+        # Шаг 1: импорт книги A
+        app_state_a = _make_app_state(store_no_git, pipeline_ok, qdrant_mock)
+        result_a = await import_content(
+            {
+                "content": STRUCTURED_BOOK,
+                "content_type": "book",
+                "domain": "replace",
+                "subject": "batch",
+                "title": "Batch Book",
+            },
+            app_state_a,
+        )
+        assert "error" not in result_a
+        collection_id_a = result_a["collection_id"]
+        root_a = await store_no_git.read(collection_id_a)
+        child_ids = [c["knowledge_id"] for c in root_a.frontmatter.children]
+        assert len(child_ids) >= 3
+
+        # Шаг 2: шпион на flush — считаем вызовы и сообщения
+        flush_messages: list[str] = []
+        orig_flush = store_no_git.flush
+
+        async def _spy_flush(message: str = ""):
+            flush_messages.append(message or "")
+            return await orig_flush(message)
+
+        monkeypatch.setattr(store_no_git, "flush", _spy_flush)
+        flush_messages.clear()
+
+        # Шаг 3: cascade delete
+        wrapper = _WrapperStyleQdrant(child_ids)
+        app_state_del = _make_app_state(store_no_git, pipeline_ok, wrapper)
+        res = await delete_entry(
+            {"knowledge_id": collection_id_a, "cascade": True}, app_state_del
+        )
+
+        assert res.get("deleted") is True
+        assert res.get("cascade_deleted") == len(child_ids)
+
+        # Ровно 2 flush: root-удаление + batch-удаление (НЕ N+1)
+        assert len(flush_messages) == 2, (
+            f"Expected 2 flushes (root + batch), got {len(flush_messages)}: {flush_messages}"
+        )
+        assert any("cascade delete" in m for m in flush_messages), (
+            f"Expected batch flush message, got: {flush_messages}"
+        )

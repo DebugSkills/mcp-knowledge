@@ -385,14 +385,22 @@ async def delete_entry(params: dict, app_state) -> dict:
                     break
                 offset = next_offset
 
-            # Удаляем каждую секцию: store.delete (→ .trash/) + qdrant.delete_by_knowledge_id
-            for child_id in child_ids:
+            # Удаляем секции пачкой: store.delete_many (→ .trash/) с ОДНИМ git-коммитом
+            # (Фаза 13.22 P1: раньше N+1 git-коммитов блокировали event loop).
+            if child_ids:
                 try:
-                    await store.delete(child_id)
-                    await loop.run_in_executor(None, qdrant.delete_by_knowledge_id, child_id)
-                    cascade_deleted += 1
+                    cascade_deleted = await store.delete_many(
+                        child_ids,
+                        commit_message=f"cascade delete: {knowledge_id} ({len(child_ids)} sections)",
+                    )
                 except Exception as exc:
-                    logger.warning("[DELETE] cascade: failed to delete child %s: %s", child_id, exc)
+                    logger.warning("[DELETE] cascade: store.delete_many failed: %s", exc)
+                # Qdrant-точки удаляем по одной (не git-операция, не блокирует)
+                for child_id in child_ids:
+                    try:
+                        await loop.run_in_executor(None, qdrant.delete_by_knowledge_id, child_id)
+                    except Exception as exc:
+                        logger.warning("[DELETE] cascade: failed to delete qdrant point %s: %s", child_id, exc)
 
             logger.info("[DELETE] cascade: %d child sections deleted for book %s", cascade_deleted, knowledge_id)
         except Exception as exc:

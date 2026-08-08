@@ -174,6 +174,40 @@ class MarkdownStore:
         logger.info("delete_entry: %s → %s", knowledge_id, trash_path.name)
         return True
 
+    async def delete_many(self, knowledge_ids: list[str], commit_message: str | None = None) -> int:
+        """Soft-delete пачкой: переместить в .trash/ БЕЗ git-коммита на каждую.
+
+        Фаза 13.22 P1 (batch-delete): каскадное удаление книги с N секциями ранее
+        делало N+1 git-коммитов (по одному на store.delete → flush), блокируя
+        single-worker event loop на больших книгах. delete_many делает ОДИН
+        git-коммит на всю пачку.
+
+        Returns:
+            Число реально удалённых записей.
+        """
+        deleted = 0
+        for knowledge_id in knowledge_ids:
+            try:
+                path = self._find_by_id(knowledge_id)
+                if path is None:
+                    continue
+                trash_path = self._trash / f"{knowledge_id}.md"
+                # Разрешаем конфликт: добавляем timestamp при дубликате в .trash
+                if trash_path.exists():
+                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                    trash_path = self._trash / f"{knowledge_id}.{ts}.md"
+                path.rename(trash_path)
+                deleted += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "delete_many: failed to soft-delete %s: %s", knowledge_id, exc
+                )
+        if deleted:
+            await self.flush(
+                commit_message or f"delete_many: {deleted} entries → .trash/"
+            )
+        return deleted
+
     async def list_entries(self, domain: str | None = None,
                            subject: str | None = None) -> list[str]:
         """Список knowledge_id в заданном домене/предмете (или все)."""
