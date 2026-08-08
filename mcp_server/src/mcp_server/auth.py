@@ -65,6 +65,7 @@ IMPORT_TOOLS: set[str] = {
 UNAUTHENTICATED_METHODS: set[str] = {
     "initialize",
     "ping",
+    "notifications/initialized",  # Фаза 13.21: MCP notification (JSON-RPC 2.0 §4.1)
 }
 
 

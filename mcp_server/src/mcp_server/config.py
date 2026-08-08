@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     # Лог сканирования (13.19) — файл в /app/data/logs (volume → хост)
     QUALITY_SCAN_LOG_DIR: str = "/app/data/logs"
 
+    # MCP request size limit (Фаза 13.21 P1-2)
+    # 128 МБ default: безопасный баланс при mem_limit 2g.
+    # Memory analysis: baseline ~120MB, JSON parsing 2-3x → пик ~670MB.
+    # 256MB было бы рискованно (~1220MB пик при concurrent embedding).
+    MCP_MAX_REQUEST_SIZE: int = 134_217_728  # 128 МБ
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         if self.WORKERS != 1:

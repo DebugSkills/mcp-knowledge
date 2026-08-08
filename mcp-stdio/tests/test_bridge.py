@@ -376,7 +376,7 @@ class TestSmokeSubprocess(unittest.TestCase):
     """
 
     def test_smoke_tools_list(self):
-        """Отправляем tools/list через subprocess → проверяем 18 tools."""
+        """Отправляем tools/list через subprocess → проверяем 20 tools."""
         import urllib.request
 
         # Skip-guard: проверяем доступность сервера
@@ -406,7 +406,7 @@ class TestSmokeSubprocess(unittest.TestCase):
         response = json.loads(stdout)
         self.assertIn("result", response)
         tools = response["result"].get("tools", [])
-        self.assertEqual(len(tools), 18, f"Ожидалось 18 tools, получено {len(tools)}: {[t['name'] for t in tools]}")
+        self.assertEqual(len(tools), 20, f"Ожидалось 20 tools, получено {len(tools)}: {[t['name'] for t in tools]}")
 
 
 if __name__ == "__main__":

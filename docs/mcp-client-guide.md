@@ -20,8 +20,8 @@
    - Env: `MCP_SERVER_URL`, `MCP_API_KEY`
 
 3. **Проверьте подключение:**
-   - Kilo: `/mcps` → статус `connected`; tools list → 18 инструментов
-   - Ручная: `echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 mcp-stdio/bridge.py` → JSON с 18 tools
+   - Kilo: `/mcps` → статус `connected`; tools list → 20 инструментов
+   - Ручная: `echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 mcp-stdio/bridge.py` → JSON с 20 tools
 
 ---
 
@@ -147,7 +147,7 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 
 ---
 
-## 7. Таблица 18 инструментов
+## 7. Таблица 20 инструментов
 
 | # | Tool | Уровень | Назначение |
 |:--|------|:-------:|-----------|
@@ -179,7 +179,7 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 1. Откройте сессию Kilo
 2. Выполните `/mcps` — отобразится список MCP-серверов
 3. `mcp-knowledge` должен быть в статусе `connected`
-4. Выполните `/mcp-tools mcp-knowledge` → список из 18 инструментов
+4. Выполните `/mcp-tools mcp-knowledge` → список из 20 инструментов
 
 ### 8.2 Ручная проверка (без Kilo)
 
@@ -325,4 +325,4 @@ grep MCP_WRITE_KEYS .env
 
 ---
 
-*Актуально на 2026-08-07. 18 MCP Tools, 3 промпта, 3 ресурса kb://, stdio-мост v1.0.*
+*Актуально на 2026-08-08. 20 MCP Tools, 3 промпта, 3 ресурса kb://, stdio-мост v1.0.*

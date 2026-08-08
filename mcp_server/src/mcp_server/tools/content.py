@@ -195,6 +195,15 @@ async def import_content(params: dict, app_state) -> dict:
     if not sections:
         return {"error": "Decomposition produced 0 sections"}
 
+    # Фаза 13.21 P1-3: для больших книг (>500 секций) quality-чеки удваивают работу
+    # (embedding каждой секции отдельно в dup_gate), авто-отключение экономит ~50% времени.
+    if quality_checks and len(sections) > 500:
+        quality_checks = False
+        logger.info(
+            "[IMPORT] auto-disabled quality_checks: %d sections > 500 threshold",
+            len(sections),
+        )
+
     # [IMPORT] start — размер и число секций для диагностики тяжёлой операции
     # (инцидент 2026-08-06: крупный импорт без общего timing невидим).
     logger.info(

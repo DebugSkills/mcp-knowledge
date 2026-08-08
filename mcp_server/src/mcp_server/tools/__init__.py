@@ -1,4 +1,4 @@
-"""MCP Tools registry — 19 tools с JSON Schema (Блок A).
+"""MCP Tools registry — 20 tools с JSON Schema (Блок A).
 
 Реальные реализации в модулях: search.py, read.py, crud.py, browse.py, admin.py, content.py, collections.py.
 

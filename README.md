@@ -152,7 +152,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 
 | Фаза | Статус | Ключевой результат |
 |------|:------:|-------------------|
-| 0-4 | ✅ | Scaffolding → Quality System (18 tools, 3 промпта, gates) |
+| 0-4 | ✅ | Scaffolding → Quality System (20 tools, 3 промпта, gates) |
 | 9 | ✅ | Idempotent E2E-сьют (S1-S8), фикс latent dup-gate бага |
 | 12 | ✅ | HTTP-level E2E (S9-S12: health/metrics/429/409/503) + observability-метрики |
 | 13 | ✅ | Полное E2E-покрытие (S13-S19) + 24 quality unit-теста + 2 прод-фикса |

@@ -24,6 +24,8 @@ from ..core.utils import _sanitize_title
 # Расширения, поддерживаемые файловым импортом (.md/.txt, PDF — в перспективе).
 SUPPORTED_EXTENSIONS = {".md", ".markdown", ".txt"}
 # Максимальный размер файла для импорта, байт (50 МБ — учебники).
+# Формула: MAX_FILE_SIZE ≤ MCP_MAX_REQUEST_SIZE(128MB) − 20% JSON-overhead = 102MB.
+# 50MB — консервативно, с запасом на content_type/metadata/JSON-encoding overhead.
 MAX_FILE_SIZE = 52_428_800
 # Таймаут HTTP для вызова import_content (30 минут — крупные учебники; 7032 секций ≈ 14 мин).
 IMPORT_TIMEOUT = 1800.0

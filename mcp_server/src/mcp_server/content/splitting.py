@@ -25,6 +25,8 @@ logger = logging.getLogger("mcp_knowledge.content.splitting")
 MAX_CHUNK_TOKENS = 512       # XLM-RoBERTa токенов на секцию (#13/#20)
 MIN_SECTIONS = 2             # если structural дал <2 → fallback clustering
 CLUSTER_COSINE = 0.75        # порог cosine для Agglomerative clustering
+CLUSTER_BATCH_SIZE = 64      # Фаза 13.21 P2-5: размер батча для embed_paragraphs_async
+                              # (64 параграфа за вызов Ollama — хардкод для первой итерации)
 
 
 @dataclass
@@ -108,9 +110,22 @@ async def embed_paragraphs_async(
     paragraphs: list[str],
     embedder,
 ) -> list[list[float]]:
-    """Embed paragraphs в run_in_executor (не блокирует event loop)."""
+    """Embed paragraphs в run_in_executor (не блокирует event loop).
+
+    Фаза 13.21 P2-5: батчинг по CLUSTER_BATCH_SIZE=64 — предотвращает
+    отправку тысяч параграфов одним вызовом Ollama (OOM guard).
+    """
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _embed_paragraphs, paragraphs, embedder)
+    if len(paragraphs) <= CLUSTER_BATCH_SIZE:
+        return await loop.run_in_executor(None, _embed_paragraphs, paragraphs, embedder)
+
+    # Батчинг: разбиваем на группы по CLUSTER_BATCH_SIZE и embed итеративно
+    all_embeddings: list[list[float]] = []
+    for i in range(0, len(paragraphs), CLUSTER_BATCH_SIZE):
+        batch = paragraphs[i : i + CLUSTER_BATCH_SIZE]
+        batch_embeddings = await loop.run_in_executor(None, _embed_paragraphs, batch, embedder)
+        all_embeddings.extend(batch_embeddings)
+    return all_embeddings
 
 
 def _cosine_clustering(

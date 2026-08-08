@@ -256,3 +256,87 @@ class TestDispatchTable:
         }
         registered = set(METHOD_DISPATCH.keys())
         assert required.issubset(registered)
+
+    def test_ping_registered(self):
+        """Фаза 13.21: ping должен быть в METHOD_DISPATCH."""
+        assert "ping" in METHOD_DISPATCH, f"ping not in dispatch: {sorted(METHOD_DISPATCH.keys())}"
+
+    def test_notifications_initialized_registered(self):
+        """Фаза 13.21: notifications/initialized должен быть в METHOD_DISPATCH."""
+        assert "notifications/initialized" in METHOD_DISPATCH, \
+            f"notifications/initialized not in dispatch: {sorted(METHOD_DISPATCH.keys())}"
+
+
+# ── P0: _validate_jsonrpc — notifications без id (Фаза 13.21) ────
+
+
+class TestValidateJsonRpcNotifications:
+    """Фаза 13.21 P0: _validate_jsonrpc — разрешить absent id для notifications/*."""
+
+    def test_notification_without_id_passes(self):
+        """notifications/initialized без id — валидация пройдена."""
+        body = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        assert _validate_jsonrpc(body) is None
+
+    def test_unknown_notification_without_id_passes(self):
+        """notifications/unknown без id — валидация пройдена (prefix match)."""
+        body = {"jsonrpc": "2.0", "method": "notifications/cancelled"}
+        assert _validate_jsonrpc(body) is None
+
+    def test_non_notification_without_id_fails(self):
+        """Обычный метод (не notifications/*) без id — по-прежнему ошибка."""
+        body = {"jsonrpc": "2.0", "method": "tools/list"}
+        err = _validate_jsonrpc(body)
+        assert err is not None
+        assert "missing 'id'" in err["error"]["message"].lower()
+
+    def test_tools_call_without_id_fails(self):
+        """tools/call без id — по-прежнему ошибка (P0 fix не сломан)."""
+        body = {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "ping"}}
+        err = _validate_jsonrpc(body)
+        assert err is not None
+        assert "missing 'id'" in err["error"]["message"].lower()
+
+    def test_notification_with_id_still_works(self):
+        """notification с id (хоть и не-стандарт) — тоже проходит."""
+        body = {"jsonrpc": "2.0", "method": "notifications/initialized", "id": 42}
+        assert _validate_jsonrpc(body) is None
+
+
+# ── Ping handler (Фаза 13.21) ───────────────────────────────────
+
+
+class TestPingHandler:
+    """Фаза 13.21: ping → {"result": {}}."""
+
+    async def test_ping_returns_empty_result(self):
+        body = {"jsonrpc": "2.0", "method": "ping", "id": 10}
+        result = await _dispatch_single(body, _make_mock_request_for_dispatch())
+        assert result is not None, "ping должен вернуть response (не 204)"
+        assert result["jsonrpc"] == "2.0"
+        assert result["result"] == {}, f"Expected empty dict, got {result.get('result')}"
+        assert result["id"] == 10
+
+    async def test_ping_ignores_params(self):
+        body = {"jsonrpc": "2.0", "method": "ping", "id": 10, "params": {"foo": "bar"}}
+        result = await _dispatch_single(body, _make_mock_request_for_dispatch())
+        assert result["result"] == {}
+
+
+# ── Notifications handler (Фаза 13.21) ──────────────────────────
+
+
+class TestNotificationsHandler:
+    """Фаза 13.21: notifications/initialized → 204 (None return)."""
+
+    async def test_notifications_initialized_returns_none(self):
+        body = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        result = await _dispatch_single(body, _make_mock_request_for_dispatch())
+        assert result is None, f"Notification handler должен вернуть None (204), got {result}"
+
+    async def test_unknown_notification_returns_none(self):
+        """P2-9: неизвестный notifications/* → 204 (не -32601)."""
+        body = {"jsonrpc": "2.0", "method": "notifications/unknown"}
+        result = await _dispatch_single(body, _make_mock_request_for_dispatch())
+        assert result is None, \
+            f"Unknown notification должен вернуть None (204), got {result}"

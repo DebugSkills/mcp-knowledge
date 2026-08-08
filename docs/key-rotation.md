@@ -121,7 +121,7 @@ curl -s -X POST http://localhost:8000/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools | length'
 ```
 
-Both should return the tool count (18 tools as of Phase 13).
+Both should return the tool count (20 tools as of Phase 13).
 
 ---
 

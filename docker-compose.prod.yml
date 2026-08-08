@@ -22,14 +22,20 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.13.4
     container_name: mcp-qdrant-prod
+    # 13.21: ulimits 65535 — иначе «Too many open files» (RocksDB flush + accept errors) при росте коллекций
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     ports:
       - "6333:6333"   # REST
       - "6334:6334"   # gRPC
     volumes:
       - ./data/qdrant:/qdrant/storage
       - ./data/qdrant/snapshots:/qdrant/snapshots
+    # В образе v1.13.4 НЕТ curl → healthcheck через bash /dev/tcp (как в dev-композе)
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:6333/healthz"]
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/6333'"]
       interval: 10s
       timeout: 5s
       retries: 3

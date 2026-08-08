@@ -3,10 +3,12 @@
 MCP Protocol Spec (P1-1):
 - Protocol version: 2024-11-05
 - initialize → handshake с capabilities
-- tools/list → все 19 tools с JSON Schema
+- tools/list → все 20 tools с JSON Schema
 - tools/call → валидация params → вызов handler
+- ping → keepalive ({"result": {}})
+- notifications/initialized → 204 (MCP notification)
 - Error codes: −32700, −32600, −32601, −32602, −32000..−32099
-- Request body ≤ 1 MB
+- Request body ≤ MCP_MAX_REQUEST_SIZE (configurable, default 128 MB)
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from .auth import check_tool_permission, get_auth
+from .config import settings
 from .prompts import PROMPTS, get_prompt
 from .resources import RESOURCES, get_kb_resource
 from .tools import TOOL_HANDLERS, TOOLS
@@ -31,8 +34,8 @@ logger = logging.getLogger("mcp_knowledge.mcp")
 SERVER_PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "mcp-knowledge-server"
 SERVER_VERSION = "0.1.0"
-# 64 МБ — импорт учебников (kb-console MAX_FILE_SIZE=50 МБ + JSON-оверхед content/метаданные).
-MAX_REQUEST_SIZE = 67_108_864
+# MCP_MAX_REQUEST_SIZE из конфигурации (128 МБ default) — синхронизировано с kb-console MAX_FILE_SIZE.
+MAX_REQUEST_SIZE = settings.MCP_MAX_REQUEST_SIZE
 
 # ── JSON-RPC 2.0 Error codes ──────────────────────────────
 
@@ -69,6 +72,9 @@ def _jsonrpc_result(result: Any, id: Any) -> dict:
 def _validate_jsonrpc(request_body: dict) -> dict | None:
     """Проверить обязательные поля JSON-RPC 2.0: jsonrpc, method, id.
 
+    P0 (Фаза 13.21): notification-методы (notifications/*) освобождены от проверки id
+    согласно JSON-RPC 2.0 §4.1 — сервер НЕ должен отвечать на Notification.
+
     Returns error dict если валидация не пройдена, None если OK.
     """
     if request_body.get("jsonrpc") != "2.0":
@@ -83,9 +89,10 @@ def _validate_jsonrpc(request_body: dict) -> dict | None:
             "Invalid Request: missing 'method'",
             request_body.get("id"),
         )
-    # id: string, number, null (notification) — допустимы
-    # отсутствие id — ошибка (кроме batch где id обязателен по спеке)
-    if "id" not in request_body:
+    # Notifications (notifications/*) не требуют id по JSON-RPC 2.0 §4.1.
+    # Обычные методы обязаны иметь id.
+    method = request_body.get("method", "")
+    if "id" not in request_body and not method.startswith("notifications/"):
         return _jsonrpc_error(
             JSONRPC_INVALID_REQUEST,
             "Invalid Request: missing 'id'",
@@ -125,7 +132,7 @@ async def _handle_initialize(params: dict, request_id: Any, _request: Request) -
 
 
 async def _handle_tools_list(_params: dict, request_id: Any, _request: Request) -> dict:
-    """tools/list: возврат всех 19 tools с JSON Schema."""
+    """tools/list: возврат всех 20 tools с JSON Schema."""
     return _jsonrpc_result({"tools": TOOLS}, request_id)
 
 
@@ -276,10 +283,28 @@ async def _handle_prompts_get(params: dict, request_id: Any, _request: Request) 
     return _jsonrpc_result(prompt_data, request_id)
 
 
+# ── MCP Protocol handlers (Фаза 13.21) ────────────────────
+
+
+async def _handle_ping(_params: dict, request_id: Any, _request: Request) -> dict:
+    """ping: MCP keepalive — возвращает {"result": {}} (пустой объект, не null)."""
+    return _jsonrpc_result({}, request_id)
+
+
+async def _handle_notification(_params: dict, _id: Any, _request: Request) -> None:
+    """notifications/initialized: MCP notification — возвращает None → 204 No Content.
+
+    Также обслуживает неизвестные notification-методы (P2-9).
+    """
+    # Неявный None: _dispatch_single отдаёт 204 для notification-ответов.
+
+
 # ── Method dispatch table ──────────────────────────────────
 
 METHOD_DISPATCH: dict[str, Any] = {
     "initialize": _handle_initialize,
+    "ping": _handle_ping,
+    "notifications/initialized": _handle_notification,
     "tools/list": _handle_tools_list,
     "tools/call": _handle_tools_call,
     "resources/list": _handle_resources_list,
@@ -376,6 +401,10 @@ async def _dispatch_single(body: dict, request: Request) -> dict | None:
     # Поиск handler'а в dispatch table
     handler = METHOD_DISPATCH.get(method)
     if handler is None:
+        # P2-9 (Фаза 13.21): неизвестный notifications/* → 204 (JSON-RPC 2.0 §4.1)
+        if method.startswith("notifications/"):
+            logger.debug("Unknown notification ignored: '%s'", method)
+            return None
         logger.warning("Method not found: '%s'", method)
         return _jsonrpc_error(
             JSONRPC_METHOD_NOT_FOUND,

@@ -313,7 +313,7 @@ curl -s -X POST http://localhost:8000/mcp \
   -d '{"jsonrpc":"2.0","id":"list-1","method":"tools/list"}' \
   | python3 -c "import sys, json; tools=json.load(sys.stdin)['result']['tools']; print(f'{len(tools)} tools'); [print(f'  - {t[\"name\"]}') for t in tools]"
 
-# Expected: 18 tools (search_knowledge, search_by_tags, get_entry, get_knowledge_map,
+# Expected: 20 tools (search_knowledge, search_by_tags, get_entry, get_knowledge_map,
 #                           list_collections, write_knowledge, update_entry, delete_entry,
 #                           list_domains, list_subjects, list_projects, reindex,
 #                           review_queue, list_quality_issues, resolve_quality_issue,
@@ -396,7 +396,7 @@ echo "Cold start: ${DURATION}s"
 - [ ] `/health/live` → HTTP 200
 - [ ] `/health` → HTTP 200, `"status":"healthy"`
 - [ ] `/health` checks: qdrant connected, embed loaded, pipeline alive, DLQ empty
-- [ ] `tools/list` → returns 18 tools
+- [ ] `tools/list` → returns 20 tools
 - [ ] `search_knowledge` → returns results (or empty array if no data)
 - [ ] `get_knowledge_map` → returns valid structure
 - [ ] `tcpdump` → **0 outbound packets**
