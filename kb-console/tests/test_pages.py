@@ -315,3 +315,61 @@ class TestMCPClientQualityMethods:
         assert result["ok"] is True
         call = quality_client._captured[0]
         assert call["tool"] == "run_quality_scan"
+
+
+# ── _read_uploaded_file (extracted to core/utils.py, Phase 13.24) ──
+
+
+class TestReadUploadedFile:
+    """Тесты _read_uploaded_file — чистая функция чтения файла (Фаза 1, 13.24)."""
+
+    def test_valid_md(self):
+        """Корректный .md файл в UTF-8 — возвращает (content, None)."""
+        from kb_console.core.utils import _read_uploaded_file
+        content, error = _read_uploaded_file("test.md", "# Hello".encode("utf-8"))
+        assert error is None
+        assert content == "# Hello"
+
+    def test_unsupported_ext(self):
+        """Неподдерживаемое расширение — возвращает (None, error_msg)."""
+        from kb_console.core.utils import _read_uploaded_file
+        content, error = _read_uploaded_file("test.pdf", b"%PDF")
+        assert content is None
+        assert error is not None
+        assert "Неподдерживаемый" in error
+
+    def test_too_large(self):
+        """Превышение MAX_FILE_SIZE — возвращает (None, error_msg)."""
+        from kb_console.core.utils import MAX_FILE_SIZE, _read_uploaded_file
+        big = b"x" * (MAX_FILE_SIZE + 1)
+        content, error = _read_uploaded_file("test.md", big)
+        assert content is None
+        assert error is not None
+        assert "слишком большой" in error
+
+    def test_encoding_fallback_windows1251(self):
+        """Файл в windows-1251 (не UTF-8) — fallback успешен."""
+        from kb_console.core.utils import _read_uploaded_file
+        # "Привет" в windows-1251 (кириллица)
+        text_cp1251 = "Привет, мир!".encode("windows-1251")
+        content, error = _read_uploaded_file("test.txt", text_cp1251)
+        assert error is None
+        assert "Привет" in content
+
+
+# ── Replace dialog (новый компонент, Фаза 2, 13.24) ──
+
+
+class TestReplaceDialogImports:
+    """Проверка импортов нового компонента replace_dialog (Фаза 2, 13.24)."""
+
+    def test_replace_dialog_module_imports(self):
+        """Модуль components.replace_dialog должен импортироваться,
+        show_replace_dialog должна быть callable."""
+        from kb_console.components.replace_dialog import show_replace_dialog
+        assert callable(show_replace_dialog)
+
+    def test_replace_dialog_in_components_init(self):
+        """components/__init__.py должен экспортировать show_replace_dialog."""
+        from kb_console.components import show_replace_dialog
+        assert callable(show_replace_dialog)

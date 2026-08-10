@@ -299,6 +299,19 @@ def build_books() -> None:
                         async def _open_btn(cid: str = cid, t: str = btitle) -> None:
                             await _open_book(cid, t)
                         ui.button("📖 Открыть", on_click=_open_btn, icon="menu_book").props("flat dense")
+                        async def _replace_btn(
+                            cid: str = cid, t: str = btitle,
+                            dom: str = b.get("domain", ""), subj: str = b.get("subject", ""),
+                        ) -> None:
+                            from ..components.replace_dialog import show_replace_dialog
+
+                            async def _on_success() -> None:
+                                cache.invalidate("books")
+                                await _show_list()
+
+                            await show_replace_dialog(cid, t, domain=dom, subject=subj, on_success=_on_success)
+
+                        ui.button("♻️ Заменить", on_click=_replace_btn, icon="cached").props("flat dense")
 
     async def _open_book(collection_id: str, title: str = "") -> None:
         """Открыть модалку книги (вызов напрямую, без обёрток view_container).
