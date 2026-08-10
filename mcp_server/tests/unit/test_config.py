@@ -1,6 +1,5 @@
 """Тесты настроек Settings (13.19: планировщик скана + лог)."""
 
-import pytest
 
 from mcp_server.config import Settings
 

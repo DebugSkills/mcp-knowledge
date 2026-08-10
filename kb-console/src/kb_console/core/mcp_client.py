@@ -4,10 +4,12 @@
 Поддерживает инжектируемый httpx.AsyncClient для E2E-тестов (ASGITransport).
 """
 
+# ruff: noqa: ASYNC230
 from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any, Self
 
 import httpx
@@ -412,3 +414,63 @@ class MCPClient:
         if cascade:
             params["cascade"] = cascade
         return await self.tools_call("delete_entry", params)
+
+    # ── 13.21: PDF import ──────────────────────────────────
+
+    async def upload_pdf(self, file_path: str, filename: str = "") -> dict[str, Any]:
+        """POST /upload — загрузить PDF через multipart.
+
+        Args:
+            file_path: путь к локальному PDF-файлу.
+            filename: имя файла (опционально).
+
+        Returns:
+            {"pdf_path": str, "content_hash": str, "size": int, "upload_id": str}
+        """
+        url = f"{self.base_url}/upload"
+        name = filename or Path(file_path).name
+        with open(file_path, "rb") as f:
+            response = await self._client.post(
+                url,
+                files={"file": (name, f, "application/pdf")},
+                headers={"X-API-Key": self.api_key},
+                timeout=120.0,
+            )
+        if response.status_code != 200:
+            detail = ""
+            try:
+                detail = response.json().get("detail", response.text[:200])
+            except (json.JSONDecodeError, ValueError):
+                detail = response.text[:200]
+            raise RuntimeError(f"PDF upload failed ({response.status_code}): {detail}")
+        return response.json()
+
+    async def list_imports(self) -> list[dict[str, Any]]:
+        """GET /imports — список всех импортов в очереди."""
+        url = f"{self.base_url}/imports"
+        response = await self._client.get(url, headers=self._headers(), timeout=10.0)
+        if response.status_code != 200:
+            return []
+        try:
+            return response.json()
+        except (json.JSONDecodeError, ValueError):
+            return []
+
+    async def get_imports_active(self) -> dict[str, Any]:
+        """GET /imports/active — текущий running-импорт (F5-recovery)."""
+        url = f"{self.base_url}/imports/active"
+        response = await self._client.get(url, headers=self._headers(), timeout=10.0)
+        if response.status_code != 200:
+            return {"active": False}
+        try:
+            return response.json()
+        except (json.JSONDecodeError, ValueError):
+            return {"active": False}
+
+    async def cancel_import(self, import_id: str) -> dict[str, Any]:
+        """POST /imports/{import_id}/cancel — отменить импорт."""
+        url = f"{self.base_url}/imports/{import_id}/cancel"
+        response = await self._client.post(url, headers=self._headers(), timeout=10.0)
+        if response.status_code != 200:
+            return {"cancelled": False, "reason": f"HTTP {response.status_code}"}
+        return response.json()

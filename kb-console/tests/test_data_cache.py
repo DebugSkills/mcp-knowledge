@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 from kb_console.core.data_cache import DataCache, cache
 
 

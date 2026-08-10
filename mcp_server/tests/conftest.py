@@ -329,4 +329,96 @@ def app_state(
     _scan_lock = MagicMock()
     _scan_lock.locked.return_value = False
     state.scan_lock = _scan_lock
+    # 13.21: heavy_ops_lock alias
+    state.heavy_ops_lock = _scan_lock
     return state
+
+
+# ═══════════════════════════════════════════════════════════════
+# 13.21: PDF test fixtures (ReportLab + PIL + pypdf)
+# ═══════════════════════════════════════════════════════════════
+
+
+@pytest.fixture
+def sample_pdf_path(tmp_path) -> str:
+    """Generate a text PDF with headings (ReportLab) — 3 pages, font-size variation.
+
+    Skip if reportlab not installed (e.g. local env without docker).
+    """
+    pytest.importorskip("reportlab", reason="reportlab not installed (docker-only dep)")
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    path = tmp_path / "sample.pdf"
+
+    c = canvas.Canvas(str(path), pagesize=A4)
+    _width, height = A4
+
+    # Page 1: heading (size 18) + body text (size 12)
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(72, height - 50, "Chapter 1: Introduction")
+    c.setFont("Helvetica", 12)
+    c.drawString(72, height - 80, "This is the first chapter. It contains introductory")
+    c.drawString(72, height - 95, "material about Python programming concepts.")
+    c.drawString(72, height - 110, "We will cover basic syntax, data types, and control flow.")
+    c.showPage()
+
+    # Page 2: heading (size 16) + body
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(72, height - 50, "Chapter 2: Advanced Topics")
+    c.setFont("Helvetica", 12)
+    c.drawString(72, height - 80, "Advanced topics include decorators, generators, context")
+    c.drawString(72, height - 95, "managers, and metaclasses. These are powerful features")
+    c.drawString(72, height - 110, "that enable writing clean and efficient Python code.")
+    c.showPage()
+
+    # Page 3: body only (no heading)
+    c.setFont("Helvetica", 12)
+    c.drawString(72, height - 50, "Conclusion and next steps. This document has covered")
+    c.drawString(72, height - 65, "the fundamentals and advanced features of Python.")
+    c.drawString(72, height - 80, "Continue practicing with real-world projects.")
+    c.showPage()
+
+    c.save()
+    return str(path)
+
+
+@pytest.fixture
+def sample_scan_pdf_path(tmp_path) -> str:
+    """Generate an image-only PDF (PIL → PDF) for OCR testing.
+
+    Creates a single-page PDF with text rendered as image — pdfplumber
+    will find no extractable text, triggering OCR path.
+    """
+    pytest.importorskip("PIL", reason="PIL/Pillow not installed")
+    from PIL import Image, ImageDraw
+
+    path = tmp_path / "sample_scan.pdf"
+
+    img = Image.new("RGB", (595, 842), color="white")  # A4 at 72 DPI
+    draw = ImageDraw.Draw(img)
+    draw.text((50, 50), "Scanned Document Title", fill="black")
+    draw.text((50, 80), "This is a scanned page. The text is rendered as an image.", fill="black")
+    draw.text((50, 110), "OCR должен извлечь этот текст через Tesseract.", fill="black")
+    img.save(str(path), "PDF")
+
+    return str(path)
+
+
+@pytest.fixture
+def sample_encrypted_pdf_path(tmp_path) -> str:
+    """Generate an encrypted PDF (pypdf writer.encrypt) for validation test."""
+    pytest.importorskip("pypdf", reason="pypdf not installed (docker-only dep)")
+
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(595, 842)  # A4
+    writer.encrypt("testpassword")
+
+    path = tmp_path / "sample_encrypted.pdf"
+    with open(str(path), "wb") as f:
+        writer.write(f)
+
+    return str(path)
+

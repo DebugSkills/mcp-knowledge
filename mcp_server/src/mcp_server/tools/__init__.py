@@ -15,7 +15,7 @@ from ..content.analyzer import analyze_content
 from .admin import reindex
 from .browse import list_domains, list_projects, list_subjects
 from .collections import list_collections
-from .content import import_content
+from .content import cancel_import, import_content
 from .crud import delete_entry, update_entry, write_knowledge
 from .quality import (
     cancel_quality_scan,
@@ -196,13 +196,22 @@ _CANCEL_QUALITY_SCAN_SCHEMA: dict[str, Any] = {
     "properties": {},
 }
 
+# ── 13.21: cancel_import schema ─────────────────────────────
+
+_CANCEL_IMPORT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "import_id": {"type": "string", "description": "ID импорта для отмены (опционально)"},
+    },
+}
+
 # ── import_content schema (Фаза 5) ─────────────────────────
 
 _IMPORT_CONTENT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "content": {"type": "string", "description": "Исходный текст (Markdown/plain)"},
-        "content_type": {"type": "string", "default": "book", "description": "Тип контента: book"},
+        "content_type": {"type": "string", "default": "book", "description": "Тип контента: book | pdf"},
         "domain": {"type": "string", "description": "Первичная классификация"},
         "subject": {"type": "string", "description": "Вторичная классификация"},
         "project": {"type": "string", "description": "Опциональный проект"},
@@ -214,6 +223,7 @@ _IMPORT_CONTENT_SCHEMA: dict[str, Any] = {
         "cleanup_orphans": {"type": "boolean", "default": False},
         "replace_collection_id": {"type": "string", "description": "ID коллекции для ЗАМЕНЫ: после успешного импорта старая книга удаляется (cascade). Import-first: старая цела до подтверждения успеха новой."},
         "replace_on_partial": {"type": "boolean", "default": False, "description": "Удалить старую книгу даже при partial_success импорта (failed>0). Default False — безопасно."},
+        "pdf_path": {"type": "string", "description": "Путь к PDF-файлу на сервере (из POST /upload, опционально для content_type=pdf)"},
     },
     "required": ["content", "domain", "subject"],
 }
@@ -335,6 +345,12 @@ TOOLS: list[dict[str, Any]] = [
         "description": "AI-анализ контента: рекомендации content_type/domain/subject/tags через Ollama LLM + TF-IDF fallback.",
         "inputSchema": _ANALYZE_CONTENT_SCHEMA,
     },
+    # ── 13.21: cancel import ─────────────────────────────────
+    {
+        "name": "cancel_import",
+        "description": "Отменить активный импорт (PDF/книга). Освобождает lock для следующей операции в очереди.",
+        "inputSchema": _CANCEL_IMPORT_SCHEMA,
+    },
 ]
 
 # ── Handler dispatch table (реальные реализации) ───────────
@@ -361,4 +377,5 @@ TOOL_HANDLERS = {
     "cancel_quality_scan": cancel_quality_scan,
     "import_content": import_content,
     "analyze_content": analyze_content,
+    "cancel_import": cancel_import,
 }

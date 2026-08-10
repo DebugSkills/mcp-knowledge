@@ -7,6 +7,7 @@ best-effort batch с orphan cleanup.
 
 from . import registry
 from .book_preprocessor import BookPreprocessor
+from .pdf_preprocessor import PDFPreprocessor
 from .preprocessor import ContentPreprocessor, ImportMeta, Section, ValidationResult
 
 # ── Регистрация препроцессоров ────────────────────────────
@@ -14,10 +15,14 @@ from .preprocessor import ContentPreprocessor, ImportMeta, Section, ValidationRe
 # embedder/token_counter = None — clustering/recursive split gracefully fallback
 registry.register(BookPreprocessor(embedder=None, token_counter=None))
 
+# PDFPreprocessor: content_type="pdf" — PDF через pdfplumber + Tesseract OCR (13.21)
+registry.register(PDFPreprocessor())
+
 __all__ = [
     "BookPreprocessor",
     "ContentPreprocessor",
     "ImportMeta",
+    "PDFPreprocessor",
     "Section",
     "ValidationResult",
     "registry",

@@ -1,4 +1,4 @@
-# ruff: noqa: BLE001
+# ruff: noqa: BLE001, ASYNC230
 """MCP Knowledge Server — точка входа.
 
 Интегрирует все компоненты Фазы 1:
@@ -263,13 +263,22 @@ async def lifespan(app: FastAPI):
     app.state.import_progress = ImportProgressTracker()
     logger.info("📊 ImportProgressTracker initialized (max_messages=50, ttl=600s)")
 
-    # 13.15: Scan state — background task + lock (root-фикс зависания event loop)
-    app.state.scan_lock = asyncio.Lock()
+    # 13.15/13.21: Heavy-ops lock — единый для import+scan+reindex (один за раз)
+    # Инвариант: все тяжёлые фоновые операции сериализуются через этот lock.
+    app.state.heavy_ops_lock = asyncio.Lock()
+    # legacy alias (используется в quality.py, tools/__init__.py)
+    app.state.scan_lock = app.state.heavy_ops_lock
     app.state.scan_task = None
     app.state.scan_progress = ImportProgressTracker(max_messages=200)
     app.state.scan_id: str | None = None
     app.state.scan_cancel_event = None  # 13.18: asyncio.Event для отмены скана
-    logger.info("🔒 Scan lock + progress tracker + cancel event initialized (phase 13.15+13.18)")
+    logger.info("🔒 Heavy-ops lock + scan state initialized (phase 13.15+13.18+13.21)")
+
+    # 13.21: Import queue state — фоновая задача + cancel + очередь (паттерн scan)
+    app.state.import_task = None
+    app.state.import_cancel_event = None
+    app.state.import_queue: list[dict] = []  # ImportRecord[] — сессионная очередь
+    logger.info("📦 Import queue state initialized (phase 13.21)")
 
     # Task 1: data_version для кеш-инвалидации kb-console
     app.state.data_version = 0
@@ -361,6 +370,17 @@ async def lifespan(app: FastAPI):
             logger.warning("[START] scan task did not finish in 5s (forced)")
         finally:
             app.state.scan_task = None
+
+    # 13.21: Cancel background import task if running (graceful shutdown)
+    if app.state.import_task is not None and not app.state.import_task.done():
+        logger.info("[START] cancelling background import task...")
+        app.state.import_task.cancel()
+        try:
+            await asyncio.wait_for(app.state.import_task, timeout=5.0)
+        except (asyncio.CancelledError, TimeoutError):
+            logger.warning("[START] import task did not finish in 5s (forced)")
+        finally:
+            app.state.import_task = None
 
     await pipeline.stop()
     qdrant.close()
@@ -468,3 +488,177 @@ async def data_version(request: Request):
         raise HTTPException(status_code=401, detail="Authentication required")
 
     return {"data_version": getattr(request.app.state, "data_version", 0)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 13.21: PDF Import endpoints — upload + queue + progress
+# ═══════════════════════════════════════════════════════════════
+
+import os as _os
+import uuid as _uuid
+
+_UPLOAD_DIR = "/tmp/pdf_uploads"
+
+
+@app.post("/upload")
+async def upload_pdf(request: Request):
+    """POST /upload — multipart PDF upload (stream to disk).
+
+    Фаза 13.21: принимает PDF файл через multipart/form-data,
+    сохраняет во временный файл /tmp/pdf_uploads/<uuid>.pdf,
+    возвращает путь для последующего import_content.
+
+    Auth: import/write ключ (X-API-Key header).
+    Size limit: MAX_PDF_FILE_SIZE (100 MB).
+    """
+
+    # Auth check
+    auth = getattr(request.state, "auth", None)
+    if auth is None or not getattr(auth, "authenticated", False):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    key_level = getattr(auth, "key_level", "none")
+    if key_level not in ("import", "write"):
+        raise HTTPException(status_code=403, detail="Import or write key required for PDF upload")
+
+    # Content-Type must be multipart
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" not in content_type:
+        raise HTTPException(status_code=415, detail="Expected multipart/form-data")
+
+    # Read form: Starlette UploadFile
+    form = await request.form()
+    uploaded_file = form.get("file")
+    if uploaded_file is None:
+        raise HTTPException(status_code=400, detail="Missing 'file' field in multipart form")
+
+    filename = getattr(uploaded_file, "filename", "upload.pdf") or "upload.pdf"
+
+    # Size validation (stream to temp file)
+    _os.makedirs(_UPLOAD_DIR, exist_ok=True)
+    upload_id = _uuid.uuid4().hex[:12]
+    dest_path = _os.path.join(_UPLOAD_DIR, f"{upload_id}_{filename}")
+
+    try:
+        total = 0
+        with open(dest_path, "wb") as f:
+            while True:
+                chunk = await uploaded_file.read(1024 * 1024)  # 1MB chunks
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > settings.MAX_PDF_FILE_SIZE:
+                    f.close()
+                    _os.unlink(dest_path)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"PDF too large: {total / (1024 * 1024):.1f} MB "
+                            f"(max {settings.MAX_PDF_FILE_SIZE / (1024 * 1024):.0f} MB)"
+                        ),
+                    )
+                f.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        if _os.path.exists(dest_path):
+            _os.unlink(dest_path)
+        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+
+    # Compute content hash
+    import hashlib
+    sha = hashlib.sha256()
+    with open(dest_path, "rb") as f:
+        sha.update(f.read(65536))
+    sha.update(str(_os.path.getsize(dest_path)).encode())
+    content_hash = sha.hexdigest()
+
+    logger.info(
+        "[UPLOAD] %s saved: %s (%.1f MB, hash=%s)",
+        filename, dest_path, total / (1024 * 1024), content_hash[:12],
+    )
+
+    return {
+        "pdf_path": dest_path,
+        "filename": filename,
+        "content_hash": content_hash,
+        "size": total,
+        "upload_id": upload_id,
+    }
+
+
+@app.get("/imports")
+async def list_imports(request: Request):
+    """GET /imports — список всех импортов (сессионная очередь).
+
+    Возвращает JSON-массив ImportRecord[] с полями:
+    import_id, name, status, phase, progress, error, created_at, finished_at.
+
+    Auth: defence-in-depth.
+    """
+    auth = getattr(request.state, "auth", None)
+    if auth is None or not getattr(auth, "authenticated", False):
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    queue = getattr(request.app.state, "import_queue", [])
+    return queue
+
+
+@app.get("/imports/active")
+async def imports_active(request: Request):
+    """GET /imports/active — текущий running-импорт (P1-7: F5-recovery).
+
+    Возвращает {import_id, status, phase, imported, total, name}
+    или {"active": false} если нет активного импорта.
+
+    Auth: defence-in-depth.
+    """
+    auth = getattr(request.state, "auth", None)
+    if auth is None or not getattr(auth, "authenticated", False):
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    queue = getattr(request.app.state, "import_queue", [])
+    for rec in queue:
+        if rec.get("status") == "running":
+            return {
+                "import_id": rec.get("import_id"),
+                "name": rec.get("name"),
+                "status": "running",
+                "phase": rec.get("phase"),
+                "imported": rec.get("imported", 0),
+                "total": rec.get("total", 0),
+            }
+    return {"active": False}
+
+
+@app.post("/imports/{import_id}/cancel")
+async def cancel_import_endpoint(import_id: str, request: Request):
+    """POST /imports/{import_id}/cancel — отменить running-импорт.
+
+    Устанавливает import_cancel_event → _bg_import проверяет между фазами
+    и завершает с status=cancelled.
+
+    Auth: defence-in-depth (import/write key).
+    """
+    auth = getattr(request.state, "auth", None)
+    if auth is None or not getattr(auth, "authenticated", False):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    key_level = getattr(auth, "key_level", "none")
+    if key_level not in ("import", "write"):
+        raise HTTPException(status_code=403, detail="Import or write key required")
+
+    cancel_event = getattr(request.app.state, "import_cancel_event", None)
+    if cancel_event is None:
+        raise HTTPException(404, "No active import to cancel")
+
+    cancel_event.set()
+    logger.info("[IMPORT] Cancel signal sent for import %s", import_id)
+
+    # Обновим запись в очереди
+    queue = getattr(request.app.state, "import_queue", [])
+    for rec in queue:
+        if rec.get("import_id") == import_id:
+            rec["status"] = "cancelled"
+            rec["error"] = "Cancelled by user"
+            break
+
+    return {"cancelled": True, "import_id": import_id}

@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
 
 import pytest
 from mcp_server.progress import ImportProgressTracker
@@ -280,5 +279,5 @@ class TestImportProgressTracker:
         # Не должно упасть
         try:
             t.prune_finished()
-        except Exception:
+        except Exception:  # noqa: BLE001
             pytest.fail("prune_finished should never raise")

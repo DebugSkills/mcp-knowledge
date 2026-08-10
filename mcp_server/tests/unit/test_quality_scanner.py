@@ -197,9 +197,17 @@ class TestRunScanCancel:
             # Создаём несколько валидных .md файлов
             for i in range(5):
                 (knowledge_dir / f"entry_{i}.md").write_text(
-                    "---\nknowledge_id: kid-%d\ndomain: eng\nsubject: test\ntags: [t]\n"
+                    f"---\nknowledge_id: kid-{i}\ndomain: eng\nsubject: test\ntags: [t]\n"
                     "created_at: 2026-08-01T10:00:00+03:00\n"
-                    "updated_at: 2026-08-03T10:00:00+03:00\n---\n# Entry %d\n" % (i, i)
+                    f"updated_at: 2026-08-03T10:00:00+03:00\n---\n# Entry {i}\n"
+                )
+
+# Second occurrence (line ~230)
+            for i in range(3):
+                (knowledge_dir / f"entry_{i}.md").write_text(
+                    f"---\nknowledge_id: kid-{i}\ndomain: eng\nsubject: test\ntags: [t]\n"
+                    "created_at: 2026-08-01T10:00:00+03:00\n"
+                    f"updated_at: 2026-08-03T10:00:00+03:00\n---\n# Entry {i}\n"
                 )
 
             # Устанавливаем cancel_event ДО запуска — скан должен прерваться после _scan_filesystem
@@ -228,9 +236,9 @@ class TestRunScanCancel:
             knowledge_dir = Path(tmp)
             for i in range(3):
                 (knowledge_dir / f"entry_{i}.md").write_text(
-                    "---\nknowledge_id: kid-%d\ndomain: eng\nsubject: test\ntags: [t]\n"
+                    f"---\nknowledge_id: kid-{i}\ndomain: eng\nsubject: test\ntags: [t]\n"
                     "created_at: 2026-08-01T10:00:00+03:00\n"
-                    "updated_at: 2026-08-03T10:00:00+03:00\n---\n# Entry %d\n" % (i, i)
+                    f"updated_at: 2026-08-03T10:00:00+03:00\n---\n# Entry {i}\n"
                 )
 
             result = await run_scan(

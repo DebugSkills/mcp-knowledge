@@ -17,7 +17,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from mcp_server.quality.issues import create_issue, set_store_dir
 from mcp_server.tools.quality import (
     _bg_scan,
@@ -331,12 +330,6 @@ class TestRunQualityScan:
     @pytest.mark.asyncio
     async def test_run_scan_prunes_old_finished(self, mock_app_state_with_settings):
         """13.19: при старте нового скана prune_finished() удаляет старые done/error записи."""
-        mock_metrics = {
-            "files_scanned": 2,
-            "review_queue_size": 1,
-            "duplicates_detected": 0,
-            "issues_created": 1,
-        }
         # Старые завершённые записи в трекере (реальный трекер — проверяем prune)
         from mcp_server.progress import ImportProgressTracker
 

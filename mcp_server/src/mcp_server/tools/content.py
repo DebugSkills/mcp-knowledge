@@ -1,4 +1,4 @@
-# ruff: noqa: BLE001, S110
+# ruff: noqa: BLE001, S110, ASYNC230
 """import_content MCP Tool (#16) — импорт крупных текстов в SSOT.
 
 Фаза 5 §5: отдельный tool для декомпозиции + best-effort batch записи.
@@ -13,12 +13,19 @@ Flow:
   7. Partial_success контракт: failed_sections[], cleanup_orphans опция
 
 Tasks: 5.1, 5.4, 5.5
+
+13.21: PDF import queue — submit_import (instant), _bg_import (async task with lock),
+cancel_import (cancel_event), base64 decode path.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import os as _os
+import uuid as _uuid
+from datetime import datetime, timezone
 
 from ..config import settings
 from ..content.linking import build_collection
@@ -46,6 +53,432 @@ def _p(tracker, import_id: str, method: str, *args) -> None:  # type: ignore[no-
         getattr(tracker, method)(import_id, *args)
     except Exception:
         pass
+
+
+# ── 13.21: Import queue (submit + bg task + cancel) ──────────
+
+# In-memory import queue records (сессионная)
+# Поля: import_id, name, status (queued|running|done|error|cancelled),
+# phase (parsing|indexing|done), imported, total, error, created_at, finished_at
+_import_queue: list[dict] = []
+
+
+async def submit_import(params: dict, app_state) -> dict:
+    """Запустить импорт как фоновую задачу (13.21).
+
+    Контракт (как run_quality_scan):
+        {"import_id": "...", "status": "started"} — импорт запущен
+        {"import_id": "...", "status": "queued"} — lock занят, в очереди
+        {"import_id": "...", "status": "error", "error": "..."} — ошибка
+
+    Для book: выполняет синхронно (как раньше).
+    Для pdf: запускает _bg_import.
+    """
+    import_id = params.get("import_id") or _uuid.uuid4().hex[:12]
+    content_type = params.get("content_type", "book")
+    pdf_path = params.get("pdf_path", "")
+    title = params.get("title", "")
+    name = title or (pdf_path.split("/")[-1] if pdf_path else content_type)
+
+    # materialize source_path for pdf
+    source_path = None
+
+    if content_type == "pdf":
+        if pdf_path and _os.path.exists(pdf_path):
+            source_path = pdf_path
+            # If the file is not in our upload dir, copy it so we own the lifecycle
+            if not source_path.startswith("/tmp/pdf_upload"):
+                tmp_dir = "/tmp/pdf_uploads"
+                _os.makedirs(tmp_dir, exist_ok=True)
+                dest = _os.path.join(tmp_dir, f"copy_{import_id}.pdf")
+                import shutil as _shutil
+                _shutil.copy2(source_path, dest)
+                source_path = dest
+        else:
+            # base64-путь: декодируем контент во временный файл
+            content = params.get("content", "")
+            if content:
+                try:
+                    raw = base64.b64decode(content)
+                except Exception:
+                    # может быть не base64 — попробуем как текст
+                    raw = content.encode("utf-8", errors="replace")
+
+                tmp_dir = "/tmp/pdf_uploads"
+                _os.makedirs(tmp_dir, exist_ok=True)
+                source_path = _os.path.join(tmp_dir, f"base64_{import_id}.pdf")
+                with open(source_path, "wb") as f:
+                    f.write(raw)
+                logger.info(
+                    "[IMPORT] base64 decoded: %s (%.1f KB)",
+                    source_path, len(raw) / 1024,
+                )
+            else:
+                return {
+                    "import_id": import_id,
+                    "status": "error",
+                    "error": "PDF import requires 'content' (base64) or 'pdf_path' parameter",
+                }
+
+        params["_source_path"] = source_path
+
+    # book: синхронный возврат (backward compat)
+    if content_type != "pdf":
+        return await import_content(params, app_state)
+
+    # pdf: фоновая задача
+    heavy_ops_lock = getattr(app_state, "heavy_ops_lock", None)
+    if heavy_ops_lock is None:
+        return {"import_id": import_id, "status": "error", "error": "heavy_ops_lock not initialized"}
+
+    # Создаём запись в очереди
+    now = datetime.now(timezone.utc).isoformat()
+    rec = {
+        "import_id": import_id,
+        "name": name,
+        "status": "queued",
+        "phase": "",
+        "imported": 0,
+        "total": 0,
+        "error": None,
+        "created_at": now,
+        "finished_at": None,
+    }
+
+    # Проверяем lock
+    if heavy_ops_lock.locked():
+        rec["status"] = "queued"
+        _import_queue.append(rec)
+        # Синхронизируем с app_state для HTTP endpoint
+        if hasattr(app_state, "import_queue"):
+            app_state.import_queue = _import_queue
+        return {"import_id": import_id, "status": "queued"}
+
+    rec["status"] = "running"
+    _import_queue.append(rec)
+    if hasattr(app_state, "import_queue"):
+        app_state.import_queue = _import_queue
+
+    # Новый cancel_event
+    app_state.import_cancel_event = asyncio.Event()
+
+    task = asyncio.create_task(
+        _bg_import(
+            import_id=import_id,
+            params=params,
+            app_state=app_state,
+            cancel_event=app_state.import_cancel_event,
+            lock=heavy_ops_lock,
+        )
+    )
+    app_state.import_task = task
+
+    logger.info("[IMPORT] task started: %s (name=%s)", import_id, name)
+    return {"import_id": import_id, "status": "started"}
+
+
+async def _bg_import(
+    import_id: str,
+    params: dict,
+    app_state,
+    cancel_event: asyncio.Event,
+    lock: asyncio.Lock,
+) -> None:
+    """Фоновая задача импорта (13.21).
+
+    Паттерн: quality.py _bg_scan.
+    - acquire lock → status=running
+    - phase "parsing": PDFPreprocessor.decompose (checkpoint+OCR)
+    - phase "indexing": batch-write sections → pipeline
+    - finally: cleanup task_ref + temp file [P0-3]
+    """
+    source_path = params.get("_source_path", "")
+    tracker = getattr(app_state, "import_progress", None)
+    content_type = params.get("content_type", "pdf")
+
+    def _update_queue(**kwargs):
+        """Обновить запись в очереди."""
+        for rec in _import_queue:
+            if rec.get("import_id") == import_id:
+                rec.update(kwargs)
+                break
+
+    try:
+        async with lock:
+            _update_queue(status="running", phase="starting")
+
+            # Phase 1: Parsing
+            _update_queue(phase="parsing")
+            _p(tracker, import_id, "set_phase", "parsing")
+
+            domain = params.get("domain", "")
+            subject = params.get("subject", "")
+            title = params.get("title", "")
+            project = params.get("project")
+            tags = params.get("tags", [])
+            cross_subjects = params.get("cross_subjects", [])
+
+            metadata = ImportMeta(
+                domain=domain,
+                subject=subject,
+                project=project,
+                title=title or source_path.split("/")[-1] if source_path else "pdf_import",
+                tags=tags,
+                cross_subjects=cross_subjects,
+                source_path=source_path,
+            )
+
+            preprocessor = get_preprocessor(content_type)
+
+            # Validate
+            validation = preprocessor.validate("", metadata)
+            if not validation.valid:
+                err = f"Content validation failed: {validation.error}"
+                _update_queue(status="error", error=err)
+                _p(tracker, import_id, "error", err)
+                return
+
+            # Decompose (with cancel_event)
+            try:
+                sections = await preprocessor.decompose("", metadata, cancel_event=cancel_event)
+            except asyncio.CancelledError:
+                _update_queue(status="cancelled", error="Cancelled during parsing")
+                _p(tracker, import_id, "error", "Cancelled during parsing")
+                return
+
+            if not sections:
+                _update_queue(status="error", error="Decomposition produced 0 sections")
+                return
+
+            _update_queue(total=len(sections))
+
+            # Cancel check before indexing
+            if cancel_event.is_set():
+                _update_queue(status="cancelled", error="Cancelled before indexing")
+                return
+
+            # Phase 2: Indexing (reuse existing batch-write)
+            _update_queue(phase="indexing")
+            _p(tracker, import_id, "set_phase", "indexing")
+
+            result = await _batch_write_sections(
+                sections=sections,
+                params=params,
+                app_state=app_state,
+                import_id=import_id,
+                cancel_event=cancel_event,
+            )
+
+            if result.get("error"):
+                _update_queue(status="error", error=result["error"])
+            elif result.get("partial_success"):
+                _update_queue(
+                    status="done",
+                    phase="done",
+                    imported=result.get("imported", 0),
+                    total=result.get("imported", 0),
+                    error=f"Partial: {result.get('failed', 0)} sections failed",
+                )
+            else:
+                _update_queue(
+                    status="done",
+                    phase="done",
+                    imported=result.get("imported", 0),
+                    total=result.get("imported", 0),
+                )
+
+            _update_queue(finished_at=datetime.now(timezone.utc).isoformat())
+
+            logger.info(
+                "[IMPORT] done import=%s imported=%d failed=%d",
+                import_id, result.get("imported", 0), result.get("failed", 0),
+            )
+
+    except asyncio.CancelledError:
+        logger.info("[IMPORT] task cancelled (shutdown): %s", import_id)
+        _update_queue(status="cancelled", error="Server shutdown")
+    except Exception as exc:
+        logger.exception("[IMPORT] task failed: %s", import_id)
+        _update_queue(status="error", error=str(exc))
+    finally:
+        # [P0-3] Cleanup temp file — only if in /tmp/ (server-owned temp files)
+        if source_path and _os.path.exists(source_path) and source_path.startswith("/tmp/"):
+            try:
+                _os.unlink(source_path)
+                logger.info("[IMPORT] temp file deleted: %s", source_path)
+            except OSError as e:
+                logger.warning("[IMPORT] failed to delete temp file %s: %s", source_path, e)
+
+        # Cleanup task reference
+        try:
+            app_state.import_task = None
+            app_state.import_cancel_event = None
+        except Exception:
+            pass
+
+
+async def _batch_write_sections(
+    sections,
+    params: dict,
+    app_state,
+    import_id: str,
+    cancel_event: asyncio.Event,
+) -> dict:
+    """Выделенный хелпер: batch-write секций (reuse из import_content)."""
+    store = app_state.store
+    pipeline = app_state.pipeline
+    tracker = getattr(app_state, "import_progress", None)
+
+    domain = params.get("domain", "")
+    subject = params.get("subject", "")
+    title = params.get("title", "")
+    project = params.get("project")
+    tags = params.get("tags", [])
+    cross_subjects = params.get("cross_subjects", [])
+    params.get("cleanup_orphans", False)
+    params.get("wait_for_index", False)
+
+    if not title:
+        title = f"{domain}/{subject} pdf"
+
+    # Collect knowledge_ids
+    section_titles = [s.title for s in sections]
+    section_ids = [s.meta["knowledge_id"] for s in sections]
+
+    collection = build_collection(
+        domain=domain,
+        subject=subject,
+        project=project,
+        title=title,
+        section_titles=section_titles,
+        section_ids=section_ids,
+        tags=tags,
+        cross_subjects=cross_subjects,
+    )
+
+    # Write root collection
+    try:
+        root_fm = collection.to_frontmatter()
+        root_entry = KnowledgeEntry(
+            frontmatter=root_fm,
+            content=f"# {title}\n\nКоллекция импортированных секций. Оглавление — в frontmatter.children.",
+        )
+        await store.write_entry(root_entry)
+        await pipeline.enqueue(root_entry, wait_for_index=False)
+    except Exception as e:
+        return {"error": f"Failed to create collection root: {e}"}
+
+    imported = 0
+    failed = 0
+    failed_sections: list[dict] = []
+
+    for i, section in enumerate(sections):
+        # Cancel check
+        if cancel_event.is_set():
+            break
+
+        try:
+            meta = section.meta
+            fm = KnowledgeFrontmatter(
+                knowledge_id=meta["knowledge_id"],
+                domain=meta["domain"],
+                subject=meta["subject"],
+                project=meta.get("project"),
+                content_type=meta.get("content_type", "book"),
+                parent_knowledge_id=collection.knowledge_id,
+                sequence_number=section.sequence_number,
+                tags=section.tags,
+                cross_subjects=meta.get("cross_subjects", []),
+            )
+            entry = KnowledgeEntry(frontmatter=fm, content=section.body)
+            await store.write_entry(entry)
+
+            try:
+                await pipeline.enqueue(entry, wait_for_index=False)
+            except Exception:
+                pass  # best-effort
+
+            imported += 1
+            _p(tracker, import_id, "section_done", section.sequence_number, section.title)
+
+            if imported % IMPORT_BATCH_COMMIT == 0:
+                _p(tracker, import_id, "log", "info",
+                   f"{imported}/{len(sections)} sections written")
+
+            if imported % settings.IMPORT_PERIODIC_COMMIT == 0:
+                try:
+                    await store.flush(
+                        f"import_content: {collection.knowledge_id} "
+                        f"periodic commit ({imported}/{len(sections)})"
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            failed += 1
+            failed_sections.append({
+                "sequence_number": section.sequence_number,
+                "title": section.title,
+                "error": str(e),
+            })
+
+    # Final git commit
+    try:
+        await store.flush(
+            f"import_content: {collection.knowledge_id} ({imported} sections)"
+        )
+    except Exception:
+        pass
+
+    # INDEX update
+    knowledge_index = getattr(app_state, "knowledge_index", None)
+    if knowledge_index:
+        try:
+            knowledge_index.update_section(domain)
+        except Exception:
+            pass
+
+    # data_version increment
+    try:
+        app_state.data_version += 1
+    except Exception:
+        pass
+
+    partial_success = failed > 0
+
+    return {
+        "collection_id": collection.knowledge_id,
+        "imported": imported,
+        "failed": failed,
+        "failed_sections": failed_sections,
+        "partial_success": partial_success,
+    }
+
+
+async def cancel_import(params: dict, app_state) -> dict:
+    """Отменить активный импорт (13.21).
+
+    Устанавливает import_cancel_event → _bg_import проверяет между фазами.
+
+    Returns:
+        {"cancelled": True, "import_id": "..."}
+        {"cancelled": False, "reason": "..."}
+    """
+    cancel_event = getattr(app_state, "import_cancel_event", None)
+    if cancel_event is None:
+        return {"cancelled": False, "reason": "no active import"}
+
+    cancel_event.set()
+    import_id = params.get("import_id", "")
+    logger.info("[IMPORT] cancel signal sent for import %s", import_id)
+
+    # Обновим очередь
+    for rec in _import_queue:
+        if import_id and rec.get("import_id") == import_id:
+            rec["status"] = "cancelled"
+            rec["error"] = "Cancelled by user"
+            break
+
+    return {"cancelled": True, "import_id": import_id}
 
 
 async def _collect_quality_report(
@@ -163,6 +596,31 @@ async def import_content(params: dict, app_state) -> dict:
     # ── Progress tracker (Фаза 13.9) ────────────────────────
     tracker = getattr(app_state, "import_progress", None)
 
+    # ── PDF path (13.21) — source_path для бинарных типов ──
+    pdf_path = params.get("pdf_path", "")
+    source_path: str | None = None
+
+    if content_type == "pdf" and not content:
+        return {"error": "PDF import requires 'content' (base64 encoded PDF) or 'pdf_path' parameter"}
+    if content_type == "pdf" and pdf_path and _os.path.exists(pdf_path):
+        source_path = pdf_path
+    elif content_type == "pdf" and content:
+        # Decode base64 → temp file
+        try:
+            raw = base64.b64decode(content)
+        except Exception:
+            raw = content.encode("utf-8", errors="replace")
+        tmp_dir = "/tmp/pdf_uploads"
+        _os.makedirs(tmp_dir, exist_ok=True)
+        source_path = _os.path.join(tmp_dir, f"mcp_{_uuid.uuid4().hex[:12]}.pdf")
+        with open(source_path, "wb") as f:
+            f.write(raw)
+        import_id = import_id or _uuid.uuid4().hex[:12]
+        logger.info(
+            "[IMPORT] base64 decoded for MCP: %s (%.1f KB)",
+            source_path, len(raw) / 1024,
+        )
+
     # ── Валидация обязательных параметров ──────────────────
     quality_issues: list[dict] = []
     quality_warnings: list[str] = []
@@ -204,6 +662,7 @@ async def import_content(params: dict, app_state) -> dict:
         title=title or content_type.capitalize(),
         tags=tags,
         cross_subjects=cross_subjects,
+        source_path=source_path,
     )
 
     validation = preprocessor.validate(content, metadata)
@@ -215,7 +674,13 @@ async def import_content(params: dict, app_state) -> dict:
 
     # ── Декомпозиция ────────────────────────────────────────
     try:
-        sections = await preprocessor.decompose(content, metadata)
+        cancel_event = getattr(app_state, "import_cancel_event", None)
+        if content_type == "pdf":
+            sections = await preprocessor.decompose(content, metadata, cancel_event=cancel_event)
+        else:
+            sections = await preprocessor.decompose(content, metadata)
+    except asyncio.CancelledError:
+        return {"error": "Import cancelled", "import_id": import_id}
     except Exception as e:
         logger.exception("Decomposition failed")
         return {"error": f"Decomposition failed: {e}"}
@@ -529,4 +994,12 @@ async def import_content(params: dict, app_state) -> dict:
         app_state.data_version += 1
     except Exception:
         pass  # best-effort
+
+    # [P0-3] Cleanup mcp_ temp file (base64 decoded)
+    if source_path and source_path.startswith("/tmp/pdf_uploads/mcp_"):
+        try:
+            _os.unlink(source_path)
+        except OSError:
+            pass
+
     return result

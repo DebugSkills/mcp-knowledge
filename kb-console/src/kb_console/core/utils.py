@@ -6,11 +6,12 @@ from pathlib import Path
 
 from nicegui import ui
 
-# Расширения, поддерживаемые файловым импортом (.md/.txt, PDF — в перспективе).
-SUPPORTED_EXTENSIONS = {".md", ".markdown", ".txt"}
-# Максимальный размер файла для импорта, байт (50 МБ — учебники).
-# Формула: MAX_FILE_SIZE ≤ MCP_MAX_REQUEST_SIZE(128MB) − 20% JSON-overhead = 102MB.
-# 50MB — консервативно, с запасом на content_type/metadata/JSON-encoding overhead.
+# Расширения, поддерживаемые файловым импортом (.md/.txt/.pdf).
+SUPPORTED_EXTENSIONS = {".md", ".markdown", ".txt", ".pdf"}
+# Маркер для PDF-файлов — не декодируются как текст (13.21)
+PDF_BINARY_MARKER = "__PDF_BINARY__"
+# Максимальный размер файла для текстового импорта, байт (50 МБ).
+# PDF-файлы передаются через multipart — лимит на сервере (100MB).
 MAX_FILE_SIZE = 52_428_800
 
 # Уровни логов импорта → CSS-классы (канонический источник, синхронизирован
@@ -61,14 +62,16 @@ def render_import_progress(snapshot: dict, container: ui.element) -> None:
 
 
 def _read_uploaded_file(name: str, data: bytes) -> tuple[str | None, str | None]:
-    """Прочитать загруженный файл в текст.
+    """Прочитать загруженный файл в текст (или PDF-маркер для .pdf).
 
     Returns:
-        (content, error): success → (text, None); failure → (None, error_msg).
+        (content, error): success → (text, None); PDF → (PDF_BINARY_MARKER, None); failure → (None, error_msg).
     """
     ext = Path(name).suffix.lower()
     if ext not in SUPPORTED_EXTENSIONS:
-        return None, f"Неподдерживаемый тип файла «{ext or 'без расширения'}». Ожидаются: .md, .markdown, .txt"
+        return None, f"Неподдерживаемый тип файла «{ext or 'без расширения'}». Ожидаются: .md, .markdown, .txt, .pdf"
+    if ext == ".pdf":
+        return PDF_BINARY_MARKER, None
     if len(data) > MAX_FILE_SIZE:
         return None, f"Файл слишком большой (макс. {MAX_FILE_SIZE // 1_048_576} МБ)"
     try:

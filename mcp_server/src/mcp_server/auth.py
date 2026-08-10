@@ -59,6 +59,7 @@ WRITE_TOOLS: set[str] = {
 # ── Import tools (MCP_IMPORT_KEYS: read + import_content, без delete/reindex) ──
 IMPORT_TOOLS: set[str] = {
     "import_content",
+    "cancel_import",
 }
 
 # ── Methods, не требующие аутентификации ─────────────────

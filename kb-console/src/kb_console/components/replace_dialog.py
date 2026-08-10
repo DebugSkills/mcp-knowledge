@@ -104,7 +104,7 @@ async def show_replace_dialog(
             on_rejected=on_rejected,
             auto_upload=True,
             max_file_size=MAX_FILE_SIZE,
-        ).props('accept=".md,.markdown,.txt"').classes("w-full")
+        ).props('accept=".md,.markdown,.txt,.pdf"').classes("w-full")
 
         # ── Domain / Subject (pre-fill из метаданных книги) ──
         domain_input = ui.input(label="Домен", value=domain).classes("w-full q-mt-sm")

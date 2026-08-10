@@ -334,10 +334,17 @@ class TestReadUploadedFile:
     def test_unsupported_ext(self):
         """Неподдерживаемое расширение — возвращает (None, error_msg)."""
         from kb_console.core.utils import _read_uploaded_file
-        content, error = _read_uploaded_file("test.pdf", b"%PDF")
+        content, error = _read_uploaded_file("test.docx", b"%PDF")
         assert content is None
         assert error is not None
         assert "Неподдерживаемый" in error
+
+    def test_pdf_returns_binary_marker(self):
+        """PDF (поддерживается с 13.21 Ф3) — возвращает PDF_BINARY_MARKER, не decode."""
+        from kb_console.core.utils import PDF_BINARY_MARKER, _read_uploaded_file
+        content, error = _read_uploaded_file("test.pdf", b"%PDF-1.7 binary")
+        assert content == PDF_BINARY_MARKER
+        assert error is None
 
     def test_too_large(self):
         """Превышение MAX_FILE_SIZE — возвращает (None, error_msg)."""

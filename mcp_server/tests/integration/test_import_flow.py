@@ -207,14 +207,14 @@ Functions should be small. They should do one thing and do it well.
         result = await import_content(
             {
                 "content": "test",
-                "content_type": "pdf",
+                "content_type": "docx",
                 "domain": "eng",
                 "subject": "sub",
             },
             app_state,
         )
         assert "error" in result
-        assert "pdf" in result["error"]
+        assert "docx" in result["error"]
 
     @pytest.mark.asyncio
     async def test_empty_content_returns_error(self, real_store, mock_pipeline_integ):

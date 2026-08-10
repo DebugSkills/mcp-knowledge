@@ -329,7 +329,6 @@ Another paragraph with more words here for testing coverage.
         from unittest.mock import patch
 
         from mcp_server.content.splitting import (
-            CLUSTER_MAX_PARAGRAPHS,
             hybrid_split,
         )
 

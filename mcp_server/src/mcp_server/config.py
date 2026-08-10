@@ -79,6 +79,18 @@ class Settings(BaseSettings):
     # Финальный flush ВСЕГДА в конце импорта.
     IMPORT_PERIODIC_COMMIT: int = 100
 
+    # ── PDF Import (13.21) ───────────────────────────────────
+    # Лимиты размера и страниц для PDF-импорта (валидация в PDFPreprocessor)
+    MAX_PDF_PAGES: int = 2000
+    MAX_PDF_FILE_SIZE: int = 104_857_600  # 100 MB
+
+    # Кеш извлечённого текста PDF (resume checkpoint — Фаза 2.2)
+    PDF_IMPORT_CACHE_DIR: str = "/app/data/pdf_cache"
+
+    # [P0-2] Checkpoint cleanup: предотвращение disk exhaustion
+    PDF_IMPORT_CACHE_MAX_AGE_DAYS: int = 30
+    PDF_IMPORT_CACHE_MAX_SIZE_MB: int = 500
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         if self.WORKERS != 1:

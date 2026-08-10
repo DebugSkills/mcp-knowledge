@@ -7,6 +7,7 @@
   4. Нажимаем «Добавить» → import_content на MCP
 """
 
+# ruff: noqa: ASYNC230
 from __future__ import annotations
 
 import time
@@ -20,6 +21,7 @@ from ..config import MCP_API_KEY, MCP_SERVER_URL
 from ..core.mcp_client import MCPClient
 from ..core.utils import (
     MAX_FILE_SIZE,
+    PDF_BINARY_MARKER,
     _read_uploaded_file,
     _sanitize_title,
     render_import_progress,
@@ -78,7 +80,47 @@ def build_import() -> None:
 
             filename = e.file.name
             raw = await e.file.read()
-            print(f"[IMPORT-UPLOAD] file={filename} size={len(raw)}B")
+            ext = Path(filename).suffix.lower()
+            print(f"[IMPORT-UPLOAD] file={filename} size={len(raw)}B ext={ext}")
+
+            if ext == ".pdf":
+                # PDF: multipart upload через POST /upload
+                import os
+                import tempfile
+                # Сохраняем raw bytes во временный файл для upload_pdf
+                tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="kb_upload_")
+                os.close(tmp_fd)
+                with open(tmp_path, "wb") as f:
+                    f.write(raw)
+                try:
+                    client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+                    upload_result = await client.upload_pdf(tmp_path, filename)
+                    await client.close()
+                    pdf_path = upload_result.get("pdf_path", "")
+                    pending_file = {
+                        "name": filename,
+                        "size": len(raw),
+                        "content": PDF_BINARY_MARKER,
+                        "pdf_path": pdf_path,
+                        "import_id": upload_result.get("upload_id", ""),
+                    }
+                    file_status_label.set_text(
+                        f"📄 {filename} — {len(raw) / 1_048_576:.1f} МБ (PDF загружен на сервер)"
+                    )
+                    title_input.value = Path(filename).stem
+                    analyze_btn.disable()
+                    import_btn.enable()
+                    ui.notify(f"«{filename}» PDF загружен на сервер", type="positive")
+                except Exception as upload_err:
+                    ui.notify(f"Ошибка загрузки PDF: {upload_err}", type="negative")
+                    print(f"[IMPORT-UPLOAD] PDF upload failed: {upload_err}")
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                return
+
             text, error = _read_uploaded_file(filename, raw)
             if error is not None:
                 print(f"[IMPORT-UPLOAD] REJECTED: {error}")
@@ -108,7 +150,7 @@ def build_import() -> None:
             on_rejected=on_rejected,
             auto_upload=True,
             max_file_size=MAX_FILE_SIZE,
-        ).props('accept=".md,.markdown,.txt"').classes("w-full").tooltip(
+        ).props('accept=".md,.markdown,.txt,.pdf"').classes("w-full").tooltip(
             "Выберите файл — контент останется в памяти, кнопка «Обработать» предложит домен/предмет/теги"
         )
 
@@ -135,7 +177,7 @@ def build_import() -> None:
     with ui.row().classes("gap-4"):
         content_type = ui.select(
             label="Тип контента",
-            options=["book"],
+            options=["book", "pdf"],
             value="book",
         ).classes("w-48")
 
@@ -445,6 +487,11 @@ def build_import() -> None:
             "domain": domain,
             "subject": subject,
         }
+        # PDF: передаём pdf_path вместо текста контента
+        if content_type.value == "pdf" and pending_file and pending_file.get("pdf_path"):
+            params["content"] = ""
+            params["pdf_path"] = pending_file["pdf_path"]
+            params["content_type"] = "pdf"
         # Санитизированный title (пустой → сервер генерит авто)
         title = _sanitize_title(title_input.value or "")
         if title:

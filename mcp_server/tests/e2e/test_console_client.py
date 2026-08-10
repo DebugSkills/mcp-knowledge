@@ -57,7 +57,7 @@ class TestMCPClientE2E:
         )
         try:
             tools = await client.tools_list()
-            assert len(tools) == 20, f"Expected 20 tools, got {len(tools)}"
+            assert len(tools) == 21, f"Expected 21 tools, got {len(tools)}"
             tool_names = {t["name"] for t in tools}
             assert "search_knowledge" in tool_names
             assert "import_content" in tool_names

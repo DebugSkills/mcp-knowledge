@@ -20,6 +20,7 @@ class ImportMeta:
     title: str | None = None
     tags: list[str] = field(default_factory=list)
     cross_subjects: list[str] = field(default_factory=list)
+    source_path: str | None = None  # путь к бинарному файлу на диске (для PDF и др.)
 
 
 @dataclass
@@ -60,5 +61,5 @@ class ContentPreprocessor(ABC):
         """Проверка пригодности контента (non-empty, размер, кодировка)."""
 
     @abstractmethod
-    def decompose(self, content: str, metadata: ImportMeta) -> list[Section]:
+    async def decompose(self, content: str, metadata: ImportMeta) -> list[Section]:
         """Декомпозиция контента в упорядоченный список семантических секций."""
