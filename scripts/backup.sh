@@ -27,27 +27,46 @@ get_collection_points() {
 }
 
 # --- Qdrant snapshot ---
+# 2026-08-09: снапшот ВСЕХ коллекций, КРОМЕ ws-*.
+# Решение владельца (docs/qdrant-ws-collections-message.md в feature/Svyazi):
+# коллекции ws-* НЕ принадлежат Svyazi (подтверждено, 2026-08-09) — они чужие,
+# в бэкапы mcp-knowledge не включаются. Снапшотим только свои (knowledge и др.).
 create_qdrant_snapshot() {
-    echo "[$(date -Iseconds)] Creating Qdrant snapshot..."
-    local resp
-    resp=$(curl -s -X POST "${QDDRANT_URL}/collections/knowledge/snapshots" \
-        -H "Content-Type: application/json" \
-        -d '{"name": "backup-'"${TIMESTAMP}"'"}' 2>&1) || {
+    echo "[$(date -Iseconds)] Creating Qdrant snapshots (excluding ws-*)..."
+    local collections
+    collections=$(curl -s "${QDDRANT_URL}/collections" \
+        | python3 -c "import sys,json; print(' '.join(c['name'] for c in json.load(sys.stdin)['result']['collections'] if not c['name'].startswith('ws-')))" 2>/dev/null)
+    if [ -z "$collections" ]; then
         echo "WARN: Qdrant snapshot failed (server not running?). Skipping."
         return 1
-    }
-    echo "[$(date -Iseconds)] Qdrant snapshot: backup-${TIMESTAMP}"
-    echo "    API response: ${resp}"
-
-    # Validate the snapshot after creation
-    validate_snapshot "backup-${TIMESTAMP}" || return 1
+    fi
+    echo "    Collections: ${collections}"
+    local c ok=1
+    for c in $collections; do
+        local resp actual
+        resp=$(curl -s -X POST "${QDDRANT_URL}/collections/${c}/snapshots" \
+            -H "Content-Type: application/json" \
+            -d '{"name": "backup-'"${TIMESTAMP}"'"}' 2>&1)
+        # Qdrant игнорирует переданный name и генерирует фактическое имя файла
+        # ({collection}-{id}-{timestamp}.snapshot) — берём его из ответа API.
+        actual=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['name'])" 2>/dev/null)
+        if [ -n "$actual" ]; then
+            echo "    ✔ ${c}: ${actual}"
+            validate_snapshot "${c}" "${actual}" || ok=0
+        else
+            echo "    ✖ ${c}: ${resp}"
+            ok=0
+        fi
+    done
+    return $ok
 }
 
 # --- Snapshot validation (G1.1) ---
-# validate_snapshot <snapshot_name>
+# validate_snapshot <collection> <snapshot_name>
 validate_snapshot() {
-    local snapshot_name="$1"
-    local snapshot_file="${SNAPSHOT_DIR}/knowledge/${snapshot_name}"
+    local collection="$1"
+    local snapshot_name="$2"
+    local snapshot_file="${SNAPSHOT_DIR}/${collection}/${snapshot_name}"
 
     echo "[$(date -Iseconds)] Validating snapshot: ${snapshot_name}..."
 
@@ -82,19 +101,21 @@ test_restore() {
     echo ""
 
     # Step 1: Create a fresh snapshot for testing
-    local test_snapshot="test-restore-${TIMESTAMP}"
-    echo "[$(date -Iseconds)] Step 1/5: Creating test snapshot '${test_snapshot}'..."
-    local snapshot_resp
+    echo "[$(date -Iseconds)] Step 1/5: Creating test snapshot 'test-restore-${TIMESTAMP}'..."
+    local snapshot_resp test_snapshot
     snapshot_resp=$(curl -s -X POST "${QDDRANT_URL}/collections/knowledge/snapshots" \
         -H "Content-Type: application/json" \
-        -d '{"name": "'"${test_snapshot}"'"}' 2>&1) || {
+        -d '{"name": "test-restore-'"${TIMESTAMP}"'"}' 2>&1) || {
         echo "ERROR: Failed to create snapshot for test restore. Is Qdrant running?"
         return 1
     }
+    # Qdrant генерирует фактическое имя файла — берём из ответа API
+    test_snapshot=$(echo "$snapshot_resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['name'])" 2>/dev/null)
+    echo "    Actual snapshot: ${test_snapshot}"
     echo "    Response: ${snapshot_resp}"
 
     # Step 1b: Validate the snapshot
-    validate_snapshot "${test_snapshot}" || return 1
+    validate_snapshot "knowledge" "${test_snapshot}" || return 1
     echo ""
 
     # Step 2: Get point count of the original collection
@@ -113,7 +134,7 @@ test_restore() {
     local restore_resp
     restore_resp=$(curl -s -X PUT "${QDDRANT_URL}/collections/${test_collection}/snapshots/recover" \
         -H "Content-Type: application/json" \
-        -d '{"location": "file:///qdrant/snapshots/knowledge/'"${test_snapshot}"'"}' 2>&1) || {
+        -d '{"location": "file:///qdrant/storage/snapshots/knowledge/'"${test_snapshot}"'"}' 2>&1) || {
         echo "ERROR: Failed to restore snapshot to '${test_collection}'"
         return 1
     }
@@ -190,7 +211,11 @@ backup_ssot_tar() {
 rotate_backups() {
     echo "[$(date -Iseconds)] Rotating backups older than ${RETENTION_DAYS} days..."
     find "$BACKUP_DIR" -name "knowledge-*.tar.gz" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
-    # Qdrant snapshots хранятся в Qdrant; ротация — через API (опционально)
+    # 2026-08-09: ротация Qdrant-снапшотов (раньше копились бесконечно).
+    # Файлы снапшотов теперь в bind-mount (data/qdrant/snapshots) — удаляем по mtime.
+    find "$SNAPSHOT_DIR" -name "backup-*.snapshot" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
+    # остаточные .checksum файлы
+    find "$SNAPSHOT_DIR" -name "backup-*.snapshot.checksum" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
 }
 
 # --- Main ---

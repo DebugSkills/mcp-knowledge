@@ -30,6 +30,14 @@
 **Применимость:** потеря/повреждение векторного индекса, сбой коллекции, миграция на новый хост.
 SSOT-данные (Markdown в `knowledge/`) **не затронуты**.
 
+> **2026-08-09:** `scripts/backup.sh` снапшотит все коллекции mcp-knowledge,
+> **кроме `ws-*`** (решение владельца: Svyazi подтвердил, что `ws-*` — чужие,
+> см. `docs/qdrant-ws-collections-message.md` в feature/Svyazi).
+> Файлы снапшотов пишутся в bind-mount `data/qdrant/snapshots/<collection>/` (env
+> `QDRANT__STORAGE__SNAPSHOTS_PATH=/qdrant/storage/snapshots` в docker-compose.yml).
+> Раньше Qdrant писал снапшоты в `/qdrant/snapshots` (слой контейнера) — они терялись
+> при пересоздании контейнера и не попадали в rsync-бэкап.
+
 ### Шаги
 
 #### 1.1. Остановить mcp-server
@@ -56,7 +64,7 @@ SNAPSHOT_NAME="backup-20260803-030000"  # замените на актуальн
 curl -s -X PUT \
   "http://localhost:6333/collections/knowledge/snapshots/recover" \
   -H "Content-Type: application/json" \
-  -d '{"location": "file:///qdrant/snapshots/knowledge/'"${SNAPSHOT_NAME}"'"}'
+  -d '{"location": "file:///qdrant/storage/snapshots/knowledge/'"${SNAPSHOT_NAME}"'"}'
 ```
 
 > **Важно:** Qdrant обрабатывает восстановление **асинхронно**. Подождите 5–10 секунд после ответа API.
@@ -183,7 +191,7 @@ SNAPSHOT_NAME="backup-20260803-030000"
 curl -s -X PUT \
   "http://localhost:6333/collections/knowledge/snapshots/recover" \
   -H "Content-Type: application/json" \
-  -d '{"location": "file:///qdrant/snapshots/knowledge/'"${SNAPSHOT_NAME}"'"}'
+  -d '{"location": "file:///qdrant/storage/snapshots/knowledge/'"${SNAPSHOT_NAME}"'"}'
 
 # 3. Запустить mcp-server
 docker compose start mcp-server

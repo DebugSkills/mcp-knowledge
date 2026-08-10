@@ -14,6 +14,11 @@ services:
       - "6333:6333"   # REST (gRPC 6334 наружу не пробрасываем — как в текущем dev)
     volumes:
       - ./data/qdrant:/qdrant/storage
+    environment:
+      # 2026-08-09: снапшоты должны писаться В bind-mount (./data/qdrant/snapshots),
+      # иначе Qdrant кладёт их в /qdrant/snapshots (слой контейнера) — они теряются
+      # при --force-recreate и не попадают в rsync-бэкап kvm-mcp-knowledge.
+      - QDRANT__STORAGE__SNAPSHOTS_PATH=/qdrant/storage/snapshots
     # В образе v1.13.4 НЕТ curl/wget → healthcheck через bash /dev/tcp
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/6333'"]
