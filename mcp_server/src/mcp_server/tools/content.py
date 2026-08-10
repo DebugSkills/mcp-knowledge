@@ -140,6 +140,7 @@ async def submit_import(params: dict, app_state) -> dict:
         "phase": "",
         "imported": 0,
         "total": 0,
+        "collection_id": "",
         "error": None,
         "created_at": now,
         "finished_at": None,
@@ -148,6 +149,7 @@ async def submit_import(params: dict, app_state) -> dict:
     # Проверяем lock
     if heavy_ops_lock.locked():
         rec["status"] = "queued"
+        rec["_params"] = params  # для отложенного запуска (продвижение очереди)
         _import_queue.append(rec)
         # Синхронизируем с app_state для HTTP endpoint
         if hasattr(app_state, "import_queue"):
@@ -209,6 +211,8 @@ async def _bg_import(
 
             # Phase 1: Parsing
             _update_queue(phase="parsing")
+            # Bug A fix: tracker.start() создаёт запись, без неё set_phase/get — no-op → GET /progress 404
+            _p(tracker, import_id, "start", 0, {"file": params.get("title", ""), "content_type": content_type})
             _p(tracker, import_id, "set_phase", "parsing")
 
             domain = params.get("domain", "")
@@ -234,7 +238,7 @@ async def _bg_import(
             validation = preprocessor.validate("", metadata)
             if not validation.valid:
                 err = f"Content validation failed: {validation.error}"
-                _update_queue(status="error", error=err)
+                _update_queue(status="error", error=err, collection_id="")
                 _p(tracker, import_id, "error", err)
                 return
 
@@ -242,19 +246,19 @@ async def _bg_import(
             try:
                 sections = await preprocessor.decompose("", metadata, cancel_event=cancel_event)
             except asyncio.CancelledError:
-                _update_queue(status="cancelled", error="Cancelled during parsing")
+                _update_queue(status="cancelled", error="Cancelled during parsing", collection_id="")
                 _p(tracker, import_id, "error", "Cancelled during parsing")
                 return
 
             if not sections:
-                _update_queue(status="error", error="Decomposition produced 0 sections")
+                _update_queue(status="error", error="Decomposition produced 0 sections", collection_id="")
                 return
 
             _update_queue(total=len(sections))
 
             # Cancel check before indexing
             if cancel_event.is_set():
-                _update_queue(status="cancelled", error="Cancelled before indexing")
+                _update_queue(status="cancelled", error="Cancelled before indexing", collection_id="")
                 return
 
             # Phase 2: Indexing (reuse existing batch-write)
@@ -270,22 +274,26 @@ async def _bg_import(
             )
 
             if result.get("error"):
-                _update_queue(status="error", error=result["error"])
+                _update_queue(status="error", error=result["error"], collection_id=result.get("collection_id", ""))
             elif result.get("partial_success"):
                 _update_queue(
                     status="done",
                     phase="done",
                     imported=result.get("imported", 0),
                     total=result.get("imported", 0),
+                    collection_id=result.get("collection_id", ""),
                     error=f"Partial: {result.get('failed', 0)} sections failed",
                 )
+                _p(tracker, import_id, "done", {"imported": result.get("imported", 0), "collection_id": result.get("collection_id", "")})
             else:
                 _update_queue(
                     status="done",
                     phase="done",
                     imported=result.get("imported", 0),
                     total=result.get("imported", 0),
+                    collection_id=result.get("collection_id", ""),
                 )
+                _p(tracker, import_id, "done", {"imported": result.get("imported", 0), "collection_id": result.get("collection_id", "")})
 
             _update_queue(finished_at=datetime.now(timezone.utc).isoformat())
 
@@ -296,10 +304,10 @@ async def _bg_import(
 
     except asyncio.CancelledError:
         logger.info("[IMPORT] task cancelled (shutdown): %s", import_id)
-        _update_queue(status="cancelled", error="Server shutdown")
+        _update_queue(status="cancelled", error="Server shutdown", collection_id="")
     except Exception as exc:
         logger.exception("[IMPORT] task failed: %s", import_id)
-        _update_queue(status="error", error=str(exc))
+        _update_queue(status="error", error=str(exc), collection_id="")
     finally:
         # [P0-3] Cleanup temp file — only if in /tmp/ (server-owned temp files)
         if source_path and _os.path.exists(source_path) and source_path.startswith("/tmp/"):
@@ -315,6 +323,12 @@ async def _bg_import(
             app_state.import_cancel_event = None
         except Exception:
             pass
+
+        # Продвижение очереди: запустить следующий queued импорт (если есть)
+        try:
+            _start_next_import(app_state)
+        except Exception as e:
+            logger.warning("[IMPORT] queue advance failed: %s", e)
 
 
 async def _batch_write_sections(
@@ -452,6 +466,36 @@ async def _batch_write_sections(
         "failed_sections": failed_sections,
         "partial_success": partial_success,
     }
+
+
+def _start_next_import(app_state) -> None:
+    """Запустить первый queued импорт после завершения текущего (продвижение очереди)."""
+    for rec in _import_queue:
+        if rec.get("status") != "queued":
+            continue
+        import_id = rec["import_id"]
+        params = rec.get("_params")
+        if params is None:
+            rec["status"] = "error"
+            rec["error"] = "queue params lost (retry import)"
+            logger.warning("[IMPORT] queued %s lost params — skipped", import_id)
+            continue
+        rec.pop("_params", None)
+        rec["status"] = "running"
+        # Новый cancel_event
+        app_state.import_cancel_event = asyncio.Event()
+        task = asyncio.create_task(
+            _bg_import(
+                import_id=import_id,
+                params=params,
+                app_state=app_state,
+                cancel_event=app_state.import_cancel_event,
+                lock=app_state.heavy_ops_lock,
+            )
+        )
+        app_state.import_task = task
+        logger.info("[IMPORT] queue advanced: %s (next from queue)", import_id)
+        return
 
 
 async def cancel_import(params: dict, app_state) -> dict:
@@ -598,6 +642,14 @@ async def import_content(params: dict, app_state) -> dict:
 
     # ── PDF path (13.21) — source_path для бинарных типов ──
     pdf_path = params.get("pdf_path", "")
+
+    # ── PDF: асинхронная очередь (13.21 Фаза 3) ──────────────
+    # submit_import запускает фоновую задачу с heavy_ops_lock (1 импорт за раз),
+    # фазами parsing→indexing, cancel_event и checkpoint-resume.
+    # Возвращает {"import_id": ..., "status": "started"|"queued"} мгновенно.
+    if content_type == "pdf":
+        return await submit_import(params, app_state)
+
     source_path: str | None = None
 
     if content_type == "pdf" and not content:

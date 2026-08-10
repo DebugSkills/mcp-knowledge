@@ -10,6 +10,7 @@
 # ruff: noqa: ASYNC230
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from datetime import UTC, datetime
@@ -17,6 +18,7 @@ from pathlib import Path
 
 from nicegui import ui
 
+from ..components.queue_console import build_import_queue
 from ..config import MCP_API_KEY, MCP_SERVER_URL
 from ..core.mcp_client import MCPClient
 from ..core.utils import (
@@ -108,6 +110,7 @@ def build_import() -> None:
                         f"📄 {filename} — {len(raw) / 1_048_576:.1f} МБ (PDF загружен на сервер)"
                     )
                     title_input.value = Path(filename).stem
+                    content_type.value = "pdf"
                     analyze_btn.disable()
                     import_btn.enable()
                     ui.notify(f"«{filename}» PDF загружен на сервер", type="positive")
@@ -235,6 +238,9 @@ def build_import() -> None:
         spinner = ui.spinner(size="md").props("color=primary")
         spinner.visible = False
         analyze_btn.disable()  # disabled пока нет файла
+
+    # ── Queue console (all imports) ──────────────────────────
+    build_import_queue()
 
     timer_label = ui.label("").classes("text-caption text-grey")
     timer_label.visible = False
@@ -380,6 +386,42 @@ def build_import() -> None:
         try:
             result = await client.tools_call("import_content", params)
 
+            # ── Bug C fix: PDF async-флоу — поллинг до терминального статуса ─
+            # submit_import возвращает мгновенно {"status":"started"|"queued"} для pdf.
+            # Book (sync) возвращает полный результат сразу — status отсутствует или "ok".
+            if result.get("status") in ("started", "queued"):
+                deadline = time.monotonic() + IMPORT_TIMEOUT
+                snapshot = None
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(0.5)
+                    snapshot = await client.get_progress(import_id)
+                    if snapshot is not None:
+                        render_import_progress(snapshot, progress_container)
+                        if snapshot.get("status") in ("done", "error", "cancelled"):
+                            break
+                    # Продолжаем поллинг (snapshot может быть None при transient error)
+                else:
+                    # deadline exceeded
+                    raise RuntimeError("Таймаут импорта (сервер не завершил за " + str(IMPORT_TIMEOUT) + "с)")
+
+                if snapshot is None:
+                    raise RuntimeError("Прогресс импорта недоступен (сервер не отвечает)")
+
+                if snapshot.get("status") == "done":
+                    result = {
+                        "imported": snapshot.get("imported", 0),
+                        "failed": snapshot.get("failed", 0),
+                        "collection_id": snapshot.get("collection_id", "—"),
+                        "status": "done",
+                        "title": params.get("title", f"{domain}/{subject}"),
+                    }
+                elif snapshot.get("status") == "error":
+                    raise RuntimeError(snapshot.get("error", "Import failed (server error)"))
+                elif snapshot.get("status") == "cancelled":
+                    raise RuntimeError("Импорт отменён")
+                else:
+                    raise RuntimeError("Неизвестный статус импорта: " + snapshot.get("status", "?"))
+
             elapsed = time.monotonic() - start_time
             imported = result.get("imported", 0)
             failed = result.get("failed", 0)
@@ -498,8 +540,12 @@ def build_import() -> None:
             params["title"] = title
         if tags:
             params["tags"] = tags
-        # 13.9: идентификатор импорта для живого прогресса (poll GET /imports/{id}/progress)
-        import_id = str(uuid.uuid4())
+        # 13.9: идентификатор импорта для живого прогресса (poll GET /imports/{id}/progress).
+        # PDF flow: используем upload_id из ответа POST /upload — корреляция upload↔import_id.
+        if pending_file and pending_file.get("pdf_path") and pending_file.get("import_id"):
+            import_id = pending_file["import_id"]
+        else:
+            import_id = str(uuid.uuid4())
         params["import_id"] = import_id
 
         # replace_collection_id

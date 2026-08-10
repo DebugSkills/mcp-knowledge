@@ -438,6 +438,30 @@ async def import_progress(import_id: str, request: Request):
 
     tracker = getattr(request.app.state, "import_progress", None)
     snapshot = tracker.get(import_id) if tracker else None
+    
+    # Fallback to import_queue: _bg_import обновляет очередь, но tracker.start()
+    # мог не отработать (баг A) — ищем запись по import_id в очереди.
+    if snapshot is None:
+        import_queue = getattr(request.app.state, "import_queue", None)
+        if import_queue:
+            for rec in import_queue:
+                if rec.get("import_id") == import_id:
+                    snapshot = {
+                        "import_id": rec.get("import_id", ""),
+                        "status": rec.get("status", "unknown"),
+                        "phase": rec.get("phase", ""),
+                        "imported": rec.get("imported", 0),
+                        "total": rec.get("total", 0),
+                        "failed": rec.get("failed", 0),
+                        "error": rec.get("error"),
+                        "collection_id": rec.get("collection_id", ""),
+                        "name": rec.get("name", ""),
+                        "finished_at": rec.get("finished_at"),
+                        "messages": [],
+                        "_source": "queue",
+                    }
+                    break
+    
     if snapshot is None:
         raise HTTPException(404, "unknown import_id")
     return snapshot
@@ -600,7 +624,12 @@ async def list_imports(request: Request):
         raise HTTPException(status_code=401, detail="Authentication required")
 
     queue = getattr(request.app.state, "import_queue", [])
-    return queue
+    # Санитизация: _params содержит контент — исключаем из ответа
+    sanitized = []
+    for rec in queue:
+        out = {k: v for k, v in rec.items() if not k.startswith("_")}
+        sanitized.append(out)
+    return sanitized
 
 
 @app.get("/imports/active")

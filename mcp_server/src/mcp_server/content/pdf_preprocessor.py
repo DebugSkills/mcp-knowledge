@@ -491,8 +491,12 @@ class PDFPreprocessor(ContentPreprocessor):
                     metadata.title or "pdf_import",
                 )
                 keywords = extract_keywords(chunk, top_n=5)
+                # Flatten: ensure keywords is list[str] not list[list]
+                flat_keywords = [
+                    k for k in keywords if isinstance(k, str)
+                ]
                 tags = deduplicate_tags(
-                    metadata.tags + keywords,
+                    metadata.tags + flat_keywords,
                     metadata.cross_subjects,
                 )
 

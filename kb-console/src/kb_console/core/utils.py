@@ -40,7 +40,7 @@ def render_import_progress(snapshot: dict, container: ui.element) -> None:
     failed = snapshot.get("failed", 0)
     status = snapshot.get("status", "running")
     percent = (imported / total * 100) if total else 0
-    done = status in ("done", "error")
+    done = status in ("done", "error", "cancelled")
     with container:
         ui.label(
             f"📊 Секция {imported}/{total} ({percent:.0f}%)"
