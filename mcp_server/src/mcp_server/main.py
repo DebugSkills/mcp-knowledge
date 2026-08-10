@@ -397,7 +397,7 @@ app = FastAPI(
 )
 
 # B1: Auth middleware (X-API-Key, constant-time сравнение)
-app.add_middleware(AuthMiddleware)
+app.add_middleware(AuthMiddleware, fastapi_app=app)
 
 app.include_router(health_router)
 
@@ -465,6 +465,33 @@ async def import_progress(import_id: str, request: Request):
     if snapshot is None:
         raise HTTPException(404, "unknown import_id")
     return snapshot
+
+
+# P2: Import log endpoint — построчный лог из ring-буфера записи очереди
+@app.get("/imports/{import_id}/log")
+async def import_log(import_id: str, request: Request):
+    """GET /imports/{import_id}/log — построчный лог импорта.
+
+    Возвращает {"import_id": "...", "log": [...]} где log — список
+    {"ts": "HH:MM:SS", "level": "info|warning|error", "text": "..."}.
+    404 если запись с import_id не найдена.
+
+    Auth: defence-in-depth — проверяет request.state.auth
+    (как /progress).
+    """
+    auth = getattr(request.state, "auth", None)
+    if auth is None or not getattr(auth, "authenticated", False):
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    import_queue = getattr(request.app.state, "import_queue", None)
+    if import_queue:
+        for rec in import_queue:
+            if rec.get("import_id") == import_id:
+                return {
+                    "import_id": import_id,
+                    "log": rec.get("log", []),
+                }
+    raise HTTPException(404, f"Import {import_id} not found")
 
 
 # 13.15: Live scan progress polling endpoint
@@ -624,10 +651,11 @@ async def list_imports(request: Request):
         raise HTTPException(status_code=401, detail="Authentication required")
 
     queue = getattr(request.app.state, "import_queue", [])
-    # Санитизация: _params содержит контент — исключаем из ответа
+    # Санитизация: _params содержит контент — исключаем из ответа.
+    # "log" тоже исключаем — lean payload (лог через GET /imports/{id}/log).
     sanitized = []
     for rec in queue:
-        out = {k: v for k, v in rec.items() if not k.startswith("_")}
+        out = {k: v for k, v in rec.items() if not k.startswith("_") and k != "log"}
         sanitized.append(out)
     return sanitized
 

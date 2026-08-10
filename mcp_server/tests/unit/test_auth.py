@@ -165,33 +165,56 @@ class TestCheckToolPermission:
         check_tool_permission(auth, "ping")
 
 
-# ── Helpers for Request mocking ────────────────────────────────
+# ── Helpers for ASGI scope mocking ────────────────────────────
 
-def _mock_request(
+def _asgi_scope(
     path: str = "/mcp",
     method: str = "POST",
     headers: dict | None = None,
-    body_bytes: bytes = b'{"jsonrpc":"2.0","method":"tools/list","id":1}',
-) -> MagicMock:
-    """Build a properly mocked FastAPI Request with state."""
-    req = MagicMock(spec=Request)
-    req.url.path = path
-    req.method = method
-    req.state.auth = AuthInfo()
-    # Headers: convert dict to case-insensitive lookup
-    req.headers = MagicMock()
-    req.headers.get = lambda key, default="": (headers or {}).get(key, default)
-    # Body: async callable returning bytes (required by _check_rate_limit E2)
-    req.body = AsyncMock(return_value=body_bytes)
-    # app.state — rate limiter mock (optional)
-    req.app = MagicMock()
-    req.app.state.rate_limiter = None  # отключён по умолчанию
-    req.app.state.rate_limiter_read = None
-    req.app.state.rate_limiter_write = None
-    return req
+) -> dict:
+    """Построить ASGI scope словарь (как приходит от uvicorn)."""
+    raw_headers: list[tuple[bytes, bytes]] = []
+    for k, v in (headers or {}).items():
+        raw_headers.append((k.encode("latin-1"), v.encode("latin-1")))
+    return {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "headers": raw_headers,
+        "query_string": b"",
+    }
 
 
-# ── AuthMiddleware ──────────────────────────────────────────────
+def _asgi_receive(body_bytes: bytes = b'{"jsonrpc":"2.0","method":"tools/list","id":1}') -> callable:
+    """Создать ASGI receive функцию с заданным body."""
+    chunks: list[bytes] = [body_bytes]
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {
+                "type": "http.request",
+                "body": body_bytes,
+                "more_body": False,
+            }
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    return receive
+
+
+def _asgi_send_collector() -> tuple[callable, list[dict]]:
+    """Создать ASGI send функцию, собирающую все сообщения."""
+    messages: list[dict] = []
+
+    async def send(message: dict):
+        messages.append(message)
+
+    return send, messages
+
+
+# ── AuthMiddleware (pure ASGI) ──────────────────────────────────
 
 
 class TestAuthMiddleware:
@@ -201,51 +224,98 @@ class TestAuthMiddleware:
 
     async def test_skip_health(self, middleware: AuthMiddleware):
         for path in ["/health", "/metrics", "/docs", "/openapi.json"]:
-            req = _mock_request(path=path, method="GET")
-            async def call_next(r): return Response(content="ok")
-            resp = await middleware.dispatch(req, call_next)
-            assert resp.status_code == 200
+            scope = _asgi_scope(path=path, method="GET")
+            receive = _asgi_receive()
+            send, messages = _asgi_send_collector()
+            # Устанавливаем мок-обработчик на ASGI app,
+            # который возвращает 200 через send
+            async def mock_app(s, r, snd):
+                await snd({"type": "http.response.start", "status": 200, "headers": []})
+                await snd({"type": "http.response.body", "body": b"ok"})
+
+            middleware.app = mock_app
+            await middleware(scope, receive, send)
+            # Проверяем: scope["state"]["auth"] установлен как AuthInfo()
+            assert scope["state"]["auth"].authenticated is False
+            assert scope["state"]["auth"].key_level == "none"
 
     async def test_skip_health_trailing_slash(self, middleware: AuthMiddleware):
-        req = _mock_request(path="/health/", method="GET")
-        async def call_next(r): return Response(content="ok")
-        resp = await middleware.dispatch(req, call_next)
-        assert resp.status_code == 200
+        scope = _asgi_scope(path="/health/", method="GET")
+        receive = _asgi_receive()
+        send, messages = _asgi_send_collector()
+
+        async def mock_app(s, r, snd):
+            await snd({"type": "http.response.start", "status": 200, "headers": []})
+            await snd({"type": "http.response.body", "body": b"ok"})
+
+        middleware.app = mock_app
+        await middleware(scope, receive, send)
+        assert scope["state"]["auth"].authenticated is False
 
     async def test_get_non_mcp_bypasses_auth(self, middleware: AuthMiddleware):
-        req = _mock_request(path="/some-page", method="GET")
-        async def call_next(r): return Response(content="ok")
-        resp = await middleware.dispatch(req, call_next)
-        assert resp.status_code == 200
+        scope = _asgi_scope(path="/some-page", method="GET")
+        receive = _asgi_receive()
+        send, messages = _asgi_send_collector()
+
+        async def mock_app(s, r, snd):
+            await snd({"type": "http.response.start", "status": 200, "headers": []})
+            await snd({"type": "http.response.body", "body": b"ok"})
+
+        middleware.app = mock_app
+        await middleware(scope, receive, send)
+        # GET без ключа → unauthenticated
+        assert scope["state"]["auth"].authenticated is False
 
     async def test_post_mcp_without_key_sets_unauthenticated(self, middleware: AuthMiddleware):
-        req = _mock_request(path="/mcp", method="POST", headers={})
-        async def call_next(r): return Response(content="ok")
-        resp = await middleware.dispatch(req, call_next)
-        assert resp.status_code == 200
-        auth = get_auth(req)
+        scope = _asgi_scope(path="/mcp", method="POST")
+        receive = _asgi_receive()
+        send, messages = _asgi_send_collector()
+
+        async def mock_app(s, r, snd):
+            await snd({"type": "http.response.start", "status": 200, "headers": []})
+            await snd({"type": "http.response.body", "body": b"ok"})
+
+        middleware.app = mock_app
+        await middleware(scope, receive, send)
+        auth = scope.get("state", {}).get("auth")
+        assert auth is not None
         assert auth.authenticated is False
 
     async def test_post_mcp_with_valid_key(self, middleware: AuthMiddleware):
-        req = _mock_request(
+        scope = _asgi_scope(
             path="/mcp", method="POST",
             headers={"X-API-Key": "write-key-abcdefgh"},
         )
-        async def call_next(r): return Response(content="ok")
-        resp = await middleware.dispatch(req, call_next)
-        assert resp.status_code == 200
-        auth = get_auth(req)
+        receive = _asgi_receive()
+        send, messages = _asgi_send_collector()
+
+        async def mock_app(s, r, snd):
+            await snd({"type": "http.response.start", "status": 200, "headers": []})
+            await snd({"type": "http.response.body", "body": b"ok"})
+
+        middleware.app = mock_app
+        # Мок rate limiter (не включён — rate_limiter=None)
+        # При отсутствии rate_limiter запрос проходит
+        await middleware(scope, receive, send)
+        auth = scope.get("state", {}).get("auth")
         assert auth.authenticated is True
         assert auth.key_level == "write"
 
     async def test_post_mcp_with_invalid_key(self, middleware: AuthMiddleware):
-        req = _mock_request(
+        scope = _asgi_scope(
             path="/mcp", method="POST",
             headers={"X-API-Key": "not-a-real-key"},
         )
-        async def call_next(r): return Response(content="ok")
-        await middleware.dispatch(req, call_next)
-        auth = get_auth(req)
+        receive = _asgi_receive()
+        send, messages = _asgi_send_collector()
+
+        async def mock_app(s, r, snd):
+            await snd({"type": "http.response.start", "status": 200, "headers": []})
+            await snd({"type": "http.response.body", "body": b"ok"})
+
+        middleware.app = mock_app
+        await middleware(scope, receive, send)
+        auth = scope.get("state", {}).get("auth")
         assert auth.authenticated is False
 
 

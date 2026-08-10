@@ -234,6 +234,29 @@ class MCPClient:
         except (json.JSONDecodeError, ValueError):
             return None
 
+    async def get_import_log(self, import_id: str) -> dict[str, Any] | None:
+        """GET /imports/{import_id}/log — построчный лог импорта из ring-буфера.
+
+        Args:
+            import_id: Идентификатор импорта.
+
+        Returns:
+            {"import_id": "...", "log": [{"ts": "...", "level": "...", "text": "..."}]}
+            или None при любой ошибке (404 / endpoint отсутствует / сеть) —
+            никогда не бросает.
+        """
+        url = f"{self.base_url}/imports/{import_id}/log"
+        try:
+            response = await self._client.get(url, headers=self._headers(), timeout=5.0)
+        except httpx.HTTPError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            return response.json()
+        except (json.JSONDecodeError, ValueError):
+            return None
+
     # ── Variant A (13.10): хелперы для «Книги» + информативный поиск ──
 
     async def get_entry(self, knowledge_id: str) -> dict[str, Any]:

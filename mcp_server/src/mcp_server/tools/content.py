@@ -42,6 +42,11 @@ logger = logging.getLogger("mcp_knowledge.tools.content")
 # уходило ~700 коммитов (batch #1..#700) и кеш .git переполнялся.
 IMPORT_BATCH_COMMIT = 10
 
+# P2: максимальное число строк в лог-буфере импорта (ring buffer)
+LOG_CAP = 200
+# P2: частота лог-строк «N/M indexing» (каждые N% прогресса)
+LOG_INDEXING_MODULUS = 25  # каждые 25%
+
 
 # ── Progress tracker helper (Фаза 13.9) ───────────────────
 
@@ -144,6 +149,7 @@ async def submit_import(params: dict, app_state) -> dict:
         "error": None,
         "created_at": now,
         "finished_at": None,
+        "log": [],  # P2: построчный лог импорта (ring buffer, cap 200)
     }
 
     # Проверяем lock
@@ -197,6 +203,7 @@ async def _bg_import(
     source_path = params.get("_source_path", "")
     tracker = getattr(app_state, "import_progress", None)
     content_type = params.get("content_type", "pdf")
+    _start_ts = datetime.now(timezone.utc)  # P2: для elapsed в done
 
     def _update_queue(**kwargs):
         """Обновить запись в очереди."""
@@ -208,6 +215,7 @@ async def _bg_import(
     try:
         async with lock:
             _update_queue(status="running", phase="starting")
+            _update_log(import_id, "info", "import started")
 
             # Phase 1: Parsing
             _update_queue(phase="parsing")
@@ -239,30 +247,37 @@ async def _bg_import(
             if not validation.valid:
                 err = f"Content validation failed: {validation.error}"
                 _update_queue(status="error", error=err, collection_id="")
+                _update_log(import_id, "error", f"validate FAIL: {validation.error}")
                 _p(tracker, import_id, "error", err)
                 return
+            _update_log(import_id, "info", "validate OK")
 
             # Decompose (with cancel_event)
             try:
                 sections = await preprocessor.decompose("", metadata, cancel_event=cancel_event)
             except asyncio.CancelledError:
                 _update_queue(status="cancelled", error="Cancelled during parsing", collection_id="")
+                _update_log(import_id, "error", "cancelled: during parsing")
                 _p(tracker, import_id, "error", "Cancelled during parsing")
                 return
 
             if not sections:
                 _update_queue(status="error", error="Decomposition produced 0 sections", collection_id="")
+                _update_log(import_id, "error", "decompose produced 0 sections")
                 return
 
             _update_queue(total=len(sections))
+            _update_log(import_id, "info", f"decompose: {len(sections)} sections")
 
             # Cancel check before indexing
             if cancel_event.is_set():
                 _update_queue(status="cancelled", error="Cancelled before indexing", collection_id="")
+                _update_log(import_id, "error", "cancelled: before indexing")
                 return
 
             # Phase 2: Indexing (reuse existing batch-write)
             _update_queue(phase="indexing")
+            _update_log(import_id, "info", f"indexing: {len(sections)} sections")
             _p(tracker, import_id, "set_phase", "indexing")
 
             result = await _batch_write_sections(
@@ -275,6 +290,7 @@ async def _bg_import(
 
             if result.get("error"):
                 _update_queue(status="error", error=result["error"], collection_id=result.get("collection_id", ""))
+                _update_log(import_id, "error", f"batch write FAIL: {result['error'][:200]}")
             elif result.get("partial_success"):
                 _update_queue(
                     status="done",
@@ -284,6 +300,8 @@ async def _bg_import(
                     collection_id=result.get("collection_id", ""),
                     error=f"Partial: {result.get('failed', 0)} sections failed",
                 )
+                elapsed = (datetime.now(timezone.utc) - _start_ts).total_seconds()
+                _update_log(import_id, "warning", f"done (partial): {result.get('imported', 0)} sections, {result.get('failed', 0)} failed in {elapsed:.0f}s")
                 _p(tracker, import_id, "done", {"imported": result.get("imported", 0), "collection_id": result.get("collection_id", "")})
             else:
                 _update_queue(
@@ -293,6 +311,8 @@ async def _bg_import(
                     total=result.get("imported", 0),
                     collection_id=result.get("collection_id", ""),
                 )
+                elapsed = (datetime.now(timezone.utc) - _start_ts).total_seconds()
+                _update_log(import_id, "info", f"done: {result.get('imported', 0)} sections in {elapsed:.0f}s")
                 _p(tracker, import_id, "done", {"imported": result.get("imported", 0), "collection_id": result.get("collection_id", "")})
 
             _update_queue(finished_at=datetime.now(timezone.utc).isoformat())
@@ -305,9 +325,11 @@ async def _bg_import(
     except asyncio.CancelledError:
         logger.info("[IMPORT] task cancelled (shutdown): %s", import_id)
         _update_queue(status="cancelled", error="Server shutdown", collection_id="")
+        _update_log(import_id, "error", "cancelled: server shutdown")
     except Exception as exc:
         logger.exception("[IMPORT] task failed: %s", import_id)
         _update_queue(status="error", error=str(exc), collection_id="")
+        _update_log(import_id, "error", f"error: {str(exc)[:250]}")
     finally:
         # [P0-3] Cleanup temp file — only if in /tmp/ (server-owned temp files)
         if source_path and _os.path.exists(source_path) and source_path.startswith("/tmp/"):
@@ -419,6 +441,14 @@ async def _batch_write_sections(
                 _p(tracker, import_id, "log", "info",
                    f"{imported}/{len(sections)} sections written")
 
+            # P2: indexing progress log (каждые 25% или каждые 10 секций)
+            if import_id:
+                total_s = len(sections)
+                pct = (imported * 100) // total_s if total_s else 0
+                if pct > 0 and pct % LOG_INDEXING_MODULUS == 0 and pct != ((imported - 1) * 100) // total_s:
+                    _update_log(import_id, "info",
+                                f"indexing: {imported}/{total_s} ({pct}%)")
+
             if imported % settings.IMPORT_PERIODIC_COMMIT == 0:
                 try:
                     await store.flush(
@@ -427,6 +457,8 @@ async def _batch_write_sections(
                     )
                 except Exception:
                     pass
+
+
         except Exception as e:
             failed += 1
             failed_sections.append({
@@ -434,12 +466,22 @@ async def _batch_write_sections(
                 "title": section.title,
                 "error": str(e),
             })
+            logger.error(
+                "import_content: section %d '%s' failed: %s",
+                section.sequence_number, section.title, e,
+            )
+            _p(tracker, import_id, "section_failed", section.sequence_number, section.title, str(e))
+            # Продолжаем best-effort
 
-    # Final git commit
+    # Final git commit — ОДИН на книгу (P2: с логом)
     try:
         await store.flush(
             f"import_content: {collection.knowledge_id} ({imported} sections)"
         )
+        # P2: git commit log (только при успехе)
+        if import_id:
+            _update_log(import_id, "info",
+                        f"git commit: {collection.knowledge_id} ({imported} sections)")
     except Exception:
         pass
 
@@ -466,6 +508,52 @@ async def _batch_write_sections(
         "failed_sections": failed_sections,
         "partial_success": partial_success,
     }
+
+
+# ── P2: Log buffer helpers (ring buffer, cap 200) ──────────
+
+
+def _append_log(rec: dict, level: str, text: str) -> None:
+    """Добавить строку в ring-буфер лога импорта.
+
+    Args:
+        rec: запись очереди (мутируется in-place).
+        level: "info" | "warning" | "error".
+        text: текст строки (≤300 символов — обрезается).
+    """
+    log = rec.setdefault("log", [])
+    entry = {
+        "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        "level": level,
+        "text": text[:300],
+    }
+    # Ring buffer: drop oldest при переполнении
+    if len(log) >= LOG_CAP:
+        # Маркер «log truncated» при ПЕРВОМ переполнении (не дублировать)
+        if not any(e.get("level") == "warning" and "truncated" in e.get("text", "") for e in log):
+            # Вставляем маркер В НАЧАЛО, затем удаляем ВТОРОЙ элемент (не маркер)
+            log.insert(0, {
+                "ts": "",
+                "level": "warning",
+                "text": f"… log truncated (showing last {LOG_CAP} entries)",
+            })
+            if len(log) > LOG_CAP:
+                log.pop(1)  # drop oldest non-marker entry (сохраняем маркер)
+        else:
+            # Маркер уже есть — удаляем старейшую НЕ-маркер запись
+            if log[0].get("level") == "warning" and "truncated" in log[0].get("text", ""):
+                log.pop(1)  # skip marker, drop next-oldest
+            else:
+                log.pop(0)  # no marker at front — drop oldest
+    log.append(entry)
+
+
+def _update_log(import_id: str, level: str, text: str) -> None:
+    """Обновить лог в записи очереди по import_id (best-effort)."""
+    for rec in _import_queue:
+        if rec.get("import_id") == import_id:
+            _append_log(rec, level, text)
+            break
 
 
 def _start_next_import(app_state) -> None:

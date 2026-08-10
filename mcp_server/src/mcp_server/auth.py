@@ -18,9 +18,6 @@ import typing
 from dataclasses import dataclass
 
 from fastapi import HTTPException, Request
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
 
 from .config import settings
 
@@ -192,12 +189,19 @@ def check_tool_permission(auth_info: AuthInfo, tool_name: str) -> None:
     )
 
 
-class AuthMiddleware(BaseHTTPMiddleware):
-    """FastAPI middleware: проверка X-API-Key header.
+class AuthMiddleware:
+    """Pure ASGI middleware: проверка X-API-Key header.
+
+    НЕ наследует BaseHTTPMiddleware — реализует __call__ напрямую,
+    устраняя root cause Content-Length mismatch при конкурентной нагрузке
+    (BaseHTTPMiddleware → anyio memory-object-stream → body-chunk overflow).
 
     Пропускает без проверки: /health, /metrics, /docs, /openapi.json.
     Для /mcp: извлекает ключ, проводит аутентификацию,
-    сохраняет AuthInfo в request.state.auth.
+    сохраняет AuthInfo в scope["state"]["auth"].
+
+    POST /mcp: читает body через обёрнутую receive (кеширует body-chunks),
+    проверяет rate-limit, затем переигрывает кешированные чанки вниз.
     """
 
     SKIP_PATHS: typing.ClassVar[set[str]] = {
@@ -211,97 +215,202 @@ class AuthMiddleware(BaseHTTPMiddleware):
         "/openapi.json",
     }
 
-    async def dispatch(self, request: Request, call_next) -> Response:
-        # Пропускаем health/metrics/docs без аутентификации + rate limit
-        if request.url.path.rstrip("/") in self.SKIP_PATHS or request.url.path in self.SKIP_PATHS:
-            request.state.auth = AuthInfo()
-            return await call_next(request)
+    def __init__(self, app, fastapi_app=None):
+        """Сохранить ссылки: внутреннее ASGI-приложение + FastAPI (для app.state).
 
-        # Извлекаем X-API-Key
-        api_key = request.headers.get("X-API-Key", "")
+        app: внутреннее ASGI-приложение (Router, переданное Starlette.add_middleware).
+        fastapi_app: FastAPI-приложение (нужен для доступа к app.state.rate_limiter_*).
+            В тестах через ASGITransport scope["app"] не устанавливается,
+            поэтому fastapi_app передаётся явно.
+        """
+        self.app = app
+        self._fastapi_app = fastapi_app
+
+    async def __call__(self, scope, receive, send):
+        """Pure ASGI entry point.
+
+        Обрабатывает HTTP-запросы: аутентификация X-API-Key,
+        rate-limit для POST /mcp (с body-reading приёмом).
+        Не-HTTP запросы (websocket) пропускает прозрачно.
+        """
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        method = scope.get("method", "")
+        normalized = path.rstrip("/")
+
+        # Инициализируем state (FastAPI ожидает dict-like scope["state"])
+        scope.setdefault("state", {})
+
+        # Пропускаем health/metrics/docs без аутентификации + rate limit
+        if normalized in self.SKIP_PATHS or path in self.SKIP_PATHS:
+            scope["state"]["auth"] = AuthInfo()
+            await self.app(scope, receive, send)
+            return
+
+        # Извлекаем X-API-Key из scope headers
+        headers = _parse_scope_headers(scope)
+        api_key = headers.get("x-api-key", "")
 
         if not api_key:
             # Для GET-запросов не на /mcp — пропускаем (браузеры)
-            if request.method == "GET" and request.url.path != "/mcp":
-                request.state.auth = AuthInfo()
-                return await call_next(request)
+            if method == "GET" and path != "/mcp":
+                scope["state"]["auth"] = AuthInfo()
+                await self.app(scope, receive, send)
+                return
 
-            logger.warning("Auth: no X-API-Key header for %s %s", request.method, request.url.path)
-            request.state.auth = AuthInfo()
-            return await call_next(request)
+            logger.warning("Auth: no X-API-Key header for %s %s", method, path)
+            scope["state"]["auth"] = AuthInfo()
+            await self.app(scope, receive, send)
+            return
 
         auth_info = authenticate_key(api_key)
-        request.state.auth = auth_info
+        scope["state"]["auth"] = auth_info
 
-        # ── E2: Rate limiting (batch-aware, per-key) ────────
-        if request.method == "POST" and request.url.path == "/mcp":
-            rate_limit_response = await self._check_rate_limit(request, auth_info)
-            if rate_limit_response is not None:
-                return rate_limit_response
+        # ── E2: Rate limiting (batch-aware, per-key) для POST /mcp ──
+        if method == "POST" and path == "/mcp":
+            # Читаем все body-чанки (кешируем для переигрывания вниз)
+            body_chunks: list[bytes] = []
+            more_body = True
+            while more_body:
+                message = await receive()
+                if message["type"] == "http.request":
+                    body_chunks.append(message.get("body", b""))
+                    more_body = message.get("more_body", False)
 
-        return await call_next(request)
+            raw_body = b"".join(body_chunks)
 
-    # ── E2: Rate limit check ────────────────────────────────
-
-    async def _check_rate_limit(self, request: Request, auth_info: AuthInfo) -> JSONResponse | None:
-        """Проверить rate limit для POST /mcp.
-
-        Batch-aware: парсит body, считает число JSON-RPC методов,
-        тратит N токенов (не 1 на HTTP request).
-
-        Returns:
-            JSONResponse с MCP_RATE_LIMITED если лимит превышен, иначе None.
-        """
-        rate_limiter = getattr(request.app.state, "rate_limiter", None)
-        if rate_limiter is None:
-            return None  # rate limiter не включён
-
-        # Считаем число методов в запросе (batch-aware P1-5)
-        method_count = 1  # по умолчанию одиночный запрос
-        try:
-            raw_body = await request.body()
-            # Кэшируем body для повторного чтения handler'ом
-            # (Starlette проверяет _body перед чтением потока)
-            request._body = raw_body
-            body = json.loads(raw_body)
-            if isinstance(body, list):
-                method_count = len(body)  # JSON-RPC batch → N методов
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            method_count = 1  # невалидный JSON → 1 токен (парсинг упадёт позже)
-
-        # Выбор rate limiter'а по уровню ключа
-        key_hash = auth_info.key_hash or "anonymous"
-        if auth_info.key_level == "read":
-            limiter = getattr(request.app.state, "rate_limiter_read", rate_limiter)
-        elif auth_info.key_level == "write":
-            limiter = getattr(request.app.state, "rate_limiter_write", rate_limiter)
-        else:
-            # Неаутентифицированные запросы — используем дефолтный (строгий)
-            limiter = rate_limiter
-
-        if not await limiter.check(key_hash, count=method_count):
-            # Фаза 12: инкремент rate_limit_rejected метрики
-            from .metrics import rate_limit_rejected
-            rate_limit_rejected.labels(key_level=auth_info.key_level).inc()
-
-            return JSONResponse(
-                content={
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32003,  # MCP_RATE_LIMITED
-                        "message": (
-                            f"Rate limit exceeded: {method_count} method(s) requested, "
-                            f"try again in a few seconds."
-                        ),
-                    },
-                    "id": None,
-                },
-                status_code=429,
+            # Проверяем rate limit
+            # Приоритет: self._fastapi_app (явно передан) → scope["app"] (uvicorn)
+            # → self.app (fallback — Router без .state, rate-limiter обойдётся)
+            root_app = self._fastapi_app or scope.get("app") or self.app
+            rate_limit_response = await _check_rate_limit_bytes(
+                raw_body, auth_info, root_app
             )
+            if rate_limit_response is not None:
+                await _send_json_response(send, rate_limit_response, 429)
+                return
 
+            # Переигрываем body вниз через обёрнутую receive
+            chunk_index = 0
+
+            async def wrapped_receive():
+                nonlocal chunk_index
+                if chunk_index < len(body_chunks):
+                    chunk = body_chunks[chunk_index]
+                    is_last = (chunk_index == len(body_chunks) - 1)
+                    chunk_index += 1
+                    return {
+                        "type": "http.request",
+                        "body": chunk,
+                        "more_body": not is_last,
+                    }
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            await self.app(scope, wrapped_receive, send)
+        else:
+            await self.app(scope, receive, send)
+
+
+def _parse_scope_headers(scope: dict) -> dict[str, str]:
+    """Извлечь HTTP-заголовки из ASGI scope в case-insensitive словарь.
+
+    scope["headers"] — список кортежей (b"header-name", b"value") в latin-1.
+    Возвращает словарь с ключами в нижнем регистре.
+    """
+    result: dict[str, str] = {}
+    for key_bytes, value_bytes in scope.get("headers", []):
+        key = key_bytes.decode("latin-1").lower()
+        value = value_bytes.decode("latin-1")
+        result[key] = value
+    return result
+
+
+async def _check_rate_limit_bytes(
+    raw_body: bytes,
+    auth_info: AuthInfo,
+    app,
+) -> dict | None:
+    """Проверить rate limit для POST /mcp по сырым байтам body.
+
+    Batch-aware: парсит body, считает число JSON-RPC методов,
+    тратит N токенов (не 1 на HTTP request).
+
+    Returns:
+        Словарь JSON-RPC error для 429 ответа, или None если лимит не превышен.
+    """
+    app_state = getattr(app, "state", None)
+    if app_state is None:
         return None
+
+    rate_limiter = getattr(app_state, "rate_limiter", None)
+    if rate_limiter is None:
+        return None  # rate limiter не включён
+
+    # Считаем число методов в запросе (batch-aware P1-5)
+    method_count = 1
+    try:
+        body = json.loads(raw_body)
+        if isinstance(body, list):
+            method_count = len(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        method_count = 1
+
+    # Выбор rate limiter'а по уровню ключа
+    key_hash = auth_info.key_hash or "anonymous"
+    if auth_info.key_level == "read":
+        limiter = getattr(app_state, "rate_limiter_read", rate_limiter)
+    elif auth_info.key_level == "write":
+        limiter = getattr(app_state, "rate_limiter_write", rate_limiter)
+    else:
+        limiter = rate_limiter
+
+    if not await limiter.check(key_hash, count=method_count):
+        from .metrics import rate_limit_rejected
+        rate_limit_rejected.labels(key_level=auth_info.key_level).inc()
+
+        return {
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32003,
+                "message": (
+                    f"Rate limit exceeded: {method_count} method(s) requested, "
+                    f"try again in a few seconds."
+                ),
+            },
+            "id": None,
+        }
+
+    return None
+
+
+async def _send_json_response(send, content: dict, status_code: int = 200) -> None:
+    """Отправить JSON-ответ через ASGI send.
+
+    Используется для rate-limit 429 ответов, которые должны быть отправлены
+    до передачи управления внутреннему приложению.
+    """
+    body = json.dumps(content).encode("utf-8")
+    await send({
+        "type": "http.response.start",
+        "status": status_code,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": body,
+        "more_body": False,
+    })
 
 
 def get_auth(request: Request) -> AuthInfo:
-    """Dependency: получить AuthInfo из request.state."""
-    return getattr(request.state, "auth", AuthInfo())
+    """Dependency: получить AuthInfo из request.state (или scope["state"])."""
+    auth = getattr(request.state, "auth", None)
+    if auth is None and hasattr(request, "scope"):
+        auth = request.scope.get("state", {}).get("auth")
+    return auth if auth is not None else AuthInfo()

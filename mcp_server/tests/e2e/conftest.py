@@ -300,7 +300,7 @@ async def e2e_http_app(real_qdrant, real_embedder, e2e_store, e2e_pipeline,
     set_pipeline(e2e_pipeline)
 
     app = FastAPI()
-    app.add_middleware(AuthMiddleware)
+    app.add_middleware(AuthMiddleware, fastapi_app=app)
     app.include_router(health_router)
 
     @app.post("/mcp")
