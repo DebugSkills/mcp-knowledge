@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -52,8 +53,6 @@ async def show_replace_dialog(
         replace_on_partial: Default False — при partial-импорте старая книга цела.
             True — заменить даже при частичном успехе (чекбокс в UI).
     """
-    import asyncio
-
     client: MCPClient | None = None
     _progress_timer: ui.timer | None = None
     pending_file: dict | None = None
@@ -288,6 +287,13 @@ async def show_replace_dialog(
             await client.close()
             client = None
 
-    dialog.on("hide", lambda _d=None: asyncio.create_task(_on_hide()))
+    async def _cleanup() -> None:
+        await _on_hide()
+
+    def _on_hide_handler(_d=None) -> None:
+        task = asyncio.create_task(_cleanup())
+        task.add_done_callback(lambda t: t.exception())  # prevent "Task exception was never retrieved"
+
+    dialog.on("hide", _on_hide_handler)
     dialog.open()
 

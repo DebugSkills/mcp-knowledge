@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from typing import ClassVar
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -326,7 +327,7 @@ class TestReadUploadedFile:
     def test_valid_md(self):
         """Корректный .md файл в UTF-8 — возвращает (content, None)."""
         from kb_console.core.utils import _read_uploaded_file
-        content, error = _read_uploaded_file("test.md", "# Hello".encode("utf-8"))
+        content, error = _read_uploaded_file("test.md", b"# Hello")
         assert error is None
         assert content == "# Hello"
 
@@ -373,3 +374,65 @@ class TestReplaceDialogImports:
         """components/__init__.py должен экспортировать show_replace_dialog."""
         from kb_console.components import show_replace_dialog
         assert callable(show_replace_dialog)
+
+
+# ── render_import_progress (чистая функция рендера, extracted to core/utils.py, Phase 13.24+critic P1-2) ──
+
+
+class TestRenderImportProgress:
+    """Unit-тесты render_import_progress — чистая функция рендера прогресса импорта.
+
+    Использует mock-объекты (MagicMock + patch) для проверки вызовов ui.*
+    без необходимости запущенного NiceGUI-сервера (page-context не нужен —
+    render_import_progress не зависит от глобального состояния NiceGUI, только
+    от переданного container и snapshot).
+
+    Проверяемые аспекты:
+      1. container.clear() вызывается перед рендером
+      2. snapshot с phase="done" рендерит финальный статус (label + linear_progress)
+      3. snapshot с error рендерит сообщения об ошибках
+    """
+
+    def test_clears_container(self):
+        """render_import_progress должен очищать контейнер перед отрисовкой."""
+        from kb_console.core.utils import render_import_progress
+        container = MagicMock()
+        snapshot = {"imported": 3, "total": 10, "failed": 0, "status": "running", "messages": []}
+        with patch("kb_console.core.utils.ui"):
+            render_import_progress(snapshot, container)
+        container.clear.assert_called_once()
+
+    def test_renders_done_status(self):
+        """Snapshot с status='done' → рендерит финальный прогресс (label + linear_progress)."""
+        from kb_console.core.utils import render_import_progress
+        container = MagicMock()
+        snapshot = {"imported": 10, "total": 10, "failed": 0, "status": "done", "messages": []}
+        with patch("kb_console.core.utils.ui") as mock_ui:
+            render_import_progress(snapshot, container)
+        assert mock_ui.label.called
+        assert mock_ui.linear_progress.called
+        # Проверяем, что linear_progress вызван с value=1.0 (100% при done)
+        mock_ui.linear_progress.assert_called_once_with(value=1.0)
+
+    def test_renders_error_with_messages(self):
+        """Snapshot с status='error' + messages → рендерит ошибку и лог-сообщения."""
+        from kb_console.core.utils import render_import_progress
+        container = MagicMock()
+        snapshot = {
+            "imported": 2,
+            "total": 10,
+            "failed": 1,
+            "status": "error",
+            "messages": [
+                {"t": "12:00:01", "text": "Import failed", "level": "error"},
+            ],
+        }
+        with patch("kb_console.core.utils.ui") as mock_ui:
+            render_import_progress(snapshot, container)
+        assert mock_ui.label.called
+        assert mock_ui.linear_progress.called
+        # Проверяем, что среди label-вызовов есть текст ошибки
+        label_texts = [c.args[0] for c in mock_ui.label.call_args_list if c.args]
+        assert any("Import failed" in str(t) for t in label_texts)
+        # Проверяем linear_progress с value=0.2 (2/10 при error)
+        mock_ui.linear_progress.assert_called_once_with(value=0.2)
