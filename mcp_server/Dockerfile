@@ -23,6 +23,8 @@ RUN git config --global --add safe.directory /app/knowledge
 COPY pyproject.toml .
 RUN pip install --no-cache-dir --index-url ${PIP_INDEX_URL} fastmcp fastapi "uvicorn[standard]" "qdrant-client>=1.13.0,<1.15" pydantic pydantic-settings pyyaml prometheus-client gitpython python-dotenv httpx scikit-learn pdfplumber pytesseract Pillow
 RUN pip install --no-cache-dir --index-url ${PIP_INDEX_URL} ruff pytest pytest-asyncio pytest-cov
+# dev-фикстуры PDF-тестов (reportlab — генерация PDF, pypdf — encrypted) — тесты в контейнере
+RUN pip install --no-cache-dir --index-url ${PIP_INDEX_URL} reportlab pypdf
 # editable install ПОСЛЕ COPY src/ — setuptools должен видеть src-layout при установке
 COPY src/ ./src/
 COPY tests/ ./tests/
