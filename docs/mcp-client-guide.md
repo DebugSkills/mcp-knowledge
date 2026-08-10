@@ -201,7 +201,7 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 | 16 | `resolve_quality_issue` | write | Разрешить: merge/deprecate/restore/resolve/ignore (cascade) |
 | 17 | `run_quality_scan` | write | Периодический quality scan (для cron, фоновая задача с lock) |
 | 18 | `cancel_quality_scan` | write | Отменить активный scan, освободить lock |
-| 19 | `import_content` | import | Декомпозиция + batch запись: content → book collection |
+| 19 | `import_content` | import | Декомпозиция + batch запись: content → book collection. **PDF (Фаза 13.21):** `content_type="pdf"` + `pdf_path` (путь с сервера после POST /upload) или base64-контент → асинхронная очередь импортов (ответ `{import_id, status: started|queued}`, прогресс в GET /imports/{id}/progress, лог в /imports/{id}/log, отмена POST /imports/{id}/cancel). Лимиты: ≤2000 страниц, ≤100 МБ (base64 ~96 МБ), OCR для сканов, encrypted → ошибка |
 | 20 | `analyze_content` | read | AI-анализ контента (Ollama LLM + TF-IDF fallback) |
 
 ---

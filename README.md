@@ -17,9 +17,13 @@ mcp-stdio/bridge.py │    │  диаг. :8085 → :8000
 │  Auth: multi-key (read/import/write, X-API-Key)    │
 │  Rate-limit: token bucket (REST, 429)              │
 │  Endpoints: POST /mcp · /health · /health/live ·   │
-│             /metrics · /imports/{id}/progress      │
+│             /metrics · /upload · /imports ·        │
+│             /imports/active · /imports/{id}/progress│
+│             /imports/{id}/log · /imports/{id}/cancel│
+│             /imports/{id}/remove · /imports/remove- │
+│             finished · /quality/scan/progress      │
 ├────────────────────────────────────────────────────┤
-│  Tools (18)                                        │
+│  Tools (20)                                        │
 │  search read crud browse admin quality import analyze │
 ├────────────────────────────────────────────────────┤
 │  Pipeline: chunk → embed → upsert (async worker)   │
@@ -49,8 +53,8 @@ docker compose up -d kb-console      # → http://localhost:8085
 
 # Тесты (нужны запущенные Qdrant :6333 и Ollama :11434)
 make e2e-slow                        # E2E S1-S20 (32 + S20 4/4)
-.venv/bin/python -m pytest mcp_server/tests -q   # полный suite (482)
-make console-test                    # unit + smoke kb-console (33)
+.venv/bin/python -m pytest mcp_server/tests -q   # полный suite (629)
+make console-test                    # unit + smoke kb-console (66)
 .venv/bin/python -m pytest mcp-stdio/tests -q    # stdio-мост (19)
 ```
 
@@ -165,18 +169,28 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | 13.9 | ✅ | Прогресс импорта (GET /imports/{id}/progress) + 1 коммит на книгу |
 | 13.10 | ✅ | list_collections + enriched search (фильтры collection_id/content_type) |
 | 13.11 | ✅ | kb-console UX: модалка, прелоадер, редактируемый title, отдельные эндпоинты |
+| 13.12 | ✅ | stdio-мост для подключения mcp-knowledge к Kilo Code + обновление доков |
+| 13.13 | ✅ | Карточка результата поиска — теги + открытие найденного фрагмента |
+| 13.14 | ✅ | Вкладка «Качество» в kb-console: агрегация книг (parent+cascade), deprecate-фикс поиска |
+| 13.15 | ✅ | Root-фикс зависания сервера: фоновый quality scan + asyncio.Lock + run_in_executor |
+| 13.16 | ✅ | Таймаут переименования книги + прогресс-панель на «Поиск» |
+| 13.17-13.18 | ✅ | search dedup+junk-filter, DataCache+data_version, cancel_quality_scan, scanner .trash-фикс |
+| 13.19 | ✅ | Nightly quality scan scheduler in-container + scan log volume + prune finished progress |
+| 13.20 | ✅ | kb-console: развёрнутые секции без ручного F5 + живая консоль скана |
+| 13.21 | ✅ | **PDF-импорт Фаза 3**: гибридный канал (POST /upload multipart + base64 MCP), pdfplumber + Tesseract OCR, декомпозиция по font-size, очередь импортов (1 за раз, фазы, checkpoint/resume, отмена), консоль очереди в UI (карточки + лог), POST /imports/{id}/cancel·remove + /imports/remove-finished + /imports/{id}/log, pure ASGI middleware (фикс Content-Length) |
+| 13.22 | ✅ | Атомарная замена книги: replace_collection_id в import_content + HITL в консоли + batch-delete (1 git-commit на каскад) |
+| 13.23 | ✅ | Qdrant-бэкап: sparse-фикс, снапшоты только своих коллекций, healthcheck /dev/tcp |
+| 13.24 | ✅ | Advisory P2-фиксы: task-ref в hide, import asyncio наверх, +3 теста render_import_progress |
 
 ## Тесты (актуальные цифры)
 
 | Уровень | Результат |
 |---------|-----------|
-| Unit + integration (сервер) | 393 passed |
-| E2E S1-S19 (реальные Qdrant+Ollama) | 32/32 (S8 — e2e_slow) |
-| E2E S20 (kb-console MCPClient ↔ сервер) | 4/4 (в контейнере mcp-server — skip, exit 0) |
-| kb-console unit + smoke | 33/33 |
+| Unit + integration (сервер) | 629 passed (2 pre-existing failures не связаны: s15 reindex blue-green, delete cascade) |
+| E2E S1-S19 (реальные Qdrant+Ollama) | 43 passed (e2e-набор: http-contract S9-S12, mcp-protocol, russian-corpus, tools-coverage, console-client) |
+| Конкурентный гейт (50× GET /imports) | PASS — регрессия Content-Length (pure ASGI middleware) закрыта |
+| kb-console unit + smoke | 66/66 |
 | mcp-stdio bridge tests | 19/19 (unit 18 + smoke 1) |
-| Полный suite (`make test`) | **482 passed**, 2 skipped, 1 deselected |
-| Docker (в контейнере mcp-server) | 424 passed / E2E 31 passed |
 | Ruff | 0 ошибок |
 
 ## Known Limitations
