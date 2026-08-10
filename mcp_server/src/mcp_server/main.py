@@ -691,3 +691,61 @@ async def cancel_import_endpoint(import_id: str, request: Request):
             break
 
     return {"cancelled": True, "import_id": import_id}
+
+
+@app.post("/imports/{import_id}/remove")
+async def remove_import_endpoint(import_id: str, request: Request):
+    """POST /imports/{import_id}/remove — удалить запись импорта из очереди.
+
+    Удаляет запись из request.app.state.import_queue по import_id.
+    Только для статусов done/error/cancelled/queued — running требует
+    предварительной отмены через /cancel.
+
+    Auth: defence-in-depth (import/write key).
+    """
+    auth = getattr(request.state, "auth", None)
+    if auth is None or not getattr(auth, "authenticated", False):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    key_level = getattr(auth, "key_level", "none")
+    if key_level not in ("import", "write"):
+        raise HTTPException(status_code=403, detail="Import or write key required")
+
+    queue = getattr(request.app.state, "import_queue", [])
+    for i, rec in enumerate(queue):
+        if rec.get("import_id") == import_id:
+            if rec.get("status") == "running":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Running import must be cancelled first",
+                )
+            queue.pop(i)
+            logger.info("[IMPORT] removed %s from queue", import_id)
+            return {"removed": True, "import_id": import_id}
+
+    raise HTTPException(status_code=404, detail=f"Import {import_id} not found")
+
+
+@app.post("/imports/remove-finished")
+async def remove_finished_endpoint(request: Request):
+    """POST /imports/remove-finished — удалить все завершённые записи из очереди.
+
+    Удаляет все записи со статусом done/error/cancelled.
+    Running-записи остаются нетронутыми.
+
+    Auth: defence-in-depth (import/write key).
+    """
+    auth = getattr(request.state, "auth", None)
+    if auth is None or not getattr(auth, "authenticated", False):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    key_level = getattr(auth, "key_level", "none")
+    if key_level not in ("import", "write"):
+        raise HTTPException(status_code=403, detail="Import or write key required")
+
+    queue = getattr(request.app.state, "import_queue", [])
+    remove_statuses = {"done", "error", "cancelled"}
+    removed = sum(1 for r in queue if r.get("status") in remove_statuses)
+    # In-place mutation (не переприсваиваем — content.py держит ту же ссылку)
+    queue[:] = [r for r in queue if r.get("status") not in remove_statuses]
+
+    logger.info("[IMPORT] removed %d finished from queue", removed)
+    return {"removed": removed}

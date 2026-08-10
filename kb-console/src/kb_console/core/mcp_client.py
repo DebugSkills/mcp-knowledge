@@ -474,3 +474,19 @@ class MCPClient:
         if response.status_code != 200:
             return {"cancelled": False, "reason": f"HTTP {response.status_code}"}
         return response.json()
+
+    async def remove_import(self, import_id: str) -> dict[str, Any]:
+        """POST /imports/{import_id}/remove — удалить запись из очереди."""
+        url = f"{self.base_url}/imports/{import_id}/remove"
+        response = await self._client.post(url, headers=self._headers(), timeout=10.0)
+        if response.status_code != 200:
+            return {"removed": False, "reason": f"HTTP {response.status_code}"}
+        return response.json()
+
+    async def remove_finished(self) -> dict[str, Any]:
+        """POST /imports/remove-finished — удалить все завершённые записи."""
+        url = f"{self.base_url}/imports/remove-finished"
+        response = await self._client.post(url, headers=self._headers(), timeout=10.0)
+        if response.status_code != 200:
+            return {"removed": 0, "reason": f"HTTP {response.status_code}"}
+        return response.json()

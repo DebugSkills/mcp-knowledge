@@ -1,8 +1,10 @@
 """Консоль очереди импортов (13.21) — карточки операций с poll + отмена.
 
 Карточки: ✅ done / ❌ error + причина / 🔄 running (фаза+прогресс) / ⏳ queued.
-Крестик: для done/error/queued → убрать локально; для running → отмена (POST cancel).
-Кнопка «убрать все» → очистить done/error/cancelled локально.
+Крестик: для done/error/queued → удалить на сервере (POST /imports/{id}/remove) + локальная
+  перерисовка; для running → отмена (POST cancel).
+Кнопка «убрать все» → удалить все done/error/cancelled на сервере (POST /imports/remove-finished)
+  + локальная перерисовка.
 
 P0-4: ui.context.client.on_disconnect(_cleanup_timers) — паттерн import_page.py:227-237.
 """
@@ -83,17 +85,16 @@ def build_import_queue() -> ui.element:
                 ui.space()
                 if has_done_or_error:
                     def _clear_finished() -> None:
-                        # Удаляем done/error/cancelled из локального списка
-                        # (сервер тоже очищает их при новом импорте через prune)
-                        records[:] = [r for r in records if r.get("status") not in ("done", "error", "cancelled")]
+                        task = asyncio.ensure_future(_do_clear_finished(records))
+                        task.add_done_callback(lambda t: t.exception())
 
                     ui.button("Убрать все", icon="clear_all", on_click=_clear_finished).props("flat dense size=sm")
 
             # Карточки
             for rec in records:
-                _render_card(rec)
+                _render_card(records, rec)
 
-    def _render_card(rec: dict) -> None:
+    def _render_card(records: list[dict], rec: dict) -> None:
         """Отрисовать одну карточку операции."""
         status = rec.get("status", "queued")
         name = rec.get("name", "—")
@@ -138,21 +139,17 @@ def build_import_queue() -> ui.element:
                 ).props("flat dense round size=sm").tooltip("Отменить импорт")
             elif status in ("done", "error", "cancelled"):
                 def _remove_local(rid: str = import_id) -> None:
-                    for _i, _r in enumerate(records):  # noqa: F821
-                        if _r.get("import_id") == rid:
-                            records.pop(_i)  # noqa: F821
-                            break
+                    task = asyncio.ensure_future(_do_remove(rid, records))
+                    task.add_done_callback(lambda t: t.exception())
 
                 ui.button(
                     icon="close",
                     on_click=_remove_local,
-                ).props("flat dense round size=sm").tooltip("Убрать из списка")
+                ).props("flat dense round size=sm").tooltip("Удалить из списка")
             elif status == "queued":
                 def _remove_queued(rid: str = import_id) -> None:
-                    for _i, _r in enumerate(records):  # noqa: F821
-                        if _r.get("import_id") == rid:
-                            records.pop(_i)  # noqa: F821
-                            break
+                    task = asyncio.ensure_future(_do_remove(rid, records))
+                    task.add_done_callback(lambda t: t.exception())
 
                 ui.button(
                     icon="close",
@@ -168,6 +165,34 @@ def build_import_queue() -> ui.element:
         client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
         try:
             await _cancel_running(import_id, client)
+        finally:
+            await client.close()
+
+    async def _do_remove(import_id: str, records: list[dict]) -> None:
+        """POST /imports/{id}/remove → удалить запись на сервере + перерисовать."""
+        client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+        try:
+            result = await client.remove_import(import_id)
+            if result.get("removed"):
+                records[:] = [r for r in records if r.get("import_id") != import_id]
+                _render_cards(records)
+        except Exception as exc:
+            ui.notify(f"Ошибка удаления: {exc}", type="negative")
+        finally:
+            await client.close()
+
+    async def _do_clear_finished(records: list[dict]) -> None:
+        """POST /imports/remove-finished → удалить все завершённые на сервере + перерисовать."""
+        client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+        try:
+            result = await client.remove_finished()
+            removed = result.get("removed", 0)
+            if removed > 0:
+                ui.notify(f"Удалено записей: {removed}", type="positive")
+            records[:] = [r for r in records if r.get("status") not in ("done", "error", "cancelled")]
+            _render_cards(records)
+        except Exception as exc:
+            ui.notify(f"Ошибка очистки: {exc}", type="negative")
         finally:
             await client.close()
 
