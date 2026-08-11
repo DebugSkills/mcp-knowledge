@@ -162,7 +162,11 @@ def build_import_queue() -> ui.element:
                         detail_parts.append(error_text[:100])
                     if status == "queued":
                         detail_parts.append("ожидание...")
-                    if status == "done" and total:
+                    # code-2026-08-11-queue: convert/analyze — итог из summary_text
+                    # (result исключён из GET /imports — lean payload)
+                    if status == "done" and rec.get("summary_text"):
+                        detail_parts.append(rec["summary_text"])
+                    elif status == "done" and total:
                         detail_parts.append(f"{total} секций")
                     if detail_parts:
                         ui.label(" · ".join(detail_parts)).classes("text-caption text-grey")

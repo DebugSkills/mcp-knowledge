@@ -149,6 +149,9 @@ async def submit_import(params: dict, app_state) -> dict:
         "error": None,
         "created_at": now,
         "finished_at": None,
+        "operation_type": "import",  # code-2026-08-11-queue: import|convert|analyze
+        "result": None,  # результат операции (convert: {text,chars}; analyze: рекомендации)
+        "summary_text": None,  # короткий итог для карточки (≤80 символов)
         "log": [],  # P2: построчный лог импорта (ring buffer, cap 200)
     }
 
@@ -299,6 +302,8 @@ async def _bg_import(
                     total=result.get("imported", 0),
                     collection_id=result.get("collection_id", ""),
                     error=f"Partial: {result.get('failed', 0)} sections failed",
+                    # код-2026-08-11: итог для карточки очереди (как у convert/analyze)
+                    summary_text=f"Импортировано секций: {result.get('imported', 0)} (partial)",
                 )
                 elapsed = (datetime.now(timezone.utc) - _start_ts).total_seconds()
                 _update_log(import_id, "warning", f"done (partial): {result.get('imported', 0)} sections, {result.get('failed', 0)} failed in {elapsed:.0f}s")
@@ -310,6 +315,8 @@ async def _bg_import(
                     imported=result.get("imported", 0),
                     total=result.get("imported", 0),
                     collection_id=result.get("collection_id", ""),
+                    # код-2026-08-11: итог для карточки очереди (как у convert/analyze)
+                    summary_text=f"Импортировано секций: {result.get('imported', 0)}",
                 )
                 elapsed = (datetime.now(timezone.utc) - _start_ts).total_seconds()
                 _update_log(import_id, "info", f"done: {result.get('imported', 0)} sections in {elapsed:.0f}s")
@@ -561,6 +568,10 @@ def _start_next_import(app_state) -> None:
     for rec in _import_queue:
         if rec.get("status") != "queued":
             continue
+        # code-2026-08-11-queue: продвигаем только import-операции.
+        # convert/analyze стартуют через create_task сразу (без _start_next_import).
+        if rec.get("operation_type", "import") != "import":
+            continue
         import_id = rec["import_id"]
         params = rec.get("_params")
         if params is None:
@@ -587,30 +598,185 @@ def _start_next_import(app_state) -> None:
 
 
 async def cancel_import(params: dict, app_state) -> dict:
-    """Отменить активный импорт (13.21).
+    """Отменить операцию в очереди (13.21 + code-2026-08-11-queue).
 
-    Устанавливает import_cancel_event → _bg_import проверяет между фазами.
+    Per-ID логика:
+    - queued → просто status="cancelled" (без event — задача ещё не стартовала)
+    - running → event.set() (rec["_cancel_event"] для convert/analyze,
+      app_state.import_cancel_event для import) + status="cancelled"
+    - done/error/cancelled → не отменяем (reason)
 
     Returns:
         {"cancelled": True, "import_id": "..."}
         {"cancelled": False, "reason": "..."}
     """
-    cancel_event = getattr(app_state, "import_cancel_event", None)
-    if cancel_event is None:
-        return {"cancelled": False, "reason": "no active import"}
-
-    cancel_event.set()
     import_id = params.get("import_id", "")
-    logger.info("[IMPORT] cancel signal sent for import %s", import_id)
-
-    # Обновим очередь
-    for rec in _import_queue:
-        if import_id and rec.get("import_id") == import_id:
-            rec["status"] = "cancelled"
-            rec["error"] = "Cancelled by user"
+    rec = None
+    for r in _import_queue:
+        if import_id and r.get("import_id") == import_id:
+            rec = r
             break
 
+    if rec is None:
+        return {"cancelled": False, "reason": "not found"}
+
+    status = rec.get("status", "")
+    if status in ("done", "error", "cancelled"):
+        return {"cancelled": False, "reason": f"already {status}"}
+
+    if status == "queued":
+        rec["status"] = "cancelled"
+        rec["error"] = "Cancelled by user"
+        logger.info("[IMPORT] queued %s cancelled (no event needed)", import_id)
+        return {"cancelled": True, "import_id": import_id}
+
+    # running: per-ID event (convert/analyze) или глобальный (import)
+    event = rec.get("_cancel_event") or getattr(app_state, "import_cancel_event", None)
+    if event is None:
+        rec["status"] = "cancelled"
+        rec["error"] = "Cancelled by user"
+        return {"cancelled": True, "import_id": import_id}
+    event.set()
+    rec["status"] = "cancelled"
+    rec["error"] = "Cancelled by user"
+    logger.info("[IMPORT] cancel signal sent for %s", import_id)
     return {"cancelled": True, "import_id": import_id}
+
+
+# ── code-2026-08-11-queue: convert/analyze фоновые операции ──
+
+async def _bg_convert(
+    import_id: str,
+    pdf_path: str,
+    app_state,
+    cancel_event: asyncio.Event,
+    lock: asyncio.Lock,
+) -> None:
+    """Фоновая операция «Преобразовать» (PDF→текст) с карточкой очереди.
+
+    - acquire heavy_ops_lock (сериализация с import — CPU-bound pdfplumber)
+    - после acquire: если cancel был вызван пока ждали lock → cancelled (без работы)
+    - PDFPreprocessor.extract_text(pdf_path, cancel_event)
+    - result={"text", "chars", "source_path"} + summary_text для карточки
+    """
+    tracker = getattr(app_state, "import_progress", None)
+
+    def _update_queue(**kwargs):
+        for rec in _import_queue:
+            if rec.get("import_id") == import_id:
+                rec.update(kwargs)
+                break
+
+    try:
+        async with lock:
+            if cancel_event.is_set():
+                _update_queue(status="cancelled", error="Cancelled while queued")
+                _update_log(import_id, "error", "cancelled: while queued")
+                return
+            _update_queue(status="running", phase="extracting")
+            _p(tracker, import_id, "start", 0, {"file": pdf_path.split("/")[-1], "content_type": "pdf"})
+            _p(tracker, import_id, "set_phase", "extracting")
+            _update_log(import_id, "info", f"convert started: {pdf_path.split('/')[-1]}")
+
+            from ..content.pdf_preprocessor import PDFPreprocessor
+
+            text = await PDFPreprocessor().extract_text(pdf_path, cancel_event=cancel_event)
+
+            if cancel_event.is_set():
+                _update_queue(status="cancelled", error="Cancelled by user")
+                _update_log(import_id, "error", "cancelled: after extraction")
+                return
+
+            result = {"text": text, "chars": len(text), "source_path": pdf_path}
+            _update_queue(
+                status="done",
+                phase="done",
+                result=result,
+                summary_text=f"{len(text):,} символов",
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
+            _p(tracker, import_id, "done", result)
+            _update_log(import_id, "info", f"done: {len(text):,} chars")
+            logger.info("[CONVERT] done %s chars=%d", import_id, len(text))
+    except asyncio.CancelledError:
+        _update_queue(status="cancelled", error="Server shutdown")
+        _update_log(import_id, "error", "cancelled: server shutdown")
+    except Exception as exc:
+        logger.exception("[CONVERT] failed: %s", import_id)
+        _update_queue(status="error", error=str(exc)[:250])
+        _update_log(import_id, "error", f"error: {str(exc)[:250]}")
+        _p(tracker, import_id, "error", str(exc)[:250])
+
+
+async def _bg_analyze(
+    import_id: str,
+    content: str,
+    app_state,
+    cancel_event: asyncio.Event,
+) -> None:
+    """Фоновая операция «Обработать» (AI-классификация) с карточкой очереди.
+
+    - без heavy_ops_lock (I/O-bound LLM-вызов), но с analyze_semaphore
+      (Semaphore(3) — защита от перегруза Ollama, P2-1)
+    - переиспользует analyze_content из analyzer.py (та же логика, что у MCP tool)
+    - result = рекомендации {content_type, domain, subject, tags, source}
+    """
+    tracker = getattr(app_state, "import_progress", None)
+    semaphore = getattr(app_state, "analyze_semaphore", None)
+
+    def _update_queue(**kwargs):
+        for rec in _import_queue:
+            if rec.get("import_id") == import_id:
+                rec.update(kwargs)
+                break
+
+    try:
+        _update_queue(status="running", phase="analyzing")
+        _p(tracker, import_id, "start", 0, {"content_type": "analyze"})
+        _p(tracker, import_id, "set_phase", "analyzing")
+        _update_log(import_id, "info", "analyze started")
+
+        if cancel_event.is_set():
+            _update_queue(status="cancelled", error="Cancelled by user")
+            _update_log(import_id, "error", "cancelled: before LLM call")
+            return
+
+        from ..content.analyzer import analyze_content
+
+        async def _run() -> dict:
+            return await analyze_content({"content": content}, app_state)
+
+        if semaphore is not None:
+            async with semaphore:  # type: ignore[attr-defined]
+                result = await _run()
+        else:
+            result = await _run()
+
+        if cancel_event.is_set():
+            _update_queue(status="cancelled", error="Cancelled by user")
+            _update_log(import_id, "error", "cancelled: after LLM call")
+            return
+
+        summary = f"{result.get('domain', '—')}/{result.get('subject', '—')}"
+        _update_queue(
+            status="done",
+            phase="done",
+            result=result,
+            summary_text=summary,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+        _p(tracker, import_id, "done", result)
+        _update_log(import_id, "info", f"done: {summary} (source={result.get('source', '?')})")
+        logger.info("[ANALYZE] done %s domain=%s subject=%s", import_id,
+                    result.get("domain", ""), result.get("subject", ""))
+    except asyncio.CancelledError:
+        _update_queue(status="cancelled", error="Server shutdown")
+        _update_log(import_id, "error", "cancelled: server shutdown")
+    except Exception as exc:
+        logger.exception("[ANALYZE] failed: %s", import_id)
+        _update_queue(status="error", error=str(exc)[:250])
+        _update_log(import_id, "error", f"error: {str(exc)[:250]}")
+        _p(tracker, import_id, "error", str(exc)[:250])
 
 
 async def _collect_quality_report(

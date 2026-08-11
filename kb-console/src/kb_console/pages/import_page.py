@@ -105,6 +105,7 @@ def build_import() -> None:
                         "content": PDF_BINARY_MARKER,
                         "pdf_path": pdf_path,
                         "import_id": upload_result.get("upload_id", ""),
+                        "base_id": upload_result.get("upload_id", ""),  # code-2026-08-11: единый base для convert/analyze/import
                     }
                     file_status_label.set_text(
                         f"📄 {filename} — {len(raw) / 1_048_576:.1f} МБ (PDF загружен на сервер)"
@@ -141,6 +142,7 @@ def build_import() -> None:
                 "size": len(raw),
                 "chars": len(text),
                 "content": text,
+                "base_id": str(uuid.uuid4()),  # code-2026-08-11: единый base для analyze/import
             }
             file_status_label.set_text(
                 f"📄 {filename} — {len(raw) / 1_048_576:.1f} МБ ({len(text):,} символов)"
@@ -314,7 +316,12 @@ def build_import() -> None:
 
     # ── Convert handler (PDF→текст, стадия 1 из 3) ─────────
     async def do_convert() -> None:
-        """Преобразовать PDF в текст через extract_pdf_text (MCP tool)."""
+        """Преобразовать PDF в текст: операция очереди + поллинг карточки.
+
+        code-2026-08-11-queue: POST /imports/convert → карточка в очереди
+        (статус/логи в build_import_queue) → поллинг GET /imports/{id}/progress
+        до терминального статуса → текст из snapshot["result"].
+        """
         nonlocal pending_file
         if pending_file is None or not pending_file.get("pdf_path"):
             ui.notify("Сначала загрузите PDF", type="warning")
@@ -325,36 +332,59 @@ def build_import() -> None:
         result_container.clear()
         _start_timer()
 
-        # P1 (critic): конвертация PDF (pdfplumber + OCR) может быть долгой —
-        # используем IMPORT_TIMEOUT (1800с), НЕ ANALYZE_TIMEOUT (60с).
         client = MCPClient(
             base_url=MCP_SERVER_URL,
             api_key=MCP_API_KEY,
             timeout=IMPORT_TIMEOUT,
         )
         try:
-            result = await client.tools_call(
-                "extract_pdf_text", {"pdf_path": pending_file["pdf_path"]}
+            resp = await client.start_convert(
+                pending_file["pdf_path"], pending_file["base_id"]
             )
-            if "error" in result:
-                raise RuntimeError(result["error"])
+            convert_id = resp.get("import_id", f"{pending_file['base_id']}:convert")
 
-            text = result.get("text", "")
-            chars = result.get("chars", len(text))
-            # Сохраняем текст в pending_file → analyze/import работают как для текста
-            pending_file["content"] = text
-            file_status_label.set_text(
-                f"📄 {pending_file['name']} — PDF конвертирован: {chars:,} символов текста"
-            )
-            # Стадия 2 и 3 становятся доступными
-            analyze_btn.enable()
-            import_btn.enable()
-            convert_btn.disable()
-            ui.notify(
-                f"PDF конвертирован ({chars:,} символов). Нажмите «Обработать» для авто-классификации",
-                type="positive",
-            )
-            print(f"[IMPORT-UPLOAD] PDF converted: {chars} chars -> analyze enabled")
+            # P2-4: поллинг с deadline (паттерн _run_import) — graceful при 404/None
+            deadline = time.monotonic() + IMPORT_TIMEOUT
+            snapshot = None
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.5)
+                snapshot = await client.get_progress(convert_id)
+                if snapshot is not None and snapshot.get("status") in ("done", "error", "cancelled"):
+                    break
+            else:
+                raise RuntimeError(f"Таймаут конвертации ({IMPORT_TIMEOUT:.0f} с)")
+
+            if snapshot is None:
+                raise RuntimeError("Прогресс конвертации недоступен (сервер не отвечает)")
+
+            status = snapshot.get("status")
+            result = snapshot.get("result") or {}
+
+            if status == "done":
+                text = result.get("text", "")
+                chars = result.get("chars", len(text))
+                # Сохраняем текст в pending_file → analyze/import работают как для текста
+                pending_file["content"] = text
+                file_status_label.set_text(
+                    f"📄 {pending_file['name']} — PDF конвертирован: {chars:,} символов текста"
+                )
+                # Стадия 2 и 3 становятся доступными
+                analyze_btn.enable()
+                import_btn.enable()
+                convert_btn.disable()
+                ui.notify(
+                    f"PDF конвертирован ({chars:,} символов). Нажмите «Обработать» для авто-классификации",
+                    type="positive",
+                )
+                print(f"[IMPORT-UPLOAD] PDF converted: {chars} chars -> analyze enabled")
+            elif status == "error":
+                convert_btn.enable()
+                file_status_label.set_text("⚠️ Ошибка конвертации PDF")
+                ui.notify(f"Ошибка конвертации PDF: {snapshot.get('error', '?')}", type="negative")
+            elif status == "cancelled":
+                convert_btn.enable()
+                file_status_label.set_text("⚠️ Конвертация отменена")
+                ui.notify("Конвертация отменена", type="warning")
         except Exception as exc:
             # P1 (critic): при ошибке возвращаем convert (можно повторить),
             # import/analyze остаются заблокированы.
@@ -371,7 +401,11 @@ def build_import() -> None:
 
     # ── Analyze handler (НОВЫЙ) ───────────────────────────
     async def do_analyze() -> None:
-        """Обработать pending_file через analyze_content и заполнить поля."""
+        """Обработать pending_file: операция очереди + поллинг карточки.
+
+        code-2026-08-11-queue: POST /imports/analyze → карточка в очереди →
+        поллинг /progress → при done заполняем форму из snapshot["result"].
+        """
         nonlocal pending_file
         if pending_file is None:
             ui.notify("Сначала загрузите файл", type="warning")
@@ -388,24 +422,53 @@ def build_import() -> None:
             timeout=ANALYZE_TIMEOUT,
         )
         try:
-            result = await client.tools_call(
-                "analyze_content",
-                {"content": pending_file["content"][:ANALYZE_FRAGMENT_CHARS]},
+            resp = await client.start_analyze(
+                pending_file["content"][:ANALYZE_FRAGMENT_CHARS],
+                pending_file["base_id"],
             )
+            analyze_id = resp.get("import_id", f"{pending_file['base_id']}:analyze")
 
-            # Заполняем поля (редактируемые!) — title_input НЕ трогаем (ручное поле)
-            content_type.value = result.get("content_type", "book")
-            domain_input.value = result.get("domain", "")
-            subject_input.value = result.get("subject", "")
-            tags = result.get("tags", [])
-            tags_input.value = ", ".join(tags)
+            # P2-4: поллинг с deadline (+30s буфер на очередь семафора)
+            deadline = time.monotonic() + ANALYZE_TIMEOUT + 30
+            snapshot = None
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.5)
+                snapshot = await client.get_progress(analyze_id)
+                if snapshot is not None and snapshot.get("status") in ("done", "error", "cancelled"):
+                    break
+            else:
+                raise RuntimeError("Таймаут анализа")
 
-            source = result.get("source", "?")
-            ui.notify(
-                f"Рекомендации получены (источник: {source}, "
-                f"фрагмент: {result.get('fragment_chars', 0)} симв.)",
-                type="positive",
-            )
+            if snapshot is None:
+                raise RuntimeError("Прогресс анализа недоступен (сервер не отвечает)")
+
+            status = snapshot.get("status")
+            result = snapshot.get("result") or {}
+
+            if status == "done":
+                # Заполняем поля (редактируемые!) — title_input НЕ трогаем (ручное поле)
+                # PDF-флоу: content_type остаётся "pdf" — импорт пойдёт через очередь
+                # (submit_import с pdf_path, карточка в build_import_queue).
+                # Для текстовых файлов — рекомендация анализатора.
+                if pending_file.get("pdf_path"):
+                    content_type.value = "pdf"
+                else:
+                    content_type.value = result.get("content_type", "book")
+                domain_input.value = result.get("domain", "")
+                subject_input.value = result.get("subject", "")
+                tags = result.get("tags", [])
+                tags_input.value = ", ".join(tags)
+
+                source = result.get("source", "?")
+                ui.notify(
+                    f"Рекомендации получены (источник: {source}, "
+                    f"фрагмент: {result.get('fragment_chars', 0)} симв.)",
+                    type="positive",
+                )
+            elif status == "error":
+                ui.notify(f"Ошибка анализа: {snapshot.get('error', '?')}", type="negative")
+            elif status == "cancelled":
+                ui.notify("Анализ отменён", type="warning")
 
         except Exception as exc:
             ui.notify(f"Ошибка анализа: {exc}", type="negative")
@@ -610,9 +673,10 @@ def build_import() -> None:
         if tags:
             params["tags"] = tags
         # 13.9: идентификатор импорта для живого прогресса (poll GET /imports/{id}/progress).
-        # PDF flow: используем upload_id из ответа POST /upload — корреляция upload↔import_id.
-        if pending_file and pending_file.get("pdf_path") and pending_file.get("import_id"):
-            import_id = pending_file["import_id"]
+        # code-2026-08-11-queue: единый base_id (upload_id для PDF / uuid4 для текста) —
+        # convert/analyze операции идут с суффиксами ":convert"/":analyze", import — как есть.
+        if pending_file and pending_file.get("base_id"):
+            import_id = pending_file["base_id"]
         else:
             import_id = str(uuid.uuid4())
         params["import_id"] = import_id

@@ -479,6 +479,50 @@ class MCPClient:
         except (json.JSONDecodeError, ValueError):
             return []
 
+    async def start_convert(self, pdf_path: str, base_id: str) -> dict[str, Any]:
+        """POST /imports/convert — операция «Преобразовать» (PDF→текст).
+
+        Создаёт карточку очереди + фоновую задачу на сервере.
+        Returns: {"import_id": "{base_id}:convert", "status": "started"|"queued"}.
+        """
+        url = f"{self.base_url}/imports/convert"
+        response = await self._client.post(
+            url,
+            json={"pdf_path": pdf_path, "base_id": base_id},
+            headers=self._headers(),
+            timeout=10.0,
+        )
+        if response.status_code != 200:
+            detail = ""
+            try:
+                detail = response.json().get("detail", response.text[:200])
+            except (json.JSONDecodeError, ValueError):
+                detail = response.text[:200]
+            raise RuntimeError(f"start_convert failed ({response.status_code}): {detail}")
+        return response.json()
+
+    async def start_analyze(self, content: str, base_id: str) -> dict[str, Any]:
+        """POST /imports/analyze — операция «Обработать» (AI-классификация).
+
+        Создаёт карточку очереди + фоновую задачу на сервере.
+        Returns: {"import_id": "{base_id}:analyze", "status": "started"}.
+        """
+        url = f"{self.base_url}/imports/analyze"
+        response = await self._client.post(
+            url,
+            json={"content": content, "base_id": base_id},
+            headers=self._headers(),
+            timeout=10.0,
+        )
+        if response.status_code != 200:
+            detail = ""
+            try:
+                detail = response.json().get("detail", response.text[:200])
+            except (json.JSONDecodeError, ValueError):
+                detail = response.text[:200]
+            raise RuntimeError(f"start_analyze failed ({response.status_code}): {detail}")
+        return response.json()
+
     async def get_imports_active(self) -> dict[str, Any]:
         """GET /imports/active — текущий running-импорт (F5-recovery)."""
         url = f"{self.base_url}/imports/active"

@@ -8,7 +8,12 @@ Variant A (13.10):
 13.11 UX:
   - Модалка non-persistent (крестик/Esc/фон) вместо inline master-detail.
   - Прелоадеры (spinners) при TOC/секции/списке.
-  - Кнопка «✏️ Переименовать» в модалке (update_entry с санитизацией).
+  - Кнопка «Переименовать» в модалке (update_entry с санитизацией).
+
+code-2026-08-11-queue-delete-emoji:
+  - Кнопка «Удалить» с confirm-диалогом (delete_entry cascade=True).
+  - Только nicegui icons (без emoji-дублей в кнопках/заголовках).
+
 
 render_book_detail / show_book_dialog переиспользуются страницей «Поиск»
 (кнопка «Открыть книгу» в результатах).
@@ -190,9 +195,11 @@ async def show_book_dialog(collection_id: str, title: str | None = None, initial
 
     with ui.dialog() as dialog, ui.card().classes("w-[720px] max-w-[90vw]"), ui.column().classes("w-full"):
         with ui.row().classes("items-center w-full justify-between"):
-            title_label = ui.label(f"📖 {current_title}").classes("text-h6")
             with ui.row().classes("items-center gap-2"):
-                rename_btn = ui.button("✏️ Переименовать", icon="edit").props("flat dense")
+                ui.icon("menu_book").classes("text-h6 text-primary")
+                title_label = ui.label(current_title).classes("text-h6")
+            with ui.row().classes("items-center gap-2"):
+                rename_btn = ui.button("Переименовать", icon="edit").props("flat dense")
                 async def _do_rename() -> None:
                     nonlocal current_title
                     _rename_input = None
@@ -210,7 +217,7 @@ async def show_book_dialog(collection_id: str, title: str | None = None, initial
                         try:
                             await client.update_entry(collection_id, content=f"# {sanitized}\n\nКоллекция импортированных секций. Оглавление — в frontmatter.children.")
                             current_title = sanitized
-                            title_label.set_text(f"📖 {sanitized}")
+                            title_label.set_text(sanitized)
                             ui.notify(f"Книга переименована в «{sanitized}»", type="positive")
                             rename_dialog.close()
                         except Exception as exc:
@@ -295,10 +302,12 @@ def build_books() -> None:
                         + (f"  ·  {b.get('project')}" if b.get("project") else "")
                     ).classes("text-caption text-grey")
                     with ui.row().classes("items-center"):
-                        ui.label(f"📄 {b.get('section_count', 0)} секций").classes("text-caption text-grey q-mr-md")
+                        with ui.row().classes("items-center"):
+                            ui.icon("article").classes("text-caption text-grey q-mr-xs")
+                            ui.label(f"{b.get('section_count', 0)} секций").classes("text-caption text-grey q-mr-md")
                         async def _open_btn(cid: str = cid, t: str = btitle) -> None:
                             await _open_book(cid, t)
-                        ui.button("📖 Открыть", on_click=_open_btn, icon="menu_book").props("flat dense")
+                        ui.button("Открыть", on_click=_open_btn, icon="menu_book").props("flat dense")
                         async def _replace_btn(
                             cid: str = cid, t: str = btitle,
                             dom: str = b.get("domain", ""), subj: str = b.get("subject", ""),
@@ -311,7 +320,52 @@ def build_books() -> None:
 
                             await show_replace_dialog(cid, t, domain=dom, subject=subj, on_success=_on_success)
 
-                        ui.button("♻️ Заменить", on_click=_replace_btn, icon="cached").props("flat dense")
+                        ui.button("Заменить", on_click=_replace_btn, icon="cached").props("flat dense")
+
+                        async def _delete_btn(cid: str = cid, t: str = btitle) -> None:
+                            """Удалить книгу-коллекцию с подтверждением (каскад).
+
+                            known limitation (P2-2): если книга открыта в модалке —
+                            модалка покажет stale-данные после удаления (non-persistent,
+                            закрывается без краша). Accept для MVP.
+                            """
+                            with ui.dialog() as confirm_dialog, ui.card().classes("q-pa-md"):
+                                ui.label("Удаление книги").classes("text-h6")
+                                ui.label(
+                                    f"Книга «{t}» ({cid}) будет удалена вместе со всеми секциями. "
+                                    f"Сохранится в .trash/. Продолжить?"
+                                ).classes("text-body2 q-mb-md")
+                                with ui.row().classes("justify-end"):
+                                    ui.button("Отмена", on_click=lambda: confirm_dialog.close()).props("flat")
+
+                                    async def _confirm_delete() -> None:
+                                        confirm_dialog.close()
+                                        ui.notify("Удаляю книгу…", type="info")
+                                        client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+                                        try:
+                                            result = await client.delete_entry(cid, cascade=True)
+                                            if result.get("deleted"):
+                                                cascade_del = result.get("cascade_deleted", 0)
+                                                cache.invalidate("books")
+                                                await _show_list()
+                                                ui.notify(
+                                                    f"Книга удалена (каскад: {cascade_del} секций)",
+                                                    type="positive",
+                                                )
+                                            else:
+                                                ui.notify(
+                                                    f"Ошибка: {result.get('error', '?')}",
+                                                    type="negative",
+                                                )
+                                        except Exception as exc:
+                                            ui.notify(f"Ошибка удаления: {exc}", type="negative")
+                                        finally:
+                                            await client.close()
+
+                                    ui.button("Удалить", icon="delete", on_click=_confirm_delete).props("color=negative")
+                            confirm_dialog.open()
+
+                        ui.button("Удалить", on_click=_delete_btn, icon="delete").props("color=negative flat dense")
 
     async def _open_book(collection_id: str, title: str = "") -> None:
         """Открыть модалку книги (вызов напрямую, без обёрток view_container).
@@ -331,5 +385,5 @@ def build_books() -> None:
             _client = None
     ui.context.client.on_disconnect(_cleanup)
 
-    ui.button("🔄 Обновить список", on_click=_show_list).props("color=primary")
+    ui.button("Обновить список", on_click=_show_list, icon="refresh").props("color=primary")
     ui.timer(0.0, _show_list, once=True)

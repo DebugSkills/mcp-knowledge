@@ -54,6 +54,11 @@ from .metrics import metrics_endpoint, set_embed_backend
 from .progress import ImportProgressTracker
 from .rate_limit import TokenBucketLimiter
 from .storage import MarkdownStore, QdrantClient
+from .tools.content import (  # code-2026-08-11-queue: convert/analyze операции
+    _bg_analyze,
+    _bg_convert,
+    _import_queue,
+)
 
 logger = logging.getLogger("mcp_knowledge")
 
@@ -278,7 +283,9 @@ async def lifespan(app: FastAPI):
     app.state.import_task = None
     app.state.import_cancel_event = None
     app.state.import_queue: list[dict] = []  # ImportRecord[] — сессионная очередь
-    logger.info("📦 Import queue state initialized (phase 13.21)")
+    # code-2026-08-11-queue: лимит одновременных analyze-операций (P2-1, перегруз Ollama)
+    app.state.analyze_semaphore = asyncio.Semaphore(3)
+    logger.info("📦 Import queue state initialized (phase 13.21 + convert/analyze ops)")
 
     # Task 1: data_version для кеш-инвалидации kb-console
     app.state.data_version = 0
@@ -457,13 +464,55 @@ async def import_progress(import_id: str, request: Request):
                         "collection_id": rec.get("collection_id", ""),
                         "name": rec.get("name", ""),
                         "finished_at": rec.get("finished_at"),
+                        # code-2026-08-11-queue: convert/analyze операции
+                        "result": rec.get("result"),
+                        "operation_type": rec.get("operation_type", "import"),
                         "messages": [],
                         "_source": "queue",
                     }
                     break
-    
+
     if snapshot is None:
         raise HTTPException(404, "unknown import_id")
+
+    # code-2026-08-11-queue: синхронизация двух хранилищ (tracker vs queue-rec).
+    # Queue-rec — SSOT для терминальных статусов/result (tracker может отставать
+    # на race между update_queue(done) и tracker.done).
+    queue = getattr(request.app.state, "import_queue", [])
+    rec = next((r for r in queue if r.get("import_id") == import_id), None)
+    if rec is not None and rec.get("status") in ("done", "error", "cancelled"):
+        # терминальный статус в queue — queue-версия полнее (result/summary_text)
+        messages = snapshot.get("messages", []) if snapshot else []
+        snapshot = {
+            "import_id": rec.get("import_id", ""),
+            "status": rec.get("status", "unknown"),
+            "phase": rec.get("phase", ""),
+            "imported": rec.get("imported", 0),
+            "total": rec.get("total", 0),
+            "failed": rec.get("failed", 0),
+            "error": rec.get("error"),
+            "collection_id": rec.get("collection_id", ""),
+            "name": rec.get("name", ""),
+            "finished_at": rec.get("finished_at"),
+            "result": rec.get("result"),
+            "operation_type": rec.get("operation_type", "import"),
+            "summary_text": rec.get("summary_text"),
+            "messages": messages,
+            "_source": "queue",
+        }
+    elif rec is not None:
+        # running-версия: дополняем tracker-поля свежими полями из queue-rec
+        if (snapshot.get("result") is None and rec.get("result") is not None):
+            snapshot["result"] = rec["result"]
+        if "operation_type" not in snapshot:
+            snapshot["operation_type"] = rec.get("operation_type", "import")
+        if snapshot.get("summary_text") is None and rec.get("summary_text"):
+            snapshot["summary_text"] = rec["summary_text"]
+
+    # Нормализация: tracker.done() пишет "summary", queue-rec пишет "result".
+    # Клиент всегда читает snapshot["result"].
+    if "summary" in snapshot and "result" not in snapshot:
+        snapshot["result"] = snapshot.pop("summary")
     return snapshot
 
 
@@ -637,6 +686,155 @@ async def upload_pdf(request: Request):
     }
 
 
+@app.post("/imports/convert")
+async def start_convert(request: Request):
+    """POST /imports/convert — операция «Преобразовать» (PDF→текст) с карточкой очереди.
+
+    code-2026-08-11-queue: создаёт запись в _import_queue (ДО ответа, P1-1),
+    запускает _bg_convert (фоновая задача, heavy_ops_lock — сериализация с import).
+    Если lock занят — операция ставится в очередь (status="queued").
+
+    Body: {pdf_path: str, base_id: str}
+    Auth: import/write key (как POST /upload).
+    """
+    auth = getattr(request.state, "auth", None)
+    if auth is None or not getattr(auth, "authenticated", False):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    key_level = getattr(auth, "key_level", "none")
+    if key_level not in ("import", "write"):
+        raise HTTPException(status_code=403, detail="Import or write key required")
+
+    body = await request.json()
+    pdf_path = body.get("pdf_path", "")
+    base_id = body.get("base_id", "")
+
+    if not pdf_path:
+        raise HTTPException(status_code=400, detail="Missing 'pdf_path'")
+    if not base_id:
+        raise HTTPException(status_code=400, detail="Missing 'base_id'")
+    if not pdf_path.startswith("/tmp/pdf_uploads"):
+        raise HTTPException(status_code=400, detail="Invalid pdf_path (must be under /tmp/pdf_uploads)")
+    if not _os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail=f"PDF file not found: {pdf_path}")
+
+    import_id = f"{base_id}:convert"
+    filename = _os.path.basename(pdf_path)
+    # /tmp/pdf_uploads/<upload_id>_<filename> — вытаскиваем читаемое имя
+    display_name = filename.split("_", 1)[1] if "_" in filename else filename
+
+    now = datetime.now(timezone.utc).isoformat()
+    cancel_event = asyncio.Event()
+    rec = {
+        "import_id": import_id,
+        "name": f"Преобразовать: {display_name}",
+        "status": "running",
+        "phase": "",
+        "imported": 0,
+        "total": 0,
+        "collection_id": "",
+        "error": None,
+        "created_at": now,
+        "finished_at": None,
+        "operation_type": "convert",
+        "result": None,
+        "summary_text": None,
+        "log": [],
+        "_cancel_event": cancel_event,
+    }
+
+    # P1-1: запись в очереди ДО запуска задачи и ДО ответа.
+    # ВАЖНО: единый модульный _import_queue (content.py) — _update_queue ищет по нему.
+    # app.state.import_queue синхронизируется ссылкой (паттерн submit_import).
+    _import_queue.append(rec)
+    request.app.state.import_queue = _import_queue
+    tracker = getattr(request.app.state, "import_progress", None)
+    if tracker is not None:
+        tracker.start(import_id, 0, {"file": display_name, "content_type": "pdf"})
+
+    heavy_ops_lock = getattr(request.app.state, "heavy_ops_lock", None)
+    if heavy_ops_lock is not None and heavy_ops_lock.locked():
+        rec["status"] = "queued"
+        logger.info("[CONVERT] lock busy — queued %s", import_id)
+        return {"import_id": import_id, "status": "queued"}
+
+    asyncio.create_task(
+        _bg_convert(
+            import_id=import_id,
+            pdf_path=pdf_path,
+            app_state=request.app.state,
+            cancel_event=cancel_event,
+            lock=heavy_ops_lock or asyncio.Lock(),
+        )
+    )
+    logger.info("[CONVERT] started %s (%s)", import_id, display_name)
+    return {"import_id": import_id, "status": "started"}
+
+
+@app.post("/imports/analyze")
+async def start_analyze(request: Request):
+    """POST /imports/analyze — операция «Обработать» (AI-классификация) с карточкой очереди.
+
+    code-2026-08-11-queue: запись в очереди + фоновая задача _bg_analyze
+    (без heavy_ops_lock — I/O-bound; с analyze_semaphore, P2-1).
+    result (рекомендации) клиент получает через GET /imports/{id}/progress.
+
+    Body: {content: str, base_id: str}
+    Auth: import/write key.
+    """
+    auth = getattr(request.state, "auth", None)
+    if auth is None or not getattr(auth, "authenticated", False):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    key_level = getattr(auth, "key_level", "none")
+    if key_level not in ("import", "write"):
+        raise HTTPException(status_code=403, detail="Import or write key required")
+
+    body = await request.json()
+    content = body.get("content", "")
+    base_id = body.get("base_id", "")
+    if not content:
+        raise HTTPException(status_code=400, detail="Missing 'content'")
+    if not base_id:
+        raise HTTPException(status_code=400, detail="Missing 'base_id'")
+
+    import_id = f"{base_id}:analyze"
+    now = datetime.now(timezone.utc).isoformat()
+    cancel_event = asyncio.Event()
+    rec = {
+        "import_id": import_id,
+        "name": f"Обработать: {base_id[:8]}",
+        "status": "running",
+        "phase": "",
+        "imported": 0,
+        "total": 0,
+        "collection_id": "",
+        "error": None,
+        "created_at": now,
+        "finished_at": None,
+        "operation_type": "analyze",
+        "result": None,
+        "summary_text": None,
+        "log": [],
+        "_cancel_event": cancel_event,
+    }
+
+    _import_queue.append(rec)
+    request.app.state.import_queue = _import_queue
+    tracker = getattr(request.app.state, "import_progress", None)
+    if tracker is not None:
+        tracker.start(import_id, 0, {"content_type": "analyze"})
+
+    asyncio.create_task(
+        _bg_analyze(
+            import_id=import_id,
+            content=content,
+            app_state=request.app.state,
+            cancel_event=cancel_event,
+        )
+    )
+    logger.info("[ANALYZE] started %s", import_id)
+    return {"import_id": import_id, "status": "started"}
+
+
 @app.get("/imports")
 async def list_imports(request: Request):
     """GET /imports — список всех импортов (сессионная очередь).
@@ -652,10 +850,11 @@ async def list_imports(request: Request):
 
     queue = getattr(request.app.state, "import_queue", [])
     # Санитизация: _params содержит контент — исключаем из ответа.
-    # "log" тоже исключаем — lean payload (лог через GET /imports/{id}/log).
+    # "log" и "result" тоже исключаем — lean payload (лог через GET /imports/{id}/log,
+    # result (текст PDF до сотен KB) через GET /imports/{id}/progress).
     sanitized = []
     for rec in queue:
-        out = {k: v for k, v in rec.items() if not k.startswith("_") and k != "log"}
+        out = {k: v for k, v in rec.items() if not k.startswith("_") and k not in ("log", "result")}
         sanitized.append(out)
     return sanitized
 
@@ -703,22 +902,29 @@ async def cancel_import_endpoint(import_id: str, request: Request):
     if key_level not in ("import", "write"):
         raise HTTPException(status_code=403, detail="Import or write key required")
 
-    cancel_event = getattr(request.app.state, "import_cancel_event", None)
-    if cancel_event is None:
-        raise HTTPException(404, "No active import to cancel")
-
-    cancel_event.set()
-    logger.info("[IMPORT] Cancel signal sent for import %s", import_id)
-
-    # Обновим запись в очереди
     queue = getattr(request.app.state, "import_queue", [])
     for rec in queue:
-        if rec.get("import_id") == import_id:
+        if rec.get("import_id") != import_id:
+            continue
+        status = rec.get("status", "")
+        if status in ("done", "error", "cancelled"):
+            raise HTTPException(409, f"Already {status}")
+        # queued → без event (задача ещё не стартовала)
+        if status == "queued":
             rec["status"] = "cancelled"
             rec["error"] = "Cancelled by user"
-            break
+            logger.info("[IMPORT] queued %s cancelled", import_id)
+            return {"cancelled": True, "import_id": import_id}
+        # running → per-ID event (convert/analyze) или глобальный (import)
+        event = rec.get("_cancel_event") or getattr(request.app.state, "import_cancel_event", None)
+        if event is not None:
+            event.set()
+        rec["status"] = "cancelled"
+        rec["error"] = "Cancelled by user"
+        logger.info("[IMPORT] cancel signal sent for import %s", import_id)
+        return {"cancelled": True, "import_id": import_id}
 
-    return {"cancelled": True, "import_id": import_id}
+    raise HTTPException(404, f"Import {import_id} not found")
 
 
 @app.post("/imports/{import_id}/remove")
