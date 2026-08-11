@@ -1,22 +1,32 @@
-# mcp-knowledge
+<div align="center">
 
-MCP Knowledge Server — семантическая база знаний для AI-агентов по протоколу MCP (Model Context Protocol). Проект сообщества DebugSkills.
+# 📚 mcp-knowledge
+
+**MCP Knowledge Server** — семантическая база знаний для AI-агентов по протоколу **MCP** (Model Context Protocol)
+
+🔗 [debugskills.ru](https://debugskills.ru/) · 🤝 Проект сообщества **DebugSkills**
+
+🛠️ **20 MCP Tools** · 🧠 Markdown SSOT → Ollama embed → Qdrant · 🌐 air-gap ready · 🏭 production-ready
+
+---
+
+</div>
 
 Хранение: Markdown SSOT → chunk → Ollama embed (nomic-embed-text) → Qdrant vector search. **20 MCP Tools**, air-gap совместимость (одноархивный deploy-bundle), production-ready (health, rate-limit, blue-green reindex, quality system). Веб-консоль **kb-console** (NiceGUI, :8085) для диагностики и обслуживания. Подключение AI-агентов (Kilo/Claude/Cline) — через **stdio-мост** (`mcp-stdio/bridge.py`, см. `docs/mcp-client-guide.md`). MCP-протокол: JSON-RPC 2.0 over HTTP (`POST /mcp`), `ping` → `{"result":{}}`, `notifications/initialized` → 204 (Фаза 13.21).
 
-## Почему это ценно для сообщества
+## 💎 Почему это ценно для сообщества
 
 MCP-сервер — это **общий накопитель знаний для совместной разработки**: любое решение, инструкция или найденный ответ записывается один раз в единую базу и становится доступно всем участникам и их AI-агентам. Что это даёт:
 
-- **Единые стандарты** — одна классификация (domains → subjects → tags), один формат записей (frontmatter + Markdown), общие конвенции. Новые участники видят, как устроен проект, без долгих расспросов.
-- **Накопление знаний** — опыт не теряется в чатах и переписке: решения, runbook'и, уроки и ответы фиксируются в SSOT, git-аудит хранит полную историю изменений, а quality system следит за актуальностью (staleness, review-очередь).
-- **Переиспользование ценной информации** — семантический поиск находит релевантное за секунды: не нужно заново искать, переспрашивать или «изобретать велосипед», если проблема уже решена.
-- **Совместная работа без конфликтов** — multi-key доступ (read / import / write) и optimistic locking защищают данные, книги-коллекции позволяют импортировать и поддерживать целые материалы (документация, руководства) как единое целое.
-- **Универсальность для AI-агентов** — стандартный протокол MCP: один раз развернул сервер — и знания доступны Kilo, Claude, Cline и любому другому MCP-клиенту без переписывания интеграций.
-- **Системное качество** — дубликаты, битые ссылки и устаревшие записи выявляются сканером автоматически, а не «когда-нибудь руками».
-- **Приватность и автономность** — полная совместимость с air-gap: база может работать в изолированном контуре без интернета.
+- **📐 Единые стандарты** — одна классификация (domains → subjects → tags), один формат записей (frontmatter + Markdown), общие конвенции. Новые участники видят, как устроен проект, без долгих расспросов.
+- **🧠 Накопление знаний** — опыт не теряется в чатах и переписке: решения, runbook'и, уроки и ответы фиксируются в SSOT, git-аудит хранит полную историю изменений, а quality system следит за актуальностью (staleness, review-очередь).
+- **♻️ Переиспользование ценной информации** — семантический поиск находит релевантное за секунды: не нужно заново искать, переспрашивать или «изобретать велосипед», если проблема уже решена.
+- **👥 Совместная работа без конфликтов** — multi-key доступ (read / import / write) и optimistic locking защищают данные, книги-коллекции позволяют импортировать и поддерживать целые материалы (документация, руководства) как единое целое.
+- **🤖 Универсальность для AI-агентов** — стандартный протокол MCP: один раз развернул сервер — и знания доступны Kilo, Claude, Cline и любому другому MCP-клиенту без переписывания интеграций.
+- **✅ Системное качество** — дубликаты, битые ссылки и устаревшие записи выявляются сканером автоматически, а не «когда-нибудь руками».
+- **🔒 Приватность и автономность** — полная совместимость с air-gap: база может работать в изолированном контуре без интернета.
 
-## Архитектура
+## 🏗️ Архитектура
 
 ```
 Kilo/Claude/Cline ──┐
@@ -52,7 +62,7 @@ mcp-stdio/bridge.py │    │  диаг. :8085 → :8000
 
 **kb-console** — отдельный самодостаточный контейнер (образ `kb-console:prod`): страницы **Статус** (health-карточки, метрики, 20 инструментов), **Книги** (список коллекций + оглавление), **Импорт** (загрузка материалов через `import_content`), **Поиск** (по корпусу). Может жить на клиентских хостах (`MCP_SERVER_URL` из env). Руководство: `kb-console/USER_GUIDE.md`.
 
-## Быстрый старт
+## 🚀 Быстрый старт
 
 ```bash
 # Разработка (venv)
@@ -70,7 +80,7 @@ make console-test                    # unit + smoke kb-console (66)
 .venv/bin/python -m pytest mcp-stdio/tests -q    # stdio-мост (19)
 ```
 
-## Продовый деплой (air-gap, одноархивный bundle)
+## 📦 Продовый деплой (air-gap, одноархивный bundle)
 
 ```bash
 make bundle                          # машина с интернетом → mcp-kb-airgap-bundle.tar.gz (~1.2 GB)
@@ -82,9 +92,9 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 ```
 Подробности: `docs/air-gap-validation.md` (в bundle — `DEPLOYMENT.md`), руководство консоли — `USER_GUIDE.md`.
 
-## MCP Tools (20)
+## 🛠️ MCP Tools (20)
 
-### Search & Read
+### 🔍 Search & Read
 | # | Tool | Назначение |
 |---|------|-----------|
 | 1 | `search_knowledge` | Семантический поиск (Ollama embed) |
@@ -92,14 +102,14 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | 3 | `get_entry` | Получить полную запись (frontmatter + Markdown) |
 | 4 | `get_knowledge_map` | Структурная карта: domains → subjects → IDs |
 
-### Write
+### ✍️ Write
 | # | Tool | Назначение |
 |---|------|-----------|
 | 5 | `write_knowledge` | Создать: Markdown SSOT → chunk → embed → Qdrant |
 | 6 | `update_entry` | Обновить с optimistic locking (version check) |
 | 7 | `delete_entry` | Удалить: SSOT + Qdrant + Git commit |
 
-### Browse
+### 🧭 Browse
 | # | Tool | Назначение |
 |---|------|-----------|
 | 5 | `list_collections` | Список книг/коллекций с метаданными (title, domain/subject, tags, section_count) |
@@ -107,12 +117,12 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | 10 | `list_subjects` | Список тем в домене |
 | 11 | `list_projects` | Список проектов (domain/subject опционально) |
 
-### Admin
+### ⚙️ Admin
 | # | Tool | Назначение |
 |---|------|-----------|
 | 12 | `reindex` | Перестроить индекс: все .md → Qdrant (blue-green, zero-downtime) |
 
-### Quality (Фаза 4 + 13.14)
+### 🩺 Quality (Фаза 4 + 13.14)
 | # | Tool | Назначение |
 |---|------|-----------|
 | 13 | `review_queue` | Топ устаревших записей (staleness_score DESC) |
@@ -122,13 +132,13 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | 17 | `run_quality_scan` | Периодический scan (для cron, daily; фоновая задача с lock) |
 | 18 | `cancel_quality_scan` | Отменить активный scan, освободить lock (Фаза 13.18) |
 
-### Import (Фаза 5 + 13.8)
+### 📥 Import (Фаза 5 + 13.8)
 | # | Tool | Назначение |
 |---|------|-----------|
 | 19 | `import_content` | Декомпозиция + batch запись: content → collection (book, cross_subjects, wait_for_index) |
 | 20 | `analyze_content` | AI-анализ контента: рекомендации content_type/domain/subject/tags (Ollama LLM + TF-IDF) |
 
-## MCP Prompts
+## 💬 MCP Prompts
 
 | Prompt | Назначение |
 |--------|-----------|
@@ -136,7 +146,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | `best-practice-write` | Best-practice для write_knowledge: SSOT, YAML frontmatter, теги, кросс-ссылки |
 | `periodic_quality_cleanup` | Пошаговая инструкция для AI-агента: review_queue → list_issues → resolve |
 
-## Quality System (Фаза 4)
+## 🛡️ Quality System (Фаза 4)
 
 | Механизм | Описание |
 |----------|----------|
@@ -147,7 +157,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | **Lifecycle** | 2-state: published ↔ deprecated (reversible restore) |
 | **Quality SLO** | `review_queue_size > 50` → Prometheus/alertmanager alert |
 
-## Конфигурация (env)
+## 📋 Конфигурация (env)
 
 | Переменная | Default | Описание |
 |-----------|---------|----------|
@@ -166,7 +176,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | `REVIEW_THRESHOLD` | 0.45 | Порог для review-очереди |
 | `DUP_SIMILARITY_THRESHOLD` | 0.92 | Cosine-порог для дублей |
 
-## Реализованные фазы
+## 🗺️ Реализованные фазы
 
 | Фаза | Статус | Ключевой результат |
 |------|:------:|-------------------|
@@ -194,7 +204,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | 13.23 | ✅ | Qdrant-бэкап: sparse-фикс, снапшоты только своих коллекций, healthcheck /dev/tcp |
 | 13.24 | ✅ | Advisory P2-фиксы: task-ref в hide, import asyncio наверх, +3 теста render_import_progress |
 
-## Тесты (актуальные цифры)
+## 🧪 Тесты (актуальные цифры)
 
 | Уровень | Результат |
 |---------|-----------|
@@ -205,7 +215,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | mcp-stdio bridge tests | 19/19 (unit 18 + smoke 1) |
 | Ruff | 0 ошибок |
 
-## Known Limitations
+## ⚠️ Known Limitations
 
 - **Factual correctness:** не проверяется (требует LLM)
 - **Coverage gaps:** не детектируются непокрытые темы
@@ -213,7 +223,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 - **Temporal dup-blind-spot:** async-окно 1-5с (компенсируется periodic scan)
 - **Backlog (§11):** gRPC-сценарий 6334 (REST эквивалентен), F1 blue-green для legacy-коллекции, CLI subprocess-тест
 
-## Коммиты (последние фазы)
+## 📜 Коммиты (последние фазы)
 
 ```
 e0973b9 fix(phase13.7): S20 importorskip — E2E зелёный в verify
