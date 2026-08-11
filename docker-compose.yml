@@ -44,6 +44,7 @@ services:
       - ../data/dlq:/app/data/dlq
       - ../data/quality:/app/data/quality
       - ../data/logs:/app/data/logs           # 13.19: логи сканирования (проброс на хост)
+      - ../data/pdf_cache:/app/data/pdf_cache # PDF checkpoint-кэш: переживает передеплой
       - ../models_cache:/app/models_cache
     env_file:
       - .env

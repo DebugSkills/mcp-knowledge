@@ -8,6 +8,7 @@ Real libraries used for fixture PDFs (importorskip'd).
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -255,3 +256,58 @@ class TestContentHash:
     def test_nonexistent_file_returns_hash(self, preprocessor):
         h = preprocessor._compute_content_hash("/nonexistent/file.pdf")
         assert len(h) == 64
+
+
+# ═══════════════════════════════════════════════════════════════
+# Regression: knowledge_id validation (13.22 bugfix)
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestKnowledgeIdValidation:
+    """knowledge_id must match ^[a-z0-9][a-z0-9_-]{2,127}$ with 8-char hex hash suffix."""
+
+    KNOWLEDGE_ID_RE = r"^[a-z0-9][a-z0-9_-]{2,127}$"
+    HEX8_RE = r"-[a-f0-9]{8}$"
+
+    def test_make_sections_from_text_knowledge_id_valid(self, preprocessor):
+        """Bug 13.22: _make_sections_from_text передавал сырой title вместо content_hash."""
+        meta = ImportMeta(
+            domain="devops",
+            subject="ai",
+            title="1-3 AI роли, которые усиливают преподавателя",
+        )
+        sections = preprocessor._make_sections_from_text(
+            body="Тестовый текст для проверки генерации knowledge_id",
+            title="Раздел 1",
+            seq=1,
+            metadata=meta,
+        )
+        assert len(sections) > 0, "Should produce at least one section"
+        for s in sections:
+            kid = s.meta["knowledge_id"]
+            assert re.match(self.KNOWLEDGE_ID_RE, kid), (
+                f"knowledge_id={kid!r} does not match {self.KNOWLEDGE_ID_RE}"
+            )
+            assert re.search(self.HEX8_RE, kid), (
+                f"knowledge_id={kid!r} does not end with 8 hex chars"
+            )
+
+    async def test_fallback_per_page_knowledge_id_valid(self, preprocessor):
+        """Bug 13.22: _fallback_per_page передавал сырой title вместо content_hash."""
+        meta = ImportMeta(
+            domain="devops",
+            subject="ai",
+            title="1-3 AI роли, которые усиливают преподавателя",
+        )
+        # Simulate two pages of text
+        full_text = "Page one content here.\n\nPage two content here."
+        sections = await preprocessor._fallback_per_page(full_text, meta)
+        assert len(sections) > 0, "Should produce sections for non-empty pages"
+        for s in sections:
+            kid = s.meta["knowledge_id"]
+            assert re.match(self.KNOWLEDGE_ID_RE, kid), (
+                f"knowledge_id={kid!r} does not match {self.KNOWLEDGE_ID_RE}"
+            )
+            assert re.search(self.HEX8_RE, kid), (
+                f"knowledge_id={kid!r} does not end with 8 hex chars"
+            )

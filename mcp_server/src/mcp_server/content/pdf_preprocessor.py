@@ -483,12 +483,13 @@ class PDFPreprocessor(ContentPreprocessor):
                     f"Страница {seq}" if chunk_idx == 0
                     else f"Страница {seq} (часть {chunk_idx + 1})"
                 )
+                content_hash = hashlib.sha256(chunk[:200].encode()).hexdigest()
                 knowledge_id = make_knowledge_id(
                     metadata.domain,
                     metadata.subject,
                     section_title,
                     seq,
-                    metadata.title or "pdf_import",
+                    content_hash,
                 )
                 keywords = extract_keywords(chunk, top_n=5)
                 # Flatten: ensure keywords is list[str] not list[list]
@@ -581,12 +582,13 @@ class PDFPreprocessor(ContentPreprocessor):
 
         for chunk_idx, chunk in enumerate(chunks):
             section_title = title if chunk_idx == 0 else f"{title} (часть {chunk_idx + 1})"
+            content_hash = hashlib.sha256(chunk[:200].encode()).hexdigest()
             knowledge_id = make_knowledge_id(
                 metadata.domain,
                 metadata.subject,
                 section_title,
                 seq,
-                metadata.title or "pdf_import",
+                content_hash,
             )
             keywords = extract_keywords(chunk, top_n=5)
             # Flatten: ensure keywords is list[str] not list[list]
