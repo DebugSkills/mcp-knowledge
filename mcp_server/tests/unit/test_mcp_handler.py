@@ -340,3 +340,15 @@ class TestNotificationsHandler:
         result = await _dispatch_single(body, _make_mock_request_for_dispatch())
         assert result is None, \
             f"Unknown notification должен вернуть None (204), got {result}"
+
+    async def test_notification_http_204_empty_body(self):
+        """Регресс: notification → HTTP 204 с ПУСТЫМ телом (не b'""').
+
+        JSONResponse(content="") сериализует "" в b'""' → при 204 uvicorn
+        кидает RuntimeError «Response content longer than Content-Length».
+        """
+        body = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode()
+        resp = await handle_mcp_request(_make_mock_request(body))
+        assert resp.status_code == 204
+        raw = resp.body if hasattr(resp, "body") else b""
+        assert raw == b"", f"204 тело должно быть пустым, got {raw!r}"

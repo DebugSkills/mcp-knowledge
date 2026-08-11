@@ -19,7 +19,7 @@ import time
 from typing import Any
 
 from fastapi import Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from .auth import check_tool_permission, get_auth
 from .config import settings
@@ -378,8 +378,9 @@ async def handle_mcp_request(request: Request) -> JSONResponse:
 
     resp = await _dispatch_single(body, request)
     if resp is None:
-        # Notification — no response
-        return JSONResponse(content="", status_code=204)
+        # Notification — no response. Пустое ТЕЛО (не JSONResponse(""):
+        # он сериализует "" в b'""' → RuntimeError «content longer than Content-Length».
+        return Response(status_code=204)
     return JSONResponse(content=resp)
 
 
