@@ -12,6 +12,7 @@ import pytest
 from mcp_server.tools.admin import reindex
 from mcp_server.tools.browse import list_domains, list_projects, list_subjects
 from mcp_server.tools.collections import list_collections
+from mcp_server.tools.content import extract_pdf_text
 from mcp_server.tools.crud import delete_entry, update_entry, write_knowledge
 from mcp_server.tools.read import get_entry, get_knowledge_map
 from mcp_server.tools.search import search_by_tags, search_knowledge
@@ -613,3 +614,62 @@ async def test_search_by_tags_filters_junk_content(app_state):
     assert "error" not in result
     assert result["total"] == 1
     assert result["results"][0]["knowledge_id"] == "kid-valid"
+
+
+# ── extract_pdf_text tool (авто-классификация PDF: Фаза 2) ────
+
+
+async def test_extract_pdf_text_missing_pdf_path(app_state):
+    """Без pdf_path → error."""
+    result = await extract_pdf_text({}, app_state)
+    assert "error" in result
+    assert "pdf_path" in result["error"]
+
+
+async def test_extract_pdf_text_rejects_path_outside_uploads(app_state):
+    """P2 (critic): путь вне /tmp/pdf_uploads → error (защита FS)."""
+    result = await extract_pdf_text({"pdf_path": "/etc/passwd"}, app_state)
+    assert "error" in result
+    assert "pdf_uploads" in result["error"]
+
+
+async def test_extract_pdf_text_file_not_found(app_state):
+    """Файл не существует → error."""
+    result = await extract_pdf_text(
+        {"pdf_path": "/tmp/pdf_uploads/definitely-missing.pdf"}, app_state
+    )
+    assert "error" in result
+    assert "not found" in result["error"]
+
+
+async def test_extract_pdf_text_happy_path(app_state, monkeypatch):
+    """PDF в /tmp/pdf_uploads → текст извлекается, chars корректны.
+
+    PDFPreprocessor.extract_text подменяется (не нужен pdfplumber/reportlab).
+    """
+    import os as _test_os
+
+    import mcp_server.content.pdf_preprocessor as pp_module
+
+    # Реальный файл в upload-директории (создаём и чистим)
+    upload_dir = "/tmp/pdf_uploads"
+    _test_os.makedirs(upload_dir, exist_ok=True)
+    pdf_path = _test_os.path.join(upload_dir, f"unit-test-{_test_os.getpid()}.pdf")
+    try:
+        with open(pdf_path, "wb") as f:  # noqa: ASYNC230 — единичный тестовый файл
+            f.write(b"%PDF-1.4 fake unit test")
+
+        class _FakePreprocessor:
+            async def extract_text(self, source_path, cancel_event=None):
+                return "Извлечённый текст документа PDF"
+
+        monkeypatch.setattr(pp_module, "PDFPreprocessor", _FakePreprocessor)
+
+        result = await extract_pdf_text({"pdf_path": pdf_path}, app_state)
+        assert "error" not in result, result
+        assert "текст" in result["text"]
+        assert result["chars"] == len("Извлечённый текст документа PDF")
+        assert result["source_path"] == pdf_path
+    finally:
+        if _test_os.path.exists(pdf_path):
+            _test_os.remove(pdf_path)

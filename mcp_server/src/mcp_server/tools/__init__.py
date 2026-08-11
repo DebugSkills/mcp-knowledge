@@ -15,7 +15,7 @@ from ..content.analyzer import analyze_content
 from .admin import reindex
 from .browse import list_domains, list_projects, list_subjects
 from .collections import list_collections
-from .content import cancel_import, import_content
+from .content import cancel_import, extract_pdf_text, import_content
 from .crud import delete_entry, update_entry, write_knowledge
 from .quality import (
     cancel_quality_scan,
@@ -239,6 +239,16 @@ _ANALYZE_CONTENT_SCHEMA: dict[str, Any] = {
     "required": ["content"],
 }
 
+# ── extract_pdf_text schema (PDF→текст для авто-классификации) ──
+
+_EXTRACT_PDF_TEXT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "pdf_path": {"type": "string", "description": "Путь к PDF на сервере (из POST /upload)"},
+    },
+    "required": ["pdf_path"],
+}
+
 # ── Tool definitions ───────────────────────────────────────
 
 TOOLS: list[dict[str, Any]] = [
@@ -345,6 +355,11 @@ TOOLS: list[dict[str, Any]] = [
         "description": "AI-анализ контента: рекомендации content_type/domain/subject/tags через Ollama LLM + TF-IDF fallback.",
         "inputSchema": _ANALYZE_CONTENT_SCHEMA,
     },
+    {
+        "name": "extract_pdf_text",
+        "description": "Конвертировать PDF → текст (pdfplumber + OCR fallback). Используется для авто-классификации PDF (Преобразовать→Обработать→Добавить).",
+        "inputSchema": _EXTRACT_PDF_TEXT_SCHEMA,
+    },
     # ── 13.21: cancel import ─────────────────────────────────
     {
         "name": "cancel_import",
@@ -377,5 +392,6 @@ TOOL_HANDLERS = {
     "cancel_quality_scan": cancel_quality_scan,
     "import_content": import_content,
     "analyze_content": analyze_content,
+    "extract_pdf_text": extract_pdf_text,
     "cancel_import": cancel_import,
 }

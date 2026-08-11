@@ -154,7 +154,7 @@ class PDFPreprocessor(ContentPreprocessor):
     ) -> list[Section]:
         """Извлечение текста из PDF → декомпозиция на секции.
 
-        Phase 1: extract text per-page (pdfplumber + OCR fallback).
+        Phase 1: extract text per-page (pdfplumber + OCR fallback) — extract_text().
         Phase 2: heading detection (font-size >1.3x median → new section).
         Fallback: per-page sections if <2 headings.
 
@@ -164,6 +164,27 @@ class PDFPreprocessor(ContentPreprocessor):
         if not source_path:
             raise ValueError("source_path is required for PDF decomposition")
 
+        # Phase 1: извлечение полного текста (с checkpoint-кешем)
+        full_text = await self.extract_text(source_path, cancel_event)
+
+        # Phase 2: heading detection + decomposition
+        return await self._build_sections(full_text, metadata, source_path)
+
+    async def extract_text(
+        self,
+        source_path: str,
+        cancel_event: asyncio.Event | None = None,
+    ) -> str:
+        """Извлечь полный текст PDF (pdfplumber + OCR fallback) с checkpoint-кешем.
+
+        Phase 1 decompose: cache lookup по content_hash → pdfplumber per-page
+        извлечение → OCR fallback для сканов → запись checkpoint.
+
+        Reusable: используется decompose() (импорт) и extract_pdf_text tool
+        (конвертация PDF→текст для авто-классификации на клиенте).
+
+        cancel_event: проверяется между страницами (P0-1).
+        """
         # ── Checkpoint: content_hash → cache lookup ─────────
         content_hash = self._compute_content_hash(source_path)
         cache_dir = Path(self._cache_dir)
@@ -218,8 +239,8 @@ class PDFPreprocessor(ContentPreprocessor):
                 content_hash[:12], len(full_text), total_pages,
             )
 
-        # ── Heading detection + decomposition ────────────────
-        return await self._build_sections(full_text, metadata, source_path)
+        return full_text
+
 
     # ── Page text extraction (pdfplumber + OCR fallback) ──
 

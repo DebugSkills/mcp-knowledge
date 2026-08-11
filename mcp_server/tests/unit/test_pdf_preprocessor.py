@@ -150,6 +150,39 @@ class TestDecompose:
 
 
 # ═══════════════════════════════════════════════════════════════
+# extract_text() — выделенный метод (авто-классификация PDF)
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestExtractText:
+    """extract_text() — возвращает полный текст PDF (с checkpoint-кешем)."""
+
+    async def test_extract_text_returns_nonempty(self, preprocessor, sample_pdf_path):
+        pytest.importorskip("pdfplumber", reason="pdfplumber not installed")
+        text = await preprocessor.extract_text(sample_pdf_path)
+        assert isinstance(text, str)
+        assert len(text) > 0
+
+    async def test_extract_text_writes_cache(self, preprocessor, sample_pdf_path):
+        pytest.importorskip("pdfplumber", reason="pdfplumber not installed")
+        await preprocessor.extract_text(sample_pdf_path)
+        cache_hash = preprocessor._compute_content_hash(sample_pdf_path)
+        cache_path = Path(preprocessor._cache_dir) / f"{cache_hash}.txt"
+        assert cache_path.exists()
+        assert cache_path.stat().st_size > 0
+
+    async def test_extract_text_consistent_across_calls(self, preprocessor, sample_pdf_path):
+        pytest.importorskip("pdfplumber", reason="pdfplumber not installed")
+        t1 = await preprocessor.extract_text(sample_pdf_path)
+        t2 = await preprocessor.extract_text(sample_pdf_path)
+        assert t1 == t2
+
+    async def test_extract_text_missing_file(self, preprocessor):
+        with pytest.raises(FileNotFoundError):
+            await preprocessor.extract_text("/nonexistent/file.pdf")
+
+
+# ═══════════════════════════════════════════════════════════════
 # OCR path (mock pytesseract)
 # ═══════════════════════════════════════════════════════════════
 

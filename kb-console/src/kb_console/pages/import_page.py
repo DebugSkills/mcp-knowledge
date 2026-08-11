@@ -111,9 +111,15 @@ def build_import() -> None:
                     )
                     title_input.value = Path(filename).stem
                     content_type.value = "pdf"
+                    # 3-стадийный PDF-флоу: Преобразовать→Обработать→Добавить.
+                    # «Сохранить нельзя» — импорт и анализ заблокированы до конвертации в текст.
+                    convert_btn.enable()
                     analyze_btn.disable()
-                    import_btn.enable()
-                    ui.notify(f"«{filename}» PDF загружен на сервер", type="positive")
+                    import_btn.disable()
+                    ui.notify(
+                        f"«{filename}» PDF загружен. Нажмите «Преобразовать» для конвертации в текст",
+                        type="positive",
+                    )
                 except Exception as upload_err:
                     ui.notify(f"Ошибка загрузки PDF: {upload_err}", type="negative")
                     print(f"[IMPORT-UPLOAD] PDF upload failed: {upload_err}")
@@ -142,6 +148,8 @@ def build_import() -> None:
             # Pre-fill title_input из имени файла (без расширения)
             title_input.value = Path(filename).stem
             analyze_btn.enable()
+            import_btn.enable()
+            convert_btn.disable()  # текстовый флоу без конвертации
             ui.notify(f"«{filename}» загружен ({len(text):,} символов)", type="positive")
             print(f"[IMPORT-UPLOAD] OK {len(text)} chars — pending_file set, textarea untouched")
 
@@ -235,9 +243,13 @@ def build_import() -> None:
     with ui.row().classes("gap-4 items-center"):
         import_btn = ui.button("Добавить", icon="save").props("color=primary")
         analyze_btn = ui.button("Обработать", icon="auto_fix_high").props("color=secondary")
+        convert_btn = ui.button("Преобразовать", icon="picture_as_pdf").props(
+            "color=info"
+        )
         spinner = ui.spinner(size="md").props("color=primary")
         spinner.visible = False
         analyze_btn.disable()  # disabled пока нет файла
+        convert_btn.disable()  # только для PDF (конвертация PDF→текст)
 
     # ── Queue console (all imports) ──────────────────────────
     build_import_queue()
@@ -299,6 +311,63 @@ def build_import() -> None:
         progress_container.visible = False
         progress_container.clear()
 
+
+    # ── Convert handler (PDF→текст, стадия 1 из 3) ─────────
+    async def do_convert() -> None:
+        """Преобразовать PDF в текст через extract_pdf_text (MCP tool)."""
+        nonlocal pending_file
+        if pending_file is None or not pending_file.get("pdf_path"):
+            ui.notify("Сначала загрузите PDF", type="warning")
+            return
+
+        convert_btn.disable()
+        spinner.visible = True
+        result_container.clear()
+        _start_timer()
+
+        # P1 (critic): конвертация PDF (pdfplumber + OCR) может быть долгой —
+        # используем IMPORT_TIMEOUT (1800с), НЕ ANALYZE_TIMEOUT (60с).
+        client = MCPClient(
+            base_url=MCP_SERVER_URL,
+            api_key=MCP_API_KEY,
+            timeout=IMPORT_TIMEOUT,
+        )
+        try:
+            result = await client.tools_call(
+                "extract_pdf_text", {"pdf_path": pending_file["pdf_path"]}
+            )
+            if "error" in result:
+                raise RuntimeError(result["error"])
+
+            text = result.get("text", "")
+            chars = result.get("chars", len(text))
+            # Сохраняем текст в pending_file → analyze/import работают как для текста
+            pending_file["content"] = text
+            file_status_label.set_text(
+                f"📄 {pending_file['name']} — PDF конвертирован: {chars:,} символов текста"
+            )
+            # Стадия 2 и 3 становятся доступными
+            analyze_btn.enable()
+            import_btn.enable()
+            convert_btn.disable()
+            ui.notify(
+                f"PDF конвертирован ({chars:,} символов). Нажмите «Обработать» для авто-классификации",
+                type="positive",
+            )
+            print(f"[IMPORT-UPLOAD] PDF converted: {chars} chars -> analyze enabled")
+        except Exception as exc:
+            # P1 (critic): при ошибке возвращаем convert (можно повторить),
+            # import/analyze остаются заблокированы.
+            convert_btn.enable()
+            file_status_label.set_text("⚠️ Ошибка конвертации PDF")
+            ui.notify(f"Ошибка конвертации PDF: {exc}", type="negative")
+            print(f"[IMPORT-UPLOAD] PDF convert failed: {exc}")
+        finally:
+            spinner.visible = False
+            _stop_timer()
+            await client.close()
+
+    convert_btn.on_click(do_convert)
 
     # ── Analyze handler (НОВЫЙ) ───────────────────────────
     async def do_analyze() -> None:

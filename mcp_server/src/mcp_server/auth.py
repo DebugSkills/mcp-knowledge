@@ -57,6 +57,7 @@ WRITE_TOOLS: set[str] = {
 IMPORT_TOOLS: set[str] = {
     "import_content",
     "cancel_import",
+    "extract_pdf_text",  # PDF→текст для авто-классификации (оперирует загруженным PDF)
 }
 
 # ── Methods, не требующие аутентификации ─────────────────

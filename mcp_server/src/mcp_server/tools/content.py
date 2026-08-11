@@ -667,6 +667,53 @@ async def _collect_quality_report(
     return {"issues": issues, "warnings": warnings, "duplicates": duplicates}
 
 
+async def extract_pdf_text(params: dict, app_state) -> dict:
+    """MCP Tool: convert PDF → текст (для авто-классификации на клиенте).
+
+    Извлекает полный текст PDF через PDFPreprocessor.extract_text()
+    (pdfplumber + OCR fallback, checkpoint-кеш по content_hash).
+
+    Args:
+        params: {
+            pdf_path (str): путь к PDF на сервере (из POST /upload)
+        }
+        app_state: Application state.
+
+    Returns:
+        {
+            text: str,           # извлечённый полный текст
+            chars: int,          # число символов
+            source_path: str,    # путь к PDF
+        }
+        Или {"error": ...} при ошибке валидации/извлечения.
+    """
+    from ..content.pdf_preprocessor import PDFPreprocessor
+
+    pdf_path = params.get("pdf_path", "")
+    if not pdf_path:
+        return {"error": "Missing required parameter: 'pdf_path'"}
+
+    # P2 (critic): защита от чтения произвольных файлов — только upload-директория.
+    if not pdf_path.startswith("/tmp/pdf_uploads"):
+        return {"error": f"Invalid pdf_path (must be under /tmp/pdf_uploads): {pdf_path}"}
+
+    if not _os.path.exists(pdf_path):
+        return {"error": f"PDF file not found: {pdf_path}"}
+
+    try:
+        preprocessor = PDFPreprocessor()
+        text = await preprocessor.extract_text(pdf_path)
+        return {
+            "text": text,
+            "chars": len(text),
+            "source_path": pdf_path,
+        }
+    except Exception as exc:  # ruff: noqa: BLE001
+        logger.error("[EXTRACT_PDF] failed for %s: %s", pdf_path, exc)
+        return {"error": f"PDF text extraction failed: {exc}"}
+
+
+
 async def import_content(params: dict, app_state) -> dict:
     """MCP Tool #16: import_content — декомпозиция + batch запись в SSOT.
 
