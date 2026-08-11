@@ -265,5 +265,54 @@ class TestReviewThreshold:
         assert should_review(0.7, threshold=0.6) is True
 
 
+class TestDupCountIntegration:
+    """R2: staleness_score с разными dup_count — проверка формулы."""
+
+    def test_zero_dups_no_contribution(self):
+        """dup_count=0 → dup_component=0.0."""
+        score = staleness_score(_input(dup_count=0), now=_now())
+        # Свежая запись без дублей → 0.0
+        assert score == 0.0
+
+    def test_one_dup_adds_half_weight(self):
+        """1 дубль → dup_factor=0.5 → вклад = 0.22 * 0.5 = 0.11."""
+        score = staleness_score(_input(dup_count=1), now=_now())
+        assert score == pytest.approx(0.11, rel=0.01)
+
+    def test_two_dups_full_weight(self):
+        """2 дубля → dup_factor=1.0 → вклад = 0.22."""
+        score = staleness_score(_input(dup_count=2), now=_now())
+        assert score == pytest.approx(0.22, rel=0.01)
+
+    def test_many_dups_capped_at_one(self):
+        """10 дублей → dup_factor=1.0 → вклад = 0.22 (cap)."""
+        score = staleness_score(_input(dup_count=10), now=_now())
+        assert score == pytest.approx(0.22, rel=0.01)
+
+    def test_dup_with_age_combined(self):
+        """Дубли + возраст: 2 дубля (0.22) + 365 дней (0.47) = 0.69."""
+        score = staleness_score(
+            _input(
+                dup_count=2,
+                updated_at=_now() - timedelta(days=365),
+            ),
+            now=_now(),
+        )
+        assert score == pytest.approx(0.69, rel=0.01)
+
+    def test_dup_with_incomplete_and_editwar(self):
+        """Все факторы: дубли + неполнота + edit_war."""
+        score = staleness_score(
+            _input(
+                dup_count=2,           # 0.22
+                recommended_missing=2,  # 0.16 * 2/3 = 0.1067
+                edit_war=True,         # 0.10
+            ),
+            now=_now(),
+        )
+        # 0.22 + 0.1067 + 0.10 = 0.4267
+        assert score == pytest.approx(0.4267, rel=0.01)
+
+
 # pytest import for approx
 import pytest

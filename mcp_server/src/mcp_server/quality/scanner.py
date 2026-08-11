@@ -199,10 +199,19 @@ async def run_scan(
     if progress and pid:
         progress.set_phase(pid, "dup_scan", "Сканирование дубликатов...")
     loop = asyncio.get_running_loop()
-    dup_count = await loop.run_in_executor(
+    dup_count, dup_map = await loop.run_in_executor(
         None, _scan_dup_pairs, scored, progress, pid, cancel_event,
     )
     metrics["duplicates_detected"] = dup_count
+
+    # R2: пост-обработка — обновить scores с dup_count для affected entries
+    if dup_map and qdrant_client is not None and not _is_cancelled():
+        if progress and pid:
+            progress.set_phase(pid, "scoring_dup", "Обновление scores с dup_count...")
+        await _update_scores_with_dup(
+            qdrant_client, scored, dup_map,
+            progress=progress, progress_id=pid,
+        )
 
     # 13.18: проверка после dup_scan
     if _is_cancelled():
@@ -401,16 +410,109 @@ async def _update_qdrant_payloads(
     logger.info("_update_qdrant_payloads: completed %d/%d scores", processed, len(scored))
 
 
+async def _update_scores_with_dup(
+    client,  # QdrantClient
+    scored: list[tuple[Path, KnowledgeFrontmatter, float]],
+    dup_map: dict[str, int],
+    *,
+    progress=None,
+    progress_id: str | None = None,
+) -> None:
+    """R2: пересчёт staleness_score с реальным dup_count + обновление Qdrant.
+
+    Для записей с dup_count > 0 пересчитывает score через staleness_score()
+    и обновляет payload через set_payload. Использует run_in_executor для
+    sync-операций.
+    """
+    from datetime import datetime, timezone
+
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+    now = datetime.now(timezone.utc)
+    loop = asyncio.get_running_loop()
+    pid = progress_id
+
+    updated = 0
+    for _filepath, frontmatter, _old_score in scored:
+        kid = frontmatter.knowledge_id
+        dc = dup_map.get(kid, 0)
+        if dc == 0:
+            continue
+
+        # Пересчитываем score с реальным dup_count
+        new_score = _compute_score_with_dup(frontmatter, now, dc, _filepath)
+
+        # Обновляем Qdrant payload
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda k=kid, s=new_score: client.set_payload(
+                    payload={
+                        PAYLOAD_STALENESS_SCORE: s,
+                    },
+                    points_filter=Filter(
+                        must=[FieldCondition(key="knowledge_id", match=MatchValue(value=k))]
+                    ),
+                ),
+            )
+            updated += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "_update_scores_with_dup: set_payload failed for %s: %s", kid, exc,
+            )
+
+    if updated:
+        logger.info(
+            "_update_scores_with_dup: %d entries updated with dup_count", updated,
+        )
+        if progress and pid:
+            progress.log(pid, "info", f"R2: {updated} scores updated with dup_count")
+
+
+def _compute_score_with_dup(
+    frontmatter: KnowledgeFrontmatter,
+    now: datetime,
+    dup_count: int,
+    filepath: Path,
+) -> float:
+    """R2: _compute_score с явным dup_count (переиспользует логику _compute_score)."""
+    fm_dict = frontmatter.model_dump()
+
+    recommended_missing = 0
+    if "source" not in fm_dict or fm_dict["source"] is None:
+        recommended_missing += 1
+    if "evergreen" not in fm_dict:
+        recommended_missing += 1
+    is_evergreen = fm_dict.get("evergreen", False) is True
+
+    is_edit_war = detect_edit_war(filepath)
+
+    inp = StalenessInput(
+        updated_at=frontmatter.updated_at,
+        evergreen=is_evergreen,
+        dup_count=dup_count,  # R2: реальный dup_count
+        recommended_missing=recommended_missing,
+        recommended_total=3,
+        edit_war=is_edit_war,
+        broken_links=0,
+        total_links=0,
+    )
+    return staleness_score(inp, now=now)
+
+
 def _scan_dup_pairs(
     scored: list[tuple[Path, KnowledgeFrontmatter, float]],
     progress=None,
     progress_id: str | None = None,
     cancel_event=None,  # 13.18: asyncio.Event для отмены (проверяется между domain-бакетами)
-) -> int:
+) -> tuple[int, dict[str, int]]:
     """Сканирует dup-пары внутри domain-бакетов.
 
     Без BGE-M3 эмбеддера использует упрощённую эвристику:
     одинаковый subject + пересечение tags ≥50% → кандидат в дубли.
+
+    R2: возвращает не только dup_count, но и dup_map (knowledge_id → dup_count)
+    для пост-обработки staleness_score с реальным dup_count.
 
     Task 2: логирует прогресс по domain-бакетам.
     13.18: проверка cancel_event между domain-бакетами.
@@ -422,7 +524,8 @@ def _scan_dup_pairs(
         cancel_event: asyncio.Event для отмены (13.18).
 
     Returns:
-        количество обнаруженных dup-пар.
+        (dup_count, dup_map): количество обнаруженных dup-пар и
+        словарь knowledge_id → dup_count для scoring.
     """
     # Группируем по domain
     by_domain: dict[str, list[tuple[Path, KnowledgeFrontmatter, float]]] = {}
@@ -430,6 +533,7 @@ def _scan_dup_pairs(
         by_domain.setdefault(fm.domain, []).append((filepath, fm, score))
 
     dup_count = 0
+    dup_map: dict[str, int] = {}  # R2: knowledge_id → dup_count
     total_domains = len(by_domain)
     domain_idx = 0
     for entries in by_domain.values():
@@ -463,6 +567,9 @@ def _scan_dup_pairs(
                 if _are_dup_candidates(fm_i, fm_j):
                     dup_count += 1
                     issue_counts[fm_i.knowledge_id] = issue_counts.get(fm_i.knowledge_id, 0) + 1
+                    # R2: dup_map для пост-обработки scoring
+                    dup_map[fm_i.knowledge_id] = dup_map.get(fm_i.knowledge_id, 0) + 1
+                    dup_map[fm_j.knowledge_id] = dup_map.get(fm_j.knowledge_id, 0) + 1
                     # Создаём issue для дубликата
                     create_issue(
                         issue_type="duplicate",
@@ -470,7 +577,7 @@ def _scan_dup_pairs(
                         severity="warn",
                         detail=f"Possible duplicate of {fm_j.knowledge_id} (same subject={fm_i.subject}, tag overlap)",
                     )
-    return dup_count
+    return dup_count, dup_map
 
 
 def _is_toc_section(fm: KnowledgeFrontmatter) -> bool:

@@ -28,6 +28,7 @@ VALID_ACTIONS: frozenset[str] = frozenset({"merge", "deprecate", "restore", "res
 # ── Константы пагинации ──────────────────────────────────────────────────────
 _SCROLL_BATCH = 1000  # точек за один scroll
 _MAX_BOOKS = 100  # макс. книг в ответе
+_PARENT_TITLE_BATCH = 50  # макс. parent_id в одном запросе для резолва title
 
 
 async def review_queue(params: dict, app_state) -> dict:
@@ -212,10 +213,10 @@ async def review_queue_books(params: dict, app_state) -> dict:
                 book["domain"] = payload.get("domain", "")
                 book["subject"] = payload.get("subject", "")
                 book["status"] = payload.get("status", "published")
-                # Title книги — из payload родительской записи (если есть)
-                # или subject/kid как fallback
+                # Title книги — из section_header первой секции как fallback
+                # (будет заменён при batch_resolve_book_titles)
                 book["title"] = (
-                    payload.get("book_title")
+                    payload.get("section_header")
                     or payload.get("subject", "")
                     or parent_id
                 )
@@ -233,6 +234,14 @@ async def review_queue_books(params: dict, app_state) -> dict:
                     "updated_at": payload.get("updated_at", ""),
                 })
 
+        # ── R1: резолв title книг из родительских записей ──────
+        parent_ids = list(books.keys())
+        if parent_ids:
+            parent_titles = await _batch_resolve_book_titles(client, parent_ids, loop)
+            for parent_id, title in parent_titles.items():
+                if parent_id in books and title:
+                    books[parent_id]["title"] = title
+
         # Сортируем top_sections по score DESC и обрезаем до 5
         for book in books.values():
             book["top_sections"].sort(key=lambda s: s["staleness_score"], reverse=True)
@@ -240,13 +249,6 @@ async def review_queue_books(params: dict, app_state) -> dict:
             # Вычисляем долю
             total = book["total_sections"]
             book["stale_fraction"] = round(book["stale_sections"] / total, 3) if total > 0 else 0.0
-            # Title книги — получаем из первой секции или Qdrant
-            if not book["title"] or book["title"] == book["book_id"]:
-                # Пытаемся получить title из payload секции
-                for s in book["top_sections"]:
-                    if s.get("title"):
-                        book["title"] = book.get("domain", "") or book["book_id"]
-                        break
 
         # Сортируем книги: сначала по stale_fraction DESC, затем по max_score DESC
         sorted_books = sorted(
@@ -255,19 +257,22 @@ async def review_queue_books(params: dict, app_state) -> dict:
             reverse=True,
         )
 
-        # Обрезаем до limit
-        result_books = sorted_books[:limit]
+        # R3: фильтруем книги с stale_sections == 0 (нет устаревших секций)
+        stale_books = [b for b in sorted_books if b["stale_sections"] > 0]
 
-        # Считаем total_stale_sections по ВСЕМ книгам (не только в выдаче)
-        total_stale = sum(b["stale_sections"] for b in books.values())
+        # Обрезаем до limit
+        result_books = stale_books[:limit]
+
+        # total_stale_sections — по ВСЕМ книгам со stale секциями
+        total_stale = sum(b["stale_sections"] for b in stale_books)
 
         logger.info(
-            "[REVIEW] review_queue_books: %d books found, %d returned, %d stale sections total",
-            len(books), len(result_books), total_stale,
+            "[REVIEW] review_queue_books: %d books found (%d with stale), %d returned, %d stale sections total",
+            len(books), len(stale_books), len(result_books), total_stale,
         )
         return {
             "books": result_books,
-            "total_books": len(books),
+            "total_books": len(stale_books),  # R3: только книги со stale секциями
             "total_stale_sections": total_stale,
         }
 
@@ -583,6 +588,74 @@ async def _cascade_set_payload(
         offset = next_offset
 
     return affected
+
+
+async def _batch_resolve_book_titles(
+    qdrant,
+    parent_ids: list[str],
+    loop,
+) -> dict[str, str]:
+    """R1: резолв title книг из payload родительских записей в Qdrant.
+
+    Для каждого parent_knowledge_id делает scroll с фильтром по knowledge_id,
+    извлекает поле title из payload. Пагинированный: батчи по _PARENT_TITLE_BATCH,
+    все Qdrant-вызовы через run_in_executor.
+
+    Args:
+        qdrant: QdrantClient wrapper (app_state.qdrant).
+        parent_ids: список parent_knowledge_id для резолва.
+        loop: asyncio event loop.
+
+    Returns:
+        dict parent_id → title (str).
+    """
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+    titles: dict[str, str] = {}
+
+    # Батчинг: до _PARENT_TITLE_BATCH parent_id в одном scroll-запросе
+    for i in range(0, len(parent_ids), _PARENT_TITLE_BATCH):
+        batch = parent_ids[i:i + _PARENT_TITLE_BATCH]
+
+        # Строим should-условия: knowledge_id IN batch
+        should_conditions = [
+            FieldCondition(key="knowledge_id", match=MatchValue(value=pid))
+            for pid in batch
+        ]
+
+        try:
+            _batch_len = len(batch)
+            points, _ = await loop.run_in_executor(
+                None,
+                lambda sc=should_conditions, bl=_batch_len: qdrant.scroll(
+                    scroll_filter=Filter(should=sc) if len(sc) > 0 else None,
+                    limit=bl,
+                    with_payload=["title"],
+                    with_vectors=False,
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[REVIEW] _batch_resolve_book_titles: scroll failed for batch %d..%d: %s",
+                i, i + len(batch), exc,
+            )
+            continue
+
+        for point in points:
+            payload = point.payload or {}
+            kid = payload.get("knowledge_id", str(point.id))
+            title = payload.get("title", "")
+            if kid in titles:
+                continue  # уже есть (первый приоритет)
+            if title:
+                titles[kid] = str(title)
+
+    if titles:
+        logger.info(
+            "[REVIEW] _batch_resolve_book_titles: resolved %d/%d book titles",
+            len(titles), len(parent_ids),
+        )
+    return titles
 
 
 # ── 4.8/13.15: Background quality scan ────────────────────────

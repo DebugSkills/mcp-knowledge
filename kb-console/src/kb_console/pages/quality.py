@@ -71,8 +71,12 @@ def build_quality() -> None:
                 # Task 1: check version before cache fetch
                 await cache.check_version(client)
                 filters = latest.get("filters", {})
+                domain = filters.get("domain", "")
+                subject = filters.get("subject", "")
+                # R4: filter-dependent cache key
+                cache_key = f"quality:{domain}:{subject}" if (domain or subject) else "quality"
                 data = await cache.get(
-                    "quality",
+                    cache_key,
                     lambda c=client, f=filters: c.review_queue_books(
                         domain=f.get("domain"),
                         subject=f.get("subject"),
@@ -179,10 +183,12 @@ async def _run_scan(on_done, scan_state: dict, progress_container, scan_btn) -> 
 
 
 async def _on_scan_done(scan_btn, scan_state: dict, on_done) -> None:
-    """Callback при завершении скана: разблокировка кнопки + обновление очереди."""
+    """Callback при завершении скана: разблокировка кнопки + инвалидация кеша + обновление очереди."""
     scan_btn.enable()
     scan_state["status"] = None
     scan_state["scan_id"] = None
+    # R4: инвалидация кеша после скана (stale_scores изменились)
+    cache.invalidate_all()
     await on_done()
 
 

@@ -653,12 +653,15 @@ class TestReviewQueueBooks:
             call_count += 1
             if call_count == 1:
                 return (batch1_pts, "offset-1")
-            return (batch2_pts, None)
+            if call_count == 2:
+                return (batch2_pts, None)
+            # 3-й вызов — _batch_resolve_book_titles (R1): payload без title
+            return ([], None)
 
         mock_app_state.qdrant.scroll = mock_scroll
         result = await review_queue_books({"limit": 10}, mock_app_state)
 
-        assert call_count == 2
+        assert call_count == 3  # 2x основной scroll + 1x резолв title (R1)
         assert result["total_books"] == 2
 
     async def test_handles_exception(self, mock_app_state):
@@ -669,6 +672,183 @@ class TestReviewQueueBooks:
         result = await review_queue_books({"limit": 10}, mock_app_state)
         assert result["books"] == []
         assert "error" in result
+
+    # ── R3: фильтр книг с stale_sections == 0 ──────────────────
+
+    async def test_filters_books_with_zero_stale_sections(self, mock_app_state):
+        """Книги с 0 устаревших секций НЕ попадают в результат (R3)."""
+        points = [
+            # book-a: все секции >= 0.45 → stale (должна быть в выдаче)
+            self._make_point("a1", "book-a", 0.9),
+            self._make_point("a2", "book-a", 0.5),
+            # book-b: ВСЕ секции < 0.45 → 0 staled (НЕ должна быть в выдаче)
+            self._make_point("b1", "book-b", 0.1),
+            self._make_point("b2", "book-b", 0.0),
+        ]
+
+        call_count = 0
+
+        def mock_scroll(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Основной scroll: все точки
+                return (points, None)
+            # _batch_resolve_book_titles: пустой ответ (нет title в payload)
+            return ([], None)
+
+        mock_app_state.qdrant.scroll = mock_scroll
+
+        result = await review_queue_books({"limit": 10}, mock_app_state)
+
+        books = result["books"]
+        assert len(books) == 1  # только book-a
+        assert books[0]["book_id"] == "book-a"
+        assert books[0]["stale_sections"] == 2
+        assert books[0]["total_sections"] == 2
+        # total_books отражает только книги со stale секциями
+        assert result["total_books"] == 1
+
+    async def test_returns_empty_when_no_stale_books(self, mock_app_state):
+        """Все книги имеют 0 stale секций → пустая выдача."""
+        points = [
+            self._make_point("x1", "book-x", 0.1),
+            self._make_point("y1", "book-y", 0.0),
+        ]
+
+        call_count = 0
+
+        def mock_scroll(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (points, None)
+            return ([], None)
+
+        mock_app_state.qdrant.scroll = mock_scroll
+
+        result = await review_queue_books({"limit": 10}, mock_app_state)
+
+        assert result["books"] == []
+        assert result["total_books"] == 0
+        assert result["total_stale_sections"] == 0
+
+    # ── R1: title из родительской записи ───────────────────────
+
+    def _make_parent_point(self, kid, title):
+        """Mock-точка родительской записи с title в payload."""
+        pt = MagicMock()
+        pt.id = kid
+        pt.payload = {"knowledge_id": kid, "title": title}
+        return pt
+
+    async def test_resolves_book_title_from_parent_record(self, mock_app_state):
+        """Title книги берётся из payload родительской записи (R1)."""
+        points = [
+            self._make_point("sec-1", "book-alpha", 0.8),
+            self._make_point("sec-2", "book-alpha", 0.6),
+        ]
+        parent_point = self._make_parent_point("book-alpha", "Alpha Book Title")
+
+        call_count = 0
+
+        def mock_scroll(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Основной scroll: секции книги
+                return (points, None)
+            # _batch_resolve_book_titles: родительская запись с title
+            return ([parent_point], None)
+
+        mock_app_state.qdrant.scroll = mock_scroll
+
+        result = await review_queue_books({"limit": 10}, mock_app_state)
+
+        assert "error" not in result
+        books = result["books"]
+        assert len(books) == 1
+        assert books[0]["title"] == "Alpha Book Title"
+
+    async def test_fallback_title_when_parent_not_found(self, mock_app_state):
+        """Если родительская запись не найдена → fallback на subject (R1)."""
+        points = [
+            self._make_point("sec-1", "book-missing", 0.8, domain="devops", subject="engineering"),
+        ]
+
+        call_count = 0
+
+        def mock_scroll(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (points, None)
+            # batch resolve: parent not found
+            return ([], None)
+
+        mock_app_state.qdrant.scroll = mock_scroll
+
+        result = await review_queue_books({"limit": 10}, mock_app_state)
+
+        books = result["books"]
+        assert len(books) == 1
+        # Fallback: section_header (empty) → subject
+        assert books[0]["title"] == "engineering"
+
+    async def test_title_from_section_header_fallback(self, mock_app_state):
+        """Если section_header есть в payload секции — используется как fallback title."""
+        points = [
+            self._make_point("sec-1", "book-z", 0.8, section_header="Z Book"),
+        ]
+
+        call_count = 0
+
+        def mock_scroll(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (points, None)
+            # batch resolve: empty
+            return ([], None)
+
+        mock_app_state.qdrant.scroll = mock_scroll
+
+        result = await review_queue_books({"limit": 10}, mock_app_state)
+
+        books = result["books"]
+        assert len(books) == 1
+        # Fallback: section_header используется (batch resolve не нашёл)
+        assert books[0]["title"] == "Z Book"
+
+    async def test_deprecated_parent_title_skipped_for_status(self, mock_app_state):
+        """Deprecated-родитель — title всё равно резолвится, но status остаётся от секции (R3 edge case)."""
+        points = [
+            self._make_point("sec-1", "book-dep", 0.9, status="published"),
+        ]
+        # Родитель deprecated
+        parent_point = self._make_parent_point("book-dep", "Deprecated Book")
+        parent_point.payload["status"] = "deprecated"
+
+        call_count = 0
+
+        def mock_scroll(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return (points, None)
+            # batch resolve: родитель с title
+            return ([parent_point], None)
+
+        mock_app_state.qdrant.scroll = mock_scroll
+
+        result = await review_queue_books({"limit": 10}, mock_app_state)
+
+        books = result["books"]
+        assert len(books) == 1
+        # Title резолвится из родителя
+        assert books[0]["title"] == "Deprecated Book"
+        # Статус секции (published) не меняется родительским deprecated
+        assert books[0]["status"] == "published"
 
 
 # ═══════════════════════════════════════════════════════════════
