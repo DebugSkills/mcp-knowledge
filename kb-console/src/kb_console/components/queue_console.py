@@ -144,7 +144,7 @@ def build_import_queue() -> ui.element:
                 ui.button(
                     chevron,
                     on_click=lambda rid=import_id: _toggle_expand(rid),
-                ).props("flat dense round size=sm").tooltip(
+                ).props("flat dense round size=md").tooltip(
                     "Свернуть" if is_expanded else "Развернуть лог"
                 )
 

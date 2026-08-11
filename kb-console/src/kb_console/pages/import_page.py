@@ -178,15 +178,6 @@ def build_import() -> None:
         "(домен/предмет book)."
     )
 
-    content_input = ui.textarea(
-        label="Контент (Markdown/plain) — или вставьте текст вручную",
-        placeholder="Введите текст для импорта или загрузите файл выше...",
-    ).classes("w-full").props("rows=10")
-    content_input.tooltip(
-        "Выберите файл — контент останется в памяти, кнопка «Обработать» предложит домен/предмет/теги. "
-        "Это поле — для ручного ввода (fallback)."
-    )
-
     with ui.row().classes("gap-4"):
         content_type = ui.select(
             label="Тип контента",
@@ -242,19 +233,47 @@ def build_import() -> None:
     ui.timer(0.0, lambda: _load_replace_options(), once=True)
 
     # ── Кнопки + спиннер ─────────────────────────────────
-    with ui.row().classes("gap-4 items-center"):
-        import_btn = ui.button("Добавить", icon="save").props("color=primary")
-        analyze_btn = ui.button("Обработать", icon="auto_fix_high").props("color=secondary")
-        convert_btn = ui.button("Преобразовать", icon="picture_as_pdf").props(
-            "color=info"
-        )
+    # Порядок: Преобразовать → Обработать → Добавить (слева-направо).
+    # flex-wrap: на 375px кнопки + спиннер переносятся без горизонтального скролла.
+    # Цвета: кнопки всегда цветные; заблокированные — полупрозрачные (opacity .55),
+    # активные — непрозрачные (opacity 1). CSS через класс .import-action-btn.
+    # Цвета: кнопки всегда цветные; заблокированные — полупрозрачные (opacity .55),
+    # активные — непрозрачные (opacity 1).
+    # Quasar кладёт .q-btn.disabled{opacity:.7!important} в @layer — CSS-правило вне
+    # слоя проигрывает (каскадные слои), поэтому применяем inline-стиль через JS:
+    # inline opacity с !important имеет максимальный приоритет.
+    ui.add_head_html(
+        """
+        <script>
+        function applyImportBtnOpacity() {
+            document.querySelectorAll('button.import-action-btn').forEach(function (b) {
+                b.style.setProperty('opacity', b.disabled ? '0.55' : '1', 'important');
+            });
+        }
+        // documentElement — всегда существует (в отличие от body в момент загрузки head)
+        new MutationObserver(applyImportBtnOpacity).observe(
+            document.documentElement, { subtree: true, attributes: true, attributeFilter: ['disabled', 'class'] }
+        );
+        document.addEventListener('DOMContentLoaded', applyImportBtnOpacity);
+        applyImportBtnOpacity();
+        </script>
+        """
+    )
+    with ui.row().classes("w-full items-center gap-2 flex-wrap"):
+        convert_btn = ui.button("Преобразовать", icon="picture_as_pdf").props("color=info").classes("import-action-btn")
+        analyze_btn = ui.button("Обработать", icon="auto_fix_high").props("color=secondary").classes("import-action-btn")
+        import_btn = ui.button("Добавить", icon="save").props("color=primary").classes("import-action-btn")
         spinner = ui.spinner(size="md").props("color=primary")
         spinner.visible = False
-        analyze_btn.disable()  # disabled пока нет файла
-        convert_btn.disable()  # только для PDF (конвертация PDF→текст)
+        convert_btn.disable()   # disabled пока нет PDF
+        analyze_btn.disable()   # disabled пока нет файла
+        import_btn.disable()    # disabled пока нет файла (скрытый БАГ: был активен без файла)
 
-    # ── Queue console (all imports) ──────────────────────────
-    build_import_queue()
+    # ── Отчёт об импорте (Variant A: обёртка с очередью + сводкой) ────
+    with ui.card().classes("w-full q-pa-md q-mt-md"):
+        ui.label("📊 Отчёт об импорте").classes("text-h6 q-mb-sm")
+        build_import_queue()
+        result_container = ui.column().classes("w-full")
 
     timer_label = ui.label("").classes("text-caption text-grey")
     timer_label.visible = False
@@ -298,9 +317,8 @@ def build_import() -> None:
             _progress_timer = None
     ui.context.client.on_disconnect(_cleanup_timer)
 
-    result_container = ui.column().classes("w-full")
-
-    # 13.9: контейнер живого прогресса импорта (прогресс-бар % + панель логов)
+    # 13.9: контейнер живого прогресса импорта — ВНЕ обёртки «Отчёт об импорте»
+    # (visible=True только во время активного импорта; result_container — после)
     progress_container = ui.column().classes("w-full q-mb-md")
     progress_container.visible = False
 
@@ -560,32 +578,35 @@ def build_import() -> None:
             collection_id = result.get("collection_id", "—")
             result_title = result.get("title", f"{domain}/{subject}")
 
-            # ── Показ результата ──────────────────────────
+            # ── Показ результата (яркая зелёная карточка-отчёт) ──
             result_container.clear()
             with result_container:
-                ui.label("✅ Импорт выполнен").classes("text-positive text-h6")
-                ui.label(f"Коллекция: {collection_id}").classes("text-body2")
-                ui.label(f"Импортировано секций: {imported}").classes("text-body2")
-                ui.label(f"Время обработки: {elapsed:.1f} сек").classes("text-caption text-grey")
-                if failed > 0:
-                    ui.label(f"Ошибок: {failed}").classes("text-negative text-body2")
+                with ui.card().classes("bg-green-6 text-white q-pa-md w-full"):
+                    ui.label("✅ Импорт выполнен").classes("text-h6")
+                    ui.label(f"Коллекция: {collection_id}").classes("text-body2")
+                    ui.label(f"Импортировано секций: {imported}").classes("text-body2")
+                    ui.label(f"Время обработки: {elapsed:.1f} сек").classes("text-caption")
+                    if failed > 0:
+                        ui.label(f"Ошибок: {failed}").classes("text-bold")
 
                 # ── Replace result (Фаза 13.22) ──────────────
                 if result.get("replaced"):
                     replaced_id = result.get("replaced_collection_id", "—")
                     cascade_del = result.get("cascade_deleted", 0)
-                    ui.label(
-                        f"♻️ Заменена книга: {replaced_id} (удалено старых секций: {cascade_del})"
-                    ).classes("text-warning text-body2")
+                    with ui.card().classes("bg-warning q-pa-sm q-mt-sm w-full"):
+                        ui.label(
+                            f"♻️ Заменена книга: {replaced_id} (удалено старых секций: {cascade_del})"
+                        ).classes("text-body2")
                 elif result.get("replace_skipped_reason"):
                     reason = result["replace_skipped_reason"]
-                    ui.label(
-                        f"⚠️ Замена отменена: {reason}"
-                    ).classes("text-negative text-body2")
+                    with ui.card().classes("bg-orange-2 q-pa-sm q-mt-sm w-full"):
+                        ui.label(
+                            f"⚠️ Замена отменена: {reason}"
+                        ).classes("text-body2")
 
                 failed_sections = result.get("failed_sections", [])
                 if failed_sections:
-                    with ui.card().classes("q-mt-md"):
+                    with ui.card().classes("bg-red-1 q-pa-sm q-mt-sm w-full"):
                         ui.label("Ошибки по секциям:").classes("text-subtitle2")
                         for fs in failed_sections:
                             seq = fs.get("sequence_number", "?")
@@ -611,17 +632,14 @@ def build_import() -> None:
             pending_file = None
             file_status_label.set_text("")
             analyze_btn.disable()
-
-            # Очищаем форму для следующего импорта
-            content_input.value = ""
-            content_input.update()
+            convert_btn.disable()
 
         except Exception as exc:
             elapsed = time.monotonic() - start_time
             result_container.clear()
-            with result_container:
-                ui.label(f"❌ Ошибка импорта (через {elapsed:.1f} сек)").classes("text-negative text-h6")
-                ui.label(str(exc)).classes("text-body2 text-negative")
+            with result_container, ui.card().classes("bg-red-5 text-white q-pa-md w-full"):
+                ui.label(f"❌ Ошибка импорта (через {elapsed:.1f} сек)").classes("text-h6")
+                ui.label(str(exc)).classes("text-body2")
             ui.notify(f"Ошибка импорта: {exc}", type="negative")
         finally:
             import_btn.enable()
@@ -635,15 +653,11 @@ def build_import() -> None:
         """Валидация + HITL-диалог при замене → _run_import."""
         nonlocal pending_file
 
-        # Контент: из pending_file или textarea
-        if pending_file is not None:
-            content = pending_file["content"]
-        else:
-            content = content_input.value
-
-        if not content.strip():
-            ui.notify("Введите контент для импорта", type="warning")
+        # Контент: только через загрузку файла (ручной ввод убран — Фаза 1)
+        if pending_file is None:
+            ui.notify("Сначала загрузите файл", type="warning")
             return
+        content = pending_file["content"]
 
         domain = domain_input.value.strip()
         subject = subject_input.value.strip()
