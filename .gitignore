@@ -31,6 +31,9 @@ mcp-kb-airgap-bundle.tar.gz
 # Agent backups
 .backup/
 
+# Operator scratch notes (локальные, не для публичной репы)
+NOTES.md
+
 # SSOT Knowledge Base (auto-gen, подключается через symlink)
 .knowledge/
 .roomodes
