@@ -38,6 +38,7 @@ PAYLOAD_SCHEMA = {
     "updated_at": qmodels.PayloadSchemaType.DATETIME,
     "parent_knowledge_id": qmodels.PayloadSchemaType.KEYWORD,  # Фаза 5: parent-child collection
     "content_type": qmodels.PayloadSchemaType.KEYWORD,  # Фаза 5: book | pdf | collection
+    "sequence_number": qmodels.PayloadSchemaType.INTEGER,  # Фаза 5: порядок секции в коллекции
 }
 
 # Индексы для payload-полей
@@ -50,6 +51,7 @@ PAYLOAD_INDEXES: list[tuple[str, qmodels.PayloadSchemaType]] = [
     ("updated_at", qmodels.PayloadSchemaType.DATETIME),
     ("parent_knowledge_id", qmodels.PayloadSchemaType.KEYWORD),  # Фаза 5
     ("content_type", qmodels.PayloadSchemaType.KEYWORD),  # Фаза 5
+    ("sequence_number", qmodels.PayloadSchemaType.INTEGER),  # Фаза 5: сортировка TOC
 ]
 
 # HNSW-параметры
@@ -101,6 +103,7 @@ def build_payload_point(
     updated_at: str,
     parent_knowledge_id: str | None = None,
     content_type: str | None = None,
+    sequence_number: int | None = None,
 ) -> qmodels.PointStruct:
     """Собрать PointStruct для upsert."""
     payload = {
@@ -120,4 +123,6 @@ def build_payload_point(
         payload["parent_knowledge_id"] = parent_knowledge_id
     if content_type:
         payload["content_type"] = content_type
+    if sequence_number is not None:
+        payload["sequence_number"] = sequence_number
     return qmodels.PointStruct(id=point_id, vector=vector, payload=payload)

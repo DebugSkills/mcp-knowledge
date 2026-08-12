@@ -41,6 +41,7 @@ READ_TOOLS: set[str] = {
     "resources/read",
     "prompts/list",
     "prompts/get",
+    "find_fragment",  # Фаза 13.23: поиск секций в книге (read-only)
 }
 
 # ── Write tools (только MCP_WRITE_KEYS) ──────────────────
@@ -51,6 +52,9 @@ WRITE_TOOLS: set[str] = {
     "reindex",
     "resolve_quality_issue",  # Фаза 13.14: мутирует Qdrant payload (deprecate/restore/merge)
     "run_quality_scan",  # Фаза 13.14: скан + запись issues в БД
+    "add_fragment",  # Фаза 13.23: создание секции книги
+    "update_fragment",  # Фаза 13.23: обновление секции книги
+    "delete_fragment",  # Фаза 13.23: удаление секции книги
 }
 
 # ── Import tools (MCP_IMPORT_KEYS: read + import_content, без delete/reindex) ──

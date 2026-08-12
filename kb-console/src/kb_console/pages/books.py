@@ -14,12 +14,20 @@ code-2026-08-11-queue-delete-emoji:
   - Кнопка «Удалить» с confirm-диалогом (delete_entry cascade=True).
   - Только nicegui icons (без emoji-дублей в кнопках/заголовках).
 
+code-2026-08-11-book-fragments (Фаза 13.23):
+  - Кнопка «Добавить раздел» в заголовке модалки.
+  - Кнопки «Изменить»/«Удалить» на каждой строке TOC.
+  - VersionConflict-обработка в «Изменить».
+  - Удалён workaround прямого fetch (TOC теперь on-the-fly из Qdrant).
+  - Сохранён fallback: TOC + notify при ненайденном фрагменте (NH-iter3-7).
 
 render_book_detail / show_book_dialog переиспользуются страницей «Поиск»
 (кнопка «Открыть книгу» в результатах).
 """
 
 from __future__ import annotations
+
+import re
 
 from nicegui import ui
 
@@ -121,6 +129,97 @@ async def render_book_detail(
                 return  # диалог закрыт пользователем — молча выходим
             raise
 
+    async def _show_edit_dialog(section: dict) -> None:
+        """Диалог «Изменить раздел» — textarea с префиллом, VersionConflict-обработка."""
+        section_id = section["knowledge_id"]
+        # Загружаем актуальный контент секции
+        sec_entry = None
+        try:
+            sec_entry = await client.get_entry(section_id)
+        except Exception as exc:
+            ui.notify(f"Не удалось загрузить раздел: {exc}", type="negative")
+            return
+        if sec_entry is None or "error" in sec_entry:
+            ui.notify("Раздел не найден", type="warning")
+            return
+
+        current_content = sec_entry.get("content", "")
+        current_version = sec_entry.get("version", 1)
+        # Префилл: контент минус первый # заголовок
+        heading_match = re.match(r"^#\s+.+?\n\n?", current_content)
+        prefilled = current_content[heading_match.end():] if heading_match else current_content
+
+        _edit_textarea = None
+        _edit_save_btn = None
+
+        async def _save_edit() -> None:
+            if _edit_save_btn is not None:
+                _edit_save_btn.disable()
+            new_content = _edit_textarea.value or ""
+            if not new_content.strip():
+                ui.notify("Содержание не может быть пустым", type="warning")
+                if _edit_save_btn is not None:
+                    _edit_save_btn.enable()
+                return
+            try:
+                result = await client.update_fragment(
+                    section_id, content=new_content, version=current_version,
+                )
+            except Exception as exc:
+                ui.notify(f"Ошибка обновления: {exc}", type="negative")
+                if _edit_save_btn is not None:
+                    _edit_save_btn.enable()
+                return
+            if result.get("conflict"):
+                # VersionConflict → notify + закрыть диалог, перечитать секцию
+                edit_dialog.close()
+                ui.notify(
+                    "Запись изменена кем-то другим — перечитайте и повторите",
+                    type="warning",
+                )
+                await render_book_detail(container, client, collection_id)
+                return
+            edit_dialog.close()
+            ui.notify("Раздел обновлён", type="positive")
+            cache.invalidate("books")
+            await render_book_detail(container, client, collection_id)
+
+        with ui.dialog() as edit_dialog, ui.card().classes("w-[600px] max-w-[90vw]"):
+            ui.label(f"Изменить: {section.get('title', '—')}").classes("text-h6")
+            ui.label(f"ID: {section_id}  ·  Версия: {current_version}").classes("text-caption text-grey")
+            _edit_textarea = ui.textarea(value=prefilled).classes("w-full").props("autogrow")
+            with ui.row().classes("gap-2 q-mt-md"):
+                _edit_save_btn = ui.button("Сохранить", on_click=_save_edit, icon="save").props("color=primary")
+                ui.button("Отмена", on_click=edit_dialog.close).props("flat")
+        edit_dialog.open()
+
+    async def _show_delete_confirm(section: dict) -> None:
+        """Confirm-диалог «Удалить раздел» (паттерн books.py:332)."""
+        section_id = section["knowledge_id"]
+        section_title = section.get("title", "—")
+
+        async def _confirm_delete_section() -> None:
+            confirm_dialog.close()
+            try:
+                result = await client.delete_fragment(section_id)
+            except Exception as exc:
+                ui.notify(f"Ошибка удаления: {exc}", type="negative")
+                return
+            if result.get("deleted"):
+                cache.invalidate("books")
+                ui.notify(f"Раздел «{section_title}» удалён", type="positive")
+                await render_book_detail(container, client, collection_id)
+            else:
+                ui.notify(f"Ошибка: {result.get('error', '?')}", type="negative")
+
+        with ui.dialog() as confirm_dialog, ui.card().classes("q-pa-md"):
+            ui.label("Удаление раздела").classes("text-h6")
+            ui.label(f"Раздел «{section_title}» ({section_id}) будет удалён. Продолжить?").classes("text-body2 q-mb-md")
+            with ui.row().classes("justify-end"):
+                ui.button("Отмена", on_click=confirm_dialog.close).props("flat")
+                ui.button("Удалить", icon="delete", on_click=_confirm_delete_section).props("color=negative")
+        confirm_dialog.open()
+
     def _render_toc_page(page: int) -> None:
         """Отрисовать страницу TOC (children[page*SIZE:(page+1)*SIZE])."""
         container.clear()
@@ -139,9 +238,17 @@ async def render_book_detail(
                 for child in children[start:end]:
                     async def _open(c=child) -> None:
                         await _show_section(c)
-                    ui.item(
-                        f"#{child.get('sequence_number', '?')}  {child.get('title', '—')}",
-                    ).props("clickable").on("click", _open).classes("text-body2")
+
+                    with ui.item().props("clickable").on("click", _open).classes("text-body2"):
+                        ui.label(f"#{child.get('sequence_number', '?')}  {child.get('title', '—')}")
+                    # Кнопки действий на строке TOC (Фаза 13.23)
+                    async def _edit_section(c=child) -> None:
+                        await _show_edit_dialog(c)
+                    async def _delete_section(c=child) -> None:
+                        await _show_delete_confirm(c)
+                    with ui.row().classes("gap-1"):
+                        ui.button(icon="edit", on_click=_edit_section).props("flat dense size=sm")
+                        ui.button(icon="delete", on_click=_delete_section).props("flat dense size=sm color=negative")
             with ui.row().classes("items-center q-mt-sm"):
                 ui.button("← Пред.", on_click=lambda: _render_toc_page(max(0, page - 1))) \
                     .props("flat dense").set_enabled(page > 0)
@@ -154,21 +261,9 @@ async def render_book_detail(
         if child:
             await _show_section(child)
         else:
-            # Фрагмент может отсутствовать в TOC (импортирован отдельно, не в frontmatter.children).
-            # Грузим его напрямую по knowledge_id — иначе «Открыть фрагмент» покажет TOC (баг 13.13).
-            sec = None
-            try:
-                sec = await client.get_entry(initial_section_id)
-            except Exception:
-                sec = None
-            if sec and "error" not in sec:
-                await _show_section({
-                    "knowledge_id": initial_section_id,
-                    "title": sec.get("title", "Фрагмент"),
-                })
-            else:
-                _render_toc_page(0)
-                ui.notify("Фрагмент не найден в оглавлении — показана книга", type="warning")
+            # NH-iter3-7: фрагмент может быть в SSOT, но не в Qdrant (DLQ/сбой) — показать TOC + notify
+            _render_toc_page(0)
+            ui.notify("Фрагмент не найден в оглавлении — показана книга", type="warning")
     else:
         _render_toc_page(0)
 
@@ -200,6 +295,51 @@ async def show_book_dialog(collection_id: str, title: str | None = None, initial
                 title_label = ui.label(current_title).classes("text-h6")
             with ui.row().classes("items-center gap-2"):
                 rename_btn = ui.button("Переименовать", icon="edit").props("flat dense")
+                add_section_btn = ui.button("Добавить раздел", icon="add").props("flat dense")
+                async def _do_add_section() -> None:
+                    _title_input = None
+                    _content_textarea = None
+                    _add_save_btn = None
+                    async def _confirm_add() -> None:
+                        raw_title = (_title_input.value or "").strip()
+                        raw_content = (_content_textarea.value or "").strip()
+                        if not raw_title:
+                            ui.notify("Заголовок не может быть пустым", type="warning")
+                            return
+                        if not raw_content:
+                            ui.notify("Содержание не может быть пустым", type="warning")
+                            return
+                        if _add_save_btn is not None:
+                            _add_save_btn.disable()
+                        try:
+                            result = await client.add_fragment(collection_id, raw_title, raw_content)
+                        except Exception as exc:
+                            ui.notify(f"Ошибка добавления: {exc}", type="negative")
+                            if _add_save_btn is not None:
+                                _add_save_btn.enable()
+                            return
+                        if "error" in result:
+                            ui.notify(f"Ошибка: {result['error']}", type="negative")
+                            if _add_save_btn is not None:
+                                _add_save_btn.enable()
+                            return
+                        add_dialog.close()
+                        ui.notify(
+                            f"Раздел «{raw_title}» добавлен (seq={result.get('sequence_number')})",
+                            type="positive",
+                        )
+                        cache.invalidate("books")
+                        await render_book_detail(detail_container, client, collection_id)
+
+                    with ui.dialog() as add_dialog, ui.card().classes("w-[600px] max-w-[90vw]"):
+                        ui.label("Добавить раздел").classes("text-h6")
+                        _title_input = ui.input(label="Заголовок раздела").classes("w-full")
+                        _content_textarea = ui.textarea(label="Содержание (Markdown)").classes("w-full").props("autogrow")
+                        with ui.row().classes("gap-2 q-mt-md"):
+                            _add_save_btn = ui.button("Добавить", on_click=_confirm_add, icon="add").props("color=primary")
+                            ui.button("Отмена", on_click=add_dialog.close).props("flat")
+                    add_dialog.open()
+                add_section_btn.on("click", _do_add_section)
                 async def _do_rename() -> None:
                     nonlocal current_title
                     _rename_input = None

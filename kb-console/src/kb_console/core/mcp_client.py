@@ -298,6 +298,96 @@ class MCPClient:
             timeout=60.0,
         )
 
+    # ── Fragment operations (Фаза 13.23) ────────────────────────
+
+    async def add_fragment(
+        self, collection_id: str, title: str, content: str,
+        tags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Добавить раздел в книгу.
+
+        Args:
+            collection_id: ID книги-коллекции.
+            title: Заголовок нового раздела.
+            content: Содержание раздела (Markdown).
+            tags: Дополнительные теги (опционально).
+
+        Returns:
+            {"fragment_id": ..., "collection_id": ..., "sequence_number": ..., "indexed": True}
+        """
+        params: dict[str, Any] = {
+            "collection_id": collection_id,
+            "title": title,
+            "content": content,
+        }
+        if tags:
+            params["tags"] = tags
+        return await self.tools_call("add_fragment", params, timeout=60.0)
+
+    async def update_fragment(
+        self,
+        fragment_id: str,
+        content: str | None = None,
+        title: str | None = None,
+        version: int | None = None,
+    ) -> dict[str, Any]:
+        """Обновить раздел книги с optimistic locking.
+
+        Args:
+            fragment_id: ID секции.
+            content: Новое содержание (Markdown).
+            title: Новый заголовок.
+            version: Ожидаемая версия (optimistic locking).
+
+        Returns:
+            {"fragment_id": ..., "version": ..., "updated_at": ...}
+            Или {"conflict": True, ...} при VersionConflict.
+
+        Note:
+            Per-call timeout 60s — как у update_entry (Фаза 13.16).
+        """
+        params: dict[str, Any] = {"fragment_id": fragment_id}
+        if content is not None:
+            params["content"] = content
+        if title is not None:
+            params["title"] = title
+        if version is not None:
+            params["version"] = version
+        return await self.tools_call("update_fragment", params, timeout=60.0)
+
+    async def delete_fragment(self, fragment_id: str) -> dict[str, Any]:
+        """Удалить раздел книги (soft-delete → .trash/ + Qdrant).
+
+        Args:
+            fragment_id: ID секции.
+
+        Returns:
+            {"fragment_id": ..., "deleted": True}
+        """
+        return await self.tools_call(
+            "delete_fragment",
+            {"fragment_id": fragment_id},
+            timeout=60.0,
+        )
+
+    async def find_fragment(
+        self, collection_id: str, query: str, limit: int = 5,
+    ) -> dict[str, Any]:
+        """Найти разделы внутри книги по семантическому запросу.
+
+        Args:
+            collection_id: ID книги-коллекции.
+            query: Поисковый запрос.
+            limit: Максимальное число результатов (default 5, max 50).
+
+        Returns:
+            {"collection_id": ..., "query": ..., "fragments": [...], "total": N}
+        """
+        return await self.tools_call(
+            "find_fragment",
+            {"collection_id": collection_id, "query": query, "limit": min(limit, 50)},
+        )
+
     async def resources_list(self) -> list[dict[str, Any]]:
         """Получить список MCP-ресурсов."""
         result = await self._call("resources/list")

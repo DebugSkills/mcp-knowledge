@@ -122,16 +122,24 @@ class TestQueueSerialization:
 
 
 class TestCancel:
-    """Cancel active import via cancel_event."""
+    """Cancel active import via cancel_event (per-ID семантика, 13.21 + queue)."""
 
     @pytest.mark.asyncio
     async def test_cancel_active_import(self, app_state_mock):
-        """Set cancel_event → import should stop."""
+        """Running import + _cancel_event → cancel returns True."""
+        import mcp_server.tools.content as content_mod
         from mcp_server.tools.content import cancel_import
 
-        app_state_mock.import_cancel_event = asyncio.Event()
-        result = await cancel_import({"import_id": "test-123"}, app_state_mock)
-        assert result.get("cancelled") is True
+        rec = {"import_id": "test-123", "status": "running", "_cancel_event": asyncio.Event()}
+        content_mod._import_queue.append(rec)
+        try:
+            app_state_mock.import_cancel_event = asyncio.Event()
+            result = await cancel_import({"import_id": "test-123"}, app_state_mock)
+            assert result.get("cancelled") is True
+            assert rec["status"] == "cancelled"
+            assert rec["_cancel_event"].is_set()
+        finally:
+            content_mod._import_queue.remove(rec)
 
     @pytest.mark.asyncio
     async def test_cancel_no_active_import(self, app_state_mock):

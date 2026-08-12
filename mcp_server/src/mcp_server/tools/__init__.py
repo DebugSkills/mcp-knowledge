@@ -17,6 +17,7 @@ from .browse import list_domains, list_projects, list_subjects
 from .collections import list_collections
 from .content import cancel_import, extract_pdf_text, import_content
 from .crud import delete_entry, update_entry, write_knowledge
+from .fragments import add_fragment, delete_fragment, find_fragment, update_fragment
 from .quality import (
     cancel_quality_scan,
     list_quality_issues,
@@ -205,6 +206,49 @@ _CANCEL_IMPORT_SCHEMA: dict[str, Any] = {
     },
 }
 
+# ── Fragment tool schemas (Фаза 13.23: фрагментные операции) ──
+
+_ADD_FRAGMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "collection_id": {"type": "string", "description": "ID книги-коллекции"},
+        "title": {"type": "string", "description": "Заголовок нового раздела"},
+        "content": {"type": "string", "description": "Содержание раздела (Markdown)"},
+        "tags": {"type": "array", "items": {"type": "string"}, "description": "Дополнительные теги"},
+    },
+    "required": ["collection_id", "title", "content"],
+}
+
+_UPDATE_FRAGMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "fragment_id": {"type": "string", "description": "ID секции"},
+        "content": {"type": "string", "description": "Новое содержание (Markdown)"},
+        "title": {"type": "string", "description": "Новый заголовок"},
+        "version": {"type": "integer", "description": "Optimistic locking: ожидаемая версия"},
+        "wait_for_index": {"type": "boolean", "default": False},
+    },
+    "required": ["fragment_id"],
+}
+
+_DELETE_FRAGMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "fragment_id": {"type": "string", "description": "ID секции для удаления"},
+    },
+    "required": ["fragment_id"],
+}
+
+_FIND_FRAGMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "collection_id": {"type": "string", "description": "ID книги-коллекции"},
+        "query": {"type": "string", "description": "Поисковый запрос"},
+        "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 50},
+    },
+    "required": ["collection_id", "query"],
+}
+
 # ── import_content schema (Фаза 5) ─────────────────────────
 
 _IMPORT_CONTENT_SCHEMA: dict[str, Any] = {
@@ -366,6 +410,27 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Отменить активный импорт (PDF/книга). Освобождает lock для следующей операции в очереди.",
         "inputSchema": _CANCEL_IMPORT_SCHEMA,
     },
+    # ── Fragment tools (Фаза 13.23) ──────────────────────────
+    {
+        "name": "add_fragment",
+        "description": "Добавить раздел в книгу: создаёт секцию с ID и sequence, индексирует, обновляет TOC.",
+        "inputSchema": _ADD_FRAGMENT_SCHEMA,
+    },
+    {
+        "name": "update_fragment",
+        "description": "Обновить раздел книги: изменить содержание и/или заголовок с optimistic locking (version check).",
+        "inputSchema": _UPDATE_FRAGMENT_SCHEMA,
+    },
+    {
+        "name": "delete_fragment",
+        "description": "Удалить раздел книги: soft-delete (→ .trash/) + удаление из Qdrant. Без каскада — только одна секция.",
+        "inputSchema": _DELETE_FRAGMENT_SCHEMA,
+    },
+    {
+        "name": "find_fragment",
+        "description": "Найти разделы внутри книги по семантическому запросу. Возвращает fragment_id, title, score, snippet.",
+        "inputSchema": _FIND_FRAGMENT_SCHEMA,
+    },
 ]
 
 # ── Handler dispatch table (реальные реализации) ───────────
@@ -394,4 +459,9 @@ TOOL_HANDLERS = {
     "analyze_content": analyze_content,
     "extract_pdf_text": extract_pdf_text,
     "cancel_import": cancel_import,
+    # Fragment tools
+    "add_fragment": add_fragment,
+    "update_fragment": update_fragment,
+    "delete_fragment": delete_fragment,
+    "find_fragment": find_fragment,
 }

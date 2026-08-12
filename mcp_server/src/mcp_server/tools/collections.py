@@ -7,7 +7,7 @@ Variant A (Surface & Enrich): новый tool для получения спис
 Flow:
   1. Qdrant scroll (filter content_type=collection, опционально domain) → точки
   2. Dedupe by knowledge_id (у коллекции может быть несколько чанков)
-  3. For each: store.read() → section_count = len(children)
+  3. For each: _build_toc() → section_count = len(toc), updated_at = max(секций)
   4. title — из markdown-заголовка контента (общий helper _derive_title)
 """
 
@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from .read import _derive_title
+from .read import _build_toc, _derive_title
 
 logger = logging.getLogger("mcp_knowledge.tools.collections")
 
@@ -49,7 +49,6 @@ async def list_collections(params: dict, app_state) -> dict:
     domain = params.get("domain")
 
     qdrant = app_state.qdrant
-    store = app_state.store
     loop = asyncio.get_running_loop()
 
     # Qdrant scroll: content_type=collection (+ опционально domain)
@@ -93,12 +92,16 @@ async def list_collections(params: dict, app_state) -> dict:
     for payload in payloads[:limit]:
         kid = payload.get("knowledge_id", "")
         section_count = 0
+        max_updated = payload.get("updated_at", "")
         try:
-            entry = await store.read(kid)
-            if entry is not None:
-                section_count = len(entry.frontmatter.children or [])
+            toc = await _build_toc(kid, app_state)
+            section_count = len(toc)
+            # P1-4: updated_at = max(секций) из TOC scroll
+            sec_timestamps = [s.get("updated_at", "") for s in toc if s.get("updated_at")]
+            if sec_timestamps:
+                max_updated = max(sec_timestamps)
         except Exception as exc:
-            logger.debug("list_collections: store.read failed for %s: %s", kid, exc)
+            logger.debug("list_collections: _build_toc failed for %s: %s", kid, exc)
 
         results.append({
             "collection_id": kid,
@@ -108,7 +111,7 @@ async def list_collections(params: dict, app_state) -> dict:
             "project": payload.get("project"),
             "tags": payload.get("tags", []),
             "section_count": section_count,
-            "updated_at": payload.get("updated_at", ""),
+            "updated_at": max_updated,
         })
 
     logger.info(

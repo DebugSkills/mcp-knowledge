@@ -47,7 +47,7 @@ class TestMCPClientE2E:
             await client.close()
 
     async def test_tools_list_17_tools(self, e2e_http_app):
-        """tools_list должен вернуть 20 инструментов (с auth)."""
+        """tools_list должен вернуть все зарегистрированные инструменты (с auth)."""
         from kb_console.core.mcp_client import MCPClient
 
         client = MCPClient(
@@ -57,7 +57,8 @@ class TestMCPClientE2E:
         )
         try:
             tools = await client.tools_list()
-            assert len(tools) == 21, f"Expected 21 tools, got {len(tools)}"
+            # 26 = базовые + quality + import + фрагментные (code-2026-08-11-book-fragments)
+            assert len(tools) == 26, f"Expected 26 tools, got {len(tools)}"
             tool_names = {t["name"] for t in tools}
             assert "search_knowledge" in tool_names
             assert "import_content" in tool_names
@@ -65,6 +66,10 @@ class TestMCPClientE2E:
             assert "write_knowledge" in tool_names
             assert "reindex" in tool_names
             assert "cancel_quality_scan" in tool_names  # 13.18
+            assert "add_fragment" in tool_names  # code-2026-08-11-book-fragments
+            assert "update_fragment" in tool_names
+            assert "delete_fragment" in tool_names
+            assert "find_fragment" in tool_names
         finally:
             await client.close()
 

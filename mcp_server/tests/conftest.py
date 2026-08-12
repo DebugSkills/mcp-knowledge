@@ -161,9 +161,46 @@ def mock_qdrant() -> MagicMock:
     # get_all_knowledge_ids()
     client.get_all_knowledge_ids = MagicMock(return_value={"ru-test-entry"})
 
-    # scroll() — for list_collections / reconciliation
+    # scroll() — for list_collections / reconciliation / _build_toc
     def _fake_scroll(limit=100, offset=None, scroll_filter=None,
                      with_payload=None, with_vectors=False):
+        # Check if filtering by parent_knowledge_id → return section points
+        if scroll_filter is not None:
+            from qdrant_client.http.models import MatchValue
+            for cond in getattr(scroll_filter, "must", []) or []:
+                key = getattr(cond, "key", "")
+                match = getattr(cond, "match", None)
+                if key == "parent_knowledge_id" and isinstance(match, MatchValue):
+                    parent_val = match.value
+                    if parent_val == "eng-testing-book-collection":
+                        # Return child sections for the test collection
+                        points = []
+                        for i, (kid, title, seq) in enumerate([
+                            ("eng-testing-ch01", "Chapter 1", 1),
+                            ("eng-testing-ch02", "Chapter 2", 2),
+                            ("eng-testing-ch03", "Chapter 3", 3),
+                        ]):
+                            p = MagicMock()
+                            p.id = 100 + i
+                            p.payload = {
+                                "knowledge_id": kid,
+                                "chunk_index": 0,
+                                "content": f"# {title}\n\nSection content.",
+                                "domain": "engineering",
+                                "subject": "testing",
+                                "content_type": "book",
+                                "parent_knowledge_id": parent_val,
+                                "sequence_number": seq,
+                                "updated_at": "2026-02-01T00:00:00+00:00",
+                            }
+                            points.append(p)
+                        return (points, None)
+                    return ([], None)  # unknown parent → empty
+                if key == "content_type" and isinstance(match, MatchValue) and match.value == "collection":
+                    # collection root scroll — fall through to default
+                    pass
+
+        # Default: return collection root (backward-compat)
         point = MagicMock()
         point.id = 99
         point.payload = {
@@ -320,6 +357,7 @@ def app_state(
     """Composite app.state mock — mimics FastAPI request.app.state."""
     state = MagicMock()
     state.qdrant = mock_qdrant
+    state.qdrant_client = None  # ensure _get_qdrant() falls through to qdrant
     state.embedder = mock_embedder
     state.store = mock_store
     state.pipeline = mock_pipeline

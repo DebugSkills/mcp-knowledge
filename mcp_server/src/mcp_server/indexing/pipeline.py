@@ -435,6 +435,7 @@ class IndexingPipeline:
                 updated_at=fm.updated_at.isoformat(),
                 parent_knowledge_id=getattr(fm, "parent_knowledge_id", None),
                 content_type=getattr(fm, "content_type", None),
+                sequence_number=getattr(fm, "sequence_number", None),
             )
             points.append(point)
 
@@ -532,6 +533,7 @@ class IndexingPipeline:
                     updated_at=fm.updated_at.isoformat(),
                     parent_knowledge_id=getattr(fm, "parent_knowledge_id", None),
                     content_type=getattr(fm, "content_type", None),
+                    sequence_number=getattr(fm, "sequence_number", None),
                 )
                 points.append(point)
 

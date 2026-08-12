@@ -317,9 +317,9 @@ async def test_get_entry_collection_has_toc(app_state):
     assert result["sequence_number"] is None
     # title derived from content
     assert result["title"] == "Test Book"
-    # children TOC
+    # children TOC (from _build_toc — mock returns 3 sections)
     children = result.get("children", [])
-    assert len(children) == 2
+    assert len(children) == 3
     assert children[0]["knowledge_id"] == "eng-testing-ch01"
     assert children[0]["title"] == "Chapter 1"
     assert children[0]["sequence_number"] == 1
@@ -412,8 +412,9 @@ async def test_list_collections_happy_path(app_state):
     assert "subject" in c
     assert "section_count" in c
     assert "updated_at" in c
-    # section_count from store.read children length
-    assert c["section_count"] == 2
+    # section_count from _build_toc (Qdrant scroll by parent_knowledge_id)
+    assert isinstance(c["section_count"], int)
+    assert c["section_count"] == 3
 
 
 async def test_list_collections_domain_filter(app_state):

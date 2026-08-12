@@ -257,7 +257,11 @@ def _render_queue(
 
 
 def _render_book_card(book: dict, expanded_cache: dict[str, list[dict]], refresh_fn, section_pages: dict[str, int]) -> None:
-    """Отрисовать карточку одной книги."""
+    """Отрисовать карточку одной книги (компактная однострочная вёрстка).
+
+    P4: одна строка — title+чипы слева, прогресс+кнопки-иконки справа.
+    Высота карточки сокращена (без отдельного ряда кнопок и широких прогресс-баров).
+    """
     book_id = book.get("book_id", "")
     title = book.get("title", book_id)
     domain = book.get("domain", "")
@@ -267,13 +271,14 @@ def _render_book_card(book: dict, expanded_cache: dict[str, list[dict]], refresh
     total_sections = book.get("total_sections", 0)
     status = book.get("status", "published")
     top_sections = book.get("top_sections", [])
+    is_expanded = book_id in expanded_cache
 
-    with ui.card().classes("w-full q-mb-sm"):
-        with ui.row().classes("items-center w-full"):
-            # Заголовок + домен/subject
-            with ui.column().classes("flex-1"):  # noqa: SIM117
-                with ui.row().classes("items-center gap-2"):
-                    ui.label(title).classes("text-h6")
+    with ui.card().classes("w-full q-mb-xs"):
+        with ui.row().classes("items-center w-full no-wrap gap-2"):
+            # Левая часть: title + чипы + мета (сжато)
+            with ui.column().classes("flex-1 min-w-0"):
+                with ui.row().classes("items-center gap-2 no-wrap"):
+                    ui.label(title).classes("text-subtitle1 text-bold ellipsis")
                     if domain:
                         ui.chip(domain).props("outline dense size=sm")
                     if subject:
@@ -282,51 +287,24 @@ def _render_book_card(book: dict, expanded_cache: dict[str, list[dict]], refresh
                         ui.badge("deprecated").props("color=grey")
                     else:
                         ui.badge("published").props("color=green")
-
-            # Прогресс-бар устаревших секций
-            with ui.column().classes("items-end"):
-                ui.label(f"{stale_fraction:.0%} устарело").classes("text-caption text-grey")
-                ui.linear_progress(stale_fraction).props("size=sm").classes("w-48")
                 ui.label(
-                    f"max-score: {max_score:.2f} | секций: {total_sections}"
+                    f"{stale_fraction:.0%} устарело · max {max_score:.2f} · {total_sections} секц."
                 ).classes("text-caption text-grey")
 
-        # Кнопки действий
-        with ui.row().classes("gap-2"):
-            # Развернуть / Свернуть секции
-            is_expanded = book_id in expanded_cache
-            ui.button(
-                "▾ Секции" if is_expanded else "▸ Развернуть",
-                on_click=lambda bid=book_id, secs=top_sections: _toggle_expand(bid, secs, expanded_cache, section_pages, refresh_fn),
-            ).props("flat dense")
-
-            ui.space()
-
-            # «Актуально» — resolve (только для published)
-            if status != "deprecated":
-                ui.button(
-                    "✅ Актуально",
-                    on_click=lambda bid=book_id: _resolve_book(bid),
-                ).props("flat dense color=positive")
-
-            # «Устарело» — deprecate cascade
-            ui.button(
-                "📦 Устарело",
-                on_click=lambda bid=book_id: _deprecate_book(bid),
-            ).props("flat dense color=warning")
-
-            # «Восстановить» — restore cascade (только для deprecated)
-            if status == "deprecated":
-                ui.button(
-                    "♻️ Восстановить",
-                    on_click=lambda bid=book_id: _restore_book(bid),
-                ).props("flat dense color=info")
-
-            # «Удалить» — delete cascade с HITL-подтверждением
-            ui.button(
-                "🗑 Удалить",
-                on_click=lambda bid=book_id, s_cnt=total_sections: _confirm_delete(bid, s_cnt),
-            ).props("flat dense color=negative")
+            # Правая часть: компактный прогресс + иконочные кнопки
+            with ui.column().classes("items-end gap-1"):
+                ui.linear_progress(stale_fraction).props("size=xs").classes("w-40")
+                with ui.row().classes("gap-1 no-wrap"):
+                    ui.button(
+                        "▾" if is_expanded else "▸",
+                        on_click=lambda bid=book_id, secs=top_sections: _toggle_expand(bid, secs, expanded_cache, section_pages, refresh_fn),
+                    ).props("flat dense").tooltip("Развернуть секции")
+                    if status != "deprecated":
+                        ui.button("✅", on_click=lambda bid=book_id: _resolve_book(bid)).props("flat dense color=positive").tooltip("Актуально")
+                    ui.button("📦", on_click=lambda bid=book_id: _deprecate_book(bid)).props("flat dense color=warning").tooltip("Устарело")
+                    if status == "deprecated":
+                        ui.button("♻️", on_click=lambda bid=book_id: _restore_book(bid)).props("flat dense color=info").tooltip("Восстановить")
+                    ui.button("🗑", on_click=lambda bid=book_id, s_cnt=total_sections: _confirm_delete(bid, s_cnt)).props("flat dense color=negative").tooltip("Удалить")
 
         # Развёрнутые секции книги
         if is_expanded:
