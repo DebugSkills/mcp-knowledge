@@ -10,7 +10,7 @@ Covers:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException, Request
@@ -23,7 +23,6 @@ from mcp_server.auth import (
     get_auth,
     mask_key,
 )
-from starlette.responses import Response
 
 # ── monkeypatched settings ────────────────────────────────────
 
@@ -187,7 +186,7 @@ def _asgi_scope(
 
 def _asgi_receive(body_bytes: bytes = b'{"jsonrpc":"2.0","method":"tools/list","id":1}') -> callable:
     """Создать ASGI receive функцию с заданным body."""
-    chunks: list[bytes] = [body_bytes]
+    _chunks: list[bytes] = [body_bytes]
     sent = False
 
     async def receive():
@@ -226,7 +225,7 @@ class TestAuthMiddleware:
         for path in ["/health", "/metrics", "/docs", "/openapi.json"]:
             scope = _asgi_scope(path=path, method="GET")
             receive = _asgi_receive()
-            send, messages = _asgi_send_collector()
+            send, _messages = _asgi_send_collector()
             # Устанавливаем мок-обработчик на ASGI app,
             # который возвращает 200 через send
             async def mock_app(s, r, snd):
@@ -242,7 +241,7 @@ class TestAuthMiddleware:
     async def test_skip_health_trailing_slash(self, middleware: AuthMiddleware):
         scope = _asgi_scope(path="/health/", method="GET")
         receive = _asgi_receive()
-        send, messages = _asgi_send_collector()
+        send, _messages = _asgi_send_collector()
 
         async def mock_app(s, r, snd):
             await snd({"type": "http.response.start", "status": 200, "headers": []})
@@ -255,7 +254,7 @@ class TestAuthMiddleware:
     async def test_get_non_mcp_bypasses_auth(self, middleware: AuthMiddleware):
         scope = _asgi_scope(path="/some-page", method="GET")
         receive = _asgi_receive()
-        send, messages = _asgi_send_collector()
+        send, _messages = _asgi_send_collector()
 
         async def mock_app(s, r, snd):
             await snd({"type": "http.response.start", "status": 200, "headers": []})
@@ -269,7 +268,7 @@ class TestAuthMiddleware:
     async def test_post_mcp_without_key_sets_unauthenticated(self, middleware: AuthMiddleware):
         scope = _asgi_scope(path="/mcp", method="POST")
         receive = _asgi_receive()
-        send, messages = _asgi_send_collector()
+        send, _messages = _asgi_send_collector()
 
         async def mock_app(s, r, snd):
             await snd({"type": "http.response.start", "status": 200, "headers": []})
@@ -287,7 +286,7 @@ class TestAuthMiddleware:
             headers={"X-API-Key": "write-key-abcdefgh"},
         )
         receive = _asgi_receive()
-        send, messages = _asgi_send_collector()
+        send, _messages = _asgi_send_collector()
 
         async def mock_app(s, r, snd):
             await snd({"type": "http.response.start", "status": 200, "headers": []})
@@ -307,7 +306,7 @@ class TestAuthMiddleware:
             headers={"X-API-Key": "not-a-real-key"},
         )
         receive = _asgi_receive()
-        send, messages = _asgi_send_collector()
+        send, _messages = _asgi_send_collector()
 
         async def mock_app(s, r, snd):
             await snd({"type": "http.response.start", "status": 200, "headers": []})

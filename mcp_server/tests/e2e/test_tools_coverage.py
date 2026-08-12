@@ -696,3 +696,458 @@ async def test_s20_list_collections_via_http(e2e_http_app):
     assert children[0]["sequence_number"] == 1
     assert "title" in children[0]
     assert "knowledge_id" in children[0]
+
+
+# ═══════════════════════════════════════════════════════════════
+# S21: fragment_lifecycle_via_http — add→find→update→conflict→delete
+# ═══════════════════════════════════════════════════════════════
+
+S21_DOMAIN = "e2e-s21"
+S21_SUBJECT = "frag"
+
+
+@pytest.mark.e2e
+async def test_s21_fragment_lifecycle_via_http(e2e_http_app):
+    """S21: import → add×2 → get_entry → find → update v1→v2 → conflict → delete → cleanup.
+
+    Паттерн S16: локальный reset()+register(BookPreprocessor), e2e-write-key.
+    """
+    from mcp_server.content.book_preprocessor import BookPreprocessor
+    from mcp_server.content.registry import register, reset
+
+    reset()
+    token_counter = type("TokenCounter", (), {
+        "count_tokens": lambda self, text: len(text.split()),
+        "truncate_to_tokens": lambda self, text, max_t: " ".join(text.split()[:max_t]),
+    })()
+    register(BookPreprocessor(embedder=e2e_http_app.app.state.embedder, token_counter=token_counter))
+
+    headers_write = {"X-API-Key": "e2e-write-key"}
+    headers_read = {"X-API-Key": "e2e-read-key"}
+
+    # Step 1: import_content — создать книгу с 2 главами
+    import_payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "import_content",
+            "arguments": {
+                "content": "# Глава 1\n\nКонтент первой главы про Docker.\n\n# Глава 2\n\nКонтент второй главы про Kubernetes.",
+                "content_type": "book",
+                "domain": S21_DOMAIN,
+                "subject": S21_SUBJECT,
+                "title": "e2e-s21-book",
+                "tags": ["e2e", "fragment-lifecycle"],
+                "wait_for_index": True,
+            },
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=import_payload, headers=headers_write)
+    assert resp.status_code == 200
+    import_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" not in import_result, f"import failed: {import_result}"
+    collection_id = import_result["collection_id"]
+    initial_imported = import_result["imported"]  # может быть 2 (chapters) или 3 (preamble+2)
+
+    # Секции импорта индексируются АСИНХРОННО (wait_for_index=False в _batch_write_sections),
+    # а add_fragment считает sequence=max+1 по TOC из Qdrant → ждём индексацию детей
+    # напрямую через pipeline.wait_for_index (паттерн S16:393-399). Poll через get_entry
+    # НЕ годится: первый запрос кэширует пустой TOC на 30s (data_version не меняется
+    # при фоновой индексации).
+    import asyncio
+    root_entry = await e2e_http_app.app.state.store.read(collection_id)
+    child_ids = [c["knowledge_id"] for c in (root_entry.frontmatter.children or [])]
+    for child_id in child_ids:
+        await e2e_http_app.app.state.pipeline.wait_for_index(child_id, timeout=15.0)
+
+    # Step 2: add_fragment ×2
+    frag1_payload = {
+        "jsonrpc": "2.0", "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "add_fragment",
+            "arguments": {
+                "collection_id": collection_id,
+                "title": "Совет по Docker Compose",
+                "content": "Используйте docker compose ps для мониторинга состояния сервисов в реальном времени.",
+                "tags": ["docker", "compose"],
+            },
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=frag1_payload, headers=headers_write)
+    assert resp.status_code == 200
+    frag1_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" not in frag1_result, f"add_fragment 1 failed: {frag1_result}"
+    frag1_id = frag1_result["fragment_id"]
+    assert frag1_result["sequence_number"] == initial_imported + 1
+    assert frag1_result["indexed"] is True
+
+    frag2_payload = {
+        "jsonrpc": "2.0", "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "add_fragment",
+            "arguments": {
+                "collection_id": collection_id,
+                "title": "Kubernetes handler tips",
+                "content": "Используйте readiness probes для проверки готовности подов перед отправкой трафика.",
+                "tags": ["k8s"],
+            },
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=frag2_payload, headers=headers_write)
+    assert resp.status_code == 200
+    frag2_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" not in frag2_result, f"add_fragment 2 failed: {frag2_result}"
+    frag2_id = frag2_result["fragment_id"]
+    assert frag2_result["sequence_number"] == initial_imported + 2
+    assert frag2_result["indexed"] is True
+
+    # Step 3: get_entry → проверяем children
+    get_payload = {
+        "jsonrpc": "2.0", "id": 4,
+        "method": "tools/call",
+        "params": {"name": "get_entry", "arguments": {"knowledge_id": collection_id}},
+    }
+    resp = await e2e_http_app.post("/mcp", json=get_payload, headers=headers_read)
+    assert resp.status_code == 200
+    get_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    children = get_result.get("children", [])
+    expected_count = initial_imported + 2
+    assert len(children) == expected_count, (
+        f"Expected {expected_count} children (original {initial_imported} + 2 fragments), got {len(children)}: {[(c['knowledge_id'], c.get('title','')) for c in children]}"
+    )
+    child_ids = {c["knowledge_id"] for c in children}
+    assert frag1_id in child_ids, f"frag1 ({frag1_id}) not in children"
+    assert frag2_id in child_ids, f"frag2 ({frag2_id}) not in children"
+    # Проверяем sequence order: 1..expected_count
+    sequences = [c["sequence_number"] for c in children]
+    assert sequences == list(range(1, expected_count + 1)), f"Sequence not 1..{expected_count}: {sequences}"
+
+    # Step 4: find_fragment — поиск по ключевому слову из frag1
+    find_payload = {
+        "jsonrpc": "2.0", "id": 5,
+        "method": "tools/call",
+        "params": {
+            "name": "find_fragment",
+            "arguments": {"collection_id": collection_id, "query": "Docker Compose мониторинг"},
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=find_payload, headers=headers_read)
+    assert resp.status_code == 200
+    find_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert find_result["total"] >= 1, f"find_fragment should find at least 1 result: {find_result}"
+    found_ids = [f["fragment_id"] for f in find_result["fragments"]]
+    assert frag1_id in found_ids, f"frag1 ({frag1_id}) should be in find results: {found_ids}"
+
+    # Step 5: update_fragment — обновить frag1 (v1 → v2)
+    update_payload = {
+        "jsonrpc": "2.0", "id": 6,
+        "method": "tools/call",
+        "params": {
+            "name": "update_fragment",
+            "arguments": {
+                "fragment_id": frag1_id,
+                "content": "Обновлённый контент: используйте docker compose ps --format json для машинной обработки.",
+                "version": 1,
+            },
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=update_payload, headers=headers_write)
+    assert resp.status_code == 200
+    update_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" not in update_result, f"update_fragment failed: {update_result}"
+    assert update_result["version"] == 2
+    assert update_result["indexed"] is True
+
+    # Step 6: повторный update_fragment(version=1) → conflict
+    resp = await e2e_http_app.post("/mcp", json=update_payload, headers=headers_write)
+    assert resp.status_code == 200
+    conflict_body = resp.json()
+    # VersionConflictError → JSON-RPC error -32005 (не result: conflict:true —
+    # update_fragment пробрасывает исключение в handler, в отличие от update_entry)
+    assert "error" in conflict_body, f"Expected JSON-RPC error for version conflict, got: {conflict_body}"
+    assert conflict_body["error"]["code"] == -32005, f"Expected -32005, got: {conflict_body}"
+    assert conflict_body["error"]["data"]["current_version"] == 2
+
+    # Step 7: delete_fragment — удалить frag1 (пауза: write-ключ burst=5, refill 20/мин)
+    await asyncio.sleep(3.5)
+    delete_payload = {
+        "jsonrpc": "2.0", "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "delete_fragment",
+            "arguments": {"fragment_id": frag1_id},
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=delete_payload, headers=headers_write)
+    assert resp.status_code == 200
+    delete_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert delete_result["deleted"] is True
+    assert delete_result["fragment_id"] == frag1_id
+
+    # Step 8: get_entry → frag1 отсутствует, frag2 остаётся
+    resp = await e2e_http_app.post("/mcp", json=get_payload, headers=headers_read)
+    assert resp.status_code == 200
+    get_result2 = json.loads(resp.json()["result"]["content"][0]["text"])
+    children2 = get_result2.get("children", [])
+    child_ids2 = {c["knowledge_id"] for c in children2}
+    assert frag1_id not in child_ids2, f"frag1 ({frag1_id}) should be deleted, still in children: {child_ids2}"
+    assert frag2_id in child_ids2, f"frag2 ({frag2_id}) should still be present"
+
+    # Step 9: cleanup — delete_entry(cascade=True) removes collection + remaining sections
+    await e2e_http_app.app.state.pipeline.wait_for_index(collection_id, timeout=10.0)
+    await asyncio.sleep(3.5)  # refill write-токенов (delete выше потратил последний burst)
+    cascade_payload = {
+        "jsonrpc": "2.0", "id": 8,
+        "method": "tools/call",
+        "params": {
+            "name": "delete_entry",
+            "arguments": {"knowledge_id": collection_id, "cascade": True},
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=cascade_payload, headers=headers_write)
+    assert resp.status_code == 200
+    cascade_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert cascade_result["deleted"] is True
+
+    # Verify Qdrant cleanup: collection + fragments removed
+    all_ids = e2e_http_app.app.state.qdrant.get_all_knowledge_ids()
+    assert collection_id not in all_ids, f"Collection {collection_id} still in Qdrant after cascade delete"
+    assert frag2_id not in all_ids, f"frag2 ({frag2_id}) still in Qdrant after cascade delete"
+
+
+# ═══════════════════════════════════════════════════════════════
+# S22: fragment edge cases — deprecated/empty/missing guards
+# ═══════════════════════════════════════════════════════════════
+
+S22_DOMAIN = "e2e-s22"
+S22_SUBJECT = "edge"
+S22_STANDALONE_ID = "e2e-s22-standalone"
+
+
+@pytest.mark.e2e
+async def test_s22_fragment_edge_cases_via_http(e2e_http_app):
+    """S22: add_fragment на несуществующую коллекцию → error,
+    на standalone запись → error, с пустым content → error,
+    в deprecated-книгу → error.
+    """
+    from mcp_server.content.book_preprocessor import BookPreprocessor
+    from mcp_server.content.registry import register, reset
+
+    reset()
+    token_counter = type("TokenCounter", (), {
+        "count_tokens": lambda self, text: len(text.split()),
+        "truncate_to_tokens": lambda self, text, max_t: " ".join(text.split()[:max_t]),
+    })()
+    register(BookPreprocessor(embedder=e2e_http_app.app.state.embedder, token_counter=token_counter))
+
+    headers_write = {"X-API-Key": "e2e-write-key"}
+
+    # ── Case 1: add_fragment на несуществующую коллекцию ──
+    missing_payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "add_fragment",
+            "arguments": {
+                "collection_id": "e2e-nonexistent-collection",
+                "title": "Test",
+                "content": "Should fail.",
+            },
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=missing_payload, headers=headers_write)
+    assert resp.status_code == 200
+    missing_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" in missing_result, f"Expected error for missing collection, got: {missing_result}"
+    assert "not found" in missing_result["error"].lower()
+
+    # ── Case 2: add_fragment на standalone запись (не коллекцию) ──
+    # Создаём standalone-запись через write_knowledge
+    write_payload = {
+        "jsonrpc": "2.0", "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "write_knowledge",
+            "arguments": {
+                "content": "# Standalone Entry\n\nЭто одиночная запись, которая не является книжной коллекцией и не содержит секций.",
+                "domain": S22_DOMAIN,
+                "subject": S22_SUBJECT,
+                "knowledge_id": S22_STANDALONE_ID,
+                "wait_for_index": True,
+            },
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=write_payload, headers=headers_write)
+    assert resp.status_code == 200
+    write_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" not in write_result, f"write_knowledge failed: {write_result}"
+
+    standalone_payload = {
+        "jsonrpc": "2.0", "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "add_fragment",
+            "arguments": {
+                "collection_id": S22_STANDALONE_ID,
+                "title": "Test",
+                "content": "Should fail on non-collection.",
+            },
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=standalone_payload, headers=headers_write)
+    assert resp.status_code == 200
+    standalone_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" in standalone_result, f"Expected error for non-collection, got: {standalone_result}"
+    assert "not a book collection" in standalone_result["error"].lower()
+
+    # ── Case 3: add_fragment с пустым content ──
+    # Создаём книгу-коллекцию для этого теста
+    import_payload = {
+        "jsonrpc": "2.0", "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "import_content",
+            "arguments": {
+                "content": "# Chapter 1\n\nEmpty content guard test: добавление фрагмента с пустым содержимым должно отклоняться сервером.",
+                "content_type": "book",
+                "domain": S22_DOMAIN,
+                "subject": S22_SUBJECT,
+                "title": "e2e-s22-edge-book",
+                "tags": ["e2e", "edge-case"],
+                "wait_for_index": True,
+            },
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=import_payload, headers=headers_write)
+    assert resp.status_code == 200
+    import_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" not in import_result, f"import failed: {import_result}"
+    s22_coll_id = import_result["collection_id"]
+
+    empty_content_payload = {
+        "jsonrpc": "2.0", "id": 5,
+        "method": "tools/call",
+        "params": {
+            "name": "add_fragment",
+            "arguments": {
+                "collection_id": s22_coll_id,
+                "title": "Empty content test",
+                "content": "",
+            },
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=empty_content_payload, headers=headers_write)
+    assert resp.status_code == 200
+    empty_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" in empty_result, f"Expected error for empty content, got: {empty_result}"
+    assert "must not be empty" in empty_result["error"].lower()
+
+    # ── Case 4: add_fragment в deprecated-книгу ──
+    # Создаём книгу → deprecate (через resolve_quality_issue) → add_fragment → error
+    # (паузы: write-ключ burst=5 исчерпан на Case 3; refill 20/мин = 1 токен/3с)
+    import asyncio
+    await asyncio.sleep(3.5)
+    dep_import_payload = {
+        "jsonrpc": "2.0", "id": 6,
+        "method": "tools/call",
+        "params": {
+            "name": "import_content",
+            "arguments": {
+                "content": "# Deprecated Book\n\nЭта книга будет деприкейтнута для проверки защиты от добавления фрагментов.",
+                "content_type": "book",
+                "domain": S22_DOMAIN,
+                "subject": S22_SUBJECT,
+                "title": "e2e-s22-dep-book",
+                "tags": ["e2e", "deprecated"],
+                "wait_for_index": True,
+            },
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=dep_import_payload, headers=headers_write)
+    assert resp.status_code == 200
+    dep_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" not in dep_result, f"import deprecated book failed: {dep_result}"
+    dep_coll_id = dep_result["collection_id"]
+
+    # Deprecate through resolve_quality_issue
+    await asyncio.sleep(3.5)
+    deprecate_payload = {
+        "jsonrpc": "2.0", "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "resolve_quality_issue",
+            "arguments": {
+                "knowledge_id": dep_coll_id,
+                "action": "deprecate",
+                "reason": "E2E test: deprecated guard verification",
+                "cascade": True,
+            },
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=deprecate_payload, headers=headers_write)
+    assert resp.status_code == 200
+    deprecate_data = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" not in deprecate_data, f"deprecate failed: {deprecate_data}"
+
+    # Try add_fragment to deprecated book
+    await asyncio.sleep(3.5)
+    dep_add_payload = {
+        "jsonrpc": "2.0", "id": 8,
+        "method": "tools/call",
+        "params": {
+            "name": "add_fragment",
+            "arguments": {
+                "collection_id": dep_coll_id,
+                "title": "Should fail",
+                "content": "Cannot add to deprecated book.",
+            },
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=dep_add_payload, headers=headers_write)
+    assert resp.status_code == 200
+    dep_add_result = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" in dep_add_result, f"Expected error for deprecated collection, got: {dep_add_result}"
+    assert "deprecated" in dep_add_result["error"].lower()
+
+    # ── Cleanup ──
+    # Restore + delete deprecated book
+    await asyncio.sleep(3.5)
+    restore_payload = {
+        "jsonrpc": "2.0", "id": 9,
+        "method": "tools/call",
+        "params": {
+            "name": "resolve_quality_issue",
+            "arguments": {
+                "knowledge_id": dep_coll_id,
+                "action": "restore",
+                "reason": "E2E cleanup",
+                "cascade": True,
+            },
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=restore_payload, headers=headers_write)
+    assert resp.status_code == 200
+    restore_data = json.loads(resp.json()["result"]["content"][0]["text"])
+    assert "error" not in restore_data, f"restore failed: {restore_data}"
+
+    # Delete both collections cascade (пауза перед каждым delete: refill write-токенов)
+    await asyncio.sleep(3.5)
+    for cid in [s22_coll_id, dep_coll_id]:
+        await e2e_http_app.app.state.pipeline.wait_for_index(cid, timeout=10.0)
+        del_payload = {
+            "jsonrpc": "2.0", "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "delete_entry",
+                "arguments": {"knowledge_id": cid, "cascade": True},
+            },
+        }
+        resp = await e2e_http_app.post("/mcp", json=del_payload, headers=headers_write)
+        assert resp.status_code == 200
+        await asyncio.sleep(3.5)
+
+    # Cleanup standalone
+    await e2e_http_app.app.state.pipeline.wait_for_index(S22_STANDALONE_ID, timeout=10.0)
+    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S22_STANDALONE_ID)

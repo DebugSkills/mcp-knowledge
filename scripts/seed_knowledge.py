@@ -10,13 +10,11 @@ seed_knowledge.py — Загрузка начального корпуса зн�
 """
 
 import argparse
-import json
 import os
-import sys
 from pathlib import Path
 
-import yaml
 import httpx
+import yaml
 
 MCP_URL = "http://localhost:8000/mcp"
 API_KEY = os.environ.get("MCP_WRITE_KEY", "dev-write-key-001")
@@ -65,7 +63,7 @@ def write_knowledge(client: httpx.Client, entry: dict) -> bool:
         knowledge_id = result.get("knowledge_id", "unknown")
         print(f"  ✅ {knowledge_id}")
         return True
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — seed-скрипт: логируем и продолжаем
         print(f"  ❌ {entry.get('domain', '?')}/{entry.get('subject', '?')}: {e}")
         return False
 

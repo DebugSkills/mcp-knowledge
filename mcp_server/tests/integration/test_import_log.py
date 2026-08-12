@@ -5,17 +5,11 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
-from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
-
 import httpx
 import pytest
 from fastapi import FastAPI, Request
 from httpx import ASGITransport
-from mcp_server.auth import AuthMiddleware, AuthInfo
-
+from mcp_server.auth import AuthMiddleware
 
 # ═══════════════════════════════════════════════════════════════
 # Auth setup — monkeypatch test keys
@@ -206,7 +200,7 @@ async def test_get_imports_excludes_log_field(log_app, auth_headers):
 @pytest.mark.asyncio
 async def test_ring_buffer_truncation_marker():
     """_append_log должен добавлять маркер «log truncated» при переполнении."""
-    from mcp_server.tools.content import _append_log, LOG_CAP
+    from mcp_server.tools.content import LOG_CAP, _append_log
 
     rec: dict = {"log": []}
     # Заполняем буфер до предела
@@ -225,7 +219,7 @@ async def test_ring_buffer_truncation_marker():
 @pytest.mark.asyncio
 async def test_ring_buffer_marker_not_duplicated():
     """Маркер не должен дублироваться при повторном переполнении."""
-    from mcp_server.tools.content import _append_log, LOG_CAP
+    from mcp_server.tools.content import LOG_CAP, _append_log
 
     rec: dict = {"log": []}
     for i in range(LOG_CAP + 10):

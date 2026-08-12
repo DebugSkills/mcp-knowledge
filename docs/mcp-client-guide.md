@@ -20,8 +20,8 @@
    - Env: `MCP_SERVER_URL`, `MCP_API_KEY`
 
 3. **Проверьте подключение:**
-   - Kilo: `/mcps` → статус `connected`; tools list → 20 инструментов
-   - Ручная: `echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 mcp-stdio/bridge.py` → JSON с 20 tools
+    - Kilo: `/mcps` → статус `connected`; tools list → 26 инструментов
+    - Ручная: `echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 mcp-stdio/bridge.py` → JSON с 26 tools
 
 ---
 
@@ -166,9 +166,9 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 
 | Уровень | Переменная `.env` | Доступ |
 |---------|-------------------|--------|
-| **read** | `MCP_READ_KEYS=["..."]` | Поиск, чтение, browse, ресурсы, промпты, `analyze_content`, `list_collections` |
-| **import** | `MCP_IMPORT_KEYS=["..."]` | Read + `import_content` (импорт книг без права delete/reindex/write) |
-| **write** | `MCP_WRITE_KEYS=["..."]` | Полный доступ: read + import + `write_knowledge`, `update_entry`, `delete_entry`, `reindex` |
+| **read** | `MCP_READ_KEYS=["..."]` | Поиск, чтение, browse, ресурсы, промпты, `analyze_content`, `list_collections`, `find_fragment` |
+| **import** | `MCP_IMPORT_KEYS=["..."]` | Read + `import_content`, `extract_pdf_text`, `cancel_import` (импорт книг без права delete/reindex/write) |
+| **write** | `MCP_WRITE_KEYS=["..."]` | Полный доступ: read + import + `write_knowledge`, `update_entry`, `delete_entry`, `reindex`, `resolve_quality_issue`, `run_quality_scan`, `add_fragment`, `update_fragment`, `delete_fragment` |
 
 **Рекомендация:**
 - AI-агенту, который только читает БЗ → **read-ключ**
@@ -179,7 +179,7 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 
 ---
 
-## 7. Таблица 20 инструментов
+## 7. Таблица 26 инструментов
 
 | # | Tool | Уровень | Назначение |
 |:--|------|:-------:|-----------|
@@ -203,6 +203,12 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 | 18 | `cancel_quality_scan` | write | Отменить активный scan, освободить lock |
 | 19 | `import_content` | import | Декомпозиция + batch запись: content → book collection. **PDF (Фаза 13.21):** `content_type="pdf"` + `pdf_path` (путь с сервера после POST /upload) или base64-контент → асинхронная очередь импортов (ответ `{import_id, status: started|queued}`, прогресс в GET /imports/{id}/progress, лог в /imports/{id}/log, отмена POST /imports/{id}/cancel). Лимиты: ≤2000 страниц, ≤100 МБ (base64 ~96 МБ), OCR для сканов, encrypted → ошибка |
 | 20 | `analyze_content` | read | AI-анализ контента (Ollama LLM + TF-IDF fallback) |
+| 21 | `extract_pdf_text` | import | Конвертировать PDF → текст (pdfplumber + OCR fallback) |
+| 22 | `cancel_import` | import | Отменить активный импорт (PDF/книга), освободить lock |
+| 23 | `add_fragment` | write | Добавить раздел в книгу: создаёт секцию с ID и sequence, индексирует, обновляет TOC |
+| 24 | `update_fragment` | write | Обновить раздел книги: изменить содержание и/или заголовок с optimistic locking |
+| 25 | `delete_fragment` | write | Удалить раздел книги: soft-delete (→ .trash/) + удаление из Qdrant, без cascade |
+| 26 | `find_fragment` | read | Найти разделы внутри книги по семантическому запросу, возвращает fragment_id/title/score/snippet |
 
 ---
 
@@ -215,7 +221,7 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 | `initialize` | `{"result": {protocolVersion, serverInfo, capabilities}}` | Handshake, protocolVersion `2024-11-05` |
 | `ping` | `{"result": {}}` (пустой объект) | Keepalive — используется MCP-клиентами |
 | `notifications/initialized` | **HTTP 204** (без тела) | Notification (без `id`) — клиент шлёт после initialize |
-| `tools/list` | `{"result": {"tools": [...20 инструментов]}}` | Schemas для автогенерации permission |
+| `tools/list` | `{"result": {"tools": [...26 инструментов]}}` | Schemas для автогенерации permission |
 | `tools/call` | `{"result": {"content": [...]}}` | Вызов инструмента |
 
 **Правила:**
@@ -230,14 +236,159 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 
 ---
 
-## 8. Проверка подключения
+## 7.2 Фрагментные операции с книгами (add/update/delete/find)
+
+Четыре новых инструмента позволяют AI-агенту и пользователю дополнять книгу новыми разделами, редактировать или удалять существующие — без полного реимпорта всей книги.
+
+### 7.2.1 Обзор инструментов
+
+| Tool | Назначение | Параметры | Возвращает |
+|------|-----------|-----------|------------|
+| `add_fragment` | Добавить раздел в книгу (append-only) | `collection_id`, `title`, `content` (required); `tags` (optional) | `{fragment_id, collection_id, sequence_number, indexed, quality_duplicates}` |
+| `update_fragment` | Обновить раздел: контент, заголовок | `fragment_id` (required); `content`, `title`, `version`, `wait_for_index` (optional) | `{fragment_id, version, updated_at, indexed}` / `{conflict: true, expected_version, current_version}` |
+| `delete_fragment` | Удалить раздел (soft-delete, без cascade) | `fragment_id` (required) | `{fragment_id, deleted: true}` |
+| `find_fragment` | Найти разделы в книге по запросу | `collection_id`, `query` (required); `limit` (default 5, max 50) | `{collection_id, query, fragments: [{fragment_id, title, sequence_number, score, snippet}], total}` |
+
+**Правила доступа:**
+- `add_fragment` / `update_fragment` / `delete_fragment` — требуют **write-ключ** (мутируют SSOT + Qdrant + Git)
+- `find_fragment` — **read-ключ** (только поиск, без мутаций)
+
+**sequence_number:** append-only; новый фрагмент получает `max(sequence_number) + 1` в книге. При пустой книге — 1.
+
+**ID-формула:** `knowledge_id = make_knowledge_id(domain, subject, title, seq, sha256(body[:200]))` — идентична импорту, поэтому реимпорт того же контента даёт тот же ID (идемпотентность).
+
+**Optimistic locking:** `update_fragment` с параметром `version` проверяет, что запись не изменилась с момента чтения. При конфликте возвращает `conflict: true` (НЕ ошибку JSON-RPC) — клиент должен перечитать запись и повторить.
+
+### 7.2.2 Рабочий цикл: «добавить заметку в сборник»
+
+**5 шагов — полный цикл от поиска книги до удаления заметки:**
+
+**Шаг 1: Найти книгу**
+
+```bash
+curl -s -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: ${MCP_API_KEY}" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_collections","arguments":{"domain":"ansible"}}}'
+```
+
+Ответ: `{"results": [{collection_id, title, domain, subject, section_count, updated_at}, ...]}`.
+
+**Шаг 2: Добавить заметку**
+
+```bash
+curl -s -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: ${MCP_API_KEY}" \
+  -d '{
+    "jsonrpc": "2.0", "id": 2,
+    "method": "tools/call",
+    "params": {
+      "name": "add_fragment",
+      "arguments": {
+        "collection_id": "ansible-handlers-book-collection",
+        "title": "Совет: --check с diff",
+        "content": "Запускайте ansible-playbook --check --diff перед каждым apply.\nЭто покажет изменения без их применения и сэкономит часы отладки.",
+        "tags": ["ansible", "best-practice"]
+      }
+    }
+  }'
+```
+
+Ответ: `{"fragment_id": "ansible-sovet-check-s-diff-4-a1b2c3d4", "collection_id": "...", "sequence_number": 4, "indexed": true}`
+
+**Шаг 3: Прочитать добавленное (два способа)**
+
+*Через get_entry — вся книга с оглавлением:*
+
+```bash
+curl -s -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: ${MCP_API_KEY}" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_entry","arguments":{"knowledge_id":"ansible-handlers-book-collection"}}}'
+```
+
+В ответе `children` поле содержит все секции (включая новую) с `knowledge_id`, `title`, `sequence_number`.
+
+*Через find_fragment — поиск по смыслу:*
+
+```bash
+curl -s -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: ${MCP_API_KEY}" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"find_fragment","arguments":{"collection_id":"ansible-handlers-book-collection","query":"check diff dry run"}}}'
+```
+
+Ответ: `{"fragments": [{"fragment_id": "ansible-sovet-check-s-diff-4-a1b2c3d4", "title": "Совет: --check с diff", "score": 0.89, "snippet": "Запускайте ansible-playbook --check..."}], "total": 1}`
+
+**Шаг 4: Обновить заметку (с optimistic locking)**
+
+```bash
+# Сначала читаем текущую версию
+# get_entry → version: 1
+curl -s -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: ${MCP_API_KEY}" \
+  -d '{
+    "jsonrpc": "2.0", "id": 5,
+    "method": "tools/call",
+    "params": {
+      "name": "update_fragment",
+      "arguments": {
+        "fragment_id": "ansible-sovet-check-s-diff-4-a1b2c3d4",
+        "content": "Запускайте ansible-playbook --check --diff перед каждым apply.\nЭто покажет изменения без их применения.\n\nДополнительно: используйте --step для пошагового выполнения.",
+        "version": 1
+      }
+    }
+  }'
+```
+
+Ответ (успех): `{"fragment_id": "...", "version": 2, "updated_at": "2026-08-12T15:00:00Z", "indexed": true}`
+
+**Обработка VersionConflict (JSON-RPC -32005):**
+
+При повторном вызове с тем же `version: 1` (после успешного обновления до v2):
+
+```json
+{
+  "message": "Version conflict: expected v1, actual v2",
+  "fragment_id": "ansible-sovet-check-s-diff-4-a1b2c3d4",
+  "expected_version": 1,
+  "current_version": 2,
+  "conflict": true
+}
+```
+
+> **Важно:** conflict возвращается как **успешный result** (не JSON-RPC error). Клиент должен проверить поле `conflict: true` в ответе, перечитать запись через `get_entry` и повторить `update_fragment` с новым `version`.
+
+**Шаг 5: Удалить заметку**
+
+```bash
+curl -s -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: ${MCP_API_KEY}" \
+  -d '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"delete_fragment","arguments":{"fragment_id":"ansible-sovet-check-s-diff-4-a1b2c3d4"}}}'
+```
+
+Ответ: `{"fragment_id": "...", "deleted": true}`
+
+### 7.2.3 Ограничения
+
+- **wait_for_index в add_fragment:** `add_fragment` всегда использует `wait_for_index=True` (секция видна в TOC сразу после возврата). Для одной секции задержка ≤2s.
+- **Deprecated/empty-content guard:** `add_fragment` в deprecated-книгу возвращает ошибку; `add_fragment` и `update_fragment` отклоняют пустой контент (иначе pipeline уходит в таймаут 30s).
+- **Soft-delete без cascade:** `delete_fragment` удаляет только одну секцию (soft-delete → `.trash/` + удаление из Qdrant). Родительская книга и другие секции не затрагиваются. Для каскадного удаления всей книги используйте `delete_entry(collection_id, cascade=True)`.
+- **Append-only sequence:** новый фрагмент всегда получает `max(sequence_number) + 1`. Вставка по позиции и переупорядочивание не поддерживаются (P2). При параллельных `add_fragment` возможна гонка sequence (не фатально: ID уникален по хешу контента).
+- **TOC on-the-fly:** оглавление книги (`get_entry` children) строится из Qdrant (scroll по `parent_knowledge_id`), а не из frontmatter. Кэш 30s инвалидируется по `data_version`. После `add_fragment`/`update_fragment`/`delete_fragment` TOC обновляется немедленно через `wait_for_index`.
+- **Legacy frontmatter.children:** поле `children` в frontmatter root-записи больше не обновляется при фрагментных операциях — оно остаётся историческим снэпшотом с момента импорта. Единственный актуальный источник TOC — `_build_toc` из Qdrant.
+
+---
 
 ### 8.1 В Kilo Code
 
 1. Откройте сессию Kilo
 2. Выполните `/mcps` — отобразится список MCP-серверов
 3. `mcp-knowledge` должен быть в статусе `connected`
-4. Выполните `/mcp-tools mcp-knowledge` → список из 20 инструментов
+4. Выполните `/mcp-tools mcp-knowledge` → список из 26 инструментов
 
 ### 8.2 Ручная проверка (без Kilo)
 
@@ -391,4 +542,4 @@ grep MCP_WRITE_KEYS .env
 
 ---
 
-*Актуально на 2026-08-08. 20 MCP Tools, 3 промпта, 3 ресурса kb://, stdio-мост v1.1 (HTTP 204 → без ответа), ping/notifications по MCP spec, MCP_MAX_REQUEST_SIZE 128 МБ.*
+*Актуально на 2026-08-12. 26 MCP Tools, 3 промпта, 3 ресурса kb://, stdio-мост v1.1 (HTTP 204 → без ответа), ping/notifications по MCP spec, MCP_MAX_REQUEST_SIZE 128 МБ.*

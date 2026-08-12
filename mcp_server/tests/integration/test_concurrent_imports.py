@@ -75,7 +75,7 @@ async def test_concurrent_get_imports_no_content_length_error(concurrent_app):
             try:
                 resp = await client.get("/imports", timeout=10.0)
                 return i, resp.status_code
-            except Exception as e:
+            except Exception:  # noqa: BLE001 — сетевой сбой → код -1
                 return i, -1
 
         tasks = [fetch_one(i) for i in range(N)]

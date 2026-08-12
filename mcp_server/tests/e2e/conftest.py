@@ -318,6 +318,9 @@ async def e2e_http_app(real_qdrant, real_embedder, e2e_store, e2e_pipeline,
     app.state.store = e2e_store
     app.state.pipeline = e2e_pipeline
     app.state.knowledge_index = e2e_knowledge_index
+    # Task 1: data_version для TOC-кэш-инвалидации (как main.py:291) — без него
+    # _build_toc кэш никогда не инвалидируется (getattr default 0 == 0).
+    app.state.data_version = 0
 
     # Rate limiter (для S10)
     app.state.rate_limiter_read = TokenBucketLimiter(
