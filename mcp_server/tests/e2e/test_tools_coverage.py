@@ -1151,3 +1151,265 @@ async def test_s22_fragment_edge_cases_via_http(e2e_http_app):
     # Cleanup standalone
     await e2e_http_app.app.state.pipeline.wait_for_index(S22_STANDALONE_ID, timeout=10.0)
     e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S22_STANDALONE_ID)
+
+
+# ═══════════════════════════════════════════════════════════════
+# S23: quality lifecycle — write → scan → list issues → resolve
+# ═══════════════════════════════════════════════════════════════
+
+S23_KNOWLEDGE_A = "e2e-s23-quality-a"
+S23_KNOWLEDGE_B = "e2e-s23-quality-b"
+S23_DOMAIN = "e2e-s23"
+S23_SUBJECT = "quality"
+
+
+@pytest.mark.e2e
+async def test_s23_quality_lifecycle_via_http(e2e_http_app):
+    """S23: write×2 → run_quality_scan → poll progress → list_quality_issues → resolve.
+
+    Fallback: если dup-детекция не сработала (свежие короткие записи),
+    создаём синтетический issue напрямую через create_issue (issues.py).
+
+    КРИТИЧНО: _e2e_quality_isolation (autouse) изолирует issues.jsonl в temp dir.
+    """
+    import asyncio
+
+    headers_write = {"X-API-Key": "e2e-write-key"}
+
+    # Step 1: write_knowledge ×2 с rate-limit паузами
+    for idx, (kid, label) in enumerate([
+        (S23_KNOWLEDGE_A, "Quality Scan Entry A"),
+        (S23_KNOWLEDGE_B, "Quality Scan Entry B"),
+    ]):
+        if idx > 0:
+            await asyncio.sleep(3.5)  # rate-limit refill
+        write_payload = {
+            "jsonrpc": "2.0", "id": idx + 1,
+            "method": "tools/call",
+            "params": {
+                "name": "write_knowledge",
+                "arguments": {
+                    "content": f"# {label}\n\nТестовое содержимое для quality scan {idx + 1}. "
+                               f"Контент должен быть достаточно длинным для анализа staleness.\n\n"
+                               f"Дополнительный абзац для увеличения размера документа.\n",
+                    "domain": S23_DOMAIN,
+                    "subject": S23_SUBJECT,
+                    "knowledge_id": kid,
+                    "wait_for_index": True,
+                },
+            },
+        }
+        resp = await e2e_http_app.post("/mcp", json=write_payload, headers=headers_write)
+        assert resp.status_code == 200
+        write_result = json.loads(resp.json()["result"]["content"][0]["text"])
+        assert "error" not in write_result, f"write failed for {kid}: {write_result}"
+        assert write_result["knowledge_id"] == kid
+
+    await asyncio.sleep(3.5)  # rate-limit refill before scan
+
+    # Step 2: run_quality_scan → validate start
+    scan_payload = {
+        "jsonrpc": "2.0", "id": 3,
+        "method": "tools/call",
+        "params": {"name": "run_quality_scan", "arguments": {}},
+    }
+    resp = await e2e_http_app.post("/mcp", json=scan_payload, headers=headers_write)
+    assert resp.status_code == 200
+    scan_body = resp.json()
+    assert "result" in scan_body, f"run_quality_scan failed: {scan_body}"
+    scan_result = json.loads(scan_body["result"]["content"][0]["text"])
+    assert "error" not in scan_result, f"run_quality_scan error: {scan_result}"
+    assert scan_result["scanned"] is True, f"Expected scanned=true, got: {scan_result}"
+    assert scan_result["status"] == "started", f"Expected status=started, got: {scan_result}"
+    scan_id = scan_result["scan_id"]
+    assert len(scan_id) == 16, f"Invalid scan_id length: {len(scan_id)}"
+
+    # Step 3: poll /quality/scan/progress → wait for done (timeout 60s)
+    deadline = asyncio.get_running_loop().time() + 60.0
+    scan_done = False
+    while asyncio.get_running_loop().time() < deadline:
+        resp = await e2e_http_app.get("/quality/scan/progress")
+        assert resp.status_code == 200
+        progress = resp.json()
+        status = progress.get("status", "")
+        if status in ("done", "error"):
+            scan_done = status == "done"
+            break
+        await asyncio.sleep(0.5)
+    assert scan_done, f"Scan did not finish in 60s. Last progress: {progress}"
+
+    # Step 4: list_quality_issues → find issues
+    await asyncio.sleep(1.0)  # даём issues записаться
+    list_payload = {
+        "jsonrpc": "2.0", "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "list_quality_issues",
+            "arguments": {"status": "open"},
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=list_payload, headers=headers_write)
+    assert resp.status_code == 200
+    list_body = resp.json()
+    assert "result" in list_body, f"list_quality_issues failed: {list_body}"
+    list_result = json.loads(list_body["result"]["content"][0]["text"])
+    assert "error" not in list_result, f"list_quality_issues error: {list_result}"
+    issues = list_result.get("issues", [])
+    assert isinstance(issues, list), f"issues should be a list, got: {list_result}"
+
+    # Step 5: resolve — либо реальный issue из скана, либо синтетический
+    if issues:
+        issue_id = issues[0]["issue_id"]
+        resolve_payload = {
+            "jsonrpc": "2.0", "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "resolve_quality_issue",
+                "arguments": {"issue_id": issue_id, "action": "resolve", "reason": "E2E test - resolved"},
+            },
+        }
+        resp = await e2e_http_app.post("/mcp", json=resolve_payload, headers=headers_write)
+        assert resp.status_code == 200
+        resolve_body = resp.json()
+        assert "result" in resolve_body, f"resolve_quality_issue failed: {resolve_body}"
+        resolve_result = json.loads(resolve_body["result"]["content"][0]["text"])
+        assert resolve_result.get("resolved") is True, f"Expected resolved=true, got: {resolve_result}"
+    else:
+        # Fallback: create synthetic issue directly (dup detection may not fire on fresh short entries)
+        from mcp_server.quality.issues import create_issue as _create_issue
+
+        syn_issue = _create_issue(
+            issue_type="duplicate",
+            knowledge_id=S23_KNOWLEDGE_A,
+            severity="warn",
+            detail="E2E synthetic issue for resolve_quality_issue coverage",
+        )
+        assert syn_issue.issue_id, "Synthetic issue_id should not be empty"
+
+        # resolve через issue_id-path
+        resolve_payload = {
+            "jsonrpc": "2.0", "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "resolve_quality_issue",
+                "arguments": {
+                    "issue_id": syn_issue.issue_id,
+                    "action": "resolve",
+                    "reason": "E2E test - synthetic resolved",
+                },
+            },
+        }
+        resp = await e2e_http_app.post("/mcp", json=resolve_payload, headers=headers_write)
+        assert resp.status_code == 200
+        resolve_body = resp.json()
+        assert "result" in resolve_body, f"resolve synthetic failed: {resolve_body}"
+        resolve_result = json.loads(resolve_body["result"]["content"][0]["text"])
+        assert resolve_result.get("resolved") is True, (
+            f"Expected resolved=true for synthetic issue, got: {resolve_result}"
+        )
+
+    # Step 6: re-check list_quality_issues — resolved issue should NOT show in open
+    list_resolved_payload = {
+        "jsonrpc": "2.0", "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "list_quality_issues",
+            "arguments": {"status": "open"},
+        },
+    }
+    resp = await e2e_http_app.post("/mcp", json=list_resolved_payload, headers=headers_write)
+    assert resp.status_code == 200
+    recheck_body = resp.json()
+    assert "result" in recheck_body, f"re-check list_quality_issues failed: {recheck_body}"
+    recheck_result = json.loads(recheck_body["result"]["content"][0]["text"])
+    open_issues = recheck_result.get("issues", [])
+
+    # The resolved issue should not appear in open status
+    # (note: the synthetic issue was a "duplicate" type — real dup issues from scan may still exist)
+    if issues:
+        resolved_ids = {issues[0]["issue_id"]}
+    else:
+        resolved_ids = {syn_issue.issue_id}
+    open_ids = {i["issue_id"] for i in open_issues}
+    assert resolved_ids.isdisjoint(open_ids), (
+        f"Resolved issues {resolved_ids} still appear in open: {open_ids}"
+    )
+
+    # Step 7: cleanup — delete both entries
+    await asyncio.sleep(3.5)  # rate-limit refill
+    for kid in [S23_KNOWLEDGE_A, S23_KNOWLEDGE_B]:
+        await e2e_http_app.app.state.pipeline.wait_for_index(kid, timeout=10.0)
+        e2e_http_app.app.state.qdrant.delete_by_knowledge_id(kid)
+
+
+# ═══════════════════════════════════════════════════════════════
+# S24: cancel_quality_scan — run → cancel → verify response
+# ═══════════════════════════════════════════════════════════════
+
+@pytest.mark.e2e
+async def test_s24_cancel_quality_scan_via_http(e2e_http_app):
+    """S24: run_quality_scan → cancel_quality_scan → verify response.
+
+    Возможные исходы:
+    - cancelled=true, scan_id=... (скан ещё активен)
+    - cancelled=false, reason="no active scan" (скан уже завершился)
+
+    Оба исхода валидны и не должны содержать error.
+    """
+    headers_write = {"X-API-Key": "e2e-write-key"}
+
+    # Step 1: run_quality_scan
+    scan_payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "tools/call",
+        "params": {"name": "run_quality_scan", "arguments": {}},
+    }
+    resp = await e2e_http_app.post("/mcp", json=scan_payload, headers=headers_write)
+    assert resp.status_code == 200
+    scan_body = resp.json()
+    assert "result" in scan_body, f"run_quality_scan failed: {scan_body}"
+    scan_result = json.loads(scan_body["result"]["content"][0]["text"])
+    assert "error" not in scan_result, f"run_quality_scan error: {scan_result}"
+    # Может быть already_running или started — оба OK
+    assert scan_result.get("scan_id"), f"scan_id missing: {scan_result}"
+
+    # Step 2: cancel_quality_scan
+    cancel_payload = {
+        "jsonrpc": "2.0", "id": 2,
+        "method": "tools/call",
+        "params": {"name": "cancel_quality_scan", "arguments": {}},
+    }
+    resp = await e2e_http_app.post("/mcp", json=cancel_payload, headers=headers_write)
+    assert resp.status_code == 200
+    cancel_body = resp.json()
+    assert "result" in cancel_body, f"cancel_quality_scan failed: {cancel_body}"
+    cancel_result = json.loads(cancel_body["result"]["content"][0]["text"])
+
+    # Step 3: validate response — must be well-formed (no error, cancelled bool present)
+    assert "error" not in cancel_result, (
+        f"cancel_quality_scan should not return error: {cancel_result}"
+    )
+    assert "cancelled" in cancel_result, (
+        f"cancel_quality_scan response missing 'cancelled': {cancel_result}"
+    )
+
+    if cancel_result["cancelled"]:
+        # Скан был активен — отмена отправлена
+        assert "scan_id" in cancel_result, f"Missing scan_id in cancel: {cancel_result}"
+    else:
+        # Скан уже завершился (быстрый скан пустой директории)
+        assert cancel_result["reason"] == "no active scan", (
+            f"Expected 'no active scan' reason, got: {cancel_result}"
+        )
+
+    # Step 4: дождаться завершения скана (если был активен) чтобы не мешать другим тестам
+    if cancel_result["cancelled"]:
+        import asyncio
+        deadline = asyncio.get_running_loop().time() + 30.0
+        while asyncio.get_running_loop().time() < deadline:
+            resp = await e2e_http_app.get("/quality/scan/progress")
+            assert resp.status_code == 200
+            progress = resp.json()
+            if progress.get("status") in ("done", "error", "not_found"):
+                break
+            await asyncio.sleep(0.5)

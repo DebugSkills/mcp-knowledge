@@ -198,6 +198,26 @@ def tmp_git_knowledge_root():
     tmp.cleanup()
 
 
+# ═══════════════════════════════════════════════════════════════
+# Ф0: Quality isolation — изолирует quality-пути от прода
+# ═══════════════════════════════════════════════════════════════
+
+@pytest.fixture(autouse=True)
+def _e2e_quality_isolation(tmp_git_knowledge_root):
+    """Изолирует quality-пути e2e от прод-данных.
+
+    Без этого run_quality_scan пишет в прод /app/data/quality/issues.jsonl
+    и сканирует прод /app/knowledge. Паттерн: set_store_dir как в unit-тестах.
+    """
+    from mcp_server.quality.issues import set_store_dir
+
+    quality_e2e_dir = str(tmp_git_knowledge_root / ".quality-e2e")
+    set_store_dir(quality_e2e_dir)
+    yield
+    # Сброс: fallback на default path (прод /app/data/quality) вне e2e
+    set_store_dir(None)
+
+
 @pytest.fixture
 def e2e_store(tmp_git_knowledge_root, monkeypatch):
     """MarkdownStore с git-аудитом (git ON, real .git)."""
@@ -265,7 +285,7 @@ def e2e_app_state(e2e_store, real_qdrant, e2e_embedder_for_pipeline,
 
 @pytest.fixture
 async def e2e_http_app(real_qdrant, real_embedder, e2e_store, e2e_pipeline,
-                        e2e_knowledge_index, e2e_keys):
+                        e2e_knowledge_index, e2e_keys, tmp_git_knowledge_root):
     """Function-scoped httpx.AsyncClient with health + MCP + metrics.
 
     Фаза 12 (v1.3 fix): httpx.AsyncClient + ASGITransport вместо TestClient —
@@ -321,6 +341,19 @@ async def e2e_http_app(real_qdrant, real_embedder, e2e_store, e2e_pipeline,
     # Task 1: data_version для TOC-кэш-инвалидации (как main.py:291) — без него
     # _build_toc кэш никогда не инвалидируется (getattr default 0 == 0).
     app.state.data_version = 0
+
+    # Ф0: settings для quality-сканера (KNOWLEDGE_DIR → изолированное хранилище).
+    # Без этого run_quality_scan берёт None → fallback на прод /app/knowledge.
+    # ВАЖНО: (1) Path, не str — scanner.py:74-77 оборачивает в Path ТОЛЬКО None,
+    # str-значение падает на .exists() ('str' object has no attribute 'exists').
+    # (2) НЕ подменять settings целиком: тулы (analyze_content и др.) читают
+    # остальные поля (ANALYZE_FRAGMENT_CHARS...) через app.state.settings →
+    # наследуем ВСЕ поля базового settings, переопределяем только KNOWLEDGE_DIR.
+    from mcp_server.config import settings as _base_settings
+
+    _merged = _base_settings.model_dump()
+    _merged["KNOWLEDGE_DIR"] = Path(tmp_git_knowledge_root)
+    app.state.settings = SimpleNamespace(**_merged)
 
     # Rate limiter (для S10)
     app.state.rate_limiter_read = TokenBucketLimiter(
