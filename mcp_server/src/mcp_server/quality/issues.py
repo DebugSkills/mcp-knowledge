@@ -250,6 +250,39 @@ def list_issues(
     return result
 
 
+def count_issues(
+    types: list[IssueType] | None = None,
+    status: str = "open",
+) -> int:
+    """Подсчитать число issues с фильтрацией БЕЗ лимита.
+
+    Используется для точного total в list_quality_issues (иначе при
+    обрезке лимитом total всегда равен limit для переполненного стора).
+
+    Args:
+        types: Фильтр по типам (None = все типы)
+        status: Фильтр по статусу (open | resolved | ignored)
+
+    Returns:
+        int: Число соответствующих записей.
+    """
+    store_path = _get_store_path()
+    if not store_path.exists():
+        return 0
+
+    with _store_lock:
+        all_issues = _read_all_issues(store_path)
+
+    count = 0
+    for entry in all_issues:
+        if types is not None and entry.get("type") not in types:
+            continue
+        if entry.get("status") != status:
+            continue
+        count += 1
+    return count
+
+
 def update_issue_status(
     issue_id: str,
     status: IssueStatus,
@@ -293,6 +326,95 @@ def update_issue_status(
 
     logger.info("Updated issue %s: status=%s", issue_id, status)
     return updated
+
+
+def bulk_update_status(
+    issue_ids: list[str],
+    status: IssueStatus,
+    resolution: str | None = None,
+) -> int:
+    """Пакетно обновить статус нескольких issues (Фаза P0 bulk-resolve).
+
+    Итерирует issue_ids и ставит status (reuse логики update_issue_status,
+    но пакетно, под одним _store_lock — одно атомарное read-modify-write
+    вместо N). Пропускает отсутствующие ID.
+
+    Args:
+        issue_ids: список issue_id для обновления.
+        status: Новый статус (resolved | ignored).
+        resolution: Описание решения (опционально, применяется ко всем).
+
+    Returns:
+        int: Число реально обновлённых issues.
+    """
+    if status not in ("resolved", "ignored"):
+        raise ValueError(f"Invalid target status: {status}. Expected 'resolved' or 'ignored'.")
+
+    if not issue_ids:
+        return 0
+
+    target: set[str] = set(issue_ids)
+    now = datetime.now(timezone.utc)
+    updated_count = 0
+
+    with _store_lock:
+        store_path = _get_store_path()
+        all_issues = _read_all_issues(store_path)
+
+        changed = False
+        for entry in all_issues:
+            if entry.get("issue_id") in target:
+                entry["status"] = status
+                entry["resolved_at"] = now.isoformat()
+                if resolution is not None:
+                    entry["resolution"] = resolution
+                updated_count += 1
+                changed = True
+
+        if changed:
+            _write_all_issues(store_path, all_issues)
+
+    logger.info(
+        "Bulk-updated %d issues: status=%s", updated_count, status,
+    )
+    return updated_count
+
+
+def list_issue_ids(
+    types: list[IssueType] | None = None,
+    status: str = "open",
+    knowledge_id: str | None = None,
+) -> list[str]:
+    """Вернуть ВСЕ issue_id по фильтру БЕЗ лимита (Фаза P0 bulk-resolve).
+
+    Переиспользует чтение стора. В отличие от list_issues (limit-пагинация),
+    возвращает полный список ID для bulk-операций.
+
+    Args:
+        types: Фильтр по типам (None = все типы).
+        status: Фильтр по статусу (open | resolved | ignored).
+        knowledge_id: Опциональный фильтр по knowledge_id.
+
+    Returns:
+        list[str]: Список issue_id (в порядке чтения стора).
+    """
+    store_path = _get_store_path()
+    if not store_path.exists():
+        return []
+
+    with _store_lock:
+        all_issues = _read_all_issues(store_path)
+
+    result: list[str] = []
+    for entry in all_issues:
+        if types is not None and entry.get("type") not in types:
+            continue
+        if entry.get("status") != status:
+            continue
+        if knowledge_id is not None and entry.get("knowledge_id") != knowledge_id:
+            continue
+        result.append(entry.get("issue_id", ""))
+    return result
 
 
 # ── Async-safe wrappers (NF-5 fix) ─────────────────────────

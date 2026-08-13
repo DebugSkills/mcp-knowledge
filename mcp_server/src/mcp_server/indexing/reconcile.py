@@ -24,6 +24,42 @@ from .pipeline import IndexingPipeline
 
 logger = logging.getLogger("mcp_knowledge.reconcile")
 
+# ── Фаза P0 (cleanup): лимит orphan-issues на коллекцию ─────────
+# Книга на 6K+ секций даёт тысячи ложных "missing child" (все children —
+# секции ВНУТРИ одного .md, а не отдельные файлы). Cap не ухудшает
+# выявление реальных битых коллекций: настоящий потерянный child имеет
+# НЕ-общий slug-префикс с parent, поэтому проходит prefix-skip и попадает
+# в лимит первым.
+MAX_ORPHAN_ISSUES_PER_COLLECTION: int = 5
+
+
+def _has_common_prefix(parent_id: str, child_id: str) -> bool:
+    """True если parent и child делят slug-префикс книги (секция, не потеря).
+
+    Книги импортируются как collection с children[] — секции ВНУТРИ одного
+    parent .md. Их knowledge_id разделяют длинный общий slug-префикс
+    (например `universal-fpf-specification-...`), а расходятся только в
+    хвосте (`-<seq>` / `-<hash>`). Такие «missing child» — 100% false-positive.
+
+    Реализация: общий префикс до первого расхождения; отбрасываем хвостовой
+    `-<hash>`/`-<part-N>` сегмент (после последнего `-`); если оставшееся
+    ядро ≥ _MIN_COMMON — считаем одной книгой. Реальный потерянный child
+    (чужой slug) общего префикса не имеет → НЕ пропускается.
+    """
+    _MIN_COMMON = 6
+    if not parent_id or not child_id:
+        return False
+    common = 0
+    for a, b in zip(parent_id, child_id):
+        if a != b:
+            break
+        common += 1
+    prefix = parent_id[:common]
+    # Отбрасываем хвостовой seq/hash-сегмент (после последнего '-')
+    if "-" in prefix:
+        prefix = prefix.rsplit("-", 1)[0]
+    return len(prefix) >= _MIN_COMMON
+
 
 class ReconcileResult:
     """Результат reconciliation."""
@@ -226,10 +262,27 @@ async def _detect_parent_child_orphans(
         children = info.get("children")
         if not children:
             continue
+        orphan_issues_created = 0
         for child_ref in children:
             if isinstance(child_ref, dict):
                 child_id = child_ref.get("knowledge_id")
                 if child_id and child_id not in entries:
+                    # Prefix-skip: секция той же книги (общий slug-префикс) —
+                    # не потерянная запись (инцидент orphan-flood 2026-08-12).
+                    if _has_common_prefix(kid, child_id):
+                        logger.debug(
+                            "[RECONCILE] skip missing child %s of %s (same-book section)",
+                            child_id, kid,
+                        )
+                        continue
+                    # Cap: не более MAX_ORPHAN_ISSUES_PER_COLLECTION на коллекцию
+                    if orphan_issues_created >= MAX_ORPHAN_ISSUES_PER_COLLECTION:
+                        logger.warning(
+                            "[RECONCILE] collection %s has >%d missing children — "
+                            "orphan issues capped",
+                            kid, MAX_ORPHAN_ISSUES_PER_COLLECTION,
+                        )
+                        break
                     logger.warning(
                         "[RECONCILE] collection %s has missing child %s", kid, child_id
                     )
@@ -244,6 +297,7 @@ async def _detect_parent_child_orphans(
                         logger.debug(
                             "[RECONCILE] failed to create orphan issue for %s: %s", kid, e
                         )
+                    orphan_issues_created += 1
                     result.orphaned_detected += 1
 
     if result.orphaned_detected > 0:

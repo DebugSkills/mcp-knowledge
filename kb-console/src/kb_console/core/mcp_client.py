@@ -458,6 +458,28 @@ class MCPClient:
             params["subject"] = subject
         return await self.tools_call("review_queue_books", params)
 
+    async def list_quality_issues(
+        self,
+        types: list[str] | None = None,
+        status: str = "open",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Список quality issues с фильтрацией (дубликаты, edit-wars, битые ссылки).
+
+        Args:
+            types: список типов (duplicate, missing_field, edit_war, broken_link,
+                conflicting) — опционально.
+            status: open | resolved | ignored (default "open").
+            limit: макс. число (default 50, max 200 на сервере).
+
+        Returns:
+            {"issues": [...], "total": N}
+        """
+        params: dict[str, Any] = {"status": status, "limit": limit}
+        if types:
+            params["types"] = types
+        return await self.tools_call("list_quality_issues", params)
+
     async def run_quality_scan(self, domain: str | None = None) -> dict[str, Any]:
         """Запустить quality scan (13.15: фоновая задача, мгновенный ответ).
 
@@ -510,6 +532,36 @@ class MCPClient:
         if cascade:
             params["cascade"] = cascade
         return await self.tools_call("resolve_quality_issue", params)
+
+    async def bulk_resolve_issues(
+        self,
+        types: list[str] | None = None,
+        knowledge_id: str | None = None,
+        action: str = "ignore",
+        reason: str = "",
+        status: str = "open",
+    ) -> dict[str, Any]:
+        """Пакетно резолвить/игнорировать issues по фильтру (P0).
+
+        Чистит накопленный шум (например ложные дубли) за один вызов.
+        Меняет только issues.jsonl, не контент.
+
+        Args:
+            types: список типов (duplicate, missing_field, orphaned, ...)
+            knowledge_id: фильтр по записи (опционально)
+            action: ignore (обратимо) | resolve
+            reason: причина
+            status: исходный статус для выборки (default "open")
+
+        Returns:
+            {"resolved": True/False, "action": ..., "count": N, "total": N}
+        """
+        params: dict[str, Any] = {"action": action, "reason": reason, "status": status}
+        if types:
+            params["types"] = types
+        if knowledge_id:
+            params["knowledge_id"] = knowledge_id
+        return await self.tools_call("bulk_resolve_issues", params)
 
     async def delete_entry(
         self, knowledge_id: str, cascade: bool = False

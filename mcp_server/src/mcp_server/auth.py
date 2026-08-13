@@ -51,6 +51,7 @@ WRITE_TOOLS: set[str] = {
     "delete_entry",
     "reindex",
     "resolve_quality_issue",  # Фаза 13.14: мутирует Qdrant payload (deprecate/restore/merge)
+    "bulk_resolve_issues",  # P0: пакетный resolve/ignore issues (мутирует issues.jsonl)
     "run_quality_scan",  # Фаза 13.14: скан + запись issues в БД
     "add_fragment",  # Фаза 13.23: создание секции книги
     "update_fragment",  # Фаза 13.23: обновление секции книги

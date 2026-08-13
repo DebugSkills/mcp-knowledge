@@ -19,6 +19,7 @@ from .content import cancel_import, extract_pdf_text, import_content
 from .crud import delete_entry, update_entry, write_knowledge
 from .fragments import add_fragment, delete_fragment, find_fragment, update_fragment
 from .quality import (
+    bulk_resolve_issues,
     cancel_quality_scan,
     list_quality_issues,
     resolve_quality_issue,
@@ -189,6 +190,29 @@ _RUN_QUALITY_SCAN_SCHEMA: dict[str, Any] = {
         "domain": {"type": "string", "description": "Опционально: скан только одного домена"},
     },
 }
+
+# ── P0: bulk_resolve_issues schema ────────────────────────────
+
+_BULK_RESOLVE_ISSUES_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "types": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Фильтр по типам (duplicate, missing_field, orphaned, ...). None = все типы.",
+        },
+        "knowledge_id": {"type": "string", "description": "Опциональный фильтр по конкретной записи"},
+        "status": {"type": "string", "default": "open", "description": "Исходный статус для выборки"},
+        "action": {
+            "type": "string",
+            "enum": ["ignore", "resolve"],
+            "default": "ignore",
+            "description": "Действие: ignore (пропустить, обратимо) | resolve (исправлено)",
+        },
+        "reason": {"type": "string", "description": "Причина решения"},
+    },
+}
+
 
 # ── 13.18: cancel_quality_scan schema ───────────────────────
 
@@ -378,6 +402,11 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _RESOLVE_QUALITY_ISSUE_SCHEMA,
     },
     {
+        "name": "bulk_resolve_issues",
+        "description": "Пакетно резолвить/игнорировать issues по фильтру (типы/knowledge_id/status). Чистит накопленный шум за один вызов; меняет только issues.jsonl, не контент.",
+        "inputSchema": _BULK_RESOLVE_ISSUES_SCHEMA,
+    },
+    {
         "name": "run_quality_scan",
         "description": "Запустить периодический quality scan: обход всех .md → staleness_score → dup-pair detection → issues + review_queue. Для cron (4.8).",
         "inputSchema": _RUN_QUALITY_SCAN_SCHEMA,
@@ -453,6 +482,7 @@ TOOL_HANDLERS = {
     "review_queue_books": review_queue_books,
     "list_quality_issues": list_quality_issues,
     "resolve_quality_issue": resolve_quality_issue,
+    "bulk_resolve_issues": bulk_resolve_issues,
     "run_quality_scan": run_quality_scan,
     "cancel_quality_scan": cancel_quality_scan,
     "import_content": import_content,

@@ -18,6 +18,7 @@ _scanned флаг для однократного on_done обновления �
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from nicegui import ui
@@ -57,6 +58,12 @@ def build_quality() -> None:
     def render_queue() -> None:
         _render_queue(latest.get("data", {}), latest.get("filters", {}), expanded_cache, render_queue.refresh, section_pages)
 
+    @ui.refreshable
+    def render_issues() -> None:
+        # refresh_fn — полный async refresh (повторный fetch + инвалидация кэша),
+        # чтобы после resolve/ignore счётчик и список обновлялись немедленно.
+        _render_issues(latest.get("issues", {}), refresh)
+
     # 13.15: _refreshing флаг — ≤1 in-flight refresh
     _refreshing = False
 
@@ -75,19 +82,29 @@ def build_quality() -> None:
                 subject = filters.get("subject", "")
                 # R4: filter-dependent cache key
                 cache_key = f"quality:{domain}:{subject}" if (domain or subject) else "quality"
-                data = await cache.get(
-                    cache_key,
-                    lambda c=client, f=filters: c.review_queue_books(
-                        domain=f.get("domain"),
-                        subject=f.get("subject"),
-                        limit=50,
+                # Параллельная загрузка очереди книг и issues (Фаза 1)
+                data, issues = await asyncio.gather(
+                    cache.get(
+                        cache_key,
+                        lambda c=client, f=filters: c.review_queue_books(
+                            domain=f.get("domain"),
+                            subject=f.get("subject"),
+                            limit=50,
+                        ),
+                        ttl=30,
                     ),
-                    ttl=30,
+                    cache.get(
+                        "quality:issues",
+                        lambda c=client: c.list_quality_issues(status="open", limit=50),
+                        ttl=30,
+                    ),
                 )
                 latest["data"] = data
+                latest["issues"] = issues
             finally:
                 await client.close()
             render_queue.refresh()
+            render_issues.refresh()
         except RuntimeError as exc:
             if "parent slot" in str(exc):
                 return
@@ -123,6 +140,9 @@ def build_quality() -> None:
 
     # 13.16: прогресс скана через build_scan_progress (DRY)
     scan_progress_container = ui.column().classes("w-full q-mb-md")
+
+    # Refreshable-блок найденных проблем (issues) — над очередью книг
+    render_issues()
 
     # Refreshable-блок очереди
     render_queue()
@@ -254,6 +274,71 @@ def _render_queue(
     # Карточки книг
     for book in books:
         _render_book_card(book, expanded_cache, refresh_fn, section_pages)
+
+
+def _render_issues(data: dict, refresh_fn) -> None:
+    """Отрисовать панель найденных проблем качества (issues).
+
+    Args:
+        data: результат list_quality_issues (issues[], total)
+        refresh_fn: callable для перерисовки refreshable-блока
+    """
+    issues = data.get("issues", []) if isinstance(data, dict) else []
+    total = data.get("total", len(issues)) if isinstance(data, dict) else 0
+
+    ui.label("Найденные проблемы (issues)").classes("text-h6 q-mb-sm q-mt-md")
+
+    if not issues:
+        ui.label("Issues не найдены").classes("text-grey text-caption")
+        return
+
+    ui.label(f"Всего issues: {total}").classes("text-subtitle2 q-mb-sm")
+
+    # P0 (B1): bulk-кнопки «Игнорировать все <тип>» — чистка накопленного шума
+    types_present = sorted({i.get("type", "") for i in issues if i.get("type")})
+    if types_present:
+        with ui.row().classes("gap-2 q-mb-sm items-center"):
+            for itype in types_present:
+                count = sum(1 for i in issues if i.get("type") == itype)
+                ui.button(
+                    f"⊘ Игнорировать все {itype} ({count})",
+                    on_click=lambda t=itype: _bulk_ignore_type(t, refresh_fn),
+                ).props("flat dense color=grey").tooltip(
+                    f"Пакетно пометить все open-issues типа {itype} как ignored (обратимо, только issues.jsonl)"
+                )
+
+    for issue in issues:
+        _render_issue_card(issue, refresh_fn)
+
+
+def _render_issue_card(issue: dict, refresh_fn) -> None:
+    """Отрисовать карточку одного issue (type-chip, knowledge_id, detail, действия)."""
+    issue_id = issue.get("issue_id", "")
+    issue_type = issue.get("type", "")
+    knowledge_id = issue.get("knowledge_id", "")
+    detail = issue.get("detail", "")
+    detected_at = issue.get("detected_at", "")
+    severity = issue.get("severity", "")
+
+    with ui.card().classes("w-full q-mb-xs"), ui.row().classes("items-center w-full no-wrap gap-2"):
+        with ui.column().classes("flex-1 min-w-0"):
+            with ui.row().classes("items-center gap-2 no-wrap"):
+                if issue_type:
+                    ui.chip(issue_type).props("outline dense size=sm color=orange")
+                ui.label(knowledge_id).classes("text-subtitle2 ellipsis")
+                if severity:
+                    ui.chip(severity).props("outline dense size=sm")
+            if detail:
+                ui.label(detail).classes("text-caption text-grey")
+            if detected_at:
+                ui.label(f"Обнаружено: {detected_at[:19]}").classes("text-caption text-grey")
+        with ui.row().classes("gap-1 no-wrap"):
+            ui.button(
+                "✅", on_click=lambda iid=issue_id: _resolve_issue(iid, refresh_fn),
+            ).props("flat dense color=positive").tooltip("Исправлено")
+            ui.button(
+                "⊘", on_click=lambda iid=issue_id: _ignore_issue(iid, refresh_fn),
+            ).props("flat dense color=grey").tooltip("Игнорировать")
 
 
 def _render_book_card(book: dict, expanded_cache: dict[str, list[dict]], refresh_fn, section_pages: dict[str, int]) -> None:
@@ -488,6 +573,110 @@ async def _restore_single(knowledge_id: str) -> None:
             await client.close()
     except Exception as exc:
         ui.notify(f"Ошибка: {exc}", type="negative")
+
+
+async def _resolve_issue(issue_id: str, refresh_fn) -> None:
+    """Разрешить issue (action=resolve — помечена исправленной)."""
+    try:
+        client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+        try:
+            result = await client.resolve_quality_issue(
+                action="resolve",
+                issue_id=issue_id,
+                reason="Issue resolved by operator",
+            )
+            if result.get("resolved"):
+                ui.notify("Issue помечена исправленной", type="positive")
+                cache.invalidate("quality:issues")
+                await refresh_fn()
+            else:
+                ui.notify(f"Ошибка: {result.get('error', 'неизвестно')}", type="negative")
+        finally:
+            await client.close()
+    except Exception as exc:
+        ui.notify(f"Ошибка: {exc}", type="negative")
+
+
+async def _ignore_issue(issue_id: str, refresh_fn) -> None:
+    """Игнорировать issue (action=ignore — пропущена)."""
+    try:
+        client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+        try:
+            result = await client.resolve_quality_issue(
+                action="ignore",
+                issue_id=issue_id,
+                reason="Issue ignored by operator",
+            )
+            if result.get("resolved"):
+                ui.notify("Issue игнорирована", type="info")
+                cache.invalidate("quality:issues")
+                await refresh_fn()
+            else:
+                ui.notify(f"Ошибка: {result.get('error', 'неизвестно')}", type="negative")
+        finally:
+            await client.close()
+    except Exception as exc:
+        ui.notify(f"Ошибка: {exc}", type="negative")
+
+
+async def _bulk_ignore_type(issue_type: str, refresh_fn) -> None:
+    """Пакетно игнорировать все open-issues данного типа (P0 B1).
+
+    HITL-подтверждение с preview-счётчиком (число open issues типа).
+    Действие обратимо (status=ignored, только issues.jsonl — контент
+    и Qdrant не трогаются).
+    """
+    # Preview: сколько open issues типа (через list_quality_issues с фильтром)
+    try:
+        preview_client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+        try:
+            preview = await preview_client.list_quality_issues(
+                types=[issue_type], status="open", limit=1,
+            )
+            total = preview.get("total", 0)
+        finally:
+            await preview_client.close()
+    except Exception:
+        total = 0
+
+    async def _do_bulk() -> None:
+        try:
+            client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY, timeout=60.0)
+            try:
+                result = await client.bulk_resolve_issues(
+                    types=[issue_type],
+                    action="ignore",
+                    reason=f"Bulk ignore of {issue_type} issues by operator",
+                )
+                if result.get("resolved"):
+                    ui.notify(
+                        f"Игнорировано: {result.get('count', 0)}/{result.get('total', 0)} "
+                        f"issues типа {issue_type}",
+                        type="info",
+                    )
+                    cache.invalidate("quality:issues")
+                    await refresh_fn()
+                else:
+                    ui.notify(f"Ошибка: {result.get('error', 'неизвестно')}", type="negative")
+            finally:
+                await client.close()
+        except Exception as exc:
+            ui.notify(f"Ошибка: {exc}", type="negative")
+
+    with ui.dialog() as dialog, ui.card().classes("q-pa-md"):
+        ui.label(f"⚠️ Пакетное игнорирование: {issue_type}").classes("text-h6")
+        ui.label(
+            f"Будут помечены как ignored все open-issues типа «{issue_type}» "
+            f"({total} шт.). Только issues.jsonl — контент и поиск не изменятся. "
+            f"Обратимо: статус можно вернуть."
+        ).classes("q-mb-md")
+        with ui.row().classes("gap-2"):
+            ui.button("Отмена", on_click=dialog.close).props("flat")
+            ui.button(
+                f"⊘ Игнорировать {total}",
+                on_click=lambda d=dialog: (_do_bulk(), d.close()),
+            ).props("flat color=grey")
+    await dialog
 
 
 async def _confirm_delete(book_id: str, section_count: int) -> None:

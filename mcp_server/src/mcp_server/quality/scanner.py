@@ -22,8 +22,13 @@ from pathlib import Path
 
 from mcp_server.config import Settings
 from mcp_server.models import KnowledgeFrontmatter
+from mcp_server.quality.dup_gate import compute_cosine
 from mcp_server.quality.edit_war import detect_edit_war
-from mcp_server.quality.issues import create_issue
+from mcp_server.quality.issues import (
+    bulk_update_status,
+    create_issue,
+    list_issue_ids,
+)
 from mcp_server.quality.scoring import (
     REVIEW_THRESHOLD,
     StalenessInput,
@@ -53,6 +58,7 @@ async def run_scan(
     progress=None,            # 13.15: ImportProgressTracker (опционально)
     progress_id: str | None = None,  # 13.15: id для трекера
     cancel_event: asyncio.Event | None = None,  # 13.18: отмена скана
+    embedder=None,            # P0: EmbeddingManager для embedding-dup (fallback при None)
 ) -> dict:
     """Запускает полный quality scan базы знаний.
 
@@ -63,6 +69,8 @@ async def run_scan(
         progress: опциональный ImportProgressTracker для live-отслеживания.
         progress_id: id записи в трекере (если progress задан).
         cancel_event: asyncio.Event для отмены скана (13.18).
+        embedder: EmbeddingManager для embedding-based dup (P0). Если None —
+            _scan_dup_pairs делает graceful fallback на теговую эвристику.
 
     Returns:
         dict с метриками сканирования (частичные при отмене):
@@ -200,7 +208,7 @@ async def run_scan(
         progress.set_phase(pid, "dup_scan", "Сканирование дубликатов...")
     loop = asyncio.get_running_loop()
     dup_count, dup_map = await loop.run_in_executor(
-        None, _scan_dup_pairs, scored, progress, pid, cancel_event,
+        None, _scan_dup_pairs, scored, progress, pid, cancel_event, embedder,
     )
     metrics["duplicates_detected"] = dup_count
 
@@ -228,6 +236,13 @@ async def run_scan(
         None, _create_issues_for_problems, scored, progress, pid, cancel_event,
     )
     metrics["issues_created"] = issue_count
+
+    # Шаг 5.5 (P0): auto-clear — закрыть open missing_field issues записей,
+    # чьё условие исчезло (score упал ниже REVIEW_THRESHOLD). Накопленные
+    # issues никогда не чистились (Д3) — этот шаг разрывает цикл.
+    cleared = await loop.run_in_executor(None, _auto_clear_stale_issues, scored)
+    if cleared:
+        logger.info("Auto-clear: %d stale missing_field issues resolved", cleared)
 
     logger.info(
         "Quality scan complete: %d files, %d in review queue, %d dups, %d issues",
@@ -505,11 +520,14 @@ def _scan_dup_pairs(
     progress=None,
     progress_id: str | None = None,
     cancel_event=None,  # 13.18: asyncio.Event для отмены (проверяется между domain-бакетами)
+    embedder=None,      # P0: EmbeddingManager для embedding-dup (fallback на теги при None)
 ) -> tuple[int, dict[str, int]]:
     """Сканирует dup-пары внутри domain-бакетов.
 
-    Без BGE-M3 эмбеддера использует упрощённую эвристику:
-    одинаковый subject + пересечение tags ≥50% → кандидат в дубли.
+    P0 (A2a): если embedder доступен — семантическая детекция через
+    compute_cosine (порог DUP_SIMILARITY_THRESHOLD=0.92) вместо грубой
+    теговой эвристики (снижает ложные дубли книг с общими тегами).
+    Если embedder недоступен — graceful fallback на _are_dup_candidates.
 
     R2: возвращает не только dup_count, но и dup_map (knowledge_id → dup_count)
     для пост-обработки staleness_score с реальным dup_count.
@@ -522,6 +540,7 @@ def _scan_dup_pairs(
         progress: опциональный ImportProgressTracker.
         progress_id: id записи в трекере.
         cancel_event: asyncio.Event для отмены (13.18).
+        embedder: EmbeddingManager (embed_sync). Если None — теговая эвристика.
 
     Returns:
         (dup_count, dup_map): количество обнаруженных dup-пар и
@@ -551,6 +570,22 @@ def _scan_dup_pairs(
             )
         # Ограничиваем число пар для производительности
         n = min(len(entries), MAX_PAIRS_PER_BUCKET)
+        # P0 (A2a): pre-embed репрезентативных текстов батчем, если embedder есть
+        use_embedding = embedder is not None and hasattr(embedder, "embed_sync")
+        emb_vectors: dict[int, list[float]] = {}
+        if use_embedding:
+            try:
+                texts = [_representative_text(fm) for _f, fm, _s in entries[:n]]
+                vecs = embedder.embed_sync(texts)
+                emb_vectors = {
+                    i: (vec.tolist() if hasattr(vec, "tolist") else list(vec))
+                    for i, vec in enumerate(vecs)
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Embedding dup-scan failed (%s), fallback to tag heuristic", exc)
+                use_embedding = False
+                emb_vectors = {}
+
         # Лимит dup-issues на одну запись: книга на 15K секций даёт тысячи пар
         # с одинаковым fm_i → тысячи issues на один knowledge_id (засорение + CPU).
         issue_counts: dict[str, int] = {}
@@ -564,20 +599,47 @@ def _scan_dup_pairs(
                 # по subject+tags → массовые false-positive дубли. Пропускаем их.
                 if _is_toc_section(fm_i) or _is_toc_section(fm_j):
                     continue
-                if _are_dup_candidates(fm_i, fm_j):
-                    dup_count += 1
-                    issue_counts[fm_i.knowledge_id] = issue_counts.get(fm_i.knowledge_id, 0) + 1
-                    # R2: dup_map для пост-обработки scoring
-                    dup_map[fm_i.knowledge_id] = dup_map.get(fm_i.knowledge_id, 0) + 1
-                    dup_map[fm_j.knowledge_id] = dup_map.get(fm_j.knowledge_id, 0) + 1
-                    # Создаём issue для дубликата
-                    create_issue(
-                        issue_type="duplicate",
-                        knowledge_id=fm_i.knowledge_id,
-                        severity="warn",
-                        detail=f"Possible duplicate of {fm_j.knowledge_id} (same subject={fm_i.subject}, tag overlap)",
-                    )
+                # P0 (A2a): cosine-similarity или теговая эвристика
+                is_dup = False
+                similarity: float | None = None
+                if use_embedding and i in emb_vectors and j in emb_vectors:
+                    similarity = compute_cosine(emb_vectors[i], emb_vectors[j])
+                    is_dup = similarity >= DUP_SIMILARITY_THRESHOLD
+                else:
+                    is_dup = _are_dup_candidates(fm_i, fm_j)
+                if not is_dup:
+                    continue
+                dup_count += 1
+                issue_counts[fm_i.knowledge_id] = issue_counts.get(fm_i.knowledge_id, 0) + 1
+                # R2: dup_map для пост-обработки scoring
+                dup_map[fm_i.knowledge_id] = dup_map.get(fm_i.knowledge_id, 0) + 1
+                dup_map[fm_j.knowledge_id] = dup_map.get(fm_j.knowledge_id, 0) + 1
+                # Создаём issue для дубликата (cosine в detail — сигнал уверенности, P0)
+                detail = (
+                    f"Possible duplicate of {fm_j.knowledge_id} "
+                    f"(same subject={fm_i.subject}, cosine={similarity:.3f})"
+                    if similarity is not None
+                    else f"Possible duplicate of {fm_j.knowledge_id} "
+                         f"(same subject={fm_i.subject}, tag overlap)"
+                )
+                create_issue(
+                    issue_type="duplicate",
+                    knowledge_id=fm_i.knowledge_id,
+                    severity="warn",
+                    detail=detail,
+                )
     return dup_count, dup_map
+
+
+def _representative_text(fm: KnowledgeFrontmatter) -> str:
+    """Репрезентативный текст записи для embedding-dup (kid + subject + tags).
+
+    KnowledgeFrontmatter не имеет поля title — используем knowledge_id
+    (читаемый slug) + subject + tags.
+    """
+    parts = [fm.knowledge_id or "", fm.subject or ""]
+    parts.extend(fm.tags or [])
+    return " ".join(p for p in parts if p)
 
 
 def _is_toc_section(fm: KnowledgeFrontmatter) -> bool:
@@ -644,6 +706,41 @@ def _create_issues_for_problems(
                 f"issues: {batch_end}/{total} entries processed, {count} issues",
             )
     return count
+
+
+def _auto_clear_stale_issues(
+    scored: list[tuple[Path, KnowledgeFrontmatter, float]],
+) -> int:
+    """P0 (A3a): закрыть open missing_field issues записей, чьё условие исчезло.
+
+    Накопленные issues никогда не очищались (Д3): даже после исправления
+    записи старый open issue оставался навсегда. Этот шаг переоценивает:
+    если запись теперь имеет score < REVIEW_THRESHOLD — закрываем её
+    open missing_field issues как resolved (self-healing стор).
+
+    Args:
+        scored: список (filepath, frontmatter, score) после scoring.
+
+    Returns:
+        int: число закрытых issues.
+    """
+    # Собираем запись → текущий score
+    score_by_kid: dict[str, float] = {}
+    for _f, fm, score in scored:
+        score_by_kid[fm.knowledge_id] = score
+
+    # Закрываем open missing_field issues записей, больше не проблемных
+    to_close: list[str] = []
+    for kid, score in score_by_kid.items():
+        if score < REVIEW_THRESHOLD:
+            open_ids = list_issue_ids(
+                types=["missing_field"], status="open", knowledge_id=kid,
+            )
+            to_close.extend(open_ids)
+
+    if not to_close:
+        return 0
+    return bulk_update_status(to_close, "resolved", "Auto-cleared: condition no longer holds (quality scan)")
 
 
 def _empty_result() -> dict:

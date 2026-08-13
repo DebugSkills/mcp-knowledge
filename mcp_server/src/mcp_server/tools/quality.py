@@ -18,7 +18,13 @@ import logging
 import uuid
 
 from mcp_server.quality import REVIEW_THRESHOLD
-from mcp_server.quality.issues import list_issues, update_issue_status
+from mcp_server.quality.issues import (
+    bulk_update_status,
+    count_issues,
+    list_issue_ids,
+    list_issues,
+    update_issue_status,
+)
 
 logger = logging.getLogger("mcp_knowledge.tools.quality")
 
@@ -296,6 +302,9 @@ async def list_quality_issues(params: dict, app_state) -> dict:
 
     try:
         issues = list_issues(types=types, status=status, limit=limit)
+        # Реальный total БЕЗ лимита (13.26): иначе при >limit open issues
+        # total == limit и счётчик в UI «застревает», хотя issues закрываются.
+        total = count_issues(types=types, status=status)
         result = [
             {
                 "issue_id": i.issue_id,
@@ -310,8 +319,8 @@ async def list_quality_issues(params: dict, app_state) -> dict:
             }
             for i in issues
         ]
-        logger.info("list_quality_issues: %d issues (status=%s)", len(result), status)
-        return {"issues": result, "total": len(result)}
+        logger.info("list_quality_issues: %d/%d issues (status=%s)", len(result), total, status)
+        return {"issues": result, "total": total}
 
     except Exception as exc:
         logger.error("list_quality_issues failed: %s", exc)
@@ -668,6 +677,7 @@ async def _bg_scan(
     scan_progress,
     scan_state: dict,
     cancel_event: asyncio.Event | None = None,  # 13.18: отмена скана
+    embedder=None,  # P0: EmbeddingManager для embedding-dup-детекции
 ) -> None:
     """Фоновая задача quality scan (13.15 + 13.18).
 
@@ -676,6 +686,7 @@ async def _bg_scan(
     scan_task очищается в finally.
 
     13.18: принимает cancel_event и пробрасывает в run_scan.
+    P0: пробрасывает embedder для embedding-dup (fallback при None).
     """
     from mcp_server.quality.scanner import run_scan
 
@@ -688,6 +699,7 @@ async def _bg_scan(
                 progress=scan_progress,
                 progress_id=scan_id,
                 cancel_event=cancel_event,
+                embedder=embedder,
             )
             # run_scan сам вызывает progress.done() в нормальном потоке (13.18)
             # но если он НЕ вызвал (cancel без progress), делаем здесь
@@ -747,6 +759,7 @@ async def run_quality_scan(params: dict, app_state) -> dict:
         )
         qdrant_client = getattr(app_state, "qdrant", None)
         scan_progress = getattr(app_state, "scan_progress", None)
+        embedder = getattr(app_state, "embedder", None)  # P0: embedding-dup
 
         if scan_progress is None:
             return {"scanned": False, "status": "error", "error": "scan_progress not initialized"}
@@ -779,6 +792,7 @@ async def run_quality_scan(params: dict, app_state) -> dict:
                 scan_progress=scan_progress,
                 scan_state={"lock": scan_lock, "task_ref": task_ref},
                 cancel_event=app_state.scan_cancel_event,
+                embedder=embedder,
             )
         )
         task_ref[0] = task
@@ -819,3 +833,60 @@ async def cancel_quality_scan(params: dict, app_state) -> dict:
         "cancelled": True,
         "scan_id": getattr(app_state, "scan_id", None),
     }
+
+
+async def bulk_resolve_issues(params: dict, app_state) -> dict:
+    """Пакетно резолвить/игнорировать issues по фильтру (P0 bulk-cleanup).
+
+    Чистит накопленный шум (например 21K false-positive дублей) за один
+    вызов. Меняет ТОЛЬКО status в issues.jsonl (issues.jsonl), не трогает
+    контент и Qdrant payload. По умолчанию action=ignore (обратимо).
+
+    Args:
+        params:
+            types (optional): список типов (duplicate, missing_field, orphaned, ...)
+            knowledge_id (optional): фильтр по конкретной записи
+            status (optional): исходный статус для выборки (default "open")
+            action (optional): "ignore" | "resolve" (default "ignore" — обратимо)
+            reason (optional): причина
+
+    Returns:
+        {"resolved": True, "action": action, "count": N, "total": N, "filtered": {...}}
+    """
+    types = params.get("types")
+    knowledge_id = params.get("knowledge_id")
+    src_status = params.get("status", "open")
+    action = params.get("action", "ignore")
+    reason = params.get("reason", "")
+
+    if action not in ("ignore", "resolve"):
+        return {
+            "resolved": False,
+            "error": f"Invalid action '{action}'. Must be 'ignore' or 'resolve'.",
+        }
+
+    try:
+        issue_ids = list_issue_ids(
+            types=types, status=src_status, knowledge_id=knowledge_id,
+        )
+        # Маппинг action → целевой статус (issue store использует resolved/ignored)
+        target_status = "ignored" if action == "ignore" else "resolved"
+        count = bulk_update_status(issue_ids, target_status, reason or None)
+        logger.info(
+            "bulk_resolve_issues: %d/%d issues -> %s (types=%s)",
+            count, len(issue_ids), action, types,
+        )
+        return {
+            "resolved": True,
+            "action": action,
+            "count": count,
+            "total": len(issue_ids),
+            "filtered": {
+                "types": types,
+                "knowledge_id": knowledge_id,
+                "status": src_status,
+            },
+        }
+    except Exception as exc:
+        logger.error("bulk_resolve_issues failed: %s", exc)
+        return {"resolved": False, "error": str(exc)}

@@ -317,6 +317,65 @@ class TestMCPClientQualityMethods:
         call = quality_client._captured[0]
         assert call["tool"] == "run_quality_scan"
 
+    @pytest.mark.asyncio
+    async def test_list_quality_issues_call(self, quality_client):
+        """list_quality_issues должен вызывать tools/call с status/limit."""
+        result = await quality_client.list_quality_issues(status="open", limit=50)
+        assert result["ok"] is True
+        call = quality_client._captured[0]
+        assert call["tool"] == "list_quality_issues"
+        assert call["args"]["status"] == "open"
+        assert call["args"]["limit"] == 50
+
+    @pytest.mark.asyncio
+    async def test_list_quality_issues_passes_types(self, quality_client):
+        """list_quality_issues передаёт types при указании."""
+        result = await quality_client.list_quality_issues(
+            types=["duplicate", "broken_link"], status="open", limit=20,
+        )
+        assert result["ok"] is True
+        call = quality_client._captured[0]
+        assert call["tool"] == "list_quality_issues"
+        assert call["args"]["types"] == ["duplicate", "broken_link"]
+        assert call["args"]["limit"] == 20
+
+
+class TestRenderIssuesPanel:
+    """Тесты рендера панели issues (Фаза 1)."""
+
+    def test_render_issues_with_data(self):
+        """При наличии issues рендерятся type-chip и кнопки resolve/ignore."""
+        from kb_console.pages import quality
+        refresh_fn = MagicMock()
+        data = {
+            "issues": [
+                {
+                    "issue_id": "iss-1",
+                    "type": "duplicate",
+                    "knowledge_id": "kid-1",
+                    "detail": "Duplicate content",
+                    "detected_at": "2026-08-12T00:00:00+00:00",
+                    "status": "open",
+                    "severity": "high",
+                }
+            ],
+            "total": 1,
+        }
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_issues(data, refresh_fn)
+        assert mock_ui.chip.called  # type-chip
+        assert mock_ui.button.called  # resolve/ignore buttons
+
+    def test_render_issues_empty(self):
+        """При отсутствии issues — нет кнопок, есть строка 'Issues не найдены'."""
+        from kb_console.pages import quality
+        refresh_fn = MagicMock()
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_issues({"issues": [], "total": 0}, refresh_fn)
+        assert not mock_ui.button.called
+        label_texts = [c.args[0] for c in mock_ui.label.call_args_list if c.args]
+        assert any("Issues не найдены" in str(t) for t in label_texts)
+
 
 # ── _read_uploaded_file (extracted to core/utils.py, Phase 13.24) ──
 
@@ -443,3 +502,56 @@ class TestRenderImportProgress:
         assert any("Import failed" in str(t) for t in label_texts)
         # Проверяем linear_progress с value=0.2 (2/10 при error)
         mock_ui.linear_progress.assert_called_once_with(value=0.2)
+
+
+class TestBulkIgnoreButton:
+    """Bulk-кнопка «Игнорировать все <тип>» в панели issues (P0 B1)."""
+
+    def test_bulk_button_renders_for_types(self):
+        """При наличии issues с типами рендерятся bulk-кнопки."""
+        from kb_console.pages import quality
+        refresh_fn = MagicMock()
+        data = {
+            "issues": [
+                {
+                    "issue_id": "iss-1",
+                    "type": "duplicate",
+                    "knowledge_id": "kid-1",
+                    "detail": "Dup",
+                    "detected_at": "2026-08-12T00:00:00+00:00",
+                    "status": "open",
+                    "severity": "warn",
+                },
+                {
+                    "issue_id": "iss-2",
+                    "type": "orphaned",
+                    "knowledge_id": "kid-2",
+                    "detail": "Missing child",
+                    "detected_at": "2026-08-12T00:00:00+00:00",
+                    "status": "open",
+                    "severity": "warn",
+                },
+            ],
+            "total": 2,
+        }
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_issues(data, refresh_fn)
+        # Ищем button-вызовы с текстом «Игнорировать все»
+        btn_texts = [
+            " ".join(str(a) for a in c.args)
+            for c in mock_ui.button.call_args_list
+        ]
+        assert any("Игнорировать все duplicate" in t for t in btn_texts)
+        assert any("Игнорировать все orphaned" in t for t in btn_texts)
+
+    def test_no_bulk_button_when_no_issues(self):
+        """Без issues — bulk-кнопок нет."""
+        from kb_console.pages import quality
+        refresh_fn = MagicMock()
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_issues({"issues": [], "total": 0}, refresh_fn)
+        btn_texts = [
+            " ".join(str(a) for a in c.args)
+            for c in mock_ui.button.call_args_list
+        ]
+        assert not any("Игнорировать все" in t for t in btn_texts)

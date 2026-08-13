@@ -253,3 +253,125 @@ class TestRunScanCancel:
             # dup_scan и issues должны отработать
             assert isinstance(result["duplicates_detected"], int)
             assert isinstance(result["issues_created"], int)
+
+
+# ═══════════════════════════════════════════════════════════════
+# P0 (A2a/A3a): embedding-dup fallback + auto-clear
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestScanDupPairsP0:
+    """_scan_dup_pairs — embedding-путь и fallback на теговую эвристику (P0)."""
+
+    def _mk_entry(self, kid: str, subject: str, tags: list[str]):
+        fm = _make_fm(knowledge_id=kid, subject=subject, tags=tags)
+        return (Path(f"/tmp/{kid}.md"), fm, 0.1)
+
+    def test_fallback_tag_heuristic_when_embedder_none(self):
+        """embedder=None → теговая эвристика (не crash)."""
+        from mcp_server.quality.scanner import _scan_dup_pairs
+
+        a = self._mk_entry("kid-a", "devops", ["ai", "automation", "teaching"])
+        b = self._mk_entry("kid-b", "devops", ["ai", "automation", "teaching", "extra"])
+        dup_count, dup_map = _scan_dup_pairs([a, b])
+        assert dup_count == 1  # tags overlap ≥50% → дубль по эвристике
+        assert "kid-a" in dup_map and "kid-b" in dup_map
+
+    def test_embedder_failure_falls_back_to_heuristic(self):
+        """embedder.embed_sync бросает → graceful fallback на теговую эвристику."""
+        from mcp_server.quality.scanner import _scan_dup_pairs
+
+        a = self._mk_entry("kid-a", "devops", ["ai", "automation"])
+        b = self._mk_entry("kid-b", "devops", ["ai", "automation", "extra"])
+
+        class BrokenEmbedder:
+            def embed_sync(self, texts):
+                raise RuntimeError("embed unavailable")
+
+        dup_count, _ = _scan_dup_pairs([a, b], embedder=BrokenEmbedder())
+        assert dup_count == 1  # fallback сработал
+
+    def test_toc_sections_skipped(self):
+        """TOC-секции не считаются дублями (существующий guard сохранён)."""
+        from mcp_server.quality.scanner import _scan_dup_pairs
+
+        a = self._mk_entry("book-table-of-content-part-1", "devops", ["ai", "toc"])
+        b = self._mk_entry("book-table-of-content-part-2", "devops", ["ai", "toc"])
+        dup_count, _ = _scan_dup_pairs([a, b])
+        assert dup_count == 0
+
+
+class TestAutoClearStaleIssues:
+    """_auto_clear_stale_issues — закрытие устаревших missing_field issues (A3a)."""
+
+    @pytest.fixture
+    def issues_tempdir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from mcp_server.quality.issues import set_store_dir
+            set_store_dir(tmp)
+            yield tmp
+
+    def test_clears_stale_issues(self, issues_tempdir):
+        """Запись с score < threshold → её open missing_field issues закрываются."""
+        from mcp_server.quality.issues import create_issue, list_issues
+        from mcp_server.quality.scanner import _auto_clear_stale_issues
+
+        # Создаём open missing_field issue для записи, которая теперь не проблемна
+        create_issue(
+            "missing_field", "kid-fixed", "warn",
+            "Staleness score 0.5 >= 0.45 — needs review",
+        )
+        # Свежая запись: score 0.1 < 0.45
+        fm = _make_fm(knowledge_id="kid-fixed")
+        scored = [(Path("/tmp/kid-fixed.md"), fm, 0.1)]
+
+        cleared = _auto_clear_stale_issues(scored)
+        assert cleared == 1
+
+        open_issues = list_issues(status="open", limit=50)
+        assert all(i.knowledge_id != "kid-fixed" for i in open_issues)
+
+    def test_keeps_problematic_issues(self, issues_tempdir):
+        """Запись с score ≥ threshold → её issues НЕ закрываются."""
+        from mcp_server.quality.issues import create_issue, list_issues
+        from mcp_server.quality.scanner import _auto_clear_stale_issues
+
+        create_issue(
+            "missing_field", "kid-still-bad", "warn",
+            "Staleness score 0.5 >= 0.45 — needs review",
+        )
+        fm = _make_fm(knowledge_id="kid-still-bad")
+        scored = [(Path("/tmp/kid-still-bad.md"), fm, 0.5)]
+
+        cleared = _auto_clear_stale_issues(scored)
+        assert cleared == 0
+
+        open_issues = list_issues(status="open", limit=50)
+        assert len(open_issues) == 1
+        assert open_issues[0].knowledge_id == "kid-still-bad"
+
+
+class TestRepresentativeText:
+    """_representative_text — репрезентативный текст для embedding-dup (P0)."""
+
+    def test_uses_available_fields(self):
+        """Использует knowledge_id + subject + tags (без поля title)."""
+        from mcp_server.quality.scanner import _representative_text
+        fm = _make_fm(
+            knowledge_id="kid-test-001",
+            subject="devops",
+            tags=["ai", "automation"],
+        )
+        text = _representative_text(fm)
+        assert "kid-test-001" in text
+        assert "devops" in text
+        assert "ai" in text
+        assert "automation" in text
+
+    def test_no_crash_with_empty_tags(self):
+        """Пустые tags → не падает."""
+        from mcp_server.quality.scanner import _representative_text
+        fm = _make_fm(knowledge_id="kid-test-001", subject="devops", tags=[])
+        text = _representative_text(fm)
+        assert "kid-test-001" in text
+        assert "devops" in text

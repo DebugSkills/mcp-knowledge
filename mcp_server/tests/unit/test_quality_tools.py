@@ -21,6 +21,7 @@ from mcp_server.quality.issues import create_issue, set_store_dir
 from mcp_server.tools.quality import (
     _bg_scan,
     _cascade_set_payload,
+    bulk_resolve_issues,
     cancel_quality_scan,
     list_quality_issues,
     resolve_quality_issue,
@@ -137,12 +138,16 @@ class TestListQualityIssues:
         assert result["issues"] == []
 
     async def test_respects_limit(self, quality_tempdir, mock_app_state):
-        """limit=1 → только 1 issue."""
+        """limit=1 → 1 issue в списке, но total отражает РЕАЛЬНОЕ число (13.26).
+
+        total — это общее число issues с фильтром БЕЗ лимита, а len(issues)
+        — сколько реально возвращено (ограничено limit).
+        """
         for i in range(3):
             create_issue("duplicate", f"kid-{i}", "warn", f"Issue {i}")
 
         result = await list_quality_issues({"limit": 1, "status": "open"}, mock_app_state)
-        assert result["total"] == 1
+        assert result["total"] == 3  # реальное число, не ограничено limit
         assert len(result["issues"]) == 1
 
 
@@ -1076,3 +1081,78 @@ class TestBgScanCancel:
             call_kwargs = mock_run_scan.call_args.kwargs
             assert "cancel_event" in call_kwargs
             assert call_kwargs["cancel_event"] is cancel_event
+
+
+# ═══════════════════════════════════════════════════════════════
+# P0: bulk_resolve_issues
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestBulkResolveIssues:
+    """bulk_resolve_issues — пакетный resolve/ignore по фильтру (P0)."""
+
+    async def test_ignore_all_by_type(self, quality_tempdir, mock_app_state):
+        """action=ignore + types=[duplicate] → все duplicate-issues помечены ignored."""
+        create_issue("duplicate", "kid-1", "warn", "Dup 1")
+        create_issue("duplicate", "kid-2", "warn", "Dup 2")
+        create_issue("missing_field", "kid-3", "warn", "Missing")
+
+        result = await bulk_resolve_issues(
+            {"types": ["duplicate"], "action": "ignore", "reason": "bulk test"},
+            mock_app_state,
+        )
+
+        assert result["resolved"] is True
+        assert result["count"] == 2
+        assert result["total"] == 2
+        assert result["action"] == "ignore"
+        # Проверяем: duplicate закрыты, missing_field остался open
+        open_after = await list_quality_issues(
+            {"types": None, "status": "open", "limit": 50}, mock_app_state,
+        )
+        remaining = [i for i in open_after["issues"] if i["type"] == "duplicate"]
+        assert len(remaining) == 0
+        assert open_after["total"] == 1  # только missing_field
+
+    async def test_resolve_all_by_knowledge_id(self, quality_tempdir, mock_app_state):
+        """action=resolve + knowledge_id → все issues конкретной записи закрыты."""
+        create_issue("duplicate", "kid-x", "warn", "Dup A")
+        create_issue("duplicate", "kid-x", "warn", "Dup B")
+        create_issue("duplicate", "kid-y", "warn", "Dup C")
+
+        result = await bulk_resolve_issues(
+            {"knowledge_id": "kid-x", "action": "resolve", "reason": "fixed"},
+            mock_app_state,
+        )
+
+        assert result["count"] == 2
+        open_after = await list_quality_issues(
+            {"types": None, "status": "open", "limit": 50}, mock_app_state,
+        )
+        assert open_after["total"] == 1  # только kid-y
+        assert open_after["issues"][0]["knowledge_id"] == "kid-y"
+
+    async def test_invalid_action_rejected(self, quality_tempdir, mock_app_state):
+        """action вне {ignore, resolve} → ошибка, ничего не меняется."""
+        create_issue("duplicate", "kid-1", "warn", "Dup")
+
+        result = await bulk_resolve_issues(
+            {"types": ["duplicate"], "action": "deprecate"},
+            mock_app_state,
+        )
+
+        assert result["resolved"] is False
+        assert "error" in result
+        open_after = await list_quality_issues(
+            {"types": None, "status": "open", "limit": 50}, mock_app_state,
+        )
+        assert open_after["total"] == 1
+
+    async def test_empty_store(self, quality_tempdir, mock_app_state):
+        """Пустой store → count=0, resolved=True."""
+        result = await bulk_resolve_issues(
+            {"types": ["duplicate"], "action": "ignore"},
+            mock_app_state,
+        )
+        assert result["resolved"] is True
+        assert result["count"] == 0
