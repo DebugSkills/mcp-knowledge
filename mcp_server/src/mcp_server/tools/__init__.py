@@ -19,6 +19,7 @@ from .content import cancel_import, extract_pdf_text, import_content
 from .crud import delete_entry, update_entry, write_knowledge
 from .fragments import add_fragment, delete_fragment, find_fragment, update_fragment
 from .quality import (
+    bulk_deprecate_duplicates,
     bulk_resolve_issues,
     cancel_quality_scan,
     list_quality_issues,
@@ -208,6 +209,30 @@ _BULK_RESOLVE_ISSUES_SCHEMA: dict[str, Any] = {
             "enum": ["ignore", "resolve"],
             "default": "ignore",
             "description": "Действие: ignore (пропустить, обратимо) | resolve (исправлено)",
+        },
+        "reason": {"type": "string", "description": "Причина решения"},
+    },
+}
+
+
+# ── Фаза 1 dedup: bulk_deprecate_duplicates schema ────────────
+
+_BULK_DEPRECATE_DUPLICATES_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "issue_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Список issue_id → deprecate их knowledge_id (Фаза 1 dedup)",
+        },
+        "knowledge_id": {
+            "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],
+            "description": "Прямой knowledge_id (или список) для deprecate",
+        },
+        "actor": {
+            "type": "string",
+            "default": "operator-batch",
+            "description": "Кто выполняет: operator-batch | auto",
         },
         "reason": {"type": "string", "description": "Причина решения"},
     },
@@ -407,6 +432,11 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _BULK_RESOLVE_ISSUES_SCHEMA,
     },
     {
+        "name": "bulk_deprecate_duplicates",
+        "description": "Пакетно deprecate записи-дубликаты (Фаза 1 dedup): скрыть из поиска (обратимо через restore), закрыть все их dup-issues, записать в audit.jsonl. Контент .md не трогается.",
+        "inputSchema": _BULK_DEPRECATE_DUPLICATES_SCHEMA,
+    },
+    {
         "name": "run_quality_scan",
         "description": "Запустить периодический quality scan: обход всех .md → staleness_score → dup-pair detection → issues + review_queue. Для cron (4.8).",
         "inputSchema": _RUN_QUALITY_SCAN_SCHEMA,
@@ -483,6 +513,7 @@ TOOL_HANDLERS = {
     "list_quality_issues": list_quality_issues,
     "resolve_quality_issue": resolve_quality_issue,
     "bulk_resolve_issues": bulk_resolve_issues,
+    "bulk_deprecate_duplicates": bulk_deprecate_duplicates,
     "run_quality_scan": run_quality_scan,
     "cancel_quality_scan": cancel_quality_scan,
     "import_content": import_content,

@@ -21,6 +21,7 @@ from mcp_server.quality.issues import create_issue, set_store_dir
 from mcp_server.tools.quality import (
     _bg_scan,
     _cascade_set_payload,
+    bulk_deprecate_duplicates,
     bulk_resolve_issues,
     cancel_quality_scan,
     list_quality_issues,
@@ -38,6 +39,8 @@ def quality_tempdir():
     """Temp directory для quality issues store."""
     with tempfile.TemporaryDirectory() as tmp:
         set_store_dir(tmp)
+        from mcp_server.quality.audit import set_store_dir as audit_set_dir
+        audit_set_dir(tmp)
         yield tmp
 
 
@@ -1156,3 +1159,89 @@ class TestBulkResolveIssues:
         )
         assert result["resolved"] is True
         assert result["count"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# Фаза 1 dedup: bulk_deprecate_duplicates + audit
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestBulkDeprecateDuplicates:
+    """bulk_deprecate_duplicates — пакетный deprecate дублей (Фаза 1 dedup)."""
+
+    async def test_deprecate_by_knowledge_id(self, quality_tempdir, mock_app_state):
+        """deprecate по knowledge_id: payload + close-all + audit."""
+        from mcp_server.quality.audit import count_actions
+        from mcp_server.quality.issues import create_issue, list_issues
+
+        create_issue("duplicate", "kid-dup-1", "warn", "Dup A of kid-target")
+        create_issue("duplicate", "kid-dup-1", "warn", "Dup B of kid-target")
+        mock_app_state.qdrant = MagicMock()
+
+        result = await bulk_deprecate_duplicates(
+            {"knowledge_id": "kid-dup-1", "reason": "test"}, mock_app_state,
+        )
+
+        assert result["resolved"] is True
+        assert result["deprecated_count"] == 1
+        assert result["issues_closed"] == 2
+        # set_payload вызван (deprecate в Qdrant)
+        assert mock_app_state.qdrant.set_payload.call_count == 1
+        # Все dup-issues закрыты
+        open_after = await list_quality_issues(
+            {"types": ["duplicate"], "status": "open", "limit": 50}, mock_app_state,
+        )
+        assert open_after["total"] == 0
+        # Audit записан
+        assert count_actions(action="bulk_deprecate") == 1
+
+    async def test_deprecate_by_issue_ids(self, quality_tempdir, mock_app_state):
+        """issue_ids → deprecate соответствующих knowledge_id."""
+        from mcp_server.quality.issues import create_issue
+
+        iss_a = create_issue("duplicate", "kid-a", "warn", "Dup of X")
+        create_issue("duplicate", "kid-b", "warn", "Dup of Y")
+        mock_app_state.qdrant = MagicMock()
+
+        result = await bulk_deprecate_duplicates(
+            {"issue_ids": [iss_a.issue_id], "reason": "test"}, mock_app_state,
+        )
+
+        assert result["deprecated_count"] == 1
+        assert result["issues_closed"] == 1
+
+    async def test_no_targets(self, quality_tempdir, mock_app_state):
+        """Без issue_ids и knowledge_id → ошибка."""
+        result = await bulk_deprecate_duplicates({}, mock_app_state)
+        assert result["resolved"] is False
+        assert "error" in result
+
+
+class TestAuditLog:
+    """audit.py — write/list/count (Фаза 1 dedup)."""
+
+    def test_write_and_list(self, quality_tempdir):
+        from mcp_server.quality.audit import list_audit, set_store_dir as audit_set_dir
+        from mcp_server.quality.audit import write_audit
+
+        audit_set_dir(quality_tempdir)
+        write_audit("deprecate", "kid-1", "operator", "test", {"x": 1})
+        write_audit("restore", "kid-1", "operator", "undo")
+        write_audit("auto_deprecate", "kid-2", "auto", "auto-test")
+
+        all_rec = list_audit(limit=100)
+        assert len(all_rec) == 3
+        # Новые сверху
+        assert all_rec[0]["action"] == "auto_deprecate"
+        # Фильтры
+        assert len(list_audit(actor="operator")) == 2
+        assert len(list_audit(action="deprecate")) == 1
+        assert len(list_audit(knowledge_id="kid-2")) == 1
+
+    def test_count_actions(self, quality_tempdir):
+        from mcp_server.quality.audit import count_actions, write_audit
+
+        write_audit("deprecate", "kid-1", "auto", "x")
+        write_audit("deprecate", "kid-2", "operator", "x")
+        assert count_actions(action="deprecate") == 2
+        assert count_actions(actor="auto") == 1

@@ -18,8 +18,10 @@ import logging
 import uuid
 
 from mcp_server.quality import REVIEW_THRESHOLD
+from mcp_server.quality.audit import write_audit
 from mcp_server.quality.issues import (
     bulk_update_status,
+    close_all_dup_issues,
     count_issues,
     list_issue_ids,
     list_issues,
@@ -316,6 +318,7 @@ async def list_quality_issues(params: dict, app_state) -> dict:
                 "status": i.status,
                 "resolved_at": i.resolved_at.isoformat() if i.resolved_at else None,
                 "resolution": i.resolution,
+                "metadata": i.metadata,  # Фаза 1 dedup: сигналы для UI (cosine, hash, standalone)
             }
             for i in issues
         ]
@@ -424,6 +427,23 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
 
                 if issue_id:
                     update_issue_status(issue_id, "resolved", reason or "deprecated")
+                # Фаза 1 (1d): закрыть ВСЕ open dup-issues записи (не одну) —
+                # иначе «висящие» проблемы на уже скрытой записи.
+                closed = close_all_dup_issues(
+                    knowledge_id, reason or "record deprecated"
+                )
+                if closed:
+                    side_effects.append(
+                        f"Closed {closed} open duplicate-issue(s) for {knowledge_id}"
+                    )
+                # Фаза 1 (1e): аудит действия
+                write_audit(
+                    action="deprecate",
+                    knowledge_id=knowledge_id,
+                    actor="operator",
+                    reason=reason or "deprecated by operator",
+                    metadata={"cascade_affected": cascade_affected, "issues_closed": closed},
+                )
                 # Task 1: инкремент data_version после мутации
                 try:
                     app_state.data_version += 1
@@ -435,6 +455,7 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
                     "knowledge_id": knowledge_id,
                     "status": "resolved",
                     "cascade_affected": cascade_affected,
+                    "issues_closed": closed,
                     "side_effects": side_effects,
                 }
             except Exception as exc:
@@ -522,7 +543,24 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
                 logger.error("merge lifecycle failed for %s: %s", knowledge_id, exc)
                 return {"resolved": False, "error": f"Merge failed: {exc}"}
             update_issue_status(issue_id, "resolved", f"merged into {target_id}. {reason}")
-            side_effects.append(f"Content merge into '{target_id}' pending — markdown merge not yet implemented")
+            # Фаза 1 (1g): честная семантика — merge = deprecate источника
+            # (обратимо через restore), контент НЕ консолидируется.
+            side_effects.append(
+                f"Source '{knowledge_id}' deprecated (hidden from search); "
+                f"target '{target_id}' remains canonical. Reversible via restore."
+            )
+            # Фаза 1 (1d): закрыть ВСЕ open dup-issues источника
+            closed = close_all_dup_issues(knowledge_id, f"merged into {target_id}")
+            if closed:
+                side_effects.append(f"Closed {closed} open duplicate-issue(s) for {knowledge_id}")
+            # Фаза 1 (1e): аудит
+            write_audit(
+                action="merge",
+                knowledge_id=knowledge_id,
+                actor="operator",
+                reason=f"merged into {target_id}. {reason}",
+                metadata={"target_id": target_id, "issues_closed": closed},
+            )
             # Task 1: инкремент data_version после мутации
             try:
                 app_state.data_version += 1
@@ -532,6 +570,7 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
                 "resolved": True,
                 "issue_id": issue_id,
                 "status": "resolved",
+                "issues_closed": closed,
                 "side_effects": side_effects,
             }
 
@@ -890,3 +929,103 @@ async def bulk_resolve_issues(params: dict, app_state) -> dict:
     except Exception as exc:
         logger.error("bulk_resolve_issues failed: %s", exc)
         return {"resolved": False, "error": str(exc)}
+
+
+async def bulk_deprecate_duplicates(params: dict, app_state) -> dict:
+    """Пакетно deprecate записи-дубликаты (Фаза 1 dedup).
+
+    Для каждого целевого knowledge_id: set_payload status=deprecated
+    (скрыть из поиска, обратимо через restore) → закрыть ВСЕ его open
+    dup-issues → записать в audit.jsonl. Контент .md НЕ трогается.
+
+    Args:
+        params:
+            issue_ids (optional): список issue_id → knowledge_id из них
+            knowledge_id (optional): прямой список/один ID записи
+            actor (optional): "operator-batch" | "auto" (default operator-batch)
+            reason (optional): причина
+
+    Returns:
+        {"resolved": True, "deprecated_count": N, "issues_closed": M, "side_effects": [...]}
+    """
+    issue_ids = params.get("issue_ids") or []
+    kid = params.get("knowledge_id")
+    actor = params.get("actor", "operator-batch")
+    reason = params.get("reason", "")
+
+    # Целевые knowledge_id: из issue_ids или напрямую
+    target_kids: list[str] = []
+    if issue_ids:
+        from mcp_server.quality.issues import list_issues
+
+        for iss in list_issues(status="open", limit=10**6):
+            if iss.issue_id in set(issue_ids) and iss.knowledge_id not in target_kids:
+                target_kids.append(iss.knowledge_id)
+    if kid:
+        kids = kid if isinstance(kid, list) else [kid]
+        for k in kids:
+            if k not in target_kids:
+                target_kids.append(k)
+
+    if not target_kids:
+        return {"resolved": False, "error": "No targets: provide issue_ids or knowledge_id"}
+
+    qdrant = getattr(app_state, "qdrant", None)
+    loop = asyncio.get_running_loop()
+    side_effects: list[str] = []
+    total_issues_closed = 0
+    deprecated_count = 0
+
+    for target in target_kids:
+        try:
+            if qdrant:
+                from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+                from mcp_server.quality.lifecycle import make_deprecation_payload_update
+
+                payload = make_deprecation_payload_update()
+                await loop.run_in_executor(
+                    None,
+                    lambda t=target, p=payload: qdrant.set_payload(
+                        payload=p,
+                        points_filter=Filter(
+                            must=[FieldCondition(key="knowledge_id", match=MatchValue(value=t))]
+                        ),
+                    ),
+                )
+                side_effects.append(f"Deprecated {target}")
+            # Закрыть все open dup-issues записи
+            closed = close_all_dup_issues(target, reason or "deprecated in batch")
+            total_issues_closed += closed
+            if closed:
+                side_effects.append(f"Closed {closed} dup-issue(s) for {target}")
+            # Аудит
+            write_audit(
+                action="bulk_deprecate",
+                knowledge_id=target,
+                actor=actor,
+                reason=reason or "deprecated in batch",
+                metadata={"issues_closed": closed},
+            )
+            deprecated_count += 1
+        except Exception as exc:
+            logger.error("bulk_deprecate failed for %s: %s", target, exc)
+            side_effects.append(f"FAILED {target}: {exc}")
+
+    # data_version++ (кэш-инвалидация)
+    try:
+        app_state.data_version += 1
+    except Exception:  # noqa: S110
+        pass  # best-effort
+
+    logger.info(
+        "bulk_deprecate_duplicates: %d records deprecated, %d issues closed (actor=%s)",
+        deprecated_count, total_issues_closed, actor,
+    )
+    return {
+        "resolved": True,
+        "deprecated_count": deprecated_count,
+        "issues_closed": total_issues_closed,
+        "side_effects": side_effects,
+        "audited": True,
+    }

@@ -16,7 +16,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,6 +50,12 @@ MAX_PAIRS_PER_BUCKET: int = 500  # макс пар для проверки в о
 # Лимит dup-issues на одну запись (13.14): книга на 15K секций даёт тысячи пар
 # с одинаковым fm_i → 15K+ issues на один knowledge_id (засорение issues + CPU 120%).
 MAX_ISSUES_PER_KNOWLEDGE: int = 10
+
+# Фаза 1 dedup: негационные токены для антоним-FP guard
+# (chto-lyubit-ai ≈ chto-ne-lyubit-ai при cosine 0.995 — ложный дубль).
+NEGATION_TOKENS: frozenset[str] = frozenset({
+    "ne", "not", "anti", "without", "no", "bez", "contra", "non", "не",
+})
 
 
 async def run_scan(
@@ -153,7 +161,7 @@ async def run_scan(
                 break
 
             batch = entries[batch_start:batch_start + BATCH_SIZE]
-            for filepath, frontmatter in batch:
+            for filepath, frontmatter, _meta in batch:
                 score = _compute_score(frontmatter, now_dt, filepath)
                 scored.append((filepath, frontmatter, score))
                 if score >= REVIEW_THRESHOLD:
@@ -207,8 +215,14 @@ async def run_scan(
     if progress and pid:
         progress.set_phase(pid, "dup_scan", "Сканирование дубликатов...")
     loop = asyncio.get_running_loop()
+    # Фаза 1 (1b/1c): side-channel сигналы + skip deprecated (re-detection loop)
+    content_meta: dict[str, dict] = {
+        fm.knowledge_id: meta for _f, fm, meta in entries
+    }
+    deprecated_kids = await _load_deprecated_kids(qdrant_client) if qdrant_client is not None else set()
     dup_count, dup_map = await loop.run_in_executor(
         None, _scan_dup_pairs, scored, progress, pid, cancel_event, embedder,
+        deprecated_kids, content_meta,
     )
     metrics["duplicates_detected"] = dup_count
 
@@ -260,18 +274,22 @@ async def run_scan(
 
 async def _scan_filesystem(
     knowledge_dir: Path,
-) -> list[tuple[Path, KnowledgeFrontmatter]]:
+) -> list[tuple[Path, KnowledgeFrontmatter, dict]]:
     """Обходит knowledge/**/*.md и парсит frontmatter.
 
     Использует run_in_executor для filesystem-операций (блокирующий I/O
     в async-контексте, паттерн из crud.py).
+
+    Фаза 1 dedup: для каждой записи возвращает content_meta
+    (content_hash — SHA256 нормализованного тела, content_length) —
+    единственный безопасный сигнал для будущего авто-режима (Critic P0-1).
     """
     import yaml
 
     loop = asyncio.get_running_loop()
 
-    def _walk() -> list[tuple[Path, KnowledgeFrontmatter]]:
-        results: list[tuple[Path, KnowledgeFrontmatter]] = []
+    def _walk() -> list[tuple[Path, KnowledgeFrontmatter, dict]]:
+        results: list[tuple[Path, KnowledgeFrontmatter, dict]] = []
         for md_file in knowledge_dir.rglob("*.md"):
             # 13.18: пропуск файлов из .trash/ (как markdown_store.py:191,204)
             if ".trash" in md_file.parts:
@@ -280,12 +298,95 @@ async def _scan_filesystem(
                 content = md_file.read_text(encoding="utf-8")
                 fm = _parse_frontmatter(content, yaml)
                 if fm is not None:
-                    results.append((md_file, fm))
+                    body = _extract_body(content)
+                    results.append((
+                        md_file, fm,
+                        {"content_hash": _content_body_hash(body), "content_length": len(body)},
+                    ))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to parse %s: %s", md_file, exc)
         return results
 
     return await loop.run_in_executor(None, _walk)
+
+
+def _extract_body(content: str) -> str:
+    """Тело записи (после YAML frontmatter) для content_hash.
+
+    Если frontmatter не закрыт/отсутствует — возвращаем весь контент.
+    """
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            return parts[2]
+    return content
+
+
+def _normalize_body(body: str) -> str:
+    """Нормализация тела для content_hash: strip + схлопывание пустых строк."""
+    normalized = re.sub(r"\n{3,}", "\n\n", body.strip())
+    return normalized
+
+
+def _content_body_hash(body: str) -> str:
+    """SHA256 нормализованного тела (первые 16 hex — компактный идентификатор)."""
+    return hashlib.sha256(_normalize_body(body).encode("utf-8")).hexdigest()[:16]
+
+
+def has_negation_pattern(slug_a: str, slug_b: str) -> bool:
+    """Антоним-guard (Фаза 1 dedup): разница токенов slug содержит отрицание.
+
+    Контрпример Critic: chto-lyubit-ai ≈ chto-ne-lyubit-ai при cosine 0.995 —
+    «что ИИ любит» / «что ИИ НЕ любит». Такие пары НЕ должны попадать в 🟢.
+    """
+    if not slug_a or not slug_b:
+        return False
+    diff = set(slug_a.split("-")) ^ set(slug_b.split("-"))
+    return bool(diff & NEGATION_TOKENS)
+
+
+async def _load_deprecated_kids(qdrant_client) -> set[str]:
+    """Загружает knowledge_id записей со status=deprecated из Qdrant (Фаза 1).
+
+    Deprecate живёт в Qdrant payload (SSOT .md не тронут) → без этого скан
+    пересоздаёт dup-issues для скрытых записей на каждом проходе
+    (re-detection loop). Возвращает set knowledge_id.
+    """
+    if qdrant_client is None or not hasattr(qdrant_client, "scroll"):
+        return set()
+    loop = asyncio.get_running_loop()
+    try:
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        scroll_filter = Filter(
+            must=[FieldCondition(key="status", match=MatchValue(value="deprecated"))]
+        )
+        deprecated: set[str] = set()
+        offset = None
+        while True:
+            _filt, _off = scroll_filter, offset
+            points, next_offset = await loop.run_in_executor(
+                None,
+                lambda f=_filt, o=_off: qdrant_client.scroll(
+                    scroll_filter=f,
+                    limit=1000,
+                    offset=o,
+                    with_payload=True,
+                    with_vectors=False,
+                ),
+            )
+            for p in points:
+                kid = (p.payload or {}).get("knowledge_id")
+                if kid:
+                    deprecated.add(kid)
+            if next_offset is None or len(points) == 0:
+                break
+            offset = next_offset
+        logger.info("Loaded %d deprecated knowledge_ids for dup-scan skip", len(deprecated))
+        return deprecated
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to load deprecated kids (%s), dup-scan without skip", exc)
+        return set()
 
 
 def _parse_frontmatter(
@@ -521,6 +622,8 @@ def _scan_dup_pairs(
     progress_id: str | None = None,
     cancel_event=None,  # 13.18: asyncio.Event для отмены (проверяется между domain-бакетами)
     embedder=None,      # P0: EmbeddingManager для embedding-dup (fallback на теги при None)
+    deprecated_kids: set[str] | None = None,  # Фаза 1: skip скрытых записей (re-detection loop)
+    content_meta: dict[str, dict] | None = None,  # Фаза 1: kid → {content_hash, content_length}
 ) -> tuple[int, dict[str, int]]:
     """Сканирует dup-пары внутри domain-бакетов.
 
@@ -593,6 +696,12 @@ def _scan_dup_pairs(
             for j in range(i + 1, n):
                 _, fm_i, _ = entries[i]
                 _, fm_j, _ = entries[j]
+                # Фаза 1 (1c): deprecated-записи пропускаем — иначе re-detection loop
+                # (deprecate живёт в Qdrant payload, SSOT .md не тронут → скан видит запись снова).
+                if deprecated_kids and (
+                    fm_i.knowledge_id in deprecated_kids or fm_j.knowledge_id in deprecated_kids
+                ):
+                    continue
                 if issue_counts.get(fm_i.knowledge_id, 0) >= MAX_ISSUES_PER_KNOWLEDGE:
                     continue  # запись уже имеет достаточно dup-issues
                 # Структурные TOC-секции («Table of Content (part N)») почти идентичны
@@ -622,11 +731,28 @@ def _scan_dup_pairs(
                     else f"Possible duplicate of {fm_j.knowledge_id} "
                          f"(same subject={fm_i.subject}, tag overlap)"
                 )
+                # Фаза 1 (1b): структурированные сигналы для Review Queue (Фаза 2).
+                # metadata НЕ входит в issue_id — идемпотентность сохранена.
+                meta_i = (content_meta or {}).get(fm_i.knowledge_id, {})
+                meta_j = (content_meta or {}).get(fm_j.knowledge_id, {})
                 create_issue(
                     issue_type="duplicate",
                     knowledge_id=fm_i.knowledge_id,
                     severity="warn",
                     detail=detail,
+                    metadata={
+                        "cosine": round(similarity, 4) if similarity is not None else None,
+                        "content_hash": meta_i.get("content_hash"),
+                        "content_length": meta_i.get("content_length"),
+                        "target_content_hash": meta_j.get("content_hash"),
+                        "target_content_length": meta_j.get("content_length"),
+                        "slug_negation": has_negation_pattern(
+                            fm_i.knowledge_id, fm_j.knowledge_id
+                        ),
+                        "standalone": fm_i.parent_knowledge_id is None,
+                        "target_standalone": fm_j.parent_knowledge_id is None,
+                        "subject": fm_i.subject,
+                    },
                 )
     return dup_count, dup_map
 

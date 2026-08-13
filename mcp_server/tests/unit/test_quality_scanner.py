@@ -375,3 +375,81 @@ class TestRepresentativeText:
         text = _representative_text(fm)
         assert "kid-test-001" in text
         assert "devops" in text
+
+
+# ═══════════════════════════════════════════════════════════════
+# Фаза 1 dedup: negation guard + content_hash + skip-deprecated
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestNegationGuard:
+    """has_negation_pattern — защита от антоним-FP (Фаза 1)."""
+
+    def test_antonyms_detected(self):
+        from mcp_server.quality.scanner import has_negation_pattern
+        # Контрпример Critic: «что ИИ любит» ≈ «что ИИ НЕ любит»
+        assert has_negation_pattern(
+            "chto-lyubit-ai", "chto-ne-lyubit-ai"
+        ) is True
+
+    def test_similar_slugs_not_flagged(self):
+        from mcp_server.quality.scanner import has_negation_pattern
+        assert has_negation_pattern("kid-a-1", "kid-a-2") is False
+        assert has_negation_pattern("engineering-mcp-1", "engineering-mcp-2") is False
+
+    def test_empty_inputs(self):
+        from mcp_server.quality.scanner import has_negation_pattern
+        assert has_negation_pattern("", "kid") is False
+        assert has_negation_pattern("kid", "") is False
+
+
+class TestContentHash:
+    """content_hash/нормализация тела (Фаза 1)."""
+
+    def test_extract_body(self):
+        from mcp_server.quality.scanner import _extract_body
+        md = "---\nknowledge_id: kid\n---\n# Body\ncontent"
+        assert _extract_body(md) == "\n# Body\ncontent"
+
+    def test_normalize_and_hash(self):
+        from mcp_server.quality.scanner import _content_body_hash, _normalize_body
+        body = "  # Title\n\n\n\ncontent  "
+        norm = _normalize_body(body)
+        assert "\n\n\n" not in norm  # пустые строки схлопнуты
+        assert norm == norm.strip()
+        h1 = _content_body_hash("text\n\n\nmore")
+        h2 = _content_body_hash("text\n\nmore")
+        assert h1 == h2  # нормализация → одинаковый hash
+        assert len(h1) == 16
+
+    def test_hash_stable_for_identical(self):
+        from mcp_server.quality.scanner import _content_body_hash
+        assert _content_body_hash("same body") == _content_body_hash("same body")
+        assert _content_body_hash("same body") != _content_body_hash("other")
+
+
+class TestSkipDeprecated:
+    """_scan_dup_pairs — skip deprecated (Фаза 1 re-detection loop fix)."""
+
+    def _mk(self, kid: str, subject: str = "devops"):
+        fm = _make_fm(knowledge_id=kid, subject=subject, tags=["ai", "auto"])
+        return (Path(f"/tmp/{kid}.md"), fm, 0.1)
+
+    def test_deprecated_pair_skipped(self):
+        from mcp_server.quality.scanner import _scan_dup_pairs
+
+        a = self._mk("kid-a")
+        b = self._mk("kid-b")
+        dup_count, _ = _scan_dup_pairs(
+            [a, b],
+            deprecated_kids={"kid-b"},
+        )
+        assert dup_count == 0  # пара с deprecated пропущена
+
+    def test_no_deprecated_normal_scan(self):
+        from mcp_server.quality.scanner import _scan_dup_pairs
+
+        a = self._mk("kid-a")
+        b = self._mk("kid-b")
+        dup_count, _ = _scan_dup_pairs([a, b], deprecated_kids=set())
+        assert dup_count == 1  # теговая эвристика (embedder None)

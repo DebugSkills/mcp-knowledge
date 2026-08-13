@@ -28,6 +28,9 @@ from ..config import MCP_API_KEY, MCP_SERVER_URL, REFRESH_SECONDS
 from ..core.data_cache import cache
 from ..core.mcp_client import MCPClient
 
+# Фаза 1 dedup: выбранные issue_id для пакетного скрытия дублей (сессия)
+_selected_issues: set[str] = set()
+
 # Интервал автообновления для quality (дольше, чем статус — данные тяжелее).
 QUALITY_REFRESH_SECONDS = max(REFRESH_SECONDS * 3, 30)
 
@@ -306,21 +309,40 @@ def _render_issues(data: dict, refresh_fn) -> None:
                 ).props("flat dense color=grey").tooltip(
                     f"Пакетно пометить все open-issues типа {itype} как ignored (обратимо, только issues.jsonl)"
                 )
+            # Фаза 1 dedup: пакетное скрытие выбранных дублей (checkbox на карточках)
+            dup_count = sum(1 for i in issues if i.get("type") == "duplicate")
+            if dup_count:
+                ui.button(
+                    "📦 Пакетно скрыть выбранные",
+                    on_click=lambda: _bulk_deprecate_selected(refresh_fn),
+                ).props("flat dense color=warning").tooltip(
+                    "Скрыть отмеченные дубликаты (deprecate, обратимо через restore; закрывает все их dup-issues)"
+                )
 
     for issue in issues:
         _render_issue_card(issue, refresh_fn)
 
 
 def _render_issue_card(issue: dict, refresh_fn) -> None:
-    """Отрисовать карточку одного issue (type-chip, knowledge_id, detail, действия)."""
+    """Отрисовать карточку одного issue (type-chip, knowledge_id, detail, действия).
+
+    Фаза 1 dedup: для duplicate-issues добавляются 📦 (deprecate дубля,
+    обратимо) и checkbox для пакетного скрытия выбранных.
+    """
     issue_id = issue.get("issue_id", "")
     issue_type = issue.get("type", "")
     knowledge_id = issue.get("knowledge_id", "")
     detail = issue.get("detail", "")
     detected_at = issue.get("detected_at", "")
     severity = issue.get("severity", "")
+    is_duplicate = issue_type == "duplicate"
 
     with ui.card().classes("w-full q-mb-xs"), ui.row().classes("items-center w-full no-wrap gap-2"):
+        # Checkbox для пакетного скрытия (только duplicate)
+        if is_duplicate:
+            ui.checkbox(on_change=lambda e, iid=issue_id: _set_selected(iid, e.value)).props(
+                "dense size=sm"
+            )
         with ui.column().classes("flex-1 min-w-0"):
             with ui.row().classes("items-center gap-2 no-wrap"):
                 if issue_type:
@@ -333,6 +355,12 @@ def _render_issue_card(issue: dict, refresh_fn) -> None:
             if detected_at:
                 ui.label(f"Обнаружено: {detected_at[:19]}").classes("text-caption text-grey")
         with ui.row().classes("gap-1 no-wrap"):
+            if is_duplicate:
+                ui.button(
+                    "📦", on_click=lambda iid=issue_id, kid=knowledge_id, d=detail: _deprecate_duplicate(
+                        iid, kid, d, refresh_fn
+                    ),
+                ).props("flat dense color=warning").tooltip("Скрыть дубликат (deprecate, обратимо)")
             ui.button(
                 "✅", on_click=lambda iid=issue_id: _resolve_issue(iid, refresh_fn),
             ).props("flat dense color=positive").tooltip("Исправлено")
@@ -676,6 +704,116 @@ async def _bulk_ignore_type(issue_type: str, refresh_fn) -> None:
                 f"⊘ Игнорировать {total}",
                 on_click=lambda d=dialog: (_do_bulk(), d.close()),
             ).props("flat color=grey")
+    await dialog
+
+
+def _set_selected(issue_id: str, value: bool) -> None:
+    """Отметить/снять issue_id в сессии для пакетного скрытия (Фаза 1 dedup)."""
+    if value:
+        _selected_issues.add(issue_id)
+    else:
+        _selected_issues.discard(issue_id)
+
+
+async def _deprecate_duplicate(issue_id: str, knowledge_id: str, detail: str, refresh_fn) -> None:
+    """HITL-подтверждение и deprecate одного дубля (📦, Фаза 1 dedup).
+
+    Обратимо через restore; сервер сам закрывает ВСЕ open dup-issues записи.
+    """
+    # Извлекаем target из detail («Possible duplicate of <target> (cosine=...)»)
+    target = ""
+    cosine = ""
+    if "Possible duplicate of " in detail:
+        rest = detail.split("Possible duplicate of ", 1)[1]
+        target = rest.split(" (", 1)[0]
+    if "cosine=" in detail:
+        cosine = detail.split("cosine=", 1)[1].rstrip(")")
+
+    async def _do() -> None:
+        try:
+            client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY, timeout=60.0)
+            try:
+                result = await client.bulk_deprecate_duplicates(
+                    issue_ids=[issue_id],
+                    reason="Duplicate hidden by operator (dedup)",
+                )
+                if result.get("resolved"):
+                    ui.notify(
+                        f"Скрыто: {result.get('deprecated_count', 0)} записей, "
+                        f"закрыто issues: {result.get('issues_closed', 0)}",
+                        type="positive",
+                    )
+                    cache.invalidate("quality:issues")
+                    await refresh_fn()
+                else:
+                    ui.notify(f"Ошибка: {result.get('error', 'неизвестно')}", type="negative")
+            finally:
+                await client.close()
+        except Exception as exc:
+            ui.notify(f"Ошибка: {exc}", type="negative")
+
+    with ui.dialog() as dialog, ui.card().classes("q-pa-md"):
+        ui.label("📦 Скрыть дубликат").classes("text-h6")
+        ui.label(
+            f"Запись: {knowledge_id}\n"
+            f"Дубликат: {target or '?'}"
+            + (f" (cosine={cosine})" if cosine else "")
+            + "\n\nБудет помечена как deprecated (скрыта из поиска). "
+            "Обратимо через ♻️ restore. Контент .md не удаляется. "
+            "Все её open dup-issues будут закрыты."
+        ).classes("q-mb-md")
+        with ui.row().classes("gap-2"):
+            ui.button("Отмена", on_click=dialog.close).props("flat")
+            ui.button(
+                "📦 Скрыть",
+                on_click=lambda d=dialog: (_do(), d.close()),
+            ).props("flat color=warning")
+    await dialog
+
+
+async def _bulk_deprecate_selected(refresh_fn) -> None:
+    """HITL-подтверждение и пакетное скрытие выбранных дублей (Фаза 1 dedup)."""
+    selected = list(_selected_issues)
+    if not selected:
+        ui.notify("Ничего не выбрано — отметьте checkbox на карточках дублей", type="warning")
+        return
+
+    async def _do() -> None:
+        try:
+            client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY, timeout=120.0)
+            try:
+                result = await client.bulk_deprecate_duplicates(
+                    issue_ids=selected,
+                    reason="Batch hide duplicates by operator (dedup)",
+                )
+                if result.get("resolved"):
+                    ui.notify(
+                        f"Скрыто: {result.get('deprecated_count', 0)} записей, "
+                        f"закрыто issues: {result.get('issues_closed', 0)}",
+                        type="positive",
+                    )
+                    _selected_issues.clear()
+                    cache.invalidate("quality:issues")
+                    await refresh_fn()
+                else:
+                    ui.notify(f"Ошибка: {result.get('error', 'неизвестно')}", type="negative")
+            finally:
+                await client.close()
+        except Exception as exc:
+            ui.notify(f"Ошибка: {exc}", type="negative")
+
+    with ui.dialog() as dialog, ui.card().classes("q-pa-md"):
+        ui.label("📦 Пакетное скрытие дублей").classes("text-h6")
+        ui.label(
+            f"Будут скрыты (deprecated) дубликаты по {len(selected)} отмеченным issue(s). "
+            "Обратимо через ♻️ restore. Контент .md не удаляется."
+        ).classes("q-mb-md")
+        with ui.row().classes("gap-2"):
+            ui.button("Отмена", on_click=dialog.close).props("flat")
+            ui.button(
+                f"📦 Скрыть {len(selected)}",
+                on_click=lambda d=dialog: (_do(), d.close()),
+            ).props("flat color=warning")
     await dialog
 
 

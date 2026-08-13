@@ -555,3 +555,61 @@ class TestBulkIgnoreButton:
             for c in mock_ui.button.call_args_list
         ]
         assert not any("Игнорировать все" in t for t in btn_texts)
+
+
+class TestDedupButtons:
+    """Фаза 1 dedup: 📦-кнопка и checkbox на dup-карточках."""
+
+    def _dup_issue(self):
+        return {
+            "issue_id": "iss-dup-1",
+            "type": "duplicate",
+            "knowledge_id": "kid-source",
+            "detail": "Possible duplicate of kid-target (same subject=devops, cosine=0.974)",
+            "detected_at": "2026-08-13T00:00:00+00:00",
+            "status": "open",
+            "severity": "warn",
+        }
+
+    def test_deprecate_button_on_duplicate_card(self):
+        """Duplicate-карточка содержит 📦 (deprecate) и checkbox."""
+        from kb_console.pages import quality
+        refresh_fn = MagicMock()
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_issue_card(self._dup_issue(), refresh_fn)
+        texts = [" ".join(str(a) for a in c.args) for c in mock_ui.button.call_args_list]
+        assert any("📦" in t for t in texts)
+        # checkbox для пакетного выбора рендерится
+        assert mock_ui.checkbox.call_count == 1
+
+    def test_no_deprecate_button_on_non_duplicate(self):
+        """Non-duplicate-карточка НЕ содержит 📦 и checkbox."""
+        from kb_console.pages import quality
+        refresh_fn = MagicMock()
+        issue = self._dup_issue()
+        issue["type"] = "missing_field"
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_issue_card(issue, refresh_fn)
+        texts = [" ".join(str(a) for a in c.args) for c in mock_ui.button.call_args_list]
+        assert not any("📦" in t for t in texts)
+        assert mock_ui.checkbox.call_count == 0
+
+    def test_bulk_hide_button_renders(self):
+        """Кнопка «Пакетно скрыть выбранные» — при наличии duplicate."""
+        from kb_console.pages import quality
+        refresh_fn = MagicMock()
+        data = {"issues": [self._dup_issue()], "total": 1}
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_issues(data, refresh_fn)
+        texts = [" ".join(str(a) for a in c.args) for c in mock_ui.button.call_args_list]
+        assert any("Пакетно скрыть выбранные" in t for t in texts)
+
+    def test_set_selected(self):
+        """_set_selected добавляет/убирает issue_id в сессию."""
+        from kb_console.pages import quality
+        quality._selected_issues.clear()
+        quality._set_selected("iss-1", True)
+        quality._set_selected("iss-2", True)
+        quality._set_selected("iss-1", False)
+        assert quality._selected_issues == {"iss-2"}
+        quality._selected_issues.clear()

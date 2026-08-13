@@ -563,6 +563,32 @@ class MCPClient:
             params["knowledge_id"] = knowledge_id
         return await self.tools_call("bulk_resolve_issues", params)
 
+    async def bulk_deprecate_duplicates(
+        self,
+        issue_ids: list[str] | None = None,
+        knowledge_id: str | list[str] | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Пакетно deprecate записи-дубликаты (Фаза 1 dedup).
+
+        Скрывает из поиска (обратимо через restore), закрывает все dup-issues,
+        пишет в audit.jsonl. Контент .md не трогается.
+
+        Args:
+            issue_ids: список issue_id (deprecate их knowledge_id)
+            knowledge_id: прямой ID записи (или список)
+            reason: причина
+
+        Returns:
+            {"resolved": True, "deprecated_count": N, "issues_closed": M, "side_effects": [...]}
+        """
+        params: dict[str, Any] = {"reason": reason}
+        if issue_ids:
+            params["issue_ids"] = issue_ids
+        if knowledge_id:
+            params["knowledge_id"] = knowledge_id
+        return await self.tools_call("bulk_deprecate_duplicates", params)
+
     async def delete_entry(
         self, knowledge_id: str, cascade: bool = False
     ) -> dict[str, Any]:

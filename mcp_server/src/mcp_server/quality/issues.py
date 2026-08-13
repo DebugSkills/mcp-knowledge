@@ -92,6 +92,10 @@ class Issue(BaseModel):
     status: IssueStatus = Field(default="open", description="Статус: open | resolved | ignored")
     resolved_at: datetime | None = Field(default=None, description="Время разрешения")
     resolution: str | None = Field(default=None, description="Описание решения")
+    metadata: dict | None = Field(
+        default=None,
+        description="Структурированные сигналы (Фаза 1 dedup: cosine, content_hash, slug_negation, standalone)",
+    )
 
 
 # ── Helpers ─────────────────────────────────────────────────
@@ -165,11 +169,14 @@ def create_issue(
     knowledge_id: str,
     severity: IssueSeverity,
     detail: str,
+    metadata: dict | None = None,
 ) -> Issue:
     """Создать issue (идемпотентно — дубликаты пропускаются).
 
     Идемпотентность: issue_id = SHA256(type, knowledge_id, detail).
     Если issue с таким ID уже существует, возвращается существующая запись.
+    ВАЖНО (Фаза 1 dedup): metadata НЕ участвует в issue_id — пересчёт
+    сигналов (cosine/content_hash) не ломает идемпотентность.
 
     Атомарность: read → append → write(tmp) → os.replace() под threading.Lock.
 
@@ -178,6 +185,7 @@ def create_issue(
         knowledge_id: ID записи знаний
         severity: Серьёзность (info, warn, critical)
         detail: Детальное описание
+        metadata: Структурированные сигналы (опционально, Фаза 1 dedup)
 
     Returns:
         Issue: Созданная (или существующая) запись
@@ -204,6 +212,7 @@ def create_issue(
             detail=detail,
             detected_at=now,
             status="open",
+            metadata=metadata,
         )
         existing.append(new_issue.model_dump(mode="json"))
         _write_all_issues(store_path, existing)
@@ -415,6 +424,27 @@ def list_issue_ids(
             continue
         result.append(entry.get("issue_id", ""))
     return result
+
+
+def close_all_dup_issues(knowledge_id: str, resolution: str | None = None) -> int:
+    """Закрыть ВСЕ open duplicate-issues записи (Фаза 1 dedup).
+
+    После deprecate/merge у записи могут оставаться НЕСКОЛЬКО duplicate-issues
+    (от разных dup-пар). Этот хелпер закрывает их все разом — не одну.
+
+    Args:
+        knowledge_id: ID записи.
+        resolution: описание решения (опционально).
+
+    Returns:
+        int: число закрытых issues.
+    """
+    issue_ids = list_issue_ids(
+        types=["duplicate"], status="open", knowledge_id=knowledge_id,
+    )
+    if not issue_ids:
+        return 0
+    return bulk_update_status(issue_ids, "resolved", resolution)
 
 
 # ── Async-safe wrappers (NF-5 fix) ─────────────────────────
