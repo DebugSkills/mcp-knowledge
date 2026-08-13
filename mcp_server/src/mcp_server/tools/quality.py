@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 
 from mcp_server.quality import REVIEW_THRESHOLD
@@ -1028,4 +1029,113 @@ async def bulk_deprecate_duplicates(params: dict, app_state) -> dict:
         "issues_closed": total_issues_closed,
         "side_effects": side_effects,
         "audited": True,
+    }
+
+
+# ── Фаза 2 dedup: Review Queue ─────────────────────────────────
+
+# Сниппет-кеш (TTL 60s): повторные вызовы не читают SSOT заново
+_snippet_cache: dict[str, tuple[float, str]] = {}
+_SNIPPET_TTL = 60.0
+_SNIPPET_LINES = 30
+_SNIPPET_MAX_CHARS = 2000
+
+
+def _snippet_from_content(content: str) -> str:
+    """Первые N строк (≤ max chars) — сниппет для diff-просмотра."""
+    lines = content.strip().split("\n")[:_SNIPPET_LINES]
+    snippet = "\n".join(lines)
+    return snippet[:_SNIPPET_MAX_CHARS]
+
+
+async def _get_snippet(knowledge_id: str, app_state) -> str:
+    """Сниппет записи через MarkdownStore.read с кешем 60s."""
+    now = time.time()
+    cached = _snippet_cache.get(knowledge_id)
+    if cached and now - cached[0] < _SNIPPET_TTL:
+        return cached[1]
+
+    store = getattr(app_state, "store", None)
+    snippet = ""
+    if store is not None and hasattr(store, "read"):
+        try:
+            entry = await store.read(knowledge_id)
+            if entry is not None:
+                snippet = _snippet_from_content(entry.content)
+        except Exception as exc:
+            logger.warning("Snippet read failed for %s: %s", knowledge_id, exc)
+
+    _snippet_cache[knowledge_id] = (now, snippet)
+    return snippet
+
+
+async def review_duplicate_pairs(params: dict, app_state) -> dict:
+    """Интерактивная ревью-очередь dup-пар (Фаза 2 dedup).
+
+    Читает open duplicate issues, ранжирует по R1–R6 (dup_ranking.py):
+    - green_batch: 🟢 пачка «Утвердить все» (exact hash ИЛИ cosine≥0.97+guards)
+    - yellow_pairs: 🟡 сомнительные — с контент-сниппетами для визуального diff
+    - red_skipped: 🔴 косвенные (только issues, не в ревью)
+
+    READ-ONLY: не мутирует данные (утверждение — через bulk_deprecate_duplicates).
+
+    Args:
+        params:
+            limit (optional): макс. число open dup-issues для анализа (default 200)
+
+    Returns:
+        {"green_batch": [...], "yellow_pairs": [...], "red_skipped": N, "total_open": M}
+    """
+    from mcp_server.quality.dup_ranking import (
+        extract_target_kid,
+        rank_pair,
+        recommend_canonical,
+        summarize_signals,
+    )
+
+    limit = min(params.get("limit", 200), 500)
+    issues = list_issues(types=["duplicate"], status="open", limit=limit)
+
+    green: list[dict] = []
+    yellow: list[dict] = []
+    red_skipped = 0
+
+    for iss in issues:
+        meta = getattr(iss, "metadata", None) or {}
+        detail = iss.detail or ""
+        flow = rank_pair(meta, detail)
+        target_kid = extract_target_kid(detail)
+        signals = summarize_signals(meta)
+        base = {
+            "issue_id": iss.issue_id,
+            "source_kid": iss.knowledge_id,
+            "target_kid": target_kid,
+            "cosine": signals["cosine"],
+            "signals": signals,
+        }
+        if flow == "green":
+            base["subject"] = meta.get("subject", "")
+            green.append(base)
+        elif flow == "yellow":
+            base["recommended_canonical"] = recommend_canonical(
+                meta, iss.knowledge_id, target_kid
+            )
+            yellow.append(base)
+        else:
+            red_skipped += 1
+
+    # Сниппеты только для 🟡 (diff-просмотр)
+    for pair in yellow:
+        pair["source_snippet"] = await _get_snippet(pair["source_kid"], app_state)
+        pair["target_snippet"] = await _get_snippet(pair["target_kid"], app_state)
+
+    logger.info(
+        "review_duplicate_pairs: %d green, %d yellow, %d red (of %d open)",
+        len(green), len(yellow), red_skipped, len(issues),
+    )
+    return {
+        "green_batch": green,
+        "yellow_pairs": yellow,
+        "red_skipped": red_skipped,
+        "total_open": len(issues),
     }

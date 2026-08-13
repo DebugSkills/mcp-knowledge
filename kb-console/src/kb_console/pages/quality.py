@@ -67,6 +67,11 @@ def build_quality() -> None:
         # чтобы после resolve/ignore счётчик и список обновлялись немедленно.
         _render_issues(latest.get("issues", {}), refresh)
 
+    # Фаза 2 dedup: ревью-очередь dup-пар (🟢 пачка / 🟡 сомнительные)
+    @ui.refreshable
+    def render_review_pairs() -> None:
+        _render_review_pairs(latest.get("review_pairs", {}), refresh)
+
     # 13.15: _refreshing флаг — ≤1 in-flight refresh
     _refreshing = False
 
@@ -85,8 +90,8 @@ def build_quality() -> None:
                 subject = filters.get("subject", "")
                 # R4: filter-dependent cache key
                 cache_key = f"quality:{domain}:{subject}" if (domain or subject) else "quality"
-                # Параллельная загрузка очереди книг и issues (Фаза 1)
-                data, issues = await asyncio.gather(
+                # Параллельная загрузка очереди книг, issues и dup-ревью (Фаза 2)
+                data, issues, review_pairs = await asyncio.gather(
                     cache.get(
                         cache_key,
                         lambda c=client, f=filters: c.review_queue_books(
@@ -101,13 +106,20 @@ def build_quality() -> None:
                         lambda c=client: c.list_quality_issues(status="open", limit=50),
                         ttl=30,
                     ),
+                    cache.get(
+                        "quality:review_pairs",
+                        lambda c=client: c.review_duplicate_pairs(limit=200),
+                        ttl=30,
+                    ),
                 )
                 latest["data"] = data
                 latest["issues"] = issues
+                latest["review_pairs"] = review_pairs
             finally:
                 await client.close()
             render_queue.refresh()
             render_issues.refresh()
+            render_review_pairs.refresh()
         except RuntimeError as exc:
             if "parent slot" in str(exc):
                 return
@@ -146,6 +158,9 @@ def build_quality() -> None:
 
     # Refreshable-блок найденных проблем (issues) — над очередью книг
     render_issues()
+
+    # Фаза 2 dedup: ревью-очередь dup-пар (🟢 пачка / 🟡 сомнительные)
+    render_review_pairs()
 
     # Refreshable-блок очереди
     render_queue()
@@ -277,6 +292,181 @@ def _render_queue(
     # Карточки книг
     for book in books:
         _render_book_card(book, expanded_cache, refresh_fn, section_pages)
+
+
+def _diff_highlight(snippet_a: str, snippet_b: str) -> str:
+    """Визуальный diff двух сниппетов через difflib.ndiff (Фаза 2 dedup).
+
+    Возвращает строки вида '+ добавлено', '- удалено', '  общее' —
+    рендер через ui.code с моноширинным шрифтом.
+    """
+    import difflib
+
+    lines_a = (snippet_a or "").splitlines()
+    lines_b = (snippet_b or "").splitlines()
+    diff = list(difflib.ndiff(lines_a, lines_b))
+    # Ограничиваем вывод (сниппеты до 30 строк — diff до ~60 строк)
+    return "\n".join(diff[:60])
+
+
+async def _approve_green_batch(green_batch: list[dict], refresh_fn) -> None:
+    """HITL: утвердить 🟢-пачку (Фаза 2) → bulk_deprecate_duplicates."""
+    issue_ids = [p["issue_id"] for p in green_batch]
+    if not issue_ids:
+        ui.notify("Нет пар для утверждения", type="warning")
+        return
+
+    async def _do() -> None:
+        try:
+            client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY, timeout=120.0)
+            try:
+                result = await client.bulk_deprecate_duplicates(
+                    issue_ids=issue_ids,
+                    reason="Green batch approved by operator (dedup review)",
+                )
+                if result.get("resolved"):
+                    ui.notify(
+                        f"Скрыто: {result.get('deprecated_count', 0)}, "
+                        f"закрыто issues: {result.get('issues_closed', 0)}",
+                        type="positive",
+                    )
+                    cache.invalidate("quality:issues")
+                    cache.invalidate("quality:review_pairs")
+                    await refresh_fn()
+                else:
+                    ui.notify(f"Ошибка: {result.get('error', 'неизвестно')}", type="negative")
+            finally:
+                await client.close()
+        except Exception as exc:
+            ui.notify(f"Ошибка: {exc}", type="negative")
+
+    with ui.dialog() as dialog, ui.card().classes("q-pa-md"):
+        ui.label("✅ Утвердить 🟢-пачку дублей").classes("text-h6")
+        ui.label(
+            f"{len(issue_ids)} пар с высокой уверенностью (exact content-hash "
+            f"или cosine ≥ 0.97 с guards). Записи-дубли будут скрыты из поиска "
+            f"(обратимо через ♻️ restore), все их dup-issues закрыты. "
+            f"Контент .md не удаляется."
+        ).classes("q-mb-md")
+        with ui.row().classes("gap-2"):
+            ui.button("Отмена", on_click=dialog.close).props("flat")
+
+            async def _confirm(dlg=dialog):
+                dlg.close()
+                await _do()
+
+            ui.button(
+                f"✅ Утвердить все ({len(issue_ids)})",
+                on_click=_confirm,
+            ).props("flat color=positive")
+    await dialog
+
+
+async def _resolve_yellow_pair(pair: dict, action: str, refresh_fn) -> None:
+    """Действие по 🟡-паре: 'deprecate' | 'not_dup' (Фаза 2).
+
+    - deprecate: скрыть source (bulk_deprecate_duplicates по issue_id)
+    - not_dup:   закрыть issue как «не дубль» (resolve, обратимо по статусу)
+    """
+    try:
+        client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY, timeout=60.0)
+        try:
+            if action == "deprecate":
+                result = await client.bulk_deprecate_duplicates(
+                    issue_ids=[pair["issue_id"]],
+                    reason="Yellow pair: source hidden by operator (dedup)",
+                )
+                ok = result.get("resolved")
+                msg = f"Скрыто: {result.get('deprecated_count', 0)} записей"
+            else:
+                result = await client.resolve_quality_issue(
+                    action="resolve",
+                    issue_id=pair["issue_id"],
+                    reason="not a duplicate by operator",
+                )
+                ok = result.get("resolved")
+                msg = "Issue закрыта (не дубль)"
+            if ok:
+                ui.notify(msg, type="positive" if action == "deprecate" else "info")
+                cache.invalidate("quality:issues")
+                cache.invalidate("quality:review_pairs")
+                await refresh_fn()
+            else:
+                ui.notify(f"Ошибка: {result.get('error', 'неизвестно')}", type="negative")
+        finally:
+            await client.close()
+    except Exception as exc:
+        ui.notify(f"Ошибка: {exc}", type="negative")
+
+
+def _render_review_pairs(data: dict, refresh_fn) -> None:
+    """Отрисовать ревью-очередь dup-пар: 🟢 пачка + 🟡 сомнительные (Фаза 2)."""
+    if not isinstance(data, dict) or not data:
+        return
+    green = data.get("green_batch", [])
+    yellow = data.get("yellow_pairs", [])
+    total_open = data.get("total_open", 0)
+
+    if not green and not yellow:
+        return
+
+    ui.label("Дубли: ревью-очередь").classes("text-h6 q-mb-sm q-mt-md")
+
+    # 🟢 Пачка «Утвердить все»
+    if green:
+        with ui.card().classes("w-full q-mb-sm q-pa-sm"), ui.row().classes(
+            "items-center gap-2 no-wrap"
+        ):
+            ui.badge("🟢 высокая уверенность").props("color=green")
+            ui.label(
+                f"{len(green)} пар — exact content-hash или cosine ≥ 0.97 "
+                f"(без антонимов, standalone)"
+            ).classes("text-body2")
+            ui.space()
+            ui.button(
+                f"✅ Утвердить все ({len(green)})",
+                on_click=lambda g=green: _approve_green_batch(g, refresh_fn),
+            ).props("flat dense color=positive")
+
+    # 🟡 Сомнительные — каждая пара с diff
+    for pair in yellow:
+        with ui.card().classes("w-full q-mb-xs q-pa-sm"):
+            with ui.row().classes("items-center gap-2 no-wrap"):
+                ui.badge("🟡 требует внимания").props("color=orange")
+                ui.label(pair.get("source_kid", "")).classes("text-subtitle2 ellipsis")
+                ui.label("≈").classes("text-grey")
+                ui.label(pair.get("target_kid", "")).classes("text-subtitle2 ellipsis")
+                if pair.get("cosine") is not None:
+                    ui.chip(f"cosine={pair['cosine']:.3f}").props("outline dense size=sm")
+                ui.label(f"канон: {pair.get('recommended_canonical', '?')}").classes(
+                    "text-caption text-grey"
+                )
+            # Визуальный diff (difflib.ndiff)
+            diff_text = _diff_highlight(
+                pair.get("source_snippet", ""), pair.get("target_snippet", "")
+            )
+            if diff_text:
+                ui.code(diff_text, language="diff").classes("w-full text-caption")
+            with ui.row().classes("gap-2 q-mt-sm"):
+                ui.button(
+                    "✅ Скрыть source",
+                    on_click=lambda p=pair: _resolve_yellow_pair(p, "deprecate", refresh_fn),
+                ).props("flat dense color=positive").tooltip(
+                    f"Скрыть {pair.get('source_kid', '')} (обратимо через restore)"
+                )
+                ui.button(
+                    "❌ Не дубль",
+                    on_click=lambda p=pair: _resolve_yellow_pair(p, "not_dup", refresh_fn),
+                ).props("flat dense color=negative").tooltip("Закрыть issue: записи различны")
+                ui.button(
+                    "⏭ Позже",
+                    on_click=lambda: ui.notify("Отложено — issue остаётся в очереди", type="info"),
+                ).props("flat dense color=grey")
+
+    if total_open and (green or yellow):
+        ui.label(f"Показаны: {len(green) + len(yellow)} из {total_open} open dup-issues").classes(
+            "text-caption text-grey q-mb-sm"
+        )
 
 
 def _render_issues(data: dict, refresh_fn) -> None:
@@ -700,9 +890,14 @@ async def _bulk_ignore_type(issue_type: str, refresh_fn) -> None:
         ).classes("q-mb-md")
         with ui.row().classes("gap-2"):
             ui.button("Отмена", on_click=dialog.close).props("flat")
+
+            async def _confirm_ignore(dlg=dialog):
+                dlg.close()
+                await _do_bulk()
+
             ui.button(
                 f"⊘ Игнорировать {total}",
-                on_click=lambda d=dialog: (_do_bulk(), d.close()),
+                on_click=_confirm_ignore,
             ).props("flat color=grey")
     await dialog
 
@@ -764,9 +959,14 @@ async def _deprecate_duplicate(issue_id: str, knowledge_id: str, detail: str, re
         ).classes("q-mb-md")
         with ui.row().classes("gap-2"):
             ui.button("Отмена", on_click=dialog.close).props("flat")
+
+            async def _confirm_single(dlg=dialog):
+                dlg.close()
+                await _do()
+
             ui.button(
                 "📦 Скрыть",
-                on_click=lambda d=dialog: (_do(), d.close()),
+                on_click=_confirm_single,
             ).props("flat color=warning")
     await dialog
 
@@ -810,9 +1010,14 @@ async def _bulk_deprecate_selected(refresh_fn) -> None:
         ).classes("q-mb-md")
         with ui.row().classes("gap-2"):
             ui.button("Отмена", on_click=dialog.close).props("flat")
+
+            async def _confirm_multi(dlg=dialog):
+                dlg.close()
+                await _do()
+
             ui.button(
                 f"📦 Скрыть {len(selected)}",
-                on_click=lambda d=dialog: (_do(), d.close()),
+                on_click=_confirm_multi,
             ).props("flat color=warning")
     await dialog
 

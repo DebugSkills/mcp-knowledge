@@ -24,6 +24,7 @@ from .quality import (
     cancel_quality_scan,
     list_quality_issues,
     resolve_quality_issue,
+    review_duplicate_pairs,
     review_queue,
     review_queue_books,
     run_quality_scan,
@@ -239,6 +240,20 @@ _BULK_DEPRECATE_DUPLICATES_SCHEMA: dict[str, Any] = {
 }
 
 
+# ── Фаза 2 dedup: review_duplicate_pairs schema ───────────────
+
+_REVIEW_DUPLICATE_PAIRS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "limit": {
+            "type": "integer",
+            "default": 200,
+            "description": "Макс. число open dup-issues для анализа (Фаза 2 dedup)",
+        },
+    },
+}
+
+
 # ── 13.18: cancel_quality_scan schema ───────────────────────
 
 _CANCEL_QUALITY_SCAN_SCHEMA: dict[str, Any] = {
@@ -437,6 +452,11 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _BULK_DEPRECATE_DUPLICATES_SCHEMA,
     },
     {
+        "name": "review_duplicate_pairs",
+        "description": "Ревью-очередь dup-пар (Фаза 2 dedup): ранжирование 🟢/🟡/🔴 по R1-R6 (exact hash, cosine+guards, антоним-guard). Read-only — утверждение через bulk_deprecate_duplicates.",
+        "inputSchema": _REVIEW_DUPLICATE_PAIRS_SCHEMA,
+    },
+    {
         "name": "run_quality_scan",
         "description": "Запустить периодический quality scan: обход всех .md → staleness_score → dup-pair detection → issues + review_queue. Для cron (4.8).",
         "inputSchema": _RUN_QUALITY_SCAN_SCHEMA,
@@ -514,6 +534,7 @@ TOOL_HANDLERS = {
     "resolve_quality_issue": resolve_quality_issue,
     "bulk_resolve_issues": bulk_resolve_issues,
     "bulk_deprecate_duplicates": bulk_deprecate_duplicates,
+    "review_duplicate_pairs": review_duplicate_pairs,
     "run_quality_scan": run_quality_scan,
     "cancel_quality_scan": cancel_quality_scan,
     "import_content": import_content,

@@ -589,6 +589,19 @@ class MCPClient:
             params["knowledge_id"] = knowledge_id
         return await self.tools_call("bulk_deprecate_duplicates", params)
 
+    async def review_duplicate_pairs(self, limit: int = 200) -> dict[str, Any]:
+        """Ревью-очередь dup-пар (Фаза 2 dedup): 🟢/🟡/🔴 ранжирование.
+
+        Read-only: возвращает green_batch (пачка «Утвердить все») и
+        yellow_pairs (сомнительные со сниппетами для diff-просмотра).
+
+        Returns:
+            {"green_batch": [...], "yellow_pairs": [...], "red_skipped": N, "total_open": M}
+        """
+        return await self.tools_call(
+            "review_duplicate_pairs", {"limit": limit}
+        )
+
     async def delete_entry(
         self, knowledge_id: str, cascade: bool = False
     ) -> dict[str, Any]:

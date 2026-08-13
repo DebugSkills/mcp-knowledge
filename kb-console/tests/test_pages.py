@@ -613,3 +613,67 @@ class TestDedupButtons:
         quality._set_selected("iss-1", False)
         assert quality._selected_issues == {"iss-2"}
         quality._selected_issues.clear()
+
+
+class TestReviewPairsPanel:
+    """Фаза 2 dedup: ревью-очередь 🟢/🟡 + diff."""
+
+    def _green_data(self):
+        return {
+            "green_batch": [{
+                "issue_id": "iss-g1", "source_kid": "kid-a", "target_kid": "kid-b",
+                "cosine": 0.99, "subject": "devops",
+                "signals": {"hash_match": True},
+            }],
+            "yellow_pairs": [],
+            "red_skipped": 0,
+            "total_open": 1,
+        }
+
+    def _yellow_data(self):
+        return {
+            "green_batch": [],
+            "yellow_pairs": [{
+                "issue_id": "iss-y1", "source_kid": "kid-x", "target_kid": "kid-y",
+                "cosine": 0.995, "recommended_canonical": "kid-y",
+                "source_snippet": "# A\nline1", "target_snippet": "# B\nline1",
+                "signals": {"slug_negation": True},
+            }],
+            "red_skipped": 0,
+            "total_open": 1,
+        }
+
+    def test_green_batch_renders_approve_button(self):
+        """🟢-пачка рендерит «Утвердить все (N)»."""
+        from kb_console.pages import quality
+        refresh_fn = MagicMock()
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_review_pairs(self._green_data(), refresh_fn)
+        texts = [" ".join(str(a) for a in c.args) for c in mock_ui.button.call_args_list]
+        assert any("Утвердить все (1)" in t for t in texts)
+
+    def test_yellow_pair_renders_actions(self):
+        """🟡-пара рендерит ✅ Скрыть source / ❌ Не дубль / ⏭ Позже."""
+        from kb_console.pages import quality
+        refresh_fn = MagicMock()
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_review_pairs(self._yellow_data(), refresh_fn)
+        texts = [" ".join(str(a) for a in c.args) for c in mock_ui.button.call_args_list]
+        joined = " | ".join(texts)
+        assert "Скрыть source" in joined
+        assert "Не дубль" in joined
+        assert "Позже" in joined
+
+    def test_diff_highlight_marks_changes(self):
+        """_diff_highlight помечает добавления/удаления префиксами +/-."""
+        from kb_console.pages import quality
+        out = quality._diff_highlight("# A\nline1", "# B\nline1")
+        assert "- # A" in out and "+ # B" in out
+
+    def test_empty_data_no_render(self):
+        """Пустые данные — ничего не рендерится (нет панели)."""
+        from kb_console.pages import quality
+        refresh_fn = MagicMock()
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_review_pairs({}, refresh_fn)
+        assert mock_ui.label.call_count == 0

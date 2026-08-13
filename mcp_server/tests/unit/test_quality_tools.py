@@ -26,6 +26,7 @@ from mcp_server.tools.quality import (
     cancel_quality_scan,
     list_quality_issues,
     resolve_quality_issue,
+    review_duplicate_pairs,
     review_queue,
     review_queue_books,
     run_quality_scan,
@@ -1245,3 +1246,57 @@ class TestAuditLog:
         write_audit("deprecate", "kid-2", "operator", "x")
         assert count_actions(action="deprecate") == 2
         assert count_actions(actor="auto") == 1
+
+
+# ═══════════════════════════════════════════════════════════════
+# Фаза 2 dedup: review_duplicate_pairs (R1-R6 ранжирование)
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestReviewDuplicatePairs:
+    """review_duplicate_pairs — 🟢/🟡/🔴 группировка (Фаза 2)."""
+
+    async def test_ranks_pairs(self, quality_tempdir, mock_app_state):
+        from mcp_server.quality.issues import create_issue
+
+        # 🟢: exact hash, standalone
+        create_issue("duplicate", "kid-src-1", "warn",
+                     "Possible duplicate of kid-tgt-1 (same subject=devops, cosine=0.95)",
+                     metadata={"cosine": 0.95, "content_hash": "abc", "content_length": 300,
+                               "target_content_hash": "abc", "target_content_length": 300,
+                               "slug_negation": False, "standalone": True,
+                               "target_standalone": True, "subject": "devops"})
+        # 🟡: антоним
+        create_issue("duplicate", "kid-src-2", "warn",
+                     "Possible duplicate of kid-tgt-2 (same subject=devops, cosine=0.995)",
+                     metadata={"cosine": 0.995, "content_hash": "x", "content_length": 300,
+                               "target_content_hash": "y", "target_content_length": 300,
+                               "slug_negation": True, "standalone": True,
+                               "target_standalone": True, "subject": "devops"})
+        # 🔴: низкий cosine
+        create_issue("duplicate", "kid-src-3", "warn",
+                     "Possible duplicate of kid-tgt-3 (same subject=devops, cosine=0.80)",
+                     metadata={"cosine": 0.80, "content_hash": "a", "content_length": 100,
+                               "target_content_hash": "b", "target_content_length": 100,
+                               "slug_negation": False, "standalone": True,
+                               "target_standalone": True, "subject": "devops"})
+
+        result = await review_duplicate_pairs({"limit": 50}, mock_app_state)
+
+        assert result["total_open"] == 3
+        assert len(result["green_batch"]) == 1
+        assert result["green_batch"][0]["source_kid"] == "kid-src-1"
+        assert result["green_batch"][0]["target_kid"] == "kid-tgt-1"
+        assert len(result["yellow_pairs"]) == 1
+        assert result["yellow_pairs"][0]["source_kid"] == "kid-src-2"
+        # 🟡 содержит сниппеты (SSOT отсутствует → пустые, но ключи есть)
+        assert "source_snippet" in result["yellow_pairs"][0]
+        assert "target_snippet" in result["yellow_pairs"][0]
+        assert "recommended_canonical" in result["yellow_pairs"][0]
+        assert result["red_skipped"] == 1
+
+    async def test_empty_store(self, quality_tempdir, mock_app_state):
+        result = await review_duplicate_pairs({"limit": 50}, mock_app_state)
+        assert result["total_open"] == 0
+        assert result["green_batch"] == []
+        assert result["yellow_pairs"] == []
