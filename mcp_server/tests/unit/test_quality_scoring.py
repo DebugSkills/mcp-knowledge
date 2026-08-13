@@ -91,8 +91,8 @@ class TestEvergreen:
         )
         assert score == 0.47
 
-    def test_evergreen_not_immune_to_dup(self):
-        """Evergreen + дубликат → score выше чем без дубля."""
+    def test_evergreen_dup_does_not_change_score(self):
+        """Evergreen: дубль НЕ меняет score (дубли → issues-канал)."""
         base = staleness_score(
             _input(updated_at=_now() - timedelta(days=100), evergreen=True),
             now=_now(),
@@ -105,31 +105,31 @@ class TestEvergreen:
             ),
             now=_now(),
         )
-        assert with_dup > base
+        assert with_dup == base
 
 
 class TestDuplication:
-    """Фактор дублирования."""
+    """Фактор дублирования (2d-lite: дубли НЕ влияют на score)."""
 
-    def test_one_dup_half_factor(self):
-        """1 дубль → dup_factor=0.5 → +0.11 к score."""
+    def test_one_dup_no_effect(self):
+        """1 дубль → score == 0.0 (дубли → issues-канал)."""
         score = staleness_score(
             _input(updated_at=_now(), dup_count=1), now=_now()
         )
-        assert score == 0.11  # 0.22 * 0.5
+        assert score == 0.0
 
-    def test_two_dups_full_factor(self):
-        """≥2 дублей → dup_factor=1.0 → +0.22."""
+    def test_two_dups_no_effect(self):
+        """≥2 дублей → score == 0.0."""
         score = staleness_score(
             _input(updated_at=_now(), dup_count=2), now=_now()
         )
-        assert score == 0.22  # 0.22 * 1.0
+        assert score == 0.0
 
-    def test_three_dups_same_as_two(self):
-        """3 дубля = 2 дубля (capped at 1.0)."""
+    def test_three_dups_no_effect(self):
+        """3 дубля → score == 0.0 (как и 2 дубля)."""
         s2 = staleness_score(_input(updated_at=_now(), dup_count=2), now=_now())
         s3 = staleness_score(_input(updated_at=_now(), dup_count=3), now=_now())
-        assert s2 == s3 == 0.22
+        assert s2 == s3 == 0.0
 
 
 class TestIncompleteFields:
@@ -207,7 +207,7 @@ class TestWorstCase:
     """Максимальный score — всё плохо."""
 
     def test_maximum_score(self):
-        """Всё плохо → score = 1.0."""
+        """Всё плохо (кроме дублей) → score = 0.78."""
         score = staleness_score(
             _input(
                 updated_at=_now() - timedelta(days=400),  # age capped
@@ -219,8 +219,8 @@ class TestWorstCase:
             ),
             now=_now(),
         )
-        # 0.47 + 0.22 + 0.16 + 0.10 + 0.05 = 1.00
-        assert score == 1.0
+        # 0.47 + 0.16 + 0.10 + 0.05 = 0.78
+        assert score == 0.78
 
 
 class TestRounding:
@@ -266,31 +266,31 @@ class TestReviewThreshold:
 
 
 class TestDupCountIntegration:
-    """R2: staleness_score с разными dup_count — проверка формулы."""
+    """2d-lite: dup_count НЕ влияет на staleness_score (дубли → issues-канал)."""
 
     def test_zero_dups_no_contribution(self):
-        """dup_count=0 → dup_component=0.0."""
+        """dup_count=0 → score = 0.0."""
         score = staleness_score(_input(dup_count=0), now=_now())
         # Свежая запись без дублей → 0.0
         assert score == 0.0
 
-    def test_one_dup_adds_half_weight(self):
-        """1 дубль → dup_factor=0.5 → вклад = 0.22 * 0.5 = 0.11."""
+    def test_one_dup_no_contribution(self):
+        """1 дубль → score = 0.0 (dup не влияет)."""
         score = staleness_score(_input(dup_count=1), now=_now())
-        assert score == pytest.approx(0.11, rel=0.01)
+        assert score == 0.0
 
-    def test_two_dups_full_weight(self):
-        """2 дубля → dup_factor=1.0 → вклад = 0.22."""
+    def test_two_dups_no_contribution(self):
+        """2 дубля → score = 0.0 (dup не влияет)."""
         score = staleness_score(_input(dup_count=2), now=_now())
-        assert score == pytest.approx(0.22, rel=0.01)
+        assert score == 0.0
 
-    def test_many_dups_capped_at_one(self):
-        """10 дублей → dup_factor=1.0 → вклад = 0.22 (cap)."""
+    def test_many_dups_no_contribution(self):
+        """10 дублей → score = 0.0 (dup не влияет)."""
         score = staleness_score(_input(dup_count=10), now=_now())
-        assert score == pytest.approx(0.22, rel=0.01)
+        assert score == 0.0
 
     def test_dup_with_age_combined(self):
-        """Дубли + возраст: 2 дубля (0.22) + 365 дней (0.47) = 0.69."""
+        """Дубли НЕ добавляются к возрасту: 365 дней → 0.47."""
         score = staleness_score(
             _input(
                 dup_count=2,
@@ -298,20 +298,20 @@ class TestDupCountIntegration:
             ),
             now=_now(),
         )
-        assert score == pytest.approx(0.69, rel=0.01)
+        assert score == pytest.approx(0.47, rel=0.01)
 
     def test_dup_with_incomplete_and_editwar(self):
-        """Все факторы: дубли + неполнота + edit_war."""
+        """Неполнота + edit_war (без dup-вклада): 0.1067 + 0.10 = 0.2067."""
         score = staleness_score(
             _input(
-                dup_count=2,           # 0.22
+                dup_count=2,           # НЕ влияет (issues-канал)
                 recommended_missing=2,  # 0.16 * 2/3 = 0.1067
                 edit_war=True,         # 0.10
             ),
             now=_now(),
         )
-        # 0.22 + 0.1067 + 0.10 = 0.4267
-        assert score == pytest.approx(0.4267, rel=0.01)
+        # 0.1067 + 0.10 = 0.2067
+        assert score == pytest.approx(0.2067, rel=0.01)
 
 
 # pytest import for approx

@@ -1,12 +1,15 @@
 """Staleness scoring — чистая функция оценки качества записи (4.5).
 
-Формула (план §6.1, v1.2):
+Формула (план §6.1, v1.2 → 2d-lite: дубли выведены из формулы):
   staleness_score = clip01(
       0.47 * age_norm          # свежесть (evergreen-сниженный вклад)
-    + 0.22 * dup_factor        # дублирование
     + 0.16 * incomplete_factor # неполнота recommended-полей
     + 0.10 * edit_war_factor   # edit-war flag
     + 0.05 * link_health_factor # broken source-URL
+
+Дублирование НЕ входит в staleness_score: дубли учитываются в issues-канале
+(duplicate issues, cosine ≥ 0.92 в scanner.py). «Устарело» = возраст +
+неполнота + edit_war + links, а не «есть дубль».
 
 Результат округляется до 4 знаков для стабильной сортировки review_queue.
 
@@ -19,9 +22,11 @@ from datetime import datetime, timezone
 
 # ── Конфигурируемые константы ────────────────────────────────
 
-# Веса формулы (сумма = 1.0)
+# Веса формулы (без дублей сумма = 0.78)
 W_AGE: float = 0.47
-W_DUP: float = 0.22
+# Дубли учитываются в issues-канале (duplicate issues, cosine≥0.92 в scanner.py).
+# dup_count сохранён в StalenessInput для совместимости сигнатуры, но НЕ влияет на score.
+W_DUP: float = 0.0
 W_INCOMPLETE: float = 0.16
 W_EDIT_WAR: float = 0.10
 W_LINK_HEALTH: float = 0.05
@@ -97,7 +102,11 @@ def _age_norm(updated_at: datetime, evergreen: bool, now: datetime | None = None
 
 
 def _dup_factor(dup_count: int) -> float:
-    """Фактор дублирования: 0 → 0.5 (1 дубль) → 1.0 (≥2 дублей)."""
+    """Фактор дублирования: 0 → 0.5 (1 дубль) → 1.0 (≥2 дублей).
+
+    2d-lite: НЕ используется в staleness_score() — дубли учитываются в
+    issues-канале. Сохранён для обратной совместимости сигнатуры.
+    """
     if dup_count <= 0:
         return 0.0
     if dup_count == 1:
@@ -136,11 +145,10 @@ def staleness_score(
         now: «текущее время» для тестирования (по умолчанию datetime.now(UTC)).
 
     Returns:
-        float [0, 1], округлённый до 4 знаков.
-        0 = идеально свежая, 1 = требует немедленной ревизии.
+        float [0, 0.78], округлённый до 4 знаков.
+        0 = идеально свежая; чем выше — тем критичнее (максимум 0.78).
     """
     age_component = W_AGE * _age_norm(inp.updated_at, inp.evergreen, now)
-    dup_component = W_DUP * _dup_factor(inp.dup_count)
     incomplete_component = W_INCOMPLETE * _incomplete_factor(
         inp.recommended_missing, inp.recommended_total
     )
@@ -151,7 +159,6 @@ def staleness_score(
 
     raw = (
         age_component
-        + dup_component
         + incomplete_component
         + edit_war_component
         + link_component
