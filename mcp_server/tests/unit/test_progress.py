@@ -281,3 +281,89 @@ class TestImportProgressTracker:
             t.prune_finished()
         except Exception:  # noqa: BLE001
             pytest.fail("prune_finished should never raise")
+
+    # ── 13.27: Дисковая персистентность ─────────────────────
+
+    def test_persist_roundtrip_survives_new_tracker(self, tmp_path):
+        """Снапшот записывается на диск; новый трекер восстанавливает done-состояние."""
+        path = tmp_path / "scan_state.json"
+        t1 = ImportProgressTracker(persist_path=path)
+        t1.start("scan-x", total=10)
+        t1.section_done("scan-x", sequence=1, title="S1")
+        t1.done("scan-x", summary={"metrics": {"files_scanned": 5}})
+
+        # Новый "процесс" (рестарт сервера) — другой инстанс, тот же файл
+        t2 = ImportProgressTracker(persist_path=path)
+        loaded = t2.load()
+        assert "scan-x" in loaded
+        entry = t2.get("scan-x")
+        assert entry is not None
+        assert entry["status"] == "done"
+        assert entry["imported"] == 1
+        assert entry["summary"]["metrics"]["files_scanned"] == 5
+
+    def test_persist_running_entry_survives(self, tmp_path):
+        """running-запись (прерванный скан) восстанавливается после рестарта."""
+        path = tmp_path / "scan_state.json"
+        t1 = ImportProgressTracker(persist_path=path)
+        t1.start("scan-y", total=10)
+        t1.set_phase("scan-y", "scoring", "Вычисление scores...")
+
+        t2 = ImportProgressTracker(persist_path=path)
+        loaded = t2.load()
+        entry = loaded.get("scan-y")
+        assert entry is not None
+        assert entry["status"] == "running"
+        assert entry["phase"] == "scoring"
+
+    def test_persist_throttle_skips_frequent_updates(self, tmp_path):
+        """Промежуточные апдейты внутри persist_every не переписывают файл."""
+        path = tmp_path / "scan_state.json"
+        t = ImportProgressTracker(persist_path=path, persist_every=60.0)
+        t.start("scan-z", total=10)
+        # start записал файл; section_done в пределах throttle — файл не трогаем
+        with open(path, encoding="utf-8") as f:
+            before = f.read()
+        t.section_done("scan-z", sequence=1, title="S1")
+        with open(path, encoding="utf-8") as f:
+            after = f.read()
+        assert after == before  # throttle сработал — файл не изменился
+
+        # force-запись терминального состояния — сразу
+        t.done("scan-z", summary={})
+        with open(path, encoding="utf-8") as f:
+            final = f.read()
+        assert '"status": "done"' in final
+
+    def test_persist_start_after_prune_force_write_not_throttled(self, tmp_path):
+        """S25-баг (13.27): start() сразу после prune_finished (force-запись)
+        НЕ должен быть пропущен throttle — иначе новый скан не попадает
+        на диск и не переживает рестарт."""
+        path = tmp_path / "scan_state.json"
+        t = ImportProgressTracker(persist_path=path, persist_every=60.0)
+        t.start("scan-old", total=5)
+        t.done("scan-old", summary={})  # завершённая запись
+        assert t.prune_finished() == 1  # force-запись, ставит _last_persist=now
+
+        t.start("scan-new", total=0)  # сразу после force-записи (throttle-окно)
+        on_disk = ImportProgressTracker(persist_path=path).load()
+        assert "scan-new" in on_disk, f"new scan lost after prune force-write: {on_disk}"
+        assert on_disk["scan-new"]["status"] == "running"
+
+    def test_persist_disabled_without_path(self, tmp_path):
+        """Без persist_path никаких файлов не создаётся (обратная совместимость)."""
+        t = ImportProgressTracker()
+        t.start("scan-w", total=1)
+        t.done("scan-w", summary={})
+        assert t.load() == {}
+
+    def test_persist_never_raises_on_bad_data(self, tmp_path):
+        """persist/load — best-effort: битый файл не роняет трекер."""
+        path = tmp_path / "scan_state.json"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{not valid json")
+        t = ImportProgressTracker(persist_path=path)
+        assert t.load() == {}
+        # И запись тоже не падает
+        t.start("scan-v", total=1)
+        t.done("scan-v", summary={})

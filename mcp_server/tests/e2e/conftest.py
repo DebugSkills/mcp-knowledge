@@ -371,7 +371,11 @@ async def e2e_http_app(real_qdrant, real_embedder, e2e_store, e2e_pipeline,
 
     app.state.scan_lock = asyncio.Lock()
     app.state.scan_task = None
-    app.state.scan_progress = ImportProgressTracker()
+    # 13.27: персистентность как в main.py — scan_state.json в tmp рядом с
+    # KNOWLEDGE_DIR; recovery-логика (auto-resume) тестируется в S25.
+    app.state.scan_progress = ImportProgressTracker(
+        persist_path=Path(tmp_git_knowledge_root).parent / "scan_state.json",
+    )
     app.state.scan_id = None
 
     @app.get("/quality/scan/progress")

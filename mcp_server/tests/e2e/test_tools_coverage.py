@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -1238,6 +1239,18 @@ async def test_s23_quality_lifecycle_via_http(e2e_http_app):
         await asyncio.sleep(0.5)
     assert scan_done, f"Scan did not finish in 60s. Last progress: {progress}"
 
+    # Step 3b (13.27): персистентность — scan_state.json записан на диск,
+    # новый инстанс трекера (имитация рестарта) восстанавливает done-состояние.
+    from mcp_server.progress import ImportProgressTracker
+
+    state_path = Path(e2e_http_app.app.state.settings.KNOWLEDGE_DIR).parent / "scan_state.json"
+    assert state_path.exists(), f"scan_state.json not persisted at {state_path}"
+    recovered = ImportProgressTracker(persist_path=state_path).load()
+    assert scan_id in recovered, f"scan {scan_id} not in persisted scan_state.json"
+    assert recovered[scan_id]["status"] == "done", (
+        f"persisted status expected done, got: {recovered[scan_id].get('status')}"
+    )
+
     # Step 4: list_quality_issues → find issues
     await asyncio.sleep(1.0)  # даём issues записаться
     list_payload = {
@@ -1413,3 +1426,111 @@ async def test_s24_cancel_quality_scan_via_http(e2e_http_app):
             if progress.get("status") in ("done", "error", "not_found"):
                 break
             await asyncio.sleep(0.5)
+
+
+# ═══════════════════════════════════════════════════════════════
+# S25 (13.27): персистентность состояния скана + recovery после рестарта
+# ═══════════════════════════════════════════════════════════════
+
+
+@pytest.mark.e2e
+async def test_s25_scan_state_survives_restart_via_http(e2e_http_app):
+    """S25 (13.27): состояние скана переживает «рестарт» сервера.
+
+    Имитация рестарта (main.py recovery-блок):
+    1. Скан1 (замедленный) стартует → scan_state.json содержит running.
+    2. «Рестарт»: новый ImportProgressTracker с тем же persist_path + новый
+       lock (старый task/lock остаются в прошлом «процессе»), load().
+    3. Running-запись помечается прерванной (error) — как в main.py.
+    4. run_quality_scan → prune_finished убирает прерванную запись,
+       стартует Скан2 с НОВЫМ scan_id.
+    5. /quality/scan/progress отдаёт новый скан; файл содержит новый running.
+
+    Старый фоновый task продолжает жить (замедленный скан) и может
+    дописать свою запись в файл ПОСЛЕ наших проверок — это ожидаемо
+    (в реальном рестарте процесс мёртв и дописывать некому).
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    from mcp_server.progress import ImportProgressTracker
+
+    headers_write = {"X-API-Key": "e2e-write-key"}
+    state_path = Path(e2e_http_app.app.state.settings.KNOWLEDGE_DIR).parent / "scan_state.json"
+
+    async def slow_scan(**kwargs):
+        """Замедленный скан: держим lock и статус running достаточно долго."""
+        await asyncio.sleep(0.6)
+        return {
+            "files_scanned": 0,
+            "review_queue_size": 0,
+            "duplicates_detected": 0,
+            "issues_created": 0,
+        }
+
+    # Step 1: Скан1 (замедленный) → running в персистентном файле
+    with patch("mcp_server.quality.scanner.run_scan", new=AsyncMock(side_effect=slow_scan)):
+        resp = await e2e_http_app.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": {"name": "run_quality_scan", "arguments": {}},
+            },
+            headers=headers_write,
+        )
+        assert resp.status_code == 200
+        scan1 = json.loads(resp.json()["result"]["content"][0]["text"])
+        assert scan1["status"] == "started", f"scan1 failed: {scan1}"
+        scan1_id = scan1["scan_id"]
+
+        await asyncio.sleep(0.2)
+        assert state_path.exists(), "scan_state.json not written during running scan"
+        on_disk = ImportProgressTracker(persist_path=state_path).load()
+        assert scan1_id in on_disk and on_disk[scan1_id]["status"] == "running", (
+            f"expected running entry for {scan1_id} on disk, got: {on_disk}"
+        )
+
+        # Step 2: «рестарт» — новый трекер с тем же файлом + новый lock
+        app = e2e_http_app.app
+        app.state.scan_progress = ImportProgressTracker(persist_path=state_path)
+        app.state.scan_lock = asyncio.Lock()  # старый lock «умер» вместе с процессом
+        app.state.scan_id = None
+        recovered = app.state.scan_progress.load()
+        assert scan1_id in recovered, "recovery: running entry not loaded from disk"
+        assert recovered[scan1_id]["status"] == "running"
+
+        # Step 3: прерванная запись → error (как в main.py recovery-блоке)
+        app.state.scan_progress.error(scan1_id, "scan interrupted by server restart (auto-resume)")
+
+        # Step 4: новый скан — prune_finished + новый scan_id
+        resp = await e2e_http_app.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0", "id": 2,
+                "method": "tools/call",
+                "params": {"name": "run_quality_scan", "arguments": {}},
+            },
+            headers=headers_write,
+        )
+        assert resp.status_code == 200
+        scan2 = json.loads(resp.json()["result"]["content"][0]["text"])
+        assert scan2["status"] == "started", f"scan2 failed: {scan2}"
+        scan2_id = scan2["scan_id"]
+        assert scan2_id != scan1_id, "auto-resume must start a NEW scan_id"
+
+        # Step 5: /progress → новый скан; файл содержит новый running
+        p = await e2e_http_app.get("/quality/scan/progress")
+        progress = p.json()
+        assert progress.get("import_id") == scan2_id, (
+            f"/quality/scan/progress should return new scan, got: {progress}"
+        )
+        assert progress["status"] in ("running", "done", "error")
+
+        on_disk2 = ImportProgressTracker(persist_path=state_path).load()
+        assert scan2_id in on_disk2, "new scan not persisted after auto-resume"
+        assert on_disk2[scan2_id]["status"] in ("running", "done", "error")
+        # Прерванная запись удалена prune-ом при старте нового скана
+        assert scan1_id not in on_disk2, (
+            f"interrupted scan {scan1_id} should be pruned, still on disk: {on_disk2}"
+        )

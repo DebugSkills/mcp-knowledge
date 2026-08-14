@@ -41,6 +41,7 @@ def build_scan_progress(
     client: MCPClient,
     *,
     on_done: Callable[[], Awaitable[None]] | None = None,
+    on_update: Callable[[dict[str, Any] | None], None] | None = None,
     poll_interval: float = SCAN_POLL_INTERVAL,
 ) -> ui.column:
     """Создать панель прогресса quality scan с авто-поллингом.
@@ -58,7 +59,12 @@ def build_scan_progress(
     Args:
         client: MCPClient для опроса GET /quality/scan/progress.
         on_done: Колбэк при завершении скана (done/error). Вызывается
-                 однократно. None = без действия.
+                 однократно на скан, КОТОРЫЙ ЗАВЕРШИЛСЯ при открытой странице
+                 (сканы, уже завершённые до загрузки страницы, не триггерят).
+                 None = без действия.
+        on_update: Колбэк на КАЖДЫЙ полл со снапшотом (или None, если
+                   активного скана нет). Удобно для синхронизации UI-состояния
+                   (например, блокировки кнопки «Запустить скан»).
         poll_interval: Интервал опроса в секундах (default 1.0).
 
     Returns:
@@ -68,7 +74,10 @@ def build_scan_progress(
     container.visible = False
 
     _poll_timer: ui.timer | None = None
-    _last_scan_id: str | None = None
+    # 13.27: id скана, на который on_done УЖЕ отработал (гарантия однократности).
+    # Инициализируется при первом полле: если скан уже завершён до загрузки
+    # страницы — считаем его "отработанным", чтобы не дёргать on_done повторно.
+    _last_done_id: str | None = None
 
     def _stop_poll() -> None:
         nonlocal _poll_timer
@@ -77,16 +86,21 @@ def build_scan_progress(
             _poll_timer = None
 
     async def _poll() -> None:
-        nonlocal _last_scan_id, _poll_timer
+        nonlocal _last_done_id, _poll_timer
 
         snapshot = await client.get_scan_progress()
+
+        # 13.27: синхронизация внешнего UI-состояния на каждый полл
+        if on_update is not None:
+            on_update(snapshot)
+
         if snapshot is None:
             # Нет активного скана (not_found / 404 / endpoint absent).
             # Скрываем панель, НО не останавливаем poll — скан может
             # начаться позже (например, с вкладки «Качество»), и панель
             # должна появиться автоматически (13.16 UX).
             container.visible = False
-            _last_scan_id = None  # сброс — следующий скан снова вызовет on_done
+            _last_done_id = None  # сброс — следующий скан снова вызовет on_done
             # Адаптивный интервал: idle → 5с
             if _poll_timer is not None and _poll_timer.interval != SCAN_IDLE_POLL_INTERVAL:
                 _poll_timer.interval = SCAN_IDLE_POLL_INTERVAL
@@ -95,6 +109,13 @@ def build_scan_progress(
         container.visible = True
         container.clear()
 
+        # 13.27: первый полл видит терминальный статус = скан завершился ДО
+        # загрузки страницы. Помечаем on_done отработанным — повторных
+        # срабатываний для уже завершённых сканов не будет.
+        scan_id: str = snapshot.get("scan_id") or snapshot.get("import_id") or ""
+        if _last_done_id is None and snapshot.get("status") in ("done", "error"):
+            _last_done_id = scan_id
+
         with container:
             status: str = snapshot.get("status", "running")
             phase: str = snapshot.get("phase", "?")
@@ -102,7 +123,6 @@ def build_scan_progress(
             total_val: int = snapshot.get("total", 0)
             percent: float = (done_val / total_val * 100) if total_val else 0
             is_done: bool = status in ("done", "error")
-            scan_id: str = snapshot.get("scan_id", "")
 
             # Заголовок: фаза + счётчик + процент
             ui.label(
@@ -155,10 +175,13 @@ def build_scan_progress(
                         ).classes("text-caption")
 
                 # НЕ останавливаем poll — панель должна быть живой для
-                # отображения новых сканов. on_done вызываем однократно
-                # на НОВЫЙ завершённый скан (по scan_id).
-                if on_done is not None and scan_id != _last_scan_id:
-                    _last_scan_id = scan_id
+                # отображения новых сканов. on_done вызываем ОДИН раз на
+                # скан (по _last_done_id): только для сканов, завершившихся
+                # при открытой странице. Скан, уже завершённый до загрузки
+                # страницы (первый полл видит done/error), помечается
+                # отработанным — повторного on_done не будет (13.27).
+                if on_done is not None and scan_id != _last_done_id:
+                    _last_done_id = scan_id
                     await on_done()
 
             # Адаптивный интервал: running → 1с, done/idle → 5с

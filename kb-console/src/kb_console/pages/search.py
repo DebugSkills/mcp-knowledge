@@ -5,15 +5,15 @@ Variant A (13.10 → 13.13): информативные результаты —
 «Открыть фрагмент» (диалог с секцией, не TOC).
 Кэш названий книг: один list_collections на первую выдачу (без N+1).
 
-Фаза 13.16: блок прогресса quality scan в начале страницы (общий компонент
-progress_panel.py), авто-скрытие при отсутствии активного скана.
+13.27: блок прогресса quality scan УБРАН со страницы — прогресс показывается
+только на «Качестве» (страница управления сканом); дублирующая панель на
+«Поиске» сбивала с толку (ранее 13.16 показывала скан на всех страницах).
 """
 
 from __future__ import annotations
 
 from nicegui import ui
 
-from ..components.progress_panel import build_scan_progress
 from ..config import MCP_API_KEY, MCP_SERVER_URL
 from ..core.data_cache import cache
 from ..core.mcp_client import MCPClient
@@ -40,15 +40,6 @@ def build_search() -> None:
     """Построить страницу «Поиск»."""
 
     ui.label("Поиск по базе знаний").classes("text-h4 q-mb-md")
-
-    # 13.16: Блок прогресса quality scan (общий компонент, авто-скрытие)
-    _scan_client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
-    build_scan_progress(client=_scan_client)
-
-    def _cleanup_scan_client() -> None:
-        import asyncio
-        asyncio.create_task(_scan_client.close())
-    ui.context.client.on_disconnect(_cleanup_scan_client)
 
     with ui.row().classes("gap-4"):
         query_input = ui.input(

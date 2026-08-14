@@ -182,6 +182,40 @@ def test_components_init_exports():
     assert callable(build_scan_progress)
 
 
+def test_scan_progress_panel_only_on_quality_page():
+    """13.27: панель прогресса скана — ТОЛЬКО на «Качестве» (управление сканом).
+
+    Раньше (13.16) панель жила и на «Поиске» — убрана как избыточная.
+    """
+    import inspect
+
+    from kb_console.pages import quality, search
+
+    search_src = inspect.getsource(search)
+    quality_src = inspect.getsource(quality)
+
+    assert "build_scan_progress" not in search_src, (
+        "search.py не должен строить панель прогресса скана (13.27)"
+    )
+    assert "build_scan_progress" in quality_src, (
+        "quality.py обязан строить панель прогресса скана при загрузке страницы"
+    )
+
+
+def test_scan_progress_panel_supports_on_update_callback():
+    """13.27: build_scan_progress принимает on_update (блокировка кнопки скана)."""
+    import inspect
+
+    from kb_console.components import progress_panel
+
+    src = inspect.getsource(progress_panel.build_scan_progress)
+    assert "on_update" in src, "build_scan_progress должен принимать on_update"
+    # fallback: сервер отдаёт import_id, панель читает scan_id или import_id
+    assert 'snapshot.get("scan_id") or snapshot.get("import_id")' in src, (
+        "панель должна читать scan_id с fallback на import_id"
+    )
+
+
 # ── _find_section_child (чистая функция, unit-тестируема) ──
 
 

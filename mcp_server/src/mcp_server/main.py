@@ -21,6 +21,7 @@
 import asyncio
 import faulthandler
 import logging
+from pathlib import Path
 
 # ── Усиленное логирование (инцидент 2026-08-06) ─────────────
 # Сервер стартует через uvicorn БЕЗ basicConfig → INFO от mcp_knowledge
@@ -274,10 +275,56 @@ async def lifespan(app: FastAPI):
     # legacy alias (используется в quality.py, tools/__init__.py)
     app.state.scan_lock = app.state.heavy_ops_lock
     app.state.scan_task = None
-    app.state.scan_progress = ImportProgressTracker(max_messages=200)
+    # 13.27: scan_progress пишется на диск (QUALITY_DIR/scan_state.json) —
+    # состояние скана переживает рестарт сервера (recovery ниже).
+    app.state.scan_progress = ImportProgressTracker(
+        max_messages=200,
+        persist_path=Path(settings.QUALITY_DIR) / "scan_state.json",
+        persist_every=2.0,
+    )
     app.state.scan_id: str | None = None
     app.state.scan_cancel_event = None  # 13.18: asyncio.Event для отмены скана
-    logger.info("🔒 Heavy-ops lock + scan state initialized (phase 13.15+13.18+13.21)")
+    logger.info("🔒 Heavy-ops lock + scan state initialized (phase 13.15+13.18+13.21+13.27)")
+
+    # ── 13.27: Recovery персистентного состояния скана после рестарта ──
+    # Завершённый скан → показываем финальные метрики в UI (scan_id сохраняем).
+    # Прерванный (status=running при старте = сервер упал/рестартнулся в
+    # середине скана) → помечаем как прерванный и АВТО-перезапускаем, чтобы
+    # качество не простаивало. Авто-рестарт идемпотентен: скан перечитывает
+    # все .md и пересчитывает scores/issues.
+    try:
+        persisted = app.state.scan_progress.load()
+        interrupted: list[str] = []
+        for sid, entry in persisted.items():
+            status = entry.get("status")
+            if status == "running":
+                interrupted.append(sid)
+            elif status in ("done", "error") and app.state.scan_id is None:
+                app.state.scan_id = sid  # UI покажет финальные метрики прошлого скана
+
+        async def _resume_interrupted() -> None:
+            # Пауза: даём lifespan доинициализироваться; скан стартует фоном.
+            await asyncio.sleep(1.0)
+            from .tools.quality import run_quality_scan
+
+            result = await run_quality_scan({}, app.state)
+            logger.info(
+                "🔄 Auto-resumed scan after restart: %s",
+                result.get("status", result),
+            )
+
+        if interrupted:
+            for sid in interrupted:
+                app.state.scan_progress.error(
+                    sid, "scan interrupted by server restart (auto-resume)"
+                )
+                logger.warning(
+                    "🔄 Scan %s was interrupted by restart → marked, will auto-resume",
+                    sid,
+                )
+            app.state.scan_resume_task = asyncio.create_task(_resume_interrupted())
+    except Exception as exc:
+        logger.warning("Scan state recovery failed (non-fatal): %s", exc)
 
     # 13.21: Import queue state — фоновая задача + cancel + очередь (паттерн scan)
     app.state.import_task = None
@@ -295,8 +342,6 @@ async def lifespan(app: FastAPI):
     # Логи quality-скана (scanner + tools.quality) дублируются в файл,
     # проброшенный на хост через docker volume — для изучения после скана.
     try:
-        from pathlib import Path
-
         scan_log_dir = Path(settings.QUALITY_SCAN_LOG_DIR)
         scan_log_dir.mkdir(parents=True, exist_ok=True)
         scan_log_path = scan_log_dir / f"quality-scan-{datetime.now(timezone.utc).astimezone().strftime('%Y%m%d')}.log"
@@ -366,6 +411,17 @@ async def lifespan(app: FastAPI):
             logger.warning("[START] scan scheduler did not finish in 3s (forced)")
         finally:
             app.state.scan_scheduler_task = None
+
+    # 13.27: Cancel auto-resume task (graceful shutdown до его старта)
+    resume_task = getattr(app.state, "scan_resume_task", None)
+    if resume_task is not None and not resume_task.done():
+        resume_task.cancel()
+        try:
+            await asyncio.wait_for(resume_task, timeout=3.0)
+        except (asyncio.CancelledError, TimeoutError):
+            logger.warning("[START] scan resume task did not finish in 3s (forced)")
+        finally:
+            app.state.scan_resume_task = None
 
     # 13.15: Cancel background scan task if running (graceful shutdown)
     if app.state.scan_task is not None and not app.state.scan_task.done():

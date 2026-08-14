@@ -134,7 +134,7 @@ def build_quality() -> None:
     # Top bar: скан + фильтры
     with ui.row().classes("gap-4 items-center q-mb-md"):
         scan_btn = ui.button("🔄 Запустить скан", on_click=lambda: _run_scan(
-            refresh, scan_state, scan_progress_container, scan_btn,
+            scan_state, scan_btn,
         )).props("flat")
         ui.separator().props("vertical")
         ui.label("Фильтры:").classes("text-grey")
@@ -153,8 +153,43 @@ def build_quality() -> None:
     global_spinner = ui.spinner("dots", size="lg").classes("q-mb-md")
     global_spinner.visible = False
 
-    # 13.16: прогресс скана через build_scan_progress (DRY)
-    scan_progress_container = ui.column().classes("w-full q-mb-md")
+    # 13.16 + 13.27 (фикс): панель прогресса скана строится ОДИН раз при
+    # загрузке страницы с постоянным MCPClient (паттерн search.py).
+    # build_scan_progress делает первый poll немедленно (ui.timer(0.0, ...)) и
+    # проверяет /quality/scan/progress: если скан уже идёт (в т.ч. запущенный
+    # другим клиентом/вкладкой или ДО перезагрузки страницы) — панель
+    # авто-появляется и показывает прогресс. Раньше панель создавалась только
+    # внутри _run_scan после успешного старта, поэтому после перезагрузки
+    # страницы прогресс активного скана не был виден.
+    _scan_client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+
+    # 13.27: кнопка скана блокируется на ВСЁ время активного скана —
+    # состояние синхронизируется через on_update на каждом полле панели
+    # (покрывает и скан, запущенный до перезагрузки страницы/другим клиентом).
+    _scan_btn_blocked = False
+
+    def _sync_scan_ui(snapshot: dict | None) -> None:
+        nonlocal _scan_btn_blocked
+        active = (
+            snapshot is not None
+            and snapshot.get("status") not in ("done", "error")
+        )
+        if active and not _scan_btn_blocked:
+            scan_btn.disable()
+            _scan_btn_blocked = True
+        elif not active and _scan_btn_blocked:
+            scan_btn.enable()
+            _scan_btn_blocked = False
+
+    build_scan_progress(
+        client=_scan_client,
+        on_done=lambda: _on_scan_done(scan_btn, scan_state, refresh),
+        on_update=_sync_scan_ui,
+    )
+
+    def _cleanup_scan_client() -> None:
+        asyncio.create_task(_scan_client.close())
+    ui.context.client.on_disconnect(_cleanup_scan_client)
 
     # Refreshable-блок найденных проблем (issues) — над очередью книг
     render_issues()
@@ -177,18 +212,23 @@ def build_quality() -> None:
 # ── Helpers ─────────────────────────────────────────────────
 
 
-async def _run_scan(on_done, scan_state: dict, progress_container, scan_btn) -> None:
-    """Запустить quality scan с live-прогрессом (13.15, DRY 13.16).
+async def _run_scan(scan_state: dict, scan_btn) -> None:
+    """Запустить quality scan (13.15, DRY 13.16).
 
-    Использует build_scan_progress из progress_panel.py для поллинга
-    и рендера прогресс-бара (вместо дублирующего кода).
+    Панель прогресса строится ОДИН раз при загрузке страницы
+    (см. build_quality) и поллит /quality/scan/progress независимо —
+    поэтому здесь НЕ создаём новую панель. Если скан уже идёт
+    (status=already_running), прогресс-панель уже показывает его.
     Кнопка скана блокируется пока status=started/running.
     """
     scan_btn.disable()
 
     try:
         client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
-        result = await client.run_quality_scan()
+        try:
+            result = await client.run_quality_scan()
+        finally:
+            await client.close()
         if result.get("status") == "already_running":
             ui.notify(
                 f"Скан уже выполняется (scan_id={result.get('scan_id', '?')})",
@@ -207,13 +247,6 @@ async def _run_scan(on_done, scan_state: dict, progress_container, scan_btn) -> 
         scan_state["status"] = "running"
         scan_state["scan_id"] = result["scan_id"]
         ui.notify(f"Скан {result['scan_id']} запущен", type="info")
-
-        # 13.16: DRY — build_scan_progress вместо дублирующего _poll_progress
-        scan_client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
-        build_scan_progress(
-            client=scan_client,
-            on_done=lambda: _on_scan_done(scan_btn, scan_state, on_done),
-        )
 
     except Exception as exc:
         scan_btn.enable()

@@ -4,12 +4,19 @@
 Фаза 13.9 (Variant A): HTTP-polling progress bar + log panel в kb-console.
 Безопасен при WORKERS=1 (сервер hard-pinned в main.py).
 Все мутаторы best-effort: никогда не кидают исключений (импорт не должен падать).
+
+Фаза 13.27: опциональная дисковая персистентность (persist_path) — снапшот
+состояния пишется в JSON (throttled, atomic), используется для quality scan:
+прогресс и статус скана переживают рестарт сервера (recovery в main.py).
 """
 
 from __future__ import annotations
 
+import json
+import os
 import time as _time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 
@@ -19,12 +26,26 @@ class ImportProgressTracker:
     Args:
         max_messages: максимальное число лог-сообщений на import_id.
         ttl_seconds: время жизни записи после завершения (get удаляет просроченные).
+        persist_path (13.27): путь к JSON-файлу для персистентного снапшота
+            состояния (используется для quality scan — прогресс переживает
+            рестарт сервера). None = без персистентности.
+        persist_every: минимальный интервал между записями на диск (сек);
+            done/error пишутся всегда (force).
     """
 
-    def __init__(self, max_messages: int = 50, ttl_seconds: int = 600) -> None:
+    def __init__(
+        self,
+        max_messages: int = 50,
+        ttl_seconds: int = 600,
+        persist_path: str | os.PathLike | None = None,
+        persist_every: float = 2.0,
+    ) -> None:
         self._max_messages = max_messages
         self._ttl_seconds = ttl_seconds
         self._data: dict[str, dict[str, Any]] = {}
+        self._persist_path = Path(persist_path) if persist_path else None
+        self._persist_every = max(0.1, persist_every)
+        self._last_persist = 0.0
 
     # ── Helpers ─────────────────────────────────────────────
 
@@ -43,6 +64,57 @@ class ImportProgressTracker:
 
     def _touch(self, entry: dict[str, Any]) -> None:
         entry["updated_at"] = self._now_iso()
+
+    # ── 13.27: Дисковая персистентность (переживает рестарт сервера) ──
+
+    def persist(self, force: bool = False) -> None:
+        """Записать снапшот _data на диск (throttled + atomic, best-effort).
+
+        force=True пишет всегда (используется для событий создания/смены
+        фазы и терминальных состояний done/error, а также prune).
+        Никогда не кидает исключений — персистентность не должна ломать
+        скан/импорт.
+        """
+        if self._persist_path is None:
+            return
+        now = _time.time()
+        if not force and (now - self._last_persist) < self._persist_every:
+            return
+        try:
+            self._last_persist = now
+            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._persist_path.with_suffix(self._persist_path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, ensure_ascii=False)
+            os.replace(tmp, self._persist_path)  # atomic на Linux
+        except Exception:
+            pass
+
+    def load(self) -> dict[str, dict[str, Any]]:
+        """Прочитать персистентный снапшот и влить в _data (best-effort).
+
+        Не перезаписывает живые записи с тем же id (приоритет — память).
+        Возвращает копию загруженных записей (для recovery-логики на старте).
+        """
+        if self._persist_path is None:
+            return {}
+        try:
+            if not self._persist_path.exists():
+                return {}
+            with open(self._persist_path, encoding="utf-8") as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                return {}
+            loaded: dict[str, dict[str, Any]] = {}
+            for key, entry in raw.items():
+                if not isinstance(entry, dict):
+                    continue
+                loaded[str(key)] = entry
+                if key not in self._data:
+                    self._data[key] = entry
+            return loaded
+        except Exception:
+            return {}
 
     # ── Public API ──────────────────────────────────────────
 
@@ -69,6 +141,11 @@ class ImportProgressTracker:
             "updated_at": now,
             "meta": meta or {},
         }
+        # 13.27: start — событие создания записи, пишем ВСЕГДА (force).
+        # Не throttle: за start() может идти prune_finished (force-запись),
+        # который ставит _last_persist=now → обычный persist() был бы
+        # пропущен 2с и новая запись не попала бы на диск (S25 catch).
+        self.persist(force=True)
 
     def set_phase(self, import_id: str, phase: str, text: str | None = None) -> None:
         """Обновить фазу импорта и опционально залогировать."""
@@ -80,6 +157,9 @@ class ImportProgressTracker:
             self._touch(entry)
             if text:
                 self.log(import_id, "info", text)
+            # Фазы меняются редко (≈7 на скан) — пишем сразу, чтобы
+            # throttle-пропуск (2с) не терял смену фазы в персистентном файле.
+            self.persist(force=True)
         except Exception:
             pass
 
@@ -103,6 +183,7 @@ class ImportProgressTracker:
             if len(entry["messages"]) > self._max_messages:
                 entry["messages"] = entry["messages"][-self._max_messages:]
             self._touch(entry)
+            self.persist()
         except Exception:
             pass
 
@@ -114,6 +195,7 @@ class ImportProgressTracker:
         try:
             entry["imported"] += 1
             self._touch(entry)
+            self.persist()
         except Exception:
             pass
 
@@ -126,6 +208,7 @@ class ImportProgressTracker:
             entry["failed"] += 1
             self.log(import_id, "warning", f"Section #{sequence} «{title}» failed: {error}")
             self._touch(entry)
+            self.persist()
         except Exception:
             pass
 
@@ -139,6 +222,7 @@ class ImportProgressTracker:
             if summary:
                 entry["summary"] = summary
             self._touch(entry)
+            self.persist(force=True)
         except Exception:
             pass
 
@@ -163,6 +247,7 @@ class ImportProgressTracker:
             ]
             for import_id in to_remove:
                 del self._data[import_id]
+            self.persist(force=True)
             return len(to_remove)
         except Exception:
             return 0
@@ -176,6 +261,7 @@ class ImportProgressTracker:
             entry["status"] = "error"
             self.log(import_id, "error", error)
             self._touch(entry)
+            self.persist(force=True)
         except Exception:
             pass
 
