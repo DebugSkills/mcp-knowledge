@@ -561,12 +561,13 @@ def _render_audit(data: dict, audit_filter: dict, render_fn, refresh_fn) -> None
             ui.badge("Авто-скрытие: ВЫКЛ").props("color=grey")
         ui.label(status_text).classes("text-caption text-grey")
         ui.space()
-        # Фаза 3 (3d): toggle «только auto»
+        # Фаза 3 (3d): toggle «только auto». ВАЖНО: первый аргумент ui.toggle —
+        # options (dict value→label), НЕ label ('str' has no attribute 'keys' → 500).
         auto_only = audit_filter.get("auto_only", False)
         ui.toggle(
-            "только auto",
-            value=auto_only,
-            on_change=lambda e: _toggle_audit_auto_only(e.value, audit_filter, render_fn),
+            {True: "только auto"},
+            value=auto_only or None,
+            on_change=lambda e: _toggle_audit_auto_only(bool(e.value), audit_filter, render_fn),
         ).props("dense")
 
     if not records:
