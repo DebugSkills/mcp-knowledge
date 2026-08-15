@@ -28,3 +28,23 @@ class TestQualityScanCronSettings:
         monkeypatch.setenv("QUALITY_SCAN_CRON_ENABLED", "false")
         settings = Settings(_env_file=None)
         assert settings.QUALITY_SCAN_CRON_ENABLED is False
+
+
+class TestAutoDedupSettings:
+    """Фаза 3 (2a): флаги авто-deprecate."""
+
+    def test_auto_dedup_defaults(self):
+        """Дефолты: OFF, FP=2 скана, cooldown=3, cap=100."""
+        settings = Settings(_env_file=None)
+        assert settings.AUTO_DEDUP_ENABLED is False
+        assert settings.AUTO_DEDUP_FP_FREE_SCANS == 2
+        assert settings.AUTO_DEDUP_RESTORE_COOLDOWN_SCANS == 3
+        assert settings.AUTO_DEDUP_MAX_PER_SCAN == 100
+
+    def test_auto_dedup_env_override(self, monkeypatch):
+        """Env-переопределение AUTO_DEDUP_ENABLED=true + cap=50."""
+        monkeypatch.setenv("AUTO_DEDUP_ENABLED", "true")
+        monkeypatch.setenv("AUTO_DEDUP_MAX_PER_SCAN", "50")
+        settings = Settings(_env_file=None)
+        assert settings.AUTO_DEDUP_ENABLED is True
+        assert settings.AUTO_DEDUP_MAX_PER_SCAN == 50

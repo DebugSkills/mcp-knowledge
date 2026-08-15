@@ -57,6 +57,9 @@ def build_quality() -> None:
     # 13.15: состояние скана для блокировки кнопки и прогресс-бара
     scan_state: dict[str, Any] = {"status": None, "scan_id": None}
 
+    # Фаза 3: фильтр панели «Журнал действий» (toggle «только auto»)
+    audit_filter: dict[str, Any] = {"auto_only": False}
+
     @ui.refreshable
     def render_queue() -> None:
         _render_queue(latest.get("data", {}), latest.get("filters", {}), expanded_cache, render_queue.refresh, section_pages)
@@ -71,6 +74,11 @@ def build_quality() -> None:
     @ui.refreshable
     def render_review_pairs() -> None:
         _render_review_pairs(latest.get("review_pairs", {}), refresh)
+
+    # Фаза 3: журнал действий (аудит) + статус авто-гейта
+    @ui.refreshable
+    def render_audit() -> None:
+        _render_audit(latest.get("audit", {}), audit_filter, render_audit.refresh, refresh)
 
     # 13.15: _refreshing флаг — ≤1 in-flight refresh
     _refreshing = False
@@ -90,8 +98,8 @@ def build_quality() -> None:
                 subject = filters.get("subject", "")
                 # R4: filter-dependent cache key
                 cache_key = f"quality:{domain}:{subject}" if (domain or subject) else "quality"
-                # Параллельная загрузка очереди книг, issues и dup-ревью (Фаза 2)
-                data, issues, review_pairs = await asyncio.gather(
+                # Параллельная загрузка очереди книг, issues, dup-ревью и аудита (Фаза 2+3)
+                data, issues, review_pairs, audit = await asyncio.gather(
                     cache.get(
                         cache_key,
                         lambda c=client, f=filters: c.review_queue_books(
@@ -111,15 +119,22 @@ def build_quality() -> None:
                         lambda c=client: c.review_duplicate_pairs(limit=200),
                         ttl=30,
                     ),
+                    cache.get(
+                        "quality:audit",
+                        lambda c=client: c.list_audit_log(limit=50),
+                        ttl=30,
+                    ),
                 )
                 latest["data"] = data
                 latest["issues"] = issues
                 latest["review_pairs"] = review_pairs
+                latest["audit"] = audit
             finally:
                 await client.close()
             render_queue.refresh()
             render_issues.refresh()
             render_review_pairs.refresh()
+            render_audit.refresh()
         except RuntimeError as exc:
             if "parent slot" in str(exc):
                 return
@@ -196,6 +211,9 @@ def build_quality() -> None:
 
     # Фаза 2 dedup: ревью-очередь dup-пар (🟢 пачка / 🟡 сомнительные)
     render_review_pairs()
+
+    # Фаза 3: журнал действий (аудит) + статус авто-гейта
+    render_audit()
 
     # Refreshable-блок очереди
     render_queue()
@@ -416,6 +434,7 @@ async def _resolve_yellow_pair(pair: dict, action: str, refresh_fn) -> None:
                     action="resolve",
                     issue_id=pair["issue_id"],
                     reason="not a duplicate by operator",
+                    marks_fp=True,  # Фаза 3: явный FP-сигнал → fp_rejection в audit
                 )
                 ok = result.get("resolved")
                 msg = "Issue закрыта (не дубль)"
@@ -500,6 +519,124 @@ def _render_review_pairs(data: dict, refresh_fn) -> None:
         ui.label(f"Показаны: {len(green) + len(yellow)} из {total_open} open dup-issues").classes(
             "text-caption text-grey q-mb-sm"
         )
+
+
+# ── Фаза 3: журнал действий (аудит) + статус авто-гейта ──────
+
+_AUDIT_RESTORABLE_ACTIONS = frozenset({"deprecate", "bulk_deprecate", "merge"})
+
+
+def _render_audit(data: dict, audit_filter: dict, render_fn, refresh_fn) -> None:
+    """Отрисовать панель «Журнал действий (аудит)» + строку статуса авто-гейта.
+
+    Args:
+        data: результат list_audit_log (records[], fp_stats{}, auto_dedup_enabled,
+            auto_dedup_config{}).
+        audit_filter: session-фильтр (toggle «только auto»).
+        render_fn: refreshable-перерисовка панели (клиентская фильтрация).
+        refresh_fn: полный async refresh (инвалидация кэша + refetch).
+    """
+    data = data if isinstance(data, dict) else {}
+    records = data.get("records", []) or []
+    fp_stats = data.get("fp_stats", {}) or {}
+    auto_enabled = bool(data.get("auto_dedup_enabled", False))
+    auto_config = data.get("auto_dedup_config", {}) or {}
+
+    ui.label("Журнал действий (аудит)").classes("text-h6 q-mb-sm q-mt-md")
+
+    # ── Строка статуса авто-гейта ──
+    scans = fp_stats.get("scans_in_window", 0)
+    rejections = fp_stats.get("rejections", 0)
+    fp_free = bool(fp_stats.get("fp_free", False))
+    fp_scans = auto_config.get("fp_free_scans", 2)
+    status_text = (
+        f"гейт: FP=0 за {fp_scans} скана"
+        f" (сканов в окне: {scans}, отказов: {rejections})"
+        + (" — гейт ОТКРЫТ" if fp_free else " — гейт закрыт")
+    )
+    with ui.row().classes("items-center gap-2 q-mb-sm"):
+        if auto_enabled:
+            ui.badge("Авто-скрытие: ВКЛ").props("color=green")
+        else:
+            ui.badge("Авто-скрытие: ВЫКЛ").props("color=grey")
+        ui.label(status_text).classes("text-caption text-grey")
+        ui.space()
+        # Фаза 3 (3d): toggle «только auto»
+        auto_only = audit_filter.get("auto_only", False)
+        ui.toggle(
+            "только auto",
+            value=auto_only,
+            on_change=lambda e: _toggle_audit_auto_only(e.value, audit_filter, render_fn),
+        ).props("dense")
+
+    if not records:
+        ui.label("Журнал пуст").classes("text-grey text-caption")
+        return
+
+    # Клиентская фильтрация «только auto»
+    if auto_only:
+        records = [r for r in records if r.get("actor") == "auto"]
+
+    for rec in records:
+        _render_audit_record(rec, refresh_fn)
+
+
+def _toggle_audit_auto_only(value: bool, audit_filter: dict, render_fn) -> None:
+    """Переключить фильтр «только auto» и перерисовать панель."""
+    audit_filter["auto_only"] = bool(value)
+    render_fn()
+
+
+def _render_audit_record(rec: dict, refresh_fn) -> None:
+    """Отрисовать карточку одной audit-записи (ts, badge action, kid, reason, ♻️)."""
+    ts = rec.get("ts", "")
+    action = rec.get("action", "")
+    actor = rec.get("actor", "")
+    kid = rec.get("knowledge_id", "")
+    reason = rec.get("reason", "")
+
+    is_auto = actor == "auto"
+    with ui.card().classes("w-full q-mb-xs q-pa-sm"), ui.row().classes(
+        "items-center w-full no-wrap gap-2"
+    ):
+        with ui.column().classes("flex-1 min-w-0"):
+            with ui.row().classes("items-center gap-2 no-wrap"):
+                if is_auto:
+                    ui.badge("auto").props("color=orange")
+                ui.chip(action).props("outline dense size=sm")
+                ui.label(kid).classes("text-subtitle2 ellipsis")
+            if reason:
+                ui.label(reason).classes("text-caption text-grey")
+            if ts:
+                ui.label(f"{ts[:19]}").classes("text-caption text-grey")
+        # Частичный restore 🟢-пачки: ♻️ на deprecate/bulk_deprecate/merge
+        if action in _AUDIT_RESTORABLE_ACTIONS and kid:
+            ui.button(
+                "♻️",
+                on_click=lambda k=kid: _restore_audit_record(k, refresh_fn),
+            ).props("flat dense color=info").tooltip(f"Восстановить {kid} (restore)")
+
+
+async def _restore_audit_record(knowledge_id: str, refresh_fn) -> None:
+    """♻️ частичный restore пачки: вернуть одну запись (action=restore)."""
+    try:
+        client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+        try:
+            result = await client.resolve_quality_issue(
+                action="restore",
+                knowledge_id=knowledge_id,
+                reason="Restored from audit panel (Фаза 3)",
+            )
+            if result.get("resolved"):
+                ui.notify(f"Запись {knowledge_id} восстановлена", type="positive")
+                cache.invalidate("quality:audit")
+                await refresh_fn()
+            else:
+                ui.notify(f"Ошибка: {result.get('error', 'неизвестно')}", type="negative")
+        finally:
+            await client.close()
+    except Exception as exc:
+        ui.notify(f"Ошибка: {exc}", type="negative")
 
 
 def _render_issues(data: dict, refresh_fn) -> None:

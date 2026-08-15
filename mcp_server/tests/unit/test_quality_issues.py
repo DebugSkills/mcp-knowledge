@@ -103,6 +103,34 @@ class TestCreateIssue:
             tmp_files = [f for f in os.listdir(tmpdir) if f.endswith(".tmp")]
             assert len(tmp_files) == 0
 
+    def test_create_issue_metadata_refresh(self):
+        """Фаза 3 (0b): повторный create с новым metadata обновляет поле, не дублирует."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_store_dir(tmpdir)
+            create_issue(
+                "duplicate", "kb-refresh", "warn", "dup",
+                metadata={"subject": "a", "target_subject": None},
+            )
+            refreshed = create_issue(
+                "duplicate", "kb-refresh", "warn", "dup",
+                metadata={"subject": "a", "target_subject": "a", "target_kid": "t"},
+            )
+            assert refreshed.metadata == {"subject": "a", "target_subject": "a", "target_kid": "t"}
+            # Одна запись в сторе (не дубликат)
+            store_path = get_issues_store_path()
+            with open(store_path) as f:
+                lines = f.readlines()
+            assert len(lines) == 1
+
+    def test_create_issue_metadata_refresh_idempotent_id(self):
+        """Фаза 3 (0b): refresh НЕ меняет issue_id (идемпотентность ID сохранена)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_store_dir(tmpdir)
+            iss1 = create_issue("duplicate", "kb-r2", "warn", "dup", metadata={"x": 1})
+            iss2 = create_issue("duplicate", "kb-r2", "warn", "dup", metadata={"x": 2})
+            assert iss1.issue_id == iss2.issue_id
+            assert iss2.metadata == {"x": 2}
+
 
 class TestListIssues:
     """Тесты фильтрации и листинга."""

@@ -38,6 +38,7 @@ READ_TOOLS: set[str] = {
     "review_queue_books",  # read-only: агрегат книг (Фаза 13.14)
     "list_quality_issues",  # read-only: список quality issues (Фаза 13.14)
     "review_duplicate_pairs",  # Фаза 2 dedup: read-only ревью-очередь dup-пар (ранжирование R1-R6)
+    "list_audit_log",  # Фаза 3: read-only журнал действий (аудит) + статус авто-гейта
     "resources/list",
     "resources/read",
     "prompts/list",

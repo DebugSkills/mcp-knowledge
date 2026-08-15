@@ -1051,11 +1051,15 @@ class TestCancelQualityScan:
 
 
 class TestBgScanCancel:
-    """_bg_scan — прокидывает cancel_event в run_scan (13.18)."""
+    """_bg_scan — прокидывает cancel_event в run_scan (13.18) + scan_completed-аудит (Фаза 3)."""
 
     @pytest.mark.asyncio
-    async def test_bg_scan_passes_cancel_event_to_run_scan(self, tmp_path):
-        """_bg_scan создаёт cancel_event и передаёт его в run_scan."""
+    async def test_bg_scan_passes_cancel_event_to_run_scan(self, tmp_path, quality_tempdir):
+        """_bg_scan создаёт cancel_event и передаёт его в run_scan.
+
+        quality_tempdir изолирует audit-стор — scan_completed-аудит (Фаза 3 1b)
+        не должен уходить в прод-путь.
+        """
         import asyncio
         from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1085,6 +1089,34 @@ class TestBgScanCancel:
             call_kwargs = mock_run_scan.call_args.kwargs
             assert "cancel_event" in call_kwargs
             assert call_kwargs["cancel_event"] is cancel_event
+
+    @pytest.mark.asyncio
+    async def test_bg_scan_writes_scan_completed_audit(self, tmp_path, quality_tempdir):
+        """Фаза 3 (1b): полный скан → scan_completed в audit."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from mcp_server.quality.audit import count_actions
+
+        scan_lock = asyncio.Lock()
+        scan_progress = MagicMock()
+        scan_state = {"lock": scan_lock, "task_ref": [None]}
+
+        with patch("mcp_server.quality.scanner.run_scan", new=AsyncMock(return_value={
+            "files_scanned": 0, "scores_updated": 0,
+            "duplicates_detected": 0, "issues_created": 0,
+            "review_queue_size": 0,
+        })):
+            await _bg_scan(
+                scan_id="test-scan-1",
+                knowledge_dir=tmp_path,
+                qdrant_client=None,
+                scan_progress=scan_progress,
+                scan_state=scan_state,
+                cancel_event=asyncio.Event(),
+            )
+
+        assert count_actions(action="scan_completed") == 1
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1173,7 +1205,7 @@ class TestBulkDeprecateDuplicates:
     async def test_deprecate_by_knowledge_id(self, quality_tempdir, mock_app_state):
         """deprecate по knowledge_id: payload + close-all + audit."""
         from mcp_server.quality.audit import count_actions
-        from mcp_server.quality.issues import create_issue, list_issues
+        from mcp_server.quality.issues import create_issue
 
         create_issue("duplicate", "kid-dup-1", "warn", "Dup A of kid-target")
         create_issue("duplicate", "kid-dup-1", "warn", "Dup B of kid-target")
@@ -1222,8 +1254,8 @@ class TestAuditLog:
     """audit.py — write/list/count (Фаза 1 dedup)."""
 
     def test_write_and_list(self, quality_tempdir):
-        from mcp_server.quality.audit import list_audit, set_store_dir as audit_set_dir
-        from mcp_server.quality.audit import write_audit
+        from mcp_server.quality.audit import list_audit, write_audit
+        from mcp_server.quality.audit import set_store_dir as audit_set_dir
 
         audit_set_dir(quality_tempdir)
         write_audit("deprecate", "kid-1", "operator", "test", {"x": 1})
@@ -1247,6 +1279,286 @@ class TestAuditLog:
         assert count_actions(action="deprecate") == 2
         assert count_actions(actor="auto") == 1
 
+    # ── Фаза 3 (1a/1d): get_fp_rate + strict + scan_completed/fp_rejection ──
+
+    def test_get_fp_rate_window(self, quality_tempdir):
+        from mcp_server.quality.audit import get_fp_rate, write_audit
+
+        # 0 сканов → fp_free=False
+        assert get_fp_rate(window_scans=2)["fp_free"] is False
+        # 1 скан → False
+        write_audit("scan_completed", "-", "system", "scan", {"scan_id": "s1"})
+        r = get_fp_rate(window_scans=2)
+        assert r["scans_in_window"] == 1
+        assert r["fp_free"] is False
+        # 2 скана + 0 rejections → True
+        write_audit("scan_completed", "-", "system", "scan", {"scan_id": "s2"})
+        r = get_fp_rate(window_scans=2)
+        assert r["fp_free"] is True
+        assert r["rejections"] == 0
+        # 1 rejection в окне → False
+        write_audit("fp_rejection", "kid-1", "operator", "not a dup")
+        r = get_fp_rate(window_scans=2)
+        assert r["fp_free"] is False
+        assert r["rejections"] == 1
+
+    def test_write_audit_strict_returns_false_on_error(self, quality_tempdir):
+        from pathlib import Path
+
+        import mcp_server.quality.audit as audit_mod
+        from mcp_server.quality.audit import write_audit
+
+        # parent — ФАЙЛ, не директория → mkdir падает → write возвращает False
+        blocker = Path(quality_tempdir) / "notadir"
+        blocker.write_text("x")
+        orig = audit_mod._get_audit_path
+        audit_mod._get_audit_path = lambda: blocker / "audit.jsonl"
+        try:
+            assert write_audit("deprecate", "k", "operator", strict=True) is False
+            assert write_audit("deprecate", "k", "operator", strict=False) is False
+        finally:
+            audit_mod._get_audit_path = orig
+
+    def test_scan_completed_and_fp_rejection_actions_allowed(self, quality_tempdir):
+        from mcp_server.quality.audit import AUDIT_ACTIONS, write_audit
+
+        assert "scan_completed" in AUDIT_ACTIONS
+        assert "fp_rejection" in AUDIT_ACTIONS
+        assert write_audit("scan_completed", "-", "system") is True
+        assert write_audit("fp_rejection", "kid", "operator") is True
+
+
+# ═══════════════════════════════════════════════════════════════
+# Фаза 3 (2c): гейт авто-deprecate внутри bulk_deprecate_duplicates
+# ═══════════════════════════════════════════════════════════════
+
+
+def _seed_r1_issue(kid: str = "auto-r1", tgt: str = "auto-tgt"):
+    """Создать open duplicate issue со строгим R1 (exact hash + target_subject)."""
+    from mcp_server.quality.issues import create_issue
+
+    return create_issue(
+        "duplicate", kid, "warn",
+        f"Possible duplicate of {tgt} (same subject=devops, cosine=0.95)",
+        metadata={
+            "cosine": 0.95, "content_hash": "abc", "content_length": 100,
+            "target_content_hash": "abc", "target_content_length": 100,
+            "slug_negation": False, "standalone": True, "target_standalone": True,
+            "subject": "devops", "target_subject": "devops", "target_kid": tgt,
+        },
+    )
+
+
+def _seed_cosine_issue(kid: str = "auto-cos", tgt: str = "auto-tgt2"):
+    """R3-cosine-пара (hash mismatch, cosine 0.98) — НЕ строгий R1."""
+    from mcp_server.quality.issues import create_issue
+
+    return create_issue(
+        "duplicate", kid, "warn",
+        f"Possible duplicate of {tgt} (same subject=devops, cosine=0.98)",
+        metadata={
+            "cosine": 0.98, "content_hash": "aaa", "content_length": 100,
+            "target_content_hash": "bbb", "target_content_length": 100,
+            "slug_negation": False, "standalone": True, "target_standalone": True,
+            "subject": "devops", "target_subject": "devops", "target_kid": tgt,
+        },
+    )
+
+
+def _seed_two_scans() -> None:
+    from mcp_server.quality.audit import write_audit
+
+    write_audit("scan_completed", "-", "system", "scan", {"scan_id": "s1"})
+    write_audit("scan_completed", "-", "system", "scan", {"scan_id": "s2"})
+
+
+class TestAutoDeprecateGate:
+    """Гейт авто-режима (Фаза 3, 2c): config off/on × fp_free × cooldown × cap × abort."""
+
+    async def test_auto_disabled_by_config(self, quality_tempdir, mock_app_state, monkeypatch):
+        from mcp_server.config import settings
+
+        monkeypatch.setattr(settings, "AUTO_DEDUP_ENABLED", False)
+        _seed_r1_issue()
+        result = await bulk_deprecate_duplicates(
+            {"actor": "auto", "filter": {"hash_only": True}}, mock_app_state,
+        )
+        assert result["resolved"] is False
+        assert "AUTO_DEDUP_ENABLED" in result["error"]
+
+    async def test_auto_requires_hash_only(self, quality_tempdir, mock_app_state, monkeypatch):
+        from mcp_server.config import settings
+
+        monkeypatch.setattr(settings, "AUTO_DEDUP_ENABLED", True)
+        result = await bulk_deprecate_duplicates({"actor": "auto"}, mock_app_state)
+        assert result["resolved"] is False
+        assert "hash_only" in result["error"]
+
+    async def test_auto_fp_free_false(self, quality_tempdir, mock_app_state, monkeypatch):
+        from mcp_server.config import settings
+        from mcp_server.quality.audit import write_audit
+
+        monkeypatch.setattr(settings, "AUTO_DEDUP_ENABLED", True)
+        write_audit("scan_completed", "-", "system", "scan", {"scan_id": "s1"})  # 1 скан
+        result = await bulk_deprecate_duplicates(
+            {"actor": "auto", "filter": {"hash_only": True}}, mock_app_state,
+        )
+        assert result["resolved"] is False
+        assert "gate closed" in result["error"]
+
+    async def test_auto_deprecates_r1_only(self, quality_tempdir, mock_app_state, monkeypatch):
+        from mcp_server.config import settings
+
+        monkeypatch.setattr(settings, "AUTO_DEDUP_ENABLED", True)
+        _seed_r1_issue("auto-r1")
+        _seed_cosine_issue("auto-cos")
+        _seed_two_scans()
+        mock_app_state.qdrant = MagicMock()
+
+        result = await bulk_deprecate_duplicates(
+            {"actor": "auto", "filter": {"hash_only": True}, "reason": "auto"},
+            mock_app_state,
+        )
+        assert result["resolved"] is True
+        assert result["deprecated_count"] == 1
+        # R1 скрыт, cosine-пара осталась open
+        open_after = await list_quality_issues(
+            {"types": ["duplicate"], "status": "open", "limit": 50}, mock_app_state,
+        )
+        open_kids = {i["knowledge_id"] for i in open_after["issues"]}
+        assert "auto-r1" not in open_kids
+        assert "auto-cos" in open_kids
+
+    async def test_auto_cooldown_shield(self, quality_tempdir, mock_app_state, monkeypatch):
+        from mcp_server.config import settings
+        from mcp_server.quality.audit import write_audit
+
+        monkeypatch.setattr(settings, "AUTO_DEDUP_ENABLED", True)
+        _seed_r1_issue("shield-kid")
+        # restore новее deprecate + 2 скана после → scans_after=2 < cooldown 3 → щит
+        write_audit("restore", "shield-kid", "operator", "restored",
+                    {"restored_by_operator": True})
+        write_audit("scan_completed", "-", "system", "scan", {"scan_id": "s1"})
+        write_audit("scan_completed", "-", "system", "scan", {"scan_id": "s2"})
+
+        result = await bulk_deprecate_duplicates(
+            {"actor": "auto", "filter": {"hash_only": True}}, mock_app_state,
+        )
+        assert result["resolved"] is True
+        assert result["deprecated_count"] == 0  # щит исключил shield-kid
+
+    async def test_auto_cap(self, quality_tempdir, mock_app_state, monkeypatch):
+        from mcp_server.config import settings
+
+        monkeypatch.setattr(settings, "AUTO_DEDUP_ENABLED", True)
+        monkeypatch.setattr(settings, "AUTO_DEDUP_MAX_PER_SCAN", 1)
+        _seed_r1_issue("auto-r1")
+        _seed_r1_issue("auto-r1b", "auto-tgt-b")
+        _seed_two_scans()
+        mock_app_state.qdrant = MagicMock()
+
+        result = await bulk_deprecate_duplicates(
+            {"actor": "auto", "filter": {"hash_only": True}}, mock_app_state,
+        )
+        assert result["deprecated_count"] == 1
+        assert result["truncated"] is True
+
+    async def test_auto_strict_abort(self, quality_tempdir, mock_app_state, monkeypatch):
+        from mcp_server.config import settings
+
+        monkeypatch.setattr(settings, "AUTO_DEDUP_ENABLED", True)
+        _seed_r1_issue("auto-r1")
+        _seed_two_scans()
+        # Сбой строгого аудита → abort пачки (0 скрытий, error)
+        monkeypatch.setattr(
+            "mcp_server.tools.quality.write_audit", lambda **kwargs: False,
+        )
+        result = await bulk_deprecate_duplicates(
+            {"actor": "auto", "filter": {"hash_only": True}}, mock_app_state,
+        )
+        assert result["resolved"] is False
+        assert "strict audit failed" in result["error"]
+        assert result["deprecated_count"] == 0
+
+
+class TestRestoreAuditAndFpRejection:
+    """Фаза 3 (1c/1e): restore-audit + fp_rejection в resolve_quality_issue."""
+
+    async def test_restore_writes_audit(self, quality_tempdir, mock_app_state):
+        from mcp_server.quality.audit import count_actions, list_audit
+        from mcp_server.quality.issues import create_issue
+
+        mock_app_state.qdrant = MagicMock()
+        create_issue("duplicate", "kid-restore", "warn", "dup")
+        result = await resolve_quality_issue(
+            {"action": "restore", "knowledge_id": "kid-restore", "reason": "restored by operator"},
+            mock_app_state,
+        )
+        assert result["resolved"] is True
+        assert count_actions(action="restore") == 1
+        rec = list_audit(action="restore")[0]
+        assert rec["metadata"]["restored_by_operator"] is True
+
+    async def test_resolve_not_dup_writes_fp_rejection(self, quality_tempdir, mock_app_state):
+        from mcp_server.quality.audit import count_actions, list_audit
+        from mcp_server.quality.issues import create_issue
+
+        iss = create_issue("duplicate", "kid-fp", "warn", "dup")
+        result = await resolve_quality_issue(
+            {"action": "resolve", "issue_id": iss.issue_id, "reason": "not a duplicate by operator"},
+            mock_app_state,
+        )
+        assert result["resolved"] is True
+        assert count_actions(action="fp_rejection") == 1
+        rec = list_audit(action="fp_rejection")[0]
+        assert rec["knowledge_id"] == "kid-fp"
+
+    async def test_resolve_marks_fp_explicit(self, quality_tempdir, mock_app_state):
+        from mcp_server.quality.audit import count_actions
+        from mcp_server.quality.issues import create_issue
+
+        iss = create_issue("duplicate", "kid-fp2", "warn", "dup")
+        result = await resolve_quality_issue(
+            {"action": "resolve", "issue_id": iss.issue_id, "marks_fp": True, "reason": "x"},
+            mock_app_state,
+        )
+        assert result["resolved"] is True
+        assert count_actions(action="fp_rejection") == 1
+
+    async def test_restore_reopens_closed_dup_issues(self, quality_tempdir, mock_app_state):
+        """Фаза 3: restore переоткрывает закрытые dup-issues записи.
+
+        Иначе идемпотентный create_issue возвращает закрытый issue →
+        восстановленная пара не видна в Review Queue (дубль невидим).
+        """
+        from mcp_server.quality.audit import write_audit
+        from mcp_server.quality.issues import (
+            close_all_dup_issues,
+            create_issue,
+            list_issues,
+        )
+
+        mock_app_state.qdrant = MagicMock()
+        create_issue("duplicate", "kid-reopen", "warn", "Possible duplicate of kid-t")
+        closed = close_all_dup_issues("kid-reopen", "deprecated in batch")
+        assert closed == 1
+
+        # Идемпотентный skip: повторный create_issue возвращает ЗАКРЫТЫЙ issue
+        again = create_issue("duplicate", "kid-reopen", "warn", "Possible duplicate of kid-t")
+        assert again.status == "resolved", "idempotent skip должен вернуть закрытый issue"
+
+        write_audit("restore", "kid-reopen", "operator", "restored",
+                    {"restored_by_operator": True})
+        result = await resolve_quality_issue(
+            {"action": "restore", "knowledge_id": "kid-reopen", "reason": "restored by operator"},
+            mock_app_state,
+        )
+        assert result["resolved"] is True
+        assert any("Reopened 1 dup-issue" in s for s in result.get("side_effects", []))
+
+        open_dup = [i for i in list_issues(status="open") if i.knowledge_id == "kid-reopen"]
+        assert len(open_dup) == 1, f"expected reopened open issue, got: {open_dup}"
+
 
 # ═══════════════════════════════════════════════════════════════
 # Фаза 2 dedup: review_duplicate_pairs (R1-R6 ранжирование)
@@ -1265,7 +1577,8 @@ class TestReviewDuplicatePairs:
                      metadata={"cosine": 0.95, "content_hash": "abc", "content_length": 300,
                                "target_content_hash": "abc", "target_content_length": 300,
                                "slug_negation": False, "standalone": True,
-                               "target_standalone": True, "subject": "devops"})
+                               "target_standalone": True, "subject": "devops",
+                               "target_subject": "devops", "target_kid": "kid-tgt-1"})
         # 🟡: антоним
         create_issue("duplicate", "kid-src-2", "warn",
                      "Possible duplicate of kid-tgt-2 (same subject=devops, cosine=0.995)",
@@ -1299,4 +1612,17 @@ class TestReviewDuplicatePairs:
         result = await review_duplicate_pairs({"limit": 50}, mock_app_state)
         assert result["total_open"] == 0
         assert result["green_batch"] == []
+        assert result["yellow_pairs"] == []
+
+    async def test_hash_only_filter(self, quality_tempdir, mock_app_state):
+        """Фаза 3 (2e): filter={hash_only:true} → green только строгие R1."""
+        _seed_r1_issue("kid-r1", "tgt-r1")
+        _seed_cosine_issue("kid-cos", "tgt-cos")
+
+        result = await review_duplicate_pairs(
+            {"limit": 50, "filter": {"hash_only": True}}, mock_app_state,
+        )
+        assert result["filter_echo"] == {"hash_only": True}
+        assert len(result["green_batch"]) == 1
+        assert result["green_batch"][0]["source_kid"] == "kid-r1"
         assert result["yellow_pairs"] == []

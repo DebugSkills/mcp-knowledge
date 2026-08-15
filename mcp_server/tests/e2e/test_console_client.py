@@ -57,10 +57,11 @@ class TestMCPClientE2E:
         )
         try:
             tools = await client.tools_list()
-            # 29 = базовые + quality + import + фрагментные (book-fragments)
+            # 30 = базовые + quality + import + фрагментные (book-fragments)
             #      + dedup: bulk_deprecate_duplicates + review_duplicate_pairs
+            #      + list_audit_log (Фаза 3)
             #      (code-2026-08-13-dedup-elimination)
-            assert len(tools) == 29, f"Expected 29 tools, got {len(tools)}"
+            assert len(tools) == 30, f"Expected 30 tools, got {len(tools)}"
             tool_names = {t["name"] for t in tools}
             assert "search_knowledge" in tool_names
             assert "import_content" in tool_names
@@ -74,6 +75,7 @@ class TestMCPClientE2E:
             assert "find_fragment" in tool_names
             assert "bulk_deprecate_duplicates" in tool_names  # dedup Ф1
             assert "review_duplicate_pairs" in tool_names  # dedup Ф2
+            assert "list_audit_log" in tool_names  # dedup Ф3 (журнал + статус гейта)
         finally:
             await client.close()
 

@@ -511,6 +511,7 @@ class MCPClient:
         knowledge_id: str | None = None,
         cascade: bool = False,
         reason: str = "",
+        marks_fp: bool | None = None,
     ) -> dict[str, Any]:
         """Разрешить quality issue (resolve/deprecate/restore/merge/ignore).
 
@@ -520,6 +521,7 @@ class MCPClient:
             knowledge_id: прямая операция на запись (Фаза 13.14)
             cascade: применить к дочерним секциям книги
             reason: причина решения
+            marks_fp: явный FP-сигнал «не дубль» для action=resolve (Фаза 3)
 
         Returns:
             {"resolved": True/False, "cascade_affected": N, "side_effects": [...]}
@@ -531,6 +533,8 @@ class MCPClient:
             params["knowledge_id"] = knowledge_id
         if cascade:
             params["cascade"] = cascade
+        if marks_fp is not None:
+            params["marks_fp"] = marks_fp
         return await self.tools_call("resolve_quality_issue", params)
 
     async def bulk_resolve_issues(
@@ -589,18 +593,56 @@ class MCPClient:
             params["knowledge_id"] = knowledge_id
         return await self.tools_call("bulk_deprecate_duplicates", params)
 
-    async def review_duplicate_pairs(self, limit: int = 200) -> dict[str, Any]:
+    async def review_duplicate_pairs(
+        self, limit: int = 200, filter: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Ревью-очередь dup-пар (Фаза 2 dedup): 🟢/🟡/🔴 ранжирование.
 
         Read-only: возвращает green_batch (пачка «Утвердить все») и
         yellow_pairs (сомнительные со сниппетами для diff-просмотра).
 
+        Args:
+            limit: макс. число open dup-issues.
+            filter: {"hash_only": True} — только строгие R1 (exact hash), Фаза 3.
+
         Returns:
             {"green_batch": [...], "yellow_pairs": [...], "red_skipped": N, "total_open": M}
         """
-        return await self.tools_call(
-            "review_duplicate_pairs", {"limit": limit}
-        )
+        params: dict[str, Any] = {"limit": limit}
+        if filter is not None:
+            params["filter"] = filter
+        return await self.tools_call("review_duplicate_pairs", params)
+
+    async def list_audit_log(
+        self,
+        action: str | None = None,
+        actor: str | None = None,
+        knowledge_id: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Журнал действий по качеству + статус авто-гейта (Фаза 3).
+
+        Read-only: записи audit.jsonl (deprecate/restore/bulk/auto/fp_rejection/
+        scan_completed) + fp_stats + auto_dedup_enabled/config.
+
+        Args:
+            action: фильтр по действию (опционально).
+            actor: фильтр по actor (опционально, "auto" для только-авто).
+            knowledge_id: фильтр по записи (опционально).
+            limit: макс. число записей (default 50, max 200 на сервере).
+
+        Returns:
+            {"records": [...], "fp_stats": {...}, "auto_dedup_enabled": bool,
+             "auto_dedup_config": {...}}
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if action is not None:
+            params["action"] = action
+        if actor is not None:
+            params["actor"] = actor
+        if knowledge_id is not None:
+            params["knowledge_id"] = knowledge_id
+        return await self.tools_call("list_audit_log", params)
 
     async def delete_entry(
         self, knowledge_id: str, cascade: bool = False

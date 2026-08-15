@@ -200,7 +200,16 @@ def create_issue(
         # Проверка на дубликат
         for entry in existing:
             if entry.get("issue_id") == issue_id:
-                logger.debug("Idempotent skip: issue %s already exists", issue_id)
+                # Фаза 3 (0b): metadata-refresh. metadata НЕ в issue_id — обновление
+                # сигналов при пересканe не ломает идемпотентность ID (Фаза 1).
+                # Без refresh старые open dup-issues никогда не получают
+                # target_subject → застревают в 🟡 навсегда (ловушка Н1).
+                if metadata is not None and entry.get("metadata") != metadata:
+                    entry["metadata"] = metadata
+                    _write_all_issues(store_path, existing)
+                    logger.debug("Idempotent skip + metadata refresh: issue %s", issue_id)
+                else:
+                    logger.debug("Idempotent skip: issue %s already exists", issue_id)
                 return _issue_from_dict(entry)
 
         # Новый issue
@@ -445,6 +454,49 @@ def close_all_dup_issues(knowledge_id: str, resolution: str | None = None) -> in
     if not issue_ids:
         return 0
     return bulk_update_status(issue_ids, "resolved", resolution)
+
+
+def reopen_dup_issues(knowledge_id: str) -> int:
+    """Переоткрыть ЗАКРЫТЫЕ duplicate-issues записи (Фаза 3).
+
+    Вызывается при restore: запись снова опубликована → dup-пары снова
+    актуальны и должны вернуться в Review Queue (HITL), а cooldown-щит
+    (restored_by_operator) защищает её от авто-re-deprecate.
+
+    Без переоткрытия идемпотентный skip create_issue (issue_id =
+    SHA256(type, kid, detail)) возвращал бы закрытый issue → скан не
+    создавал бы open-issue для восстановленной пары → дубль невидим.
+
+    Args:
+        knowledge_id: ID записи.
+
+    Returns:
+        int: число переоткрытых issues.
+    """
+    with _store_lock:
+        store_path = _get_store_path()
+        all_issues = _read_all_issues(store_path)
+
+        reopened = 0
+        for entry in all_issues:
+            if (
+                entry.get("type") == "duplicate"
+                and entry.get("knowledge_id") == knowledge_id
+                and entry.get("status") in ("resolved", "ignored")
+            ):
+                entry["status"] = "open"
+                entry.pop("resolved_at", None)
+                entry.pop("resolution", None)
+                reopened += 1
+
+        if reopened:
+            _write_all_issues(store_path, all_issues)
+
+    if reopened:
+        logger.info(
+            "Reopened %d duplicate issue(s) for restored record %s", reopened, knowledge_id,
+        )
+    return reopened
 
 
 # ── Async-safe wrappers (NF-5 fix) ─────────────────────────

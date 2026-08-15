@@ -1534,3 +1534,258 @@ async def test_s25_scan_state_survives_restart_via_http(e2e_http_app):
         assert scan1_id not in on_disk2, (
             f"interrupted scan {scan1_id} should be pruned, still on disk: {on_disk2}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════
+# S26: авто-deprecate (Фаза 3) — гейт, cooldown-щит, FP закрывает гейт
+# ═══════════════════════════════════════════════════════════════
+# Сценарий: 2 байт-идентичные записи → скан1 → скан2 (fp_free) → авто
+# (actor="auto", hash_only) deprecate → restore → скан3: НЕ re-deprecate
+# (cooldown-щит) → «Не дубль» (fp_rejection) → гейт закрыт.
+# Изоляция: _e2e_quality_isolation (autouse) — issues + audit в temp dir.
+
+S26_KNOWLEDGE_A = "e2e-s26-dup-a"
+S26_KNOWLEDGE_B = "e2e-s26-dup-b"
+S26_DOMAIN = "e2e-s26"
+S26_SUBJECT = "dedup"
+
+_S26_BODY = (
+    "Ключевой принцип проектирования систем: разделение ответственности. "
+    "Каждый модуль должен иметь одну причину для изменения, а границы между "
+    "модулями должны быть явными и проверяемыми. Это позволяет развивать "
+    "систему инкрементально, не ломая смежные компоненты. "
+    "Второй принцип: минимальный интерфейс. Чем меньше контракт между "
+    "модулями, тем проще тестировать каждый из них изолированно. "
+    "Третий принцип: явные зависимости. Внешние сервисы и хранилища "
+    "передаются через конструктор, а не создаются внутри модуля. "
+    "Четвёртый принцип: устойчивость к отказам. Система должна деградировать "
+    "предсказуемо: при недоступности вспомогательного сервиса основные "
+    "сценарии продолжают работать с ограничениями. "
+    "Пятый принцип: наблюдаемость. Ключевые события логируются с "
+    "контекстом, метрики собираются автоматически, трейсы связывают запросы "
+    "через границы сервисов."
+)
+
+
+async def _s26_run_scan_and_wait(e2e_http_app, headers_write, tag: str) -> dict:
+    """Запустить quality scan и дождаться done (возвращает scan_id).
+
+    Retry на 429 (rate-limit): скан — write-tool, плотная e2e-последовательность.
+    """
+    import asyncio
+
+    for attempt in range(6):
+        resp = await e2e_http_app.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": {"name": "run_quality_scan", "arguments": {}},
+            },
+            headers=headers_write,
+        )
+        if resp.status_code == 429:
+            await asyncio.sleep(3.5)
+            continue
+        break
+    assert resp.status_code == 200, f"{tag}: run_quality_scan HTTP {resp.status_code}"
+    body = resp.json()
+    assert "result" in body, f"{tag}: run_quality_scan failed: {body}"
+    result = json.loads(body["result"]["content"][0]["text"])
+    assert "error" not in result, f"{tag}: {result}"
+    assert result["status"] == "started", f"{tag}: expected started, got: {result}"
+    scan_id = result["scan_id"]
+
+    deadline = asyncio.get_running_loop().time() + 60.0
+    while asyncio.get_running_loop().time() < deadline:
+        resp = await e2e_http_app.get("/quality/scan/progress")
+        assert resp.status_code == 200
+        progress = resp.json()
+        status = progress.get("status", "")
+        if status in ("done", "error"):
+            assert status == "done", f"{tag}: scan ended with error: {progress}"
+            return {"scan_id": scan_id, "progress": progress}
+        await asyncio.sleep(0.5)
+    raise AssertionError(f"{tag}: scan did not finish in 60s")
+
+
+async def _s26_mcp_call(e2e_http_app, headers_write, tool: str, arguments: dict, rid: int) -> dict:
+    """tools/call обёртка: возвращает распарсенный result-текст.
+
+    Retry на 429 (rate-limit, -32003): плотные e2e-последовательности
+    превышают burst 5 — пауза 3.5s (refill) до 6 попыток.
+    """
+    import asyncio
+
+    for attempt in range(6):
+        resp = await e2e_http_app.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0", "id": rid,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": arguments},
+            },
+            headers=headers_write,
+        )
+        if resp.status_code == 429:
+            await asyncio.sleep(3.5)
+            continue
+        assert resp.status_code == 200, f"{tool}: HTTP {resp.status_code}: {resp.text}"
+        body = resp.json()
+        assert "result" in body, f"{tool}: failed: {body}"
+        return json.loads(body["result"]["content"][0]["text"])
+    raise AssertionError(f"{tool}: rate limit persisted after 6 attempts")
+
+
+@pytest.mark.e2e
+async def test_s26_auto_deprecate_gate_via_http(e2e_http_app):
+    """S26 (Фаза 3): полный цикл авто-deprecate с гейтом FP=0, cooldown-щитом,
+    restore и закрытием гейта операторским FP-сигналом."""
+    import asyncio
+
+    from mcp_server.config import settings as _settings
+
+    headers_write = {"X-API-Key": "e2e-write-key"}
+
+    # ── Step 1: 2 байт-идентичные записи (R1 exact hash) ──
+    for idx, kid in enumerate([S26_KNOWLEDGE_A, S26_KNOWLEDGE_B]):
+        if idx > 0:
+            await asyncio.sleep(3.5)  # rate-limit refill
+        write_result = await _s26_mcp_call(
+            e2e_http_app, headers_write, "write_knowledge",
+            {
+                "content": _S26_BODY,
+                "domain": S26_DOMAIN,
+                "subject": S26_SUBJECT,
+                "knowledge_id": kid,
+                "wait_for_index": True,
+            },
+            rid=idx + 1,
+        )
+        assert "error" not in write_result, f"write failed for {kid}: {write_result}"
+        assert write_result["knowledge_id"] == kid
+
+    await asyncio.sleep(3.5)  # rate-limit refill before scans
+
+    # ── Step 2: скан1 + скан2 → fp_free=True (2 скана, 0 отказов) ──
+    await _s26_run_scan_and_wait(e2e_http_app, headers_write, "scan1")
+    await asyncio.sleep(1.0)  # даём issues записаться
+    await _s26_run_scan_and_wait(e2e_http_app, headers_write, "scan2")
+    await asyncio.sleep(1.0)
+
+    # Dup-issue существует (R1) — гейт его видит
+    issues = await _s26_mcp_call(
+        e2e_http_app, headers_write, "list_quality_issues",
+        {"types": ["duplicate"], "status": "open", "limit": 50}, rid=10,
+    )
+    dup_open = [i for i in issues.get("issues", []) if i["knowledge_id"] in (S26_KNOWLEDGE_A, S26_KNOWLEDGE_B)]
+    assert dup_open, f"S26: no dup issue detected after 2 scans: {issues}"
+
+    # ── Step 3: авто-deprecate (actor="auto", hash_only) ──
+    try:
+        _settings.AUTO_DEDUP_ENABLED = True  # включаем ПОСЛЕ скан2 — хук скан2 не сработал
+        auto_result = await _s26_mcp_call(
+            e2e_http_app, headers_write, "bulk_deprecate_duplicates",
+            {"actor": "auto", "filter": {"hash_only": True}, "reason": "S26 e2e"},
+            rid=11,
+        )
+        assert auto_result.get("resolved") is True, f"S26: auto gate failed: {auto_result}"
+        assert auto_result.get("deprecated_count", 0) >= 1, (
+            f"S26: expected >=1 deprecation, got: {auto_result}"
+        )
+    finally:
+        _settings.AUTO_DEDUP_ENABLED = False
+
+    # Dup-issues закрыты, запись скрыта
+    issues_after = await _s26_mcp_call(
+        e2e_http_app, headers_write, "list_quality_issues",
+        {"types": ["duplicate"], "status": "open", "limit": 50}, rid=12,
+    )
+    dup_after = [i for i in issues_after.get("issues", []) if i["knowledge_id"] in (S26_KNOWLEDGE_A, S26_KNOWLEDGE_B)]
+    assert not dup_after, f"S26: dup issues should be closed after auto: {issues_after}"
+
+    # Аудит: bulk_deprecate с actor=auto + fp_stats
+    audit = await _s26_mcp_call(
+        e2e_http_app, headers_write, "list_audit_log",
+        {"limit": 100}, rid=13,
+    )
+    auto_audits = [r for r in audit.get("records", []) if r.get("actor") == "auto"]
+    assert auto_audits, f"S26: no auto audit records: {audit}"
+    assert audit.get("fp_stats", {}).get("fp_free") is True, f"S26: fp_stats: {audit.get('fp_stats')}"
+
+    # ── Step 4: restore записи (♻️) → restore-audit с restored_by_operator ──
+    # Тул не возвращает deprecated_kids — берём из audit-записи actor="auto"
+    deprecated_kid = auto_audits[0].get("knowledge_id")
+    restore_result = await _s26_mcp_call(
+        e2e_http_app, headers_write, "resolve_quality_issue",
+        {"action": "restore", "knowledge_id": deprecated_kid, "reason": "S26 e2e restore"},
+        rid=14,
+    )
+    assert restore_result.get("resolved") is True, f"S26: restore failed: {restore_result}"
+
+    audit2 = await _s26_mcp_call(
+        e2e_http_app, headers_write, "list_audit_log",
+        {"action": "restore", "limit": 20}, rid=15,
+    )
+    restore_recs = [r for r in audit2.get("records", []) if r.get("metadata", {}).get("restored_by_operator")]
+    assert restore_recs, f"S26: restore audit missing restored_by_operator: {audit2}"
+
+    # ── Step 5: скан3 → новая dup-пара, НО cooldown-щит блокирует авто ──
+    await _s26_run_scan_and_wait(e2e_http_app, headers_write, "scan3")
+    await asyncio.sleep(1.0)
+
+    issues3 = await _s26_mcp_call(
+        e2e_http_app, headers_write, "list_quality_issues",
+        {"types": ["duplicate"], "status": "open", "limit": 50}, rid=16,
+    )
+    dup3 = [i for i in issues3.get("issues", []) if i["knowledge_id"] in (S26_KNOWLEDGE_A, S26_KNOWLEDGE_B)]
+    assert dup3, f"S26: dup pair not re-detected after restore: {issues3}"
+
+    try:
+        _settings.AUTO_DEDUP_ENABLED = True
+        shield_result = await _s26_mcp_call(
+            e2e_http_app, headers_write, "bulk_deprecate_duplicates",
+            {"actor": "auto", "filter": {"hash_only": True}, "reason": "S26 e2e"},
+            rid=17,
+        )
+        assert shield_result.get("resolved") is True, f"S26: shield step: {shield_result}"
+        assert shield_result.get("deprecated_count") == 0, (
+            f"S26: cooldown shield should block re-deprecate, got: {shield_result}"
+        )
+    finally:
+        _settings.AUTO_DEDUP_ENABLED = False
+
+    # ── Step 6: оператор «Не дубль» (marks_fp=True) → гейт ЗАКРЫТ ──
+    fp_issue = dup3[0]["issue_id"]
+    fp_result = await _s26_mcp_call(
+        e2e_http_app, headers_write, "resolve_quality_issue",
+        {"action": "resolve", "issue_id": fp_issue,
+         "reason": "not a duplicate by operator", "marks_fp": True},
+        rid=18,
+    )
+    assert fp_result.get("resolved") is True, f"S26: fp resolve failed: {fp_result}"
+
+    audit3 = await _s26_mcp_call(
+        e2e_http_app, headers_write, "list_audit_log",
+        {"action": "fp_rejection", "limit": 20}, rid=19,
+    )
+    fp_recs = [r for r in audit3.get("records", []) if r.get("knowledge_id") in (S26_KNOWLEDGE_A, S26_KNOWLEDGE_B)]
+    assert fp_recs, f"S26: fp_rejection audit missing kid: {audit3}"
+
+    try:
+        _settings.AUTO_DEDUP_ENABLED = True
+        closed_result = await _s26_mcp_call(
+            e2e_http_app, headers_write, "bulk_deprecate_duplicates",
+            {"actor": "auto", "filter": {"hash_only": True}, "reason": "S26 e2e"},
+            rid=20,
+        )
+        assert closed_result.get("resolved") is False, f"S26: gate should be closed: {closed_result}"
+        assert "gate closed" in closed_result.get("error", ""), f"S26: {closed_result}"
+    finally:
+        _settings.AUTO_DEDUP_ENABLED = False
+
+    # ── Cleanup: удалить e2e-записи ──
+    await asyncio.sleep(3.5)  # rate-limit refill
+    for kid in [S26_KNOWLEDGE_A, S26_KNOWLEDGE_B]:
+        await e2e_http_app.app.state.pipeline.wait_for_index(kid, timeout=10.0)
+        e2e_http_app.app.state.qdrant.delete_by_knowledge_id(kid)

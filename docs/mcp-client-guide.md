@@ -20,8 +20,8 @@
    - Env: `MCP_SERVER_URL`, `MCP_API_KEY`
 
 3. **Проверьте подключение:**
-    - Kilo: `/mcps` → статус `connected`; tools list → 26 инструментов
-    - Ручная: `echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 mcp-stdio/bridge.py` → JSON с 26 tools
+    - Kilo: `/mcps` → статус `connected`; tools list → 30 инструментов
+    - Ручная: `echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 mcp-stdio/bridge.py` → JSON с 30 tools
 
 ---
 
@@ -179,7 +179,7 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 
 ---
 
-## 7. Таблица 26 инструментов
+## 7. Таблица 30 инструментов
 
 | # | Tool | Уровень | Назначение |
 |:--|------|:-------:|-----------|
@@ -198,7 +198,7 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 | 13 | `review_queue` | read | Топ устаревших записей (staleness_score DESC) |
 | 14 | `review_queue_books` | read | Топ устаревших КНИГ (агрегат по parent, доля устаревших секций) |
 | 15 | `list_quality_issues` | read | Проблемы: дубликаты, edit-wars, битые ссылки |
-| 16 | `resolve_quality_issue` | write | Разрешить: merge/deprecate/restore/resolve/ignore (cascade) |
+| 16 | `resolve_quality_issue` | write | Разрешить: merge/deprecate/restore/resolve/ignore (cascade). **Фаза 3:** `marks_fp=True` для action=resolve — явный FP-сигнал «не дубль» (пишет `fp_rejection` в audit, закрывает авто-гейт); restore переоткрывает dup-issues записи + пишет restore-audit (`restored_by_operator` — cooldown-щит авто) |
 | 17 | `run_quality_scan` | write | Периодический quality scan (для cron, фоновая задача с lock). Мгновенный ответ `{scanned, status: started|already_running|error, scan_id}`; прогресс — GET `/quality/scan/progress` (**13.27:** состояние пишется в `scan_state.json`, переживает рестарт сервера; прерванный скан авто-возобновляется при старте) |
 | 18 | `cancel_quality_scan` | write | Отменить активный scan, освободить lock |
 | 19 | `import_content` | import | Декомпозиция + batch запись: content → book collection. **PDF (Фаза 13.21):** `content_type="pdf"` + `pdf_path` (путь с сервера после POST /upload) или base64-контент → асинхронная очередь импортов (ответ `{import_id, status: started|queued}`, прогресс в GET /imports/{id}/progress, лог в /imports/{id}/log, отмена POST /imports/{id}/cancel). Лимиты: ≤2000 страниц, ≤100 МБ (base64 ~96 МБ), OCR для сканов, encrypted → ошибка |
@@ -209,6 +209,10 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 | 24 | `update_fragment` | write | Обновить раздел книги: изменить содержание и/или заголовок с optimistic locking |
 | 25 | `delete_fragment` | write | Удалить раздел книги: soft-delete (→ .trash/) + удаление из Qdrant, без cascade |
 | 26 | `find_fragment` | read | Найти разделы внутри книги по семантическому запросу, возвращает fragment_id/title/score/snippet |
+| 27 | `bulk_resolve_issues` | write | Пакетно резолвить/игнорировать issues по фильтру (P0): чистит шум за один вызов (`types`/`knowledge_id`/`status`/`action=ignore|resolve`); меняет только issues.jsonl, не контент |
+| 28 | `bulk_deprecate_duplicates` | write | Пакетно скрыть записи-дубликаты (Фаза 1 dedup): обратимый deprecate + закрытие всех dup-issues + audit.jsonl. **Фаза 3:** `actor="auto"` — серверный гейт авто-режима (config `AUTO_DEDUP_ENABLED` + FP=0 за N сканов + `filter={hash_only: True}` обязателен + cooldown-щит + cap `MAX_PER_SCAN` + strict-audit abort) |
+| 29 | `review_duplicate_pairs` | read | Ревью-очередь dup-пар (Фаза 2): 🟢/🟡/🔴 ранжирование R1-R6, сниппеты для diff. **Фаза 3:** `filter={hash_only: True}` — только строгие R1 (exact content-hash), никогда cosine |
+| 30 | `list_audit_log` | read | Журнал действий по качеству + статус авто-гейта (Фаза 3): записи audit.jsonl (deprecate/restore/bulk/auto/fp_rejection/scan_completed) + `fp_stats` (scans_in_window/rejections/fp_free) + `auto_dedup_enabled/config`. Фильтры: `action`, `actor` (для «только auto»), `knowledge_id`, `limit` |
 
 ---
 
@@ -221,7 +225,7 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 | `initialize` | `{"result": {protocolVersion, serverInfo, capabilities}}` | Handshake, protocolVersion `2024-11-05` |
 | `ping` | `{"result": {}}` (пустой объект) | Keepalive — используется MCP-клиентами |
 | `notifications/initialized` | **HTTP 204** (без тела) | Notification (без `id`) — клиент шлёт после initialize |
-| `tools/list` | `{"result": {"tools": [...26 инструментов]}}` | Schemas для автогенерации permission |
+| `tools/list` | `{"result": {"tools": [...30 инструментов]}}` | Schemas для автогенерации permission |
 | `tools/call` | `{"result": {"content": [...]}}` | Вызов инструмента |
 
 **Правила:**
@@ -388,7 +392,7 @@ curl -s -X POST http://localhost:8000/mcp \
 1. Откройте сессию Kilo
 2. Выполните `/mcps` — отобразится список MCP-серверов
 3. `mcp-knowledge` должен быть в статусе `connected`
-4. Выполните `/mcp-tools mcp-knowledge` → список из 26 инструментов
+4. Выполните `/mcp-tools mcp-knowledge` → список из 30 инструментов
 
 ### 8.2 Ручная проверка (без Kilo)
 

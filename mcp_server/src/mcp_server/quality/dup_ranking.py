@@ -78,19 +78,53 @@ def extract_target_kid(detail: str) -> str:
 # ── Ранжирование ──────────────────────────────────────────────
 
 
+def is_r1_exact_hash(metadata: dict | None) -> bool:
+    """Единый предикат строгого R1 (Фаза 3, 2b): exact content-hash + standalone + same_subject.
+
+    Без cosine-условия — авто (bulk/review filter.hash_only) НИКОГДА не
+    работает по cosine (R3). Используется rank_pair (R1) И bulk/review
+    (filter.hash_only) — один предикат, ноль дублирования.
+
+    Args:
+        metadata: сигналы dup-пары (Фаза 1). Отсутствие target_subject
+            (легаси до Фазы 3) → same_subject=False → НЕ R1 (консервативно).
+
+    Returns:
+        True если пара — строгий R1 (exact hash + both standalone + real same_subject).
+    """
+    meta = metadata or {}
+    content_hash = meta.get("content_hash")
+    target_hash = meta.get("target_content_hash")
+    if not (content_hash and target_hash and content_hash == target_hash):
+        return False
+    standalone = bool(meta.get("standalone", False))
+    target_standalone = bool(meta.get("target_standalone", False))
+    if not (standalone and target_standalone):
+        return False
+    target_subject = meta.get("target_subject")
+    same_subject = target_subject is not None and meta.get("subject") == target_subject
+    return same_subject
+
+
 def rank_pair(metadata: dict | None, detail: str = "") -> str:
     """Классифицировать dup-пару: 'green' | 'yellow' | 'red'.
 
     Args:
         metadata: структурированные сигналы из Фазы 1 (cosine, content_hash,
             content_length, target_content_hash, target_content_length,
-            slug_negation, standalone, target_standalone, subject).
+            slug_negation, standalone, target_standalone, subject, target_subject).
         detail: строка detail (fallback для cosine, когда metadata пустая).
 
     Returns:
         "green" (пачка «утвердить все») | "yellow" (сомнительная) | "red".
     """
     meta = metadata or {}
+
+    # R1 (Фаза 3, 2b): ЕДИНЫЙ предикат is_r1_exact_hash вызывается ПЕРВЫМ — ДО
+    # cosine-gate. exact-hash пара с cosine<0.92 не должна уходить в 🔴
+    # (hash сильнее cosine — slug-сигнал). Устраняет расхождение review/bulk.
+    if is_r1_exact_hash(meta):
+        return "green"
 
     # R6: без cosine — косвенное совпадение
     cosine = meta.get("cosine")
@@ -102,18 +136,13 @@ def rank_pair(metadata: dict | None, detail: str = "") -> str:
     content_hash = meta.get("content_hash")
     target_hash = meta.get("target_content_hash")
     hash_match = bool(content_hash and target_hash and content_hash == target_hash)
-    same_subject = True  # subject всегда совпадает внутри пары скана
     standalone = bool(meta.get("standalone", False))
     target_standalone = bool(meta.get("target_standalone", False))
     both_standalone = standalone and target_standalone
     negation = bool(meta.get("slug_negation", False))
     len_diff = rel_length_diff(meta.get("content_length"), meta.get("target_content_length"))
 
-    # R1: байт-идентичный standalone-контент → 🟢 (FP=0)
-    if hash_match and both_standalone and same_subject:
-        return "green"
-
-    # R2: hash совпал, но parent/subject → 🟡 (cross-collection риск)
+    # R2: hash совпал, но не R1 (parent/subject) → 🟡 (cross-collection риск)
     if hash_match:
         return "yellow"
 
@@ -154,22 +183,6 @@ def recommend_canonical(metadata: dict | None, source_kid: str, target_kid: str)
     if a_std != b_std:
         return source_kid if a_std else target_kid
     return target_kid  # дефолт — на кого ссылается issue
-
-
-def group_green_batches(
-    pairs: list[dict], max_batch: int = 25
-) -> list[list[dict]]:
-    """Сгруппировать 🟢-пары в батчи для «Утвердить все» (кластер по subject)."""
-    by_subject: dict[str, list[dict]] = {}
-    for p in pairs:
-        s = p.get("subject", "")
-        by_subject.setdefault(s, []).append(p)
-
-    batches: list[list[dict]] = []
-    for group in by_subject.values():
-        for i in range(0, len(group), max_batch):
-            batches.append(group[i:i + max_batch])
-    return batches
 
 
 def summarize_signals(metadata: dict | None) -> dict:

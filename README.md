@@ -60,7 +60,7 @@ mcp-stdio/bridge.py │    │  диаг. :8085 → :8000
 └────────────────────────────────────────────────────┘
 ```
 
-**kb-console** — отдельный самодостаточный контейнер (образ `kb-console:prod`): страницы **Статус** (health-карточки, метрики, 20 инструментов), **Книги** (список коллекций + оглавление), **Импорт** (загрузка материалов через `import_content`), **Поиск** (по корпусу), **Качество** (запуск quality-скана с живым прогрессом, review-очередь устаревших книг, issues, dedup-ревью 🟢/🟡). Может жить на клиентских хостах (`MCP_SERVER_URL` из env). Руководство: `kb-console/USER_GUIDE.md`.
+**kb-console** — отдельный самодостаточный контейнер (образ `kb-console:prod`): страницы **Статус** (health-карточки, метрики, 30 инструментов), **Книги** (список коллекций + оглавление), **Импорт** (загрузка материалов через `import_content`), **Поиск** (по корпусу), **Качество** (запуск quality-скана с живым прогрессом, review-очередь устаревших книг, issues, dedup-ревью 🟢/🟡). Может жить на клиентских хостах (`MCP_SERVER_URL` из env). Руководство: `kb-console/USER_GUIDE.md`.
 
 ## 🚀 Быстрый старт
 
@@ -204,6 +204,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | 13.23 | ✅ | Qdrant-бэкап: sparse-фикс, снапшоты только своих коллекций, healthcheck /dev/tcp |
 | 13.24 | ✅ | Advisory P2-фиксы: task-ref в hide, import asyncio наверх, +3 теста render_import_progress |
 | 13.27 | ✅ | Прогресс скана: панель только на «Качестве» (построение при загрузке страницы, кнопка заблокирована на время скана, on_done однократно), персистентность scan_state.json + авто-resume прерванного скана после рестарта |
+| 13.28 | ✅ | **Фаза 3 dedup: авто-deprecate 🟢-пачек (exact content-hash ONLY).** Серверный гейт целиком внутри `bulk_deprecate_duplicates` при `actor="auto"`: `AUTO_DEDUP_ENABLED` (по умолчанию **false**) + FP=0 за `AUTO_DEDUP_FP_FREE_SCANS=2` полных скана (`scan_completed`/`fp_rejection` в audit.jsonl) + `filter={hash_only}` (R1-предикат, cosine НИКОГДА не авто) + cooldown-щит `AUTO_DEDUP_RESTORE_COOLDOWN_SCANS=3` после restore (`restored_by_operator`) + cap `AUTO_DEDUP_MAX_PER_SCAN=100` + strict-audit (сбой аудита = abort пачки). Restore переоткрывает dup-issues (пара снова в Review Queue). UI «Качество»: панель «Журнал действий» (`list_audit_log`) со статусом гейта, ♻️ per-record restore, «Не дубль» → `marks_fp=True`. **Hot-reload НЕТ — флаги читаются при старте, изменение требует рестарта.** Включение: утром под присмотром, НЕ перед ночным cron 03:00 |
 
 ## 🧪 Тесты (актуальные цифры)
 

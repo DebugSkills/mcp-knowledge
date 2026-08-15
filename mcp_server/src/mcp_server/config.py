@@ -67,6 +67,16 @@ class Settings(BaseSettings):
     # Лог сканирования (13.19) — файл в /app/data/logs (volume → хост)
     QUALITY_SCAN_LOG_DIR: str = "/app/data/logs"
 
+    # ── Dedup auto-deprecate (Фаза 3) ──────────────────────
+    # OFF по умолчанию (блокер 2): авто-скрытие включается только явно (env).
+    AUTO_DEDUP_ENABLED: bool = False
+    # FP=0 за ≥N ПОЛНЫХ сканов (scan_completed в audit) открывает гейт.
+    AUTO_DEDUP_FP_FREE_SCANS: int = 2
+    # restore оператором исключает запись из авто на N сканов (cooldown-щит).
+    AUTO_DEDUP_RESTORE_COOLDOWN_SCANS: int = 3
+    # cap авто-скрытий за один скан (защита от массового скрытия, P2-10).
+    AUTO_DEDUP_MAX_PER_SCAN: int = 100
+
     # MCP request size limit (Фаза 13.21 P1-2)
     # 128 МБ default: безопасный баланс при mem_limit 2g.
     # Memory analysis: baseline ~120MB, JSON parsing 2-3x → пик ~670MB.

@@ -40,6 +40,8 @@ _audit_lock = threading.Lock()
 AUDIT_ACTIONS: frozenset[str] = frozenset({
     "deprecate", "restore", "bulk_deprecate", "merge",
     "auto_deprecate", "resolve_issue",
+    # Фаза 3 (1a): история полных сканов + фиксация FP-решений оператора
+    "scan_completed", "fp_rejection",
 })
 
 
@@ -65,7 +67,8 @@ def write_audit(
     actor: str,
     reason: str = "",
     metadata: dict | None = None,
-) -> None:
+    strict: bool = False,
+) -> bool:
     """Записать одно действие в audit.jsonl (append-only, атомарно).
 
     Args:
@@ -74,6 +77,11 @@ def write_audit(
         actor: Кто выполнил (operator | operator-batch | auto | system).
         reason: Человекочитаемая причина.
         metadata: Дополнительные структурированные данные (issue_id, count, ...).
+        strict: Зарезервирован для API-совместимости (авто-путь передаёт strict=True).
+            В обоих режимах ошибка записи возвращает False, НЕ raise.
+
+    Returns:
+        True при успешной записи; False при ошибке (никогда не бросает).
     """
     if action not in AUDIT_ACTIONS:
         logger.warning("Unknown audit action '%s' (recorded anyway)", action)
@@ -101,7 +109,9 @@ def write_audit(
                 os.fsync(fh.fileno())
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to write audit record: %s", exc)
+            return False
     logger.debug("Audit: %s %s by %s", action, knowledge_id, actor)
+    return True
 
 
 def list_audit(
@@ -152,3 +162,52 @@ def list_audit(
 def count_actions(actor: str | None = None, action: str | None = None) -> int:
     """Число записей audit по фильтру (для FP-мониторинга Фазы 3)."""
     return len(list_audit(actor=actor, action=action, limit=10**6))
+
+
+def get_fp_rate(window_scans: int = 2) -> dict:
+    """FP-rate за последние N полных сканов (Фаза 3, 1d).
+
+    Читает audit.jsonl и считает:
+    - scans_in_window: число записей scan_completed (полные сканы, не отменённые);
+    - rejections: fp_rejection события с ts >= ts(scan_completed[-window_scans]);
+    - approved: авто-скрытия (bulk_deprecate + actor="auto") в том же окне.
+    fp_free = scans_in_window >= window_scans AND rejections == 0.
+
+    Returns:
+        {"scans_in_window", "rejections", "approved", "fp_rate", "fp_free"}
+    """
+    records = list_audit(limit=10**6)
+    records.reverse()  # хронологический порядок (старые → новые)
+
+    scans = [r for r in records if r.get("action") == "scan_completed"]
+    if len(scans) < window_scans:
+        return {
+            "scans_in_window": len(scans),
+            "rejections": 0,
+            "approved": 0,
+            "fp_rate": 0.0,
+            "fp_free": False,
+        }
+
+    # Окно: от ts предпоследнего из window_scans последних полных сканов до сейчас
+    window_start_ts = scans[-window_scans].get("ts", "")
+
+    rejections = 0
+    approved = 0
+    for rec in records:
+        if rec.get("ts", "") < window_start_ts:
+            continue
+        action = rec.get("action")
+        if action == "fp_rejection":
+            rejections += 1
+        elif action == "bulk_deprecate" and rec.get("actor") == "auto":
+            approved += 1
+
+    fp_rate = rejections / (rejections + approved) if (rejections + approved) else 0.0
+    return {
+        "scans_in_window": len(scans),
+        "rejections": rejections,
+        "approved": approved,
+        "fp_rate": round(fp_rate, 4),
+        "fp_free": rejections == 0,
+    }

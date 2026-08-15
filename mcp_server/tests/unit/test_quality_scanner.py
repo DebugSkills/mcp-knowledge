@@ -420,7 +420,7 @@ class TestContentHash:
         h1 = _content_body_hash("text\n\n\nmore")
         h2 = _content_body_hash("text\n\nmore")
         assert h1 == h2  # нормализация → одинаковый hash
-        assert len(h1) == 16
+        assert len(h1) == 64  # Фаза 3 (0e): полный sha256 (было 16 hex)
 
     def test_hash_stable_for_identical(self):
         from mcp_server.quality.scanner import _content_body_hash

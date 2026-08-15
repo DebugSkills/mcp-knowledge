@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from mcp_server.quality.dup_ranking import (
     extract_target_kid,
-    group_green_batches,
     has_negation_pattern,
+    is_r1_exact_hash,
     rank_pair,
     recommend_canonical,
     rel_length_diff,
@@ -18,7 +18,7 @@ from mcp_server.quality.dup_ranking import (
 
 
 def _meta(**overrides) -> dict:
-    """Базовые сигналы dup-пары (структура Фазы 1)."""
+    """Базовые сигналы dup-пары (структура Фазы 1 + target_subject Фазы 3)."""
     base = {
         "cosine": 0.95,
         "content_hash": "aaa111",
@@ -29,6 +29,8 @@ def _meta(**overrides) -> dict:
         "standalone": True,
         "target_standalone": True,
         "subject": "devops",
+        "target_subject": "devops",  # Фаза 3 (0a): реальное сравнение subject
+        "target_kid": "tgt-kid",
     }
     base.update(overrides)
     return base
@@ -41,6 +43,27 @@ class TestRankPair:
         """R1: exact content-hash + standalone + same subject → 🟢."""
         assert rank_pair(_meta(
             content_hash="abc", target_content_hash="abc",
+        )) == "green"
+
+    def test_r1_hash_match_different_subject_yellow(self):
+        """R1: exact hash + standalone, но РАЗНЫЙ subject → НЕ green (🟡)."""
+        assert rank_pair(_meta(
+            content_hash="abc", target_content_hash="abc",
+            subject="devops", target_subject="other",
+        )) == "yellow"
+
+    def test_r1_hash_match_legacy_no_target_subject_yellow(self):
+        """R1: exact hash + standalone, но БЕЗ target_subject (легаси) → 🟡."""
+        assert rank_pair(_meta(
+            content_hash="abc", target_content_hash="abc",
+            target_subject=None,
+        )) == "yellow"
+
+    def test_r1_hash_match_before_cosine_gate(self):
+        """Фаза 3 (2b): exact-hash пара с cosine<0.92 → 🟢 (hash сильнее cosine)."""
+        assert rank_pair(_meta(
+            content_hash="abc", target_content_hash="abc",
+            cosine=0.80,
         )) == "green"
 
     def test_r2_hash_equal_with_parent_yellow(self):
@@ -121,11 +144,34 @@ class TestHelpers:
         )
         assert recommend_canonical(meta, "src", "tgt") == "src"
 
-    def test_group_green_batches(self):
-        pairs = [{"subject": "a", "issue_id": f"i{n}"} for n in range(60)]
-        batches = group_green_batches(pairs, max_batch=25)
-        assert len(batches) == 3
-        assert all(len(b) <= 25 for b in batches)
+    def test_is_r1_exact_hash_true(self):
+        """is_r1_exact_hash: exact hash + standalone + same_subject → True."""
+        assert is_r1_exact_hash(_meta(
+            content_hash="abc", target_content_hash="abc",
+        )) is True
+
+    def test_is_r1_exact_hash_false_on_hash_mismatch(self):
+        assert is_r1_exact_hash(_meta(
+            content_hash="abc", target_content_hash="xyz",
+        )) is False
+
+    def test_is_r1_exact_hash_false_on_non_standalone(self):
+        assert is_r1_exact_hash(_meta(
+            content_hash="abc", target_content_hash="abc",
+            standalone=False,
+        )) is False
+
+    def test_is_r1_exact_hash_false_on_different_subject(self):
+        assert is_r1_exact_hash(_meta(
+            content_hash="abc", target_content_hash="abc",
+            target_subject="other",
+        )) is False
+
+    def test_is_r1_exact_hash_false_on_legacy_no_target_subject(self):
+        assert is_r1_exact_hash(_meta(
+            content_hash="abc", target_content_hash="abc",
+            target_subject=None,
+        )) is False
 
     def test_summarize_signals(self):
         s = summarize_signals(_meta(cosine=0.974))

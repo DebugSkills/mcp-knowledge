@@ -208,14 +208,19 @@ def _e2e_quality_isolation(tmp_git_knowledge_root):
 
     Без этого run_quality_scan пишет в прод /app/data/quality/issues.jsonl
     и сканирует прод /app/knowledge. Паттерн: set_store_dir как в unit-тестах.
+    Фаза 3: изолирован и audit-стор (scan_completed/fp_rejection/restore —
+    иначе e2e S26 и любой скан писали бы в прод audit.jsonl).
     """
+    from mcp_server.quality import audit
     from mcp_server.quality.issues import set_store_dir
 
     quality_e2e_dir = str(tmp_git_knowledge_root / ".quality-e2e")
     set_store_dir(quality_e2e_dir)
+    audit.set_store_dir(quality_e2e_dir)
     yield
     # Сброс: fallback на default path (прод /app/data/quality) вне e2e
     set_store_dir(None)
+    audit.set_store_dir(None)
 
 
 @pytest.fixture

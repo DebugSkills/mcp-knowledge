@@ -22,6 +22,7 @@ from .quality import (
     bulk_deprecate_duplicates,
     bulk_resolve_issues,
     cancel_quality_scan,
+    list_audit_log,
     list_quality_issues,
     resolve_quality_issue,
     review_duplicate_pairs,
@@ -182,6 +183,7 @@ _RESOLVE_QUALITY_ISSUE_SCHEMA: dict[str, Any] = {
         "target_id": {"type": "string", "description": "target knowledge_id (для merge)"},
         "reason": {"type": "string", "description": "Причина решения"},
         "cascade": {"type": "boolean", "default": False, "description": "Применить к дочерним секциям книги (Фаза 13.14)"},
+        "marks_fp": {"type": "boolean", "description": "Явный FP-сигнал «не дубль» для action=resolve (Фаза 3)"},
     },
     "required": ["action"],
 }
@@ -236,6 +238,11 @@ _BULK_DEPRECATE_DUPLICATES_SCHEMA: dict[str, Any] = {
             "description": "Кто выполняет: operator-batch | auto",
         },
         "reason": {"type": "string", "description": "Причина решения"},
+        "filter": {
+            "type": "object",
+            "properties": {"hash_only": {"type": "boolean", "default": False}},
+            "description": "Фаза 3: filter={hash_only:true} — только строгие R1 (exact hash) пары. Для actor=auto обязателен.",
+        },
     },
 }
 
@@ -250,6 +257,23 @@ _REVIEW_DUPLICATE_PAIRS_SCHEMA: dict[str, Any] = {
             "default": 200,
             "description": "Макс. число open dup-issues для анализа (Фаза 2 dedup)",
         },
+        "filter": {
+            "type": "object",
+            "properties": {"hash_only": {"type": "boolean", "default": False}},
+            "description": "Фаза 3: filter={hash_only:true} — только строгие R1 (exact hash) пары в green_batch",
+        },
+    },
+}
+
+# ── Фаза 3: list_audit_log schema ───────────────────────────
+
+_LIST_AUDIT_LOG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "actor": {"type": "string", "description": "Фильтр по actor (operator | auto | system | operator-batch)"},
+        "action": {"type": "string", "description": "Фильтр по действию (deprecate | restore | bulk_deprecate | merge | fp_rejection | scan_completed)"},
+        "knowledge_id": {"type": "string", "description": "Фильтр по записи"},
+        "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
     },
 }
 
@@ -457,6 +481,11 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _REVIEW_DUPLICATE_PAIRS_SCHEMA,
     },
     {
+        "name": "list_audit_log",
+        "description": "Журнал действий по качеству (Фаза 3): deprecate/restore/bulk/auto/fp_rejection/scan_completed. Read-only — включает fp_stats и статус авто-гейта (AUTO_DEDUP_ENABLED).",
+        "inputSchema": _LIST_AUDIT_LOG_SCHEMA,
+    },
+    {
         "name": "run_quality_scan",
         "description": "Запустить периодический quality scan: обход всех .md → staleness_score → dup-pair detection → issues + review_queue. Для cron (4.8).",
         "inputSchema": _RUN_QUALITY_SCAN_SCHEMA,
@@ -535,6 +564,7 @@ TOOL_HANDLERS = {
     "bulk_resolve_issues": bulk_resolve_issues,
     "bulk_deprecate_duplicates": bulk_deprecate_duplicates,
     "review_duplicate_pairs": review_duplicate_pairs,
+    "list_audit_log": list_audit_log,
     "run_quality_scan": run_quality_scan,
     "cancel_quality_scan": cancel_quality_scan,
     "import_content": import_content,

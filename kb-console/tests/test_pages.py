@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from typing import ClassVar
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -711,3 +711,199 @@ class TestReviewPairsPanel:
         with patch("kb_console.pages.quality.ui") as mock_ui:
             quality._render_review_pairs({}, refresh_fn)
         assert mock_ui.label.call_count == 0
+
+
+class TestAuditPanelPhase3:
+    """Фаза 3 dedup: панель «Журнал действий» + FP-сигналы + гейт-статус."""
+
+    def _audit_data(self, fp_free: bool = True, enabled: bool = True):
+        return {
+            "records": [
+                {
+                    "ts": "2026-08-14T10:00:00+00:00", "action": "bulk_deprecate",
+                    "actor": "auto", "knowledge_id": "kid-1", "reason": "auto R1",
+                },
+                {
+                    "ts": "2026-08-14T09:00:00+00:00", "action": "restore",
+                    "actor": "operator", "knowledge_id": "kid-2",
+                    "reason": "Restored from audit panel (Фаза 3)",
+                },
+            ],
+            "fp_stats": {
+                "scans_in_window": 2, "rejections": 0,
+                "approved": 1, "fp_rate": 0.0, "fp_free": fp_free,
+            },
+            "auto_dedup_enabled": enabled,
+            "auto_dedup_config": {"fp_free_scans": 2, "cooldown_scans": 3, "max_per_scan": 100},
+        }
+
+    def test_render_audit_shows_gate_status(self):
+        """Статус-строка гейта: badge ВКЛ + fp_stats текст."""
+        from kb_console.pages import quality
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_audit(
+                self._audit_data(fp_free=True, enabled=True), {"auto_only": False},
+                render_fn=MagicMock(), refresh_fn=MagicMock(),
+            )
+        texts = [" ".join(str(a) for a in c.args) for c in mock_ui.badge.call_args_list]
+        assert any("Авто-скрытие: ВКЛ" in t for t in texts)
+        labels = [" ".join(str(a) for a in c.args) for c in mock_ui.label.call_args_list]
+        assert any("гейт ОТКРЫТ" in t for t in labels)
+
+    def test_render_audit_gate_closed_badge(self):
+        """Авто выключено → badge ВЫКЛ, гейт закрыт."""
+        from kb_console.pages import quality
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_audit(
+                self._audit_data(fp_free=False, enabled=False), {"auto_only": False},
+                render_fn=MagicMock(), refresh_fn=MagicMock(),
+            )
+        texts = [" ".join(str(a) for a in c.args) for c in mock_ui.badge.call_args_list]
+        assert any("Авто-скрытие: ВЫКЛ" in t for t in texts)
+        labels = [" ".join(str(a) for a in c.args) for c in mock_ui.label.call_args_list]
+        assert any("гейт закрыт" in t for t in labels)
+
+    def test_render_audit_record_restore_button(self):
+        """♻️ рендерится на deprecate/bulk_deprecate (частичный restore пачки),
+        НЕ на restore/fp_rejection/scan_completed."""
+        from kb_console.pages import quality
+        refresh_fn = MagicMock()
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_audit_record(
+                {"ts": "t", "action": "bulk_deprecate", "actor": "auto",
+                 "knowledge_id": "kid-1", "reason": "r"}, refresh_fn,
+            )
+        texts = [" ".join(str(a) for a in c.args) for c in mock_ui.button.call_args_list]
+        assert any("♻️" in t for t in texts)
+        assert mock_ui.badge.call_count == 1  # auto-badge
+
+        mock_ui.reset_mock()
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_audit_record(
+                {"ts": "t", "action": "restore", "actor": "operator",
+                 "knowledge_id": "kid-2", "reason": "r"}, refresh_fn,
+            )
+        texts = [" ".join(str(a) for a in c.args) for c in mock_ui.button.call_args_list]
+        assert not any("♻️" in t for t in texts)
+
+    def test_render_audit_auto_only_filter(self):
+        """Toggle «только auto» фильтрует записи по actor=="auto"."""
+        from kb_console.pages import quality
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_audit(
+                self._audit_data(), {"auto_only": True},
+                render_fn=MagicMock(), refresh_fn=MagicMock(),
+            )
+        # 1 запись (actor=auto) прошла фильтр → 1 карточка + 1 строка «Журнал пуст» нет
+        card_calls = [c for c in mock_ui.card.call_args_list]
+        assert len(card_calls) >= 1
+        labels = [" ".join(str(a) for a in c.args) for c in mock_ui.label.call_args_list]
+        assert not any("Журнал пуст" in t for t in labels)
+
+    def test_render_audit_empty(self):
+        """Пустой журнал — «Журнал пуст», без карточек."""
+        from kb_console.pages import quality
+        data = self._audit_data()
+        data["records"] = []
+        with patch("kb_console.pages.quality.ui") as mock_ui:
+            quality._render_audit(
+                data, {"auto_only": False}, render_fn=MagicMock(), refresh_fn=MagicMock(),
+            )
+        labels = [" ".join(str(a) for a in c.args) for c in mock_ui.label.call_args_list]
+        assert any("Журнал пуст" in t for t in labels)
+
+    @pytest.mark.asyncio
+    async def test_not_dup_marks_fp_true(self):
+        """«Не дубль» шлёт marks_fp=True (явный FP-сигнал)."""
+        from kb_console.pages import quality
+        pair = {"issue_id": "iss-y1"}
+        mock_client = MagicMock()
+        mock_client.resolve_quality_issue = AsyncMock(return_value={"resolved": True})
+        mock_client.close = AsyncMock()
+        with (
+            patch.object(quality, "MCPClient", return_value=mock_client),
+            patch.object(quality, "ui"),
+            patch.object(quality, "cache"),
+        ):
+            await quality._resolve_yellow_pair(pair, "not_dup", refresh_fn=AsyncMock())
+        kwargs = mock_client.resolve_quality_issue.call_args.kwargs
+        assert kwargs["marks_fp"] is True
+        assert kwargs["action"] == "resolve"
+
+    @pytest.mark.asyncio
+    async def test_restore_audit_record_calls_restore(self):
+        """♻️ вызывает resolve_quality_issue action=restore по knowledge_id."""
+        from kb_console.pages import quality
+        mock_client = MagicMock()
+        mock_client.resolve_quality_issue = AsyncMock(return_value={"resolved": True})
+        mock_client.close = AsyncMock()
+        with (
+            patch.object(quality, "MCPClient", return_value=mock_client),
+            patch.object(quality, "ui"),
+            patch.object(quality, "cache"),
+        ):
+            await quality._restore_audit_record("kid-1", refresh_fn=AsyncMock())
+        kwargs = mock_client.resolve_quality_issue.call_args.kwargs
+        assert kwargs["action"] == "restore"
+        assert kwargs["knowledge_id"] == "kid-1"
+
+
+class TestMCPClientAuditMethodsPhase3:
+    """Фаза 3: MCPClient-обёртки list_audit_log / marks_fp / filter."""
+
+    @pytest.fixture
+    def quality_transport(self):
+        captured = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content) if request.content else {}
+            method = body.get("method", "")
+            rid = body.get("id", 1)
+            if method == "tools/call":
+                params = body.get("params", {})
+                captured.append({"tool": params.get("name", ""), "args": dict(params.get("arguments", {}))})
+                inner = {"ok": True, "tool": params.get("name", "")}
+                wrapped = {"content": [{"type": "text", "text": json.dumps(inner)}]}
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": rid, "result": wrapped})
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": rid, "result": {"ok": True}})
+
+        transport = httpx.MockTransport(handler)
+        transport.captured = captured
+        return transport
+
+    @pytest.fixture
+    def quality_client(self, quality_transport):
+        c = httpx.AsyncClient(transport=quality_transport, base_url="http://test")
+        client = MCPClient(base_url="http://test", client=c)
+        client._captured = quality_transport.captured
+        return client
+
+    @pytest.mark.asyncio
+    async def test_list_audit_log_call(self, quality_client):
+        """list_audit_log передаёт action/actor/limit."""
+        result = await quality_client.list_audit_log(action="restore", limit=20)
+        assert result["ok"] is True
+        call = quality_client._captured[0]
+        assert call["tool"] == "list_audit_log"
+        assert call["args"]["action"] == "restore"
+        assert call["args"]["limit"] == 20
+
+    @pytest.mark.asyncio
+    async def test_resolve_marks_fp_passed(self, quality_client):
+        """resolve_quality_issue с marks_fp=True."""
+        result = await quality_client.resolve_quality_issue(
+            action="resolve", issue_id="iss-1", reason="not a duplicate", marks_fp=True,
+        )
+        assert result["ok"] is True
+        call = quality_client._captured[0]
+        assert call["args"]["marks_fp"] is True
+        assert call["args"]["issue_id"] == "iss-1"
+
+    @pytest.mark.asyncio
+    async def test_review_pairs_hash_only_filter(self, quality_client):
+        """review_duplicate_pairs передаёт filter={hash_only: True}."""
+        result = await quality_client.review_duplicate_pairs(limit=10, filter={"hash_only": True})
+        assert result["ok"] is True
+        call = quality_client._captured[0]
+        assert call["tool"] == "review_duplicate_pairs"
+        assert call["args"]["filter"] == {"hash_only": True}

@@ -19,7 +19,7 @@ import time
 import uuid
 
 from mcp_server.quality import REVIEW_THRESHOLD
-from mcp_server.quality.audit import write_audit
+from mcp_server.quality.audit import get_fp_rate, list_audit, write_audit
 from mcp_server.quality.issues import (
     bulk_update_status,
     close_all_dup_issues,
@@ -345,6 +345,8 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
             target_id (optional str): target knowledge_id для merge
             reason (optional str): причина решения
             cascade (optional bool): применить к дочерним секциям (deprecate/restore)
+            marks_fp (optional bool): явный FP-сигнал «не дубль» (Фаза 3).
+                None → автодетект по reason ("not a duplicate" in reason.lower()).
     """
     issue_id = params.get("issue_id", "")
     action = params.get("action", "")
@@ -352,6 +354,7 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
     reason = params.get("reason", "")
     knowledge_id = params.get("knowledge_id")  # Фаза 13.14: прямая операция
     cascade = params.get("cascade", False)      # Фаза 13.14: каскад на секции
+    marks_fp = params.get("marks_fp")           # Фаза 3 (1c): явный FP-сигнал
 
     # Валидация
     if not issue_id and not knowledge_id:
@@ -381,7 +384,28 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
         if action == "resolve":
             if not issue_id:
                 return {"resolved": False, "error": "issue_id is required for resolve action"}
+            # P2-NEW-1: kid-lookup ДО смены статуса — после update_issue_status
+            # issue уже не open, list_issues(status="open") его не найдёт → kid="-".
+            iss_before = next(
+                (i for i in list_issues(limit=None) if i.issue_id == issue_id), None
+            )
+            kid_from_issue = iss_before.knowledge_id if iss_before else None
             update_issue_status(issue_id, "resolved", reason)
+            # Фаза 3 (1c): FP-детект — оператор пометил «не дубль».
+            # marks_fp=True ИЛИ reason содержит "not a duplicate" (backward-compat:
+            # UI уже шлёт такой reason) → пишем fp_rejection в audit (закрывает гейт).
+            is_fp = marks_fp if marks_fp is not None else (
+                "not a duplicate" in (reason or "").lower()
+            )
+            if is_fp:
+                kid = kid_from_issue or knowledge_id or "-"
+                write_audit(
+                    action="fp_rejection",
+                    knowledge_id=kid,
+                    actor="operator",
+                    reason=reason or "not a duplicate",
+                    metadata={"issue_id": issue_id},
+                )
             return {"resolved": True, "issue_id": issue_id, "status": "resolved", "side_effects": side_effects}
 
         elif action == "ignore":
@@ -499,11 +523,36 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
 
                 if issue_id:
                     update_issue_status(issue_id, "resolved", reason or "restored")
+                # Фаза 3 (1e, P1-NEW-1): restore-audit — СРАЗУ после update_issue_status,
+                # ПЕРЕД data_version++. Без этого cooldown-щит (2d) не находит
+                # «ts последнего restore» → восстановленная запись re-auto-deprecate.
+                write_audit(
+                    action="restore",
+                    knowledge_id=knowledge_id,
+                    actor="operator",
+                    reason=reason or "restored by operator",
+                    metadata={
+                        "restored_by_operator": True,  # явный сигнал для cooldown-щита
+                        "cascade_affected": cascade_affected,
+                        "issue_id": issue_id or None,
+                    },
+                )
                 # Task 1: инкремент data_version после мутации
                 try:
                     app_state.data_version += 1
                 except Exception:  # noqa: S110
                     pass  # best-effort
+                # Фаза 3: restore переоткрывает dup-issues записи — пара снова
+                # видна в Review Queue, cooldown-щит защищает от авто-re-deprecate.
+                # (иначе идемпотентный create_issue возвращает закрытый issue → дубль невидим)
+                try:
+                    from mcp_server.quality.issues import reopen_dup_issues
+
+                    reopened = reopen_dup_issues(knowledge_id)
+                    if reopened:
+                        side_effects.append(f"Reopened {reopened} dup-issue(s) for {knowledge_id}")
+                except Exception as exc:
+                    logger.warning("reopen_dup_issues failed (non-fatal): %s", exc)
                 return {
                     "resolved": True,
                     "issue_id": issue_id,
@@ -718,6 +767,7 @@ async def _bg_scan(
     scan_state: dict,
     cancel_event: asyncio.Event | None = None,  # 13.18: отмена скана
     embedder=None,  # P0: EmbeddingManager для embedding-dup-детекции
+    app_state=None,  # Фаза 3 (2f): app.state для авто-хука (bulk_deprecate_duplicates)
 ) -> None:
     """Фоновая задача quality scan (13.15 + 13.18).
 
@@ -727,6 +777,9 @@ async def _bg_scan(
 
     13.18: принимает cancel_event и пробрасывает в run_scan.
     P0: пробрасывает embedder для embedding-dup (fallback при None).
+    Фаза 3: после полного скана пишет scan_completed в audit (1b) и
+    запускает пост-скан авто-хук (2f) — весь хук в try/except, сбой
+    авто НИКОГДА не помечает успешный скан failed.
     """
     from mcp_server.quality.scanner import run_scan
 
@@ -752,6 +805,35 @@ async def _bg_scan(
                 metrics["duplicates_detected"],
                 metrics["issues_created"],
             )
+            # Фаза 3 (1b): scan_completed в audit — только полный скан
+            # (отменённый/сбойный скан сюда не доходит). Н2: прогресс-трекер
+            # prune_finished удаляет историю → счётчик сканов живёт в audit.
+            write_audit(
+                action="scan_completed",
+                knowledge_id="-",
+                actor="system",
+                reason="quality scan complete",
+                metadata={"scan_id": scan_id, "metrics": metrics},
+            )
+            # Фаза 3 (2f): пост-скан авто-хук ПОСЛЕ scan_completed-аудита.
+            # Порядок критичен: гейт должен ВИДЕТЬ только что завершённый скан.
+            try:
+                from mcp_server.config import settings
+
+                if settings.AUTO_DEDUP_ENABLED and app_state is not None:
+                    await bulk_deprecate_duplicates(
+                        {
+                            "filter": {"hash_only": True},
+                            "actor": "auto",
+                            "reason": "auto R1 exact content-hash (FP=0 gate)",
+                        },
+                        app_state,
+                    )
+            except Exception as exc:
+                # Весь хук внутри try/except: сбой авто НИКОГДА не роняет скан.
+                logger.error(
+                    "[AUTO-DEDUP] post-scan hook failed (scan result unaffected): %s", exc
+                )
     except asyncio.CancelledError:
         logger.info("Background scan %s cancelled (shutdown)", scan_id)
         scan_progress.error(scan_id, "scan cancelled (server shutdown)")
@@ -833,6 +915,7 @@ async def run_quality_scan(params: dict, app_state) -> dict:
                 scan_state={"lock": scan_lock, "task_ref": task_ref},
                 cancel_event=app_state.scan_cancel_event,
                 embedder=embedder,
+                app_state=app_state,  # Фаза 3 (2f): для авто-хука
             )
         )
         task_ref[0] = task
@@ -932,12 +1015,61 @@ async def bulk_resolve_issues(params: dict, app_state) -> dict:
         return {"resolved": False, "error": str(exc)}
 
 
+def _restored_shielded_kids(audit_records: list[dict] | None = None) -> set[str]:
+    """Фаза 3 (2d): kids с активным restore-щитом (cooldown).
+
+    По audit-записям: для каждого kid сравниваем ts последнего restore
+    (metadata.restored_by_operator=True) vs ts последнего deprecate-подобного
+    (deprecate|bulk_deprecate|merge). Если restore новее — kid в щите, пока
+    число scan_completed после restore < AUTO_DEDUP_RESTORE_COOLDOWN_SCANS.
+
+    Данные — только audit.jsonl (развилка 1A): переживает рестарт, 0 миграций.
+    """
+    from mcp_server.config import settings
+
+    if audit_records is None:
+        audit_records = list_audit(limit=10**6)
+    records = list(audit_records)
+    records.reverse()  # хронологический порядок (старые → новые)
+
+    cooldown = settings.AUTO_DEDUP_RESTORE_COOLDOWN_SCANS
+
+    restore_ts: dict[str, str] = {}
+    deprecate_ts: dict[str, str] = {}
+    scan_completed_ts: list[str] = []
+
+    for rec in records:
+        ts = rec.get("ts", "")
+        action = rec.get("action")
+        kid = rec.get("knowledge_id")
+        meta = rec.get("metadata") or {}
+        if action == "restore" and meta.get("restored_by_operator") is True:
+            restore_ts[kid] = ts
+        elif action in ("deprecate", "bulk_deprecate", "merge"):
+            deprecate_ts[kid] = ts
+        elif action == "scan_completed":
+            scan_completed_ts.append(ts)
+
+    shielded: set[str] = set()
+    for kid, rts in restore_ts.items():
+        dts = deprecate_ts.get(kid)
+        if dts is not None and dts >= rts:
+            continue  # deprecate после restore → щит снят (запись заново скрыта)
+        scans_after = sum(1 for t in scan_completed_ts if t > rts)
+        if scans_after < cooldown:
+            shielded.add(kid)
+    return shielded
+
+
 async def bulk_deprecate_duplicates(params: dict, app_state) -> dict:
-    """Пакетно deprecate записи-дубликаты (Фаза 1 dedup).
+    """Пакетно deprecate записи-дубликаты (Фаза 1 dedup + Фаза 3 авто-гейт).
 
     Для каждого целевого knowledge_id: set_payload status=deprecated
     (скрыть из поиска, обратимо через restore) → закрыть ВСЕ его open
     dup-issues → записать в audit.jsonl. Контент .md НЕ трогается.
+
+    Фаза 3: actor="auto" — гейт ЦЕЛИКОМ внутри тула (config + FP=0 за ≥N
+    полных сканов + hash_only + cooldown + cap). Вызывающий не доверяется.
 
     Args:
         params:
@@ -945,18 +1077,58 @@ async def bulk_deprecate_duplicates(params: dict, app_state) -> dict:
             knowledge_id (optional): прямой список/один ID записи
             actor (optional): "operator-batch" | "auto" (default operator-batch)
             reason (optional): причина
+            filter (optional): {"hash_only": bool} — единая форма с review (2e)
 
     Returns:
-        {"resolved": True, "deprecated_count": N, "issues_closed": M, "side_effects": [...]}
+        {"resolved": True, "deprecated_count": N, "issues_closed": M,
+         "side_effects": [...], "truncated": bool, "audited": True}
     """
     issue_ids = params.get("issue_ids") or []
     kid = params.get("knowledge_id")
     actor = params.get("actor", "operator-batch")
     reason = params.get("reason", "")
+    filter_param = params.get("filter") or {}
 
-    # Целевые knowledge_id: из issue_ids или напрямую
+    is_auto = actor == "auto"
+    hash_only = bool(filter_param.get("hash_only", False))
+
+    # ── Фаза 3 (2c): гейт авто-режима — ПЕРВАЯ строка обработки, до мутаций ──
+    if is_auto:
+        from mcp_server.config import settings
+
+        if not settings.AUTO_DEDUP_ENABLED:
+            return {
+                "resolved": False,
+                "error": "auto-deprecate disabled by config (AUTO_DEDUP_ENABLED=false)",
+            }
+        if not hash_only:
+            return {
+                "resolved": False,
+                "error": "auto requires hash_only filter; cosine (R3) is never auto-applied",
+            }
+        fp = get_fp_rate(window_scans=settings.AUTO_DEDUP_FP_FREE_SCANS)
+        if not fp["fp_free"]:
+            return {
+                "resolved": False,
+                "error": (
+                    f"auto gate closed: FP=0 over {settings.AUTO_DEDUP_FP_FREE_SCANS} scans "
+                    f"required (scans_in_window={fp['scans_in_window']}, "
+                    f"rejections={fp['rejections']})"
+                ),
+            }
+
+    # Целевые knowledge_id: filter.hash_only | issue_ids | прямой knowledge_id
     target_kids: list[str] = []
-    if issue_ids:
+    if hash_only:
+        # Фаза 3 (2c): ЕДИНЫЙ предикат is_r1_exact_hash напрямую (не rank_pair).
+        # metadata-refresh (0b) гарантирует актуальность сигналов.
+        from mcp_server.quality.dup_ranking import is_r1_exact_hash
+        from mcp_server.quality.issues import list_issues
+
+        for iss in list_issues(types=["duplicate"], status="open", limit=10**6):
+            if is_r1_exact_hash(getattr(iss, "metadata", None) or {}) and iss.knowledge_id not in target_kids:
+                target_kids.append(iss.knowledge_id)
+    elif issue_ids:
         from mcp_server.quality.issues import list_issues
 
         for iss in list_issues(status="open", limit=10**6):
@@ -968,8 +1140,34 @@ async def bulk_deprecate_duplicates(params: dict, app_state) -> dict:
             if k not in target_kids:
                 target_kids.append(k)
 
+    # Фаза 3 (2d): cooldown-щит — исключить восстановленные оператором записи
+    if is_auto:
+        shielded = _restored_shielded_kids()
+        if shielded:
+            target_kids = [k for k in target_kids if k not in shielded]
+
+    # Фаза 3 (2c): cap авто-скрытий за один скан
+    truncated = False
+    if is_auto:
+        from mcp_server.config import settings
+
+        if len(target_kids) > settings.AUTO_DEDUP_MAX_PER_SCAN:
+            target_kids = target_kids[:settings.AUTO_DEDUP_MAX_PER_SCAN]
+            truncated = True
+
     if not target_kids:
-        return {"resolved": False, "error": "No targets: provide issue_ids or knowledge_id"}
+        if is_auto:
+            # Фаза 3 (2c): гейт прошёл (config+fp_free), но кандидатов нет —
+            # все R1 закрыты cooldown-щитом либо exact-hash дублей не найдено.
+            # Это НЕ ошибка: авто ничего не делает, resolved=True с count=0.
+            return {
+                "resolved": True,
+                "deprecated_count": 0,
+                "issues_closed": 0,
+                "audited": False,
+                "truncated": truncated,
+            }
+        return {"resolved": False, "error": "No targets: provide issue_ids or knowledge_id or filter"}
 
     qdrant = getattr(app_state, "qdrant", None)
     loop = asyncio.get_running_loop()
@@ -978,6 +1176,27 @@ async def bulk_deprecate_duplicates(params: dict, app_state) -> dict:
     deprecated_count = 0
 
     for target in target_kids:
+        # Фаза 3 (2c, P2-NEW-4): авто-путь — audit-FIRST strict. Без audit-записи
+        # авто-скрытие невозможно; сбой аудита → abort пачки (остаток не трогаем).
+        if is_auto and not write_audit(
+            action="bulk_deprecate",
+            knowledge_id=target,
+            actor=actor,
+            reason=reason or "auto R1 exact content-hash (FP=0 gate)",
+            metadata={"issues_closed": None, "auto": True},
+            strict=True,
+        ):
+                logger.error(
+                    "[AUTO-DEDUP] strict audit failed for %s — aborting batch", target,
+                )
+                return {
+                    "resolved": False,
+                    "error": f"strict audit failed for {target} (batch aborted)",
+                    "deprecated_count": deprecated_count,
+                    "issues_closed": total_issues_closed,
+                    "side_effects": side_effects,
+                    "truncated": truncated,
+                }
         try:
             if qdrant:
                 from qdrant_client.models import FieldCondition, Filter, MatchValue
@@ -1000,14 +1219,15 @@ async def bulk_deprecate_duplicates(params: dict, app_state) -> dict:
             total_issues_closed += closed
             if closed:
                 side_effects.append(f"Closed {closed} dup-issue(s) for {target}")
-            # Аудит
-            write_audit(
-                action="bulk_deprecate",
-                knowledge_id=target,
-                actor=actor,
-                reason=reason or "deprecated in batch",
-                metadata={"issues_closed": closed},
-            )
+            # Операторский путь: аудит ПОСЛЕ (как было); авто — уже выше (audit-FIRST)
+            if not is_auto:
+                write_audit(
+                    action="bulk_deprecate",
+                    knowledge_id=target,
+                    actor=actor,
+                    reason=reason or "deprecated in batch",
+                    metadata={"issues_closed": closed},
+                )
             deprecated_count += 1
         except Exception as exc:
             logger.error("bulk_deprecate failed for %s: %s", target, exc)
@@ -1029,6 +1249,7 @@ async def bulk_deprecate_duplicates(params: dict, app_state) -> dict:
         "issues_closed": total_issues_closed,
         "side_effects": side_effects,
         "audited": True,
+        "truncated": truncated,
     }
 
 
@@ -1079,21 +1300,31 @@ async def review_duplicate_pairs(params: dict, app_state) -> dict:
 
     READ-ONLY: не мутирует данные (утверждение — через bulk_deprecate_duplicates).
 
+    Фаза 3 (2e): опциональный filter={"hash_only": bool} — ЕДИНАЯ форма с bulk.
+    При hash_only=true green_batch = пары, отобранные is_r1_exact_hash НАПРЯМУЮ
+    (не rank_pair) — устраняет расхождение предикатов (exact-hash пара с
+    cosine<0.92 видна в green обоими путями). Ответ += filter_echo.
+
     Args:
         params:
             limit (optional): макс. число open dup-issues для анализа (default 200)
+            filter (optional): {"hash_only": bool = false}
 
     Returns:
-        {"green_batch": [...], "yellow_pairs": [...], "red_skipped": N, "total_open": M}
+        {"green_batch": [...], "yellow_pairs": [...], "red_skipped": N,
+         "total_open": M, "filter_echo": {...}}
     """
     from mcp_server.quality.dup_ranking import (
         extract_target_kid,
+        is_r1_exact_hash,
         rank_pair,
         recommend_canonical,
         summarize_signals,
     )
 
     limit = min(params.get("limit", 200), 500)
+    filter_param = params.get("filter") or {}
+    hash_only = bool(filter_param.get("hash_only", False))
     issues = list_issues(types=["duplicate"], status="open", limit=limit)
 
     green: list[dict] = []
@@ -1103,7 +1334,6 @@ async def review_duplicate_pairs(params: dict, app_state) -> dict:
     for iss in issues:
         meta = getattr(iss, "metadata", None) or {}
         detail = iss.detail or ""
-        flow = rank_pair(meta, detail)
         target_kid = extract_target_kid(detail)
         signals = summarize_signals(meta)
         base = {
@@ -1113,6 +1343,16 @@ async def review_duplicate_pairs(params: dict, app_state) -> dict:
             "cosine": signals["cosine"],
             "signals": signals,
         }
+        if hash_only:
+            # Фаза 3 (2e): строго R1 (exact hash) — ЕДИНЫЙ предикат, не rank_pair.
+            if is_r1_exact_hash(meta):
+                base["subject"] = meta.get("subject", "")
+                green.append(base)
+            else:
+                red_skipped += 1
+            continue
+
+        flow = rank_pair(meta, detail)
         if flow == "green":
             base["subject"] = meta.get("subject", "")
             green.append(base)
@@ -1133,9 +1373,51 @@ async def review_duplicate_pairs(params: dict, app_state) -> dict:
         "review_duplicate_pairs: %d green, %d yellow, %d red (of %d open)",
         len(green), len(yellow), red_skipped, len(issues),
     )
-    return {
+    result = {
         "green_batch": green,
         "yellow_pairs": yellow,
         "red_skipped": red_skipped,
         "total_open": len(issues),
+    }
+    if hash_only:
+        result["filter_echo"] = {"hash_only": True}
+    return result
+
+
+async def list_audit_log(params: dict, app_state) -> dict:
+    """Фаза 3 (3a): read-only журнал действий (аудит) + статус авто-гейта.
+
+    Обёртка над list_audit + get_fp_rate — один вызов для панели «Журнал
+    действий» и строки статуса авто-скрытия.
+
+    Args:
+        params:
+            actor (optional): фильтр по actor (operator | auto | system | ...)
+            action (optional): фильтр по действию (deprecate | restore | ...)
+            knowledge_id (optional): фильтр по записи
+            limit (default 50, max 200): макс. число записей
+
+    Returns:
+        {"records": [...], "fp_stats": {...}, "auto_dedup_enabled": bool,
+         "auto_dedup_config": {...}}
+    """
+    actor = params.get("actor")
+    action = params.get("action")
+    knowledge_id = params.get("knowledge_id")
+    limit = min(params.get("limit", 50), 200)
+
+    from mcp_server.config import settings
+
+    records = list_audit(
+        actor=actor, action=action, knowledge_id=knowledge_id, limit=limit,
+    )
+    return {
+        "records": records,
+        "fp_stats": get_fp_rate(),
+        "auto_dedup_enabled": settings.AUTO_DEDUP_ENABLED,
+        "auto_dedup_config": {
+            "fp_free_scans": settings.AUTO_DEDUP_FP_FREE_SCANS,
+            "restore_cooldown_scans": settings.AUTO_DEDUP_RESTORE_COOLDOWN_SCANS,
+            "max_per_scan": settings.AUTO_DEDUP_MAX_PER_SCAN,
+        },
     }

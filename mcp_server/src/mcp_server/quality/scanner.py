@@ -25,6 +25,9 @@ from pathlib import Path
 from mcp_server.config import Settings
 from mcp_server.models import KnowledgeFrontmatter
 from mcp_server.quality.dup_gate import compute_cosine
+from mcp_server.quality.dup_ranking import (
+    NEGATION_TOKENS,  # Фаза 3 (0d): единый источник
+)
 from mcp_server.quality.edit_war import detect_edit_war
 from mcp_server.quality.issues import (
     bulk_update_status,
@@ -50,13 +53,6 @@ MAX_PAIRS_PER_BUCKET: int = 500  # макс пар для проверки в о
 # Лимит dup-issues на одну запись (13.14): книга на 15K секций даёт тысячи пар
 # с одинаковым fm_i → 15K+ issues на один knowledge_id (засорение issues + CPU 120%).
 MAX_ISSUES_PER_KNOWLEDGE: int = 10
-
-# Фаза 1 dedup: негационные токены для антоним-FP guard
-# (chto-lyubit-ai ≈ chto-ne-lyubit-ai при cosine 0.995 — ложный дубль).
-NEGATION_TOKENS: frozenset[str] = frozenset({
-    "ne", "not", "anti", "without", "no", "bez", "contra", "non", "не",
-})
-
 
 async def run_scan(
     knowledge_dir: Path | None = None,
@@ -329,8 +325,13 @@ def _normalize_body(body: str) -> str:
 
 
 def _content_body_hash(body: str) -> str:
-    """SHA256 нормализованного тела (первые 16 hex — компактный идентификатор)."""
-    return hashlib.sha256(_normalize_body(body).encode("utf-8")).hexdigest()[:16]
+    """SHA256 нормализованного тела (полные 64 hex, Фаза 3 P2-1).
+
+    16-hex (64-bit) рисковал коллизиями; полный sha256 безопаснее.
+    Старые metadata (16 hex) при сравнении с новыми дадут hash_match=False
+    → консервативно 🟡 до следующего скана (metadata-refresh, 0b).
+    """
+    return hashlib.sha256(_normalize_body(body).encode("utf-8")).hexdigest()
 
 
 def has_negation_pattern(slug_a: str, slug_b: str) -> bool:
@@ -752,6 +753,9 @@ def _scan_dup_pairs(
                         "standalone": fm_i.parent_knowledge_id is None,
                         "target_standalone": fm_j.parent_knowledge_id is None,
                         "subject": fm_i.subject,
+                        # Фаза 3 (0a, P1-1): реальное сравнение subject + target kid
+                        "target_subject": fm_j.subject,
+                        "target_kid": fm_j.knowledge_id,
                     },
                 )
     return dup_count, dup_map
