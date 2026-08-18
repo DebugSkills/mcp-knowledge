@@ -16,13 +16,15 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from ..storage.schema import ZONE_PRIVATE, collection_for_zone
+from .auth_zone import zones_from_auth
 from .read import _build_toc, _derive_title
 
 logger = logging.getLogger("mcp_knowledge.tools.collections")
 
 _COLLECTION_PAYLOAD_FIELDS = [
     "knowledge_id", "domain", "subject", "project",
-    "tags", "updated_at", "content",
+    "tags", "updated_at", "content", "zone",
 ]
 
 
@@ -51,8 +53,8 @@ async def list_collections(params: dict, app_state) -> dict:
     qdrant = app_state.qdrant
     loop = asyncio.get_running_loop()
 
-    # Qdrant scroll: content_type=collection (+ опционально domain)
-    def _scroll() -> list:
+    # Qdrant scroll: content_type=collection (+ опционально domain), по зонам
+    def _scroll(z: str) -> list:
         from qdrant_client.http import models as qmodels
 
         conditions = [
@@ -73,20 +75,22 @@ async def list_collections(params: dict, app_state) -> dict:
             limit=limit * 2,  # overscan для dedupe по knowledge_id
             with_payload=_COLLECTION_PAYLOAD_FIELDS,
             with_vectors=False,
+            collection_name=collection_for_zone(z),
         )
         return points
 
-    points = await loop.run_in_executor(None, _scroll)
-
-    # Dedupe by knowledge_id (несколько чанков на коллекцию)
+    # W3 C5: внешний цикл по зонам; subscriber → только public (zones_from_auth)
     seen: set[str] = set()
     payloads: list[dict] = []
-    for point in points:
-        payload = point.payload or {}
-        kid = payload.get("knowledge_id", "")
-        if kid and kid not in seen:
-            seen.add(kid)
-            payloads.append(payload)
+    for zone in zones_from_auth(params):
+        points = await loop.run_in_executor(None, _scroll, zone)
+        # Dedupe by knowledge_id (несколько чанков на коллекцию) — общий seen
+        for point in points:
+            payload = point.payload or {}
+            kid = payload.get("knowledge_id", "")
+            if kid and kid not in seen:
+                seen.add(kid)
+                payloads.append(payload)
 
     results: list[dict] = []
     for payload in payloads[:limit]:
@@ -94,7 +98,9 @@ async def list_collections(params: dict, app_state) -> dict:
         section_count = 0
         max_updated = payload.get("updated_at", "")
         try:
-            toc = await _build_toc(kid, app_state)
+            toc = await _build_toc(
+                kid, app_state, zone=payload.get("zone", ZONE_PRIVATE)
+            )
             section_count = len(toc)
             # P1-4: updated_at = max(секций) из TOC scroll
             sec_timestamps = [s.get("updated_at", "") for s in toc if s.get("updated_at")]

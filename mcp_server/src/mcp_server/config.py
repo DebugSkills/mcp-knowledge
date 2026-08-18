@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     # Rate limiting (Фаза 3 E2: token bucket, per-key)
     RATE_LIMIT_READ_PER_MIN: int = 100   # read-ключ: 100 запросов/мин (≈1.67 токенов/сек)
     RATE_LIMIT_WRITE_PER_MIN: int = 20   # write-ключ: 20 запросов/мин (≈0.33 токенов/сек)
+    # Subscriber-ключ (W3, двухконтурная модель доступа): 45 req/min (решение оператора)
+    RATE_LIMIT_SUBSCRIBER_PER_MIN: int = 45
 
     # DLQ (#14)
     DLQ_DIR: str = "/app/data/dlq"
@@ -59,6 +61,12 @@ class Settings(BaseSettings):
 
     # Quality (Фаза 4)
     QUALITY_DIR: str = "/app/data/quality"
+
+    # Token store (W3, план two-zone-access §2.3) — SSOT токенов доступа.
+    # TOKENS_DIR: паттерн QUALITY_DIR (pydantic-settings → env-override);
+    # локально /app недоступен → тесты задают TokenStore(tokens_dir=...) или env.
+    TOKENS_DIR: str = "/app/data/tokens"
+    TOKEN_INDEX_TTL_SEC: int = 5  # TTL in-memory индекса (перечитывание файла)
 
     # Quality scan scheduler (13.19) — ночной периодический скан ВНУТРИ контейнера
     QUALITY_SCAN_CRON_ENABLED: bool = True

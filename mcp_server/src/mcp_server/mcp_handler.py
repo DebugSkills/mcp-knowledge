@@ -21,7 +21,7 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
-from .auth import check_tool_permission, get_auth
+from .auth import SUBSCRIBER_TOOLS, check_tool_permission, get_auth
 from .config import settings
 from .prompts import PROMPTS, get_prompt
 from .resources import RESOURCES, get_kb_resource
@@ -131,8 +131,16 @@ async def _handle_initialize(params: dict, request_id: Any, _request: Request) -
     )
 
 
-async def _handle_tools_list(_params: dict, request_id: Any, _request: Request) -> dict:
-    """tools/list: возврат всех 20 tools с JSON Schema."""
+async def _handle_tools_list(_params: dict, request_id: Any, request: Request) -> dict:
+    """tools/list: возврат tools с JSON Schema.
+
+    W3.17: subscriber видит только TOOLS ∩ SUBSCRIBER_TOOLS —
+    внутренние quality/write-тулы не видны даже в списке.
+    """
+    auth_info = get_auth(request)
+    if auth_info.key_level == "subscriber":
+        tools = [t for t in TOOLS if t["name"] in SUBSCRIBER_TOOLS]
+        return _jsonrpc_result({"tools": tools}, request_id)
     return _jsonrpc_result({"tools": TOOLS}, request_id)
 
 
@@ -167,6 +175,12 @@ async def _handle_tools_call(params: dict, request_id: Any, request: Request) ->
                 request_id,
             )
         raise
+
+    # W3.9: прокинуть auth-контекст в args тула (служебный ключ _auth,
+    # не в JSON Schema). Тулы, не читающие _auth, его игнорируют.
+    if isinstance(tool_args, dict):
+        tool_args = dict(tool_args)
+        tool_args["_auth"] = auth_info
 
     # Поиск handler'а
     handler = TOOL_HANDLERS.get(tool_name)
@@ -232,13 +246,17 @@ async def _handle_tools_call(params: dict, request_id: Any, request: Request) ->
         )
 
 
-async def _handle_resources_list(_params: dict, request_id: Any, _request: Request) -> dict:
+async def _handle_resources_list(_params: dict, request_id: Any, request: Request) -> dict:
     """resources/list: список всех ресурсов kb://."""
+    if get_auth(request).key_level == "subscriber":
+        return _jsonrpc_error(MCP_AUTH_FAILED, "Forbidden: resources/prompts are not available for subscriber", request_id)
     return _jsonrpc_result({"resources": RESOURCES}, request_id)
 
 
 async def _handle_resources_read(params: dict, request_id: Any, request: Request) -> dict:
     """resources/read: чтение kb:// ресурса (kb://, kb://{domain}, kb://{domain}/{subject})."""
+    if get_auth(request).key_level == "subscriber":
+        return _jsonrpc_error(MCP_AUTH_FAILED, "Forbidden: resources/prompts are not available for subscriber", request_id)
     uri = params.get("uri", "")
     if not uri:
         return _jsonrpc_error(
@@ -259,13 +277,17 @@ async def _handle_resources_read(params: dict, request_id: Any, request: Request
         )
 
 
-async def _handle_prompts_list(_params: dict, request_id: Any, _request: Request) -> dict:
+async def _handle_prompts_list(_params: dict, request_id: Any, request: Request) -> dict:
     """prompts/list: список всех доступных промптов."""
+    if get_auth(request).key_level == "subscriber":
+        return _jsonrpc_error(MCP_AUTH_FAILED, "Forbidden: resources/prompts are not available for subscriber", request_id)
     return _jsonrpc_result({"prompts": PROMPTS}, request_id)
 
 
-async def _handle_prompts_get(params: dict, request_id: Any, _request: Request) -> dict:
+async def _handle_prompts_get(params: dict, request_id: Any, request: Request) -> dict:
     """prompts/get: получение содержимого промпта по имени."""
+    if get_auth(request).key_level == "subscriber":
+        return _jsonrpc_error(MCP_AUTH_FAILED, "Forbidden: resources/prompts are not available for subscriber", request_id)
     name = params.get("name", "")
     if not name:
         return _jsonrpc_error(

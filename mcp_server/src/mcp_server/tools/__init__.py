@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..content.analyzer import analyze_content
-from .admin import reindex
+from .admin import reindex, set_zone
 from .browse import list_domains, list_projects, list_subjects
 from .collections import list_collections
 from .content import cancel_import, extract_pdf_text, import_content
@@ -48,6 +48,7 @@ _SEARCH_QUERY_SCHEMA: dict[str, Any] = {
         "collection_id": {"type": "string", "description": "Поиск внутри книги (фильтр по parent_knowledge_id)"},
         "content_type": {"type": "string", "description": "Фильтр по типу контента (book, collection)"},
         "include_deprecated": {"type": "boolean", "default": False, "description": "Показывать deprecated-записи в результатах (Фаза 13.14)"},
+        "zone": {"type": "string", "enum": ["public", "private"], "description": "Зона поиска: public|private (по умолчанию — из токена/обе)"},
     },
     "required": ["query"],
 }
@@ -67,6 +68,7 @@ _SEARCH_TAGS_SCHEMA: dict[str, Any] = {
         "tags": {"type": "array", "items": {"type": "string"}, "description": "Теги для поиска"},
         "match_all": {"type": "boolean", "default": True, "description": "AND (true) или OR (false)"},
         "limit": {"type": "integer", "default": 500, "minimum": 1, "maximum": 1000},
+        "zone": {"type": "string", "enum": ["public", "private"], "description": "Зона поиска: public|private (по умолчанию — из токена/обе)"},
     },
     "required": ["tags"],
 }
@@ -97,6 +99,7 @@ _WRITE_SCHEMA: dict[str, Any] = {
         "tags": {"type": "array", "items": {"type": "string"}},
         "knowledge_id": {"type": "string", "description": "Опциональный ID (авто-генерация если не указан)"},
         "wait_for_index": {"type": "boolean", "default": False},
+        "zone": {"type": "string", "enum": ["public", "private"], "default": "private", "description": "Зона доступа записи (W1): public | private"},
     },
     "required": ["content", "domain", "subject"],
 }
@@ -137,6 +140,16 @@ _REINDEX_SCHEMA: dict[str, Any] = {
     },
 }
 
+_SET_ZONE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "knowledge_id": {"type": "string", "description": "ID записи (книга или секция)"},
+        "zone": {"type": "string", "enum": ["public", "private"], "description": "Целевая зона: public | private"},
+        "reason": {"type": "string", "description": "Причина перекладки (для audit.jsonl, опционально)"},
+    },
+    "required": ["knowledge_id", "zone"],
+}
+
 # ── Quality Tool schemas (Фаза 4) ────────────────────────────
 
 _REVIEW_QUEUE_SCHEMA: dict[str, Any] = {
@@ -162,7 +175,7 @@ _LIST_QUALITY_ISSUES_SCHEMA: dict[str, Any] = {
     "properties": {
         "types": {
             "type": "array",
-            "items": {"type": "string", "enum": ["duplicate", "missing_field", "edit_war", "broken_link", "conflicting", "orphaned"]},
+            "items": {"type": "string", "enum": ["duplicate", "missing_field", "edit_war", "broken_link", "conflicting", "orphaned", "zone_violation", "sensitive"]},
             "description": "Фильтр по типам issues",
         },
         "status": {"type": "string", "default": "open", "enum": ["open", "resolved", "ignored"]},
@@ -303,6 +316,7 @@ _ADD_FRAGMENT_SCHEMA: dict[str, Any] = {
         "title": {"type": "string", "description": "Заголовок нового раздела"},
         "content": {"type": "string", "description": "Содержание раздела (Markdown)"},
         "tags": {"type": "array", "items": {"type": "string"}, "description": "Дополнительные теги"},
+        "zone": {"type": "string", "enum": ["public", "private"], "default": "private", "description": "Зона доступа раздела (W1): наследуется от книги, если не задана"},
     },
     "required": ["collection_id", "title", "content"],
 }
@@ -315,6 +329,7 @@ _UPDATE_FRAGMENT_SCHEMA: dict[str, Any] = {
         "title": {"type": "string", "description": "Новый заголовок"},
         "version": {"type": "integer", "description": "Optimistic locking: ожидаемая версия"},
         "wait_for_index": {"type": "boolean", "default": False},
+        "zone": {"type": "string", "enum": ["public", "private"], "description": "Зона доступа раздела (W1): public | private; без параметра зона не меняется"},
     },
     "required": ["fragment_id"],
 }
@@ -356,6 +371,7 @@ _IMPORT_CONTENT_SCHEMA: dict[str, Any] = {
         "replace_collection_id": {"type": "string", "description": "ID коллекции для ЗАМЕНЫ: после успешного импорта старая книга удаляется (cascade). Import-first: старая цела до подтверждения успеха новой."},
         "replace_on_partial": {"type": "boolean", "default": False, "description": "Удалить старую книгу даже при partial_success импорта (failed>0). Default False — безопасно."},
         "pdf_path": {"type": "string", "description": "Путь к PDF-файлу на сервере (из POST /upload, опционально для content_type=pdf)"},
+        "zone": {"type": "string", "enum": ["public", "private"], "default": "private", "description": "Зона доступа книги (W1): public | private. При replace_collection_id без явной zone наследуется зона заменяемой книги."},
     },
     "required": ["content", "domain", "subject"],
 }
@@ -443,6 +459,11 @@ TOOLS: list[dict[str, Any]] = [
         "name": "reindex",
         "description": "Перестроить индекс: перечитать все Markdown-файлы → переиндексировать в Qdrant.",
         "inputSchema": _REINDEX_SCHEMA,
+    },
+    {
+        "name": "set_zone",
+        "description": "Переложить запись между зонами (public/private) — курирование public-слоя (W4).",
+        "inputSchema": _SET_ZONE_SCHEMA,
     },
     # ── Quality tools (Фаза 4) ───────────────────────────────
     {
@@ -556,6 +577,7 @@ TOOL_HANDLERS = {
     "list_subjects": list_subjects,
     "list_projects": list_projects,
     "reindex": reindex,
+    "set_zone": set_zone,
     # Quality tools (Фаза 4)
     "review_queue": review_queue,
     "review_queue_books": review_queue_books,

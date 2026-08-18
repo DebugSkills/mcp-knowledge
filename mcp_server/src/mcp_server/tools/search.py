@@ -16,6 +16,8 @@ import re
 import time
 
 from ..metrics import search_latency, tag_search_latency
+from ..storage.schema import collection_for_zone
+from .auth_zone import zones_from_auth
 from .read import _derive_title
 
 logger = logging.getLogger("mcp_knowledge.tools.search")
@@ -108,51 +110,58 @@ async def search_knowledge(params: dict, app_state) -> dict:
     # Over-fetch: запрашиваем top_k*3 для учёта дубликатов, cap 200
     fetch_k = min(top_k * 3, 200)
     seen: dict[str, dict] = {}  # knowledge_id → formatted
-    offset = 0
     max_iterations = 2
 
-    for _ in range(max_iterations):
-        batch = await loop.run_in_executor(
-            None,
-            lambda off=offset: qdrant.search(
-                vector=vector,
-                top_k=fetch_k,
-                filters=filter_dict,
-                score_threshold=score_threshold,
-                exclude_content_types=exclude_content_types,
-                exclude_statuses=exclude_statuses,
-                offset=off,
-            ),
-        )
+    # W3: двухзонный поиск — внешний цикл по зонам (public первым), внутри over-fetch
+    zones = zones_from_auth(params)
+    for zone in zones:
+        offset = 0
+        for _ in range(max_iterations):
+            batch = await loop.run_in_executor(
+                None,
+                lambda off=offset, z=zone: qdrant.search(
+                    vector=vector,
+                    top_k=fetch_k,
+                    filters=filter_dict,
+                    score_threshold=score_threshold,
+                    exclude_content_types=exclude_content_types,
+                    exclude_statuses=exclude_statuses,
+                    offset=off,
+                    collection_name=collection_for_zone(z),
+                ),
+            )
 
-        if not batch:
-            break
+            if not batch:
+                break
 
-        for point in batch:
-            payload = point.payload or {}
-            content = (payload.get("content") or "").strip()
-            if not _is_meaningful_content(content):
-                continue  # фильтр пустых/мусорных фрагментов
+            for point in batch:
+                payload = point.payload or {}
+                content = (payload.get("content") or "").strip()
+                if not _is_meaningful_content(content):
+                    continue  # фильтр пустых/мусорных фрагментов
 
-            kid = payload.get("knowledge_id", "")
-            if kid in seen:
-                # Дедуп: сохраняем с максимальным score
-                if point.score > seen[kid].get("_raw_score", 0):
-                    seen[kid] = _format_point(point, payload)
-                    seen[kid]["_raw_score"] = point.score
-                continue
+                kid = payload.get("knowledge_id", "")
+                if kid in seen:
+                    # Дедуп: сохраняем с максимальным score
+                    if point.score > seen[kid].get("_raw_score", 0):
+                        seen[kid] = _format_point(point, payload)
+                        seen[kid]["_raw_score"] = point.score
+                    continue
 
-            seen[kid] = _format_point(point, payload)
-            seen[kid]["_raw_score"] = point.score
+                seen[kid] = _format_point(point, payload)
+                seen[kid]["_raw_score"] = point.score
+
+                if len(seen) >= top_k:
+                    break
 
             if len(seen) >= top_k:
                 break
 
-        if len(seen) >= top_k:
-            break
+            offset += len(batch)
+            if offset >= fetch_k * 2:  # безопасный limit
+                break
 
-        offset += len(batch)
-        if offset >= fetch_k * 2:  # безопасный limit
+        if len(seen) >= top_k:
             break
 
     # Убираем _raw_score из результатов и берём top_k
@@ -186,14 +195,19 @@ async def search_by_tags(params: dict, app_state) -> dict:
 
     # Issue-#5-fix: latency tracking
     t0 = time.monotonic()
-    results = await loop.run_in_executor(
-        None,
-        lambda: qdrant.search_by_tags(
-            tags=tags,
-            match_all=match_all,
-            limit=limit,
-        ),
-    )
+    # W3: двухзонный поиск — цикл по зонам (public первым), дедуп общий
+    results = []
+    for zone in zones_from_auth(params):
+        batch = await loop.run_in_executor(
+            None,
+            lambda z=zone: qdrant.search_by_tags(
+                tags=tags,
+                match_all=match_all,
+                limit=limit,
+                collection_name=collection_for_zone(z),
+            ),
+        )
+        results.extend(batch)
 
     formatted = []
     seen: set[str] = set()

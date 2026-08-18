@@ -130,7 +130,7 @@ class TestHandlers:
         assert "tools" in result["result"]["capabilities"]
 
     async def test_tools_list_returns_all_tools(self):
-        result = await _handle_tools_list({}, request_id=1, _request=_make_mock_request_for_dispatch())
+        result = await _handle_tools_list({}, request_id=1, request=_make_mock_request_for_dispatch())
         assert "tools" in result["result"]
         tool_names = [t["name"] for t in result["result"]["tools"]]
         assert "search_knowledge" in tool_names

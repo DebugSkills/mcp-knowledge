@@ -15,11 +15,13 @@ import hmac
 import json
 import logging
 import typing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from fastapi import HTTPException, Request
 
 from .config import settings
+from .token_store import TokenStore
 
 logger = logging.getLogger("mcp_knowledge.auth")
 
@@ -59,6 +61,7 @@ WRITE_TOOLS: set[str] = {
     "add_fragment",  # Фаза 13.23: создание секции книги
     "update_fragment",  # Фаза 13.23: обновление секции книги
     "delete_fragment",  # Фаза 13.23: удаление секции книги
+    "set_zone",  # W4: перекладка записи между зонами (курирование public-слоя)
 }
 
 # ── Import tools (MCP_IMPORT_KEYS: read + import_content, без delete/reindex) ──
@@ -66,6 +69,24 @@ IMPORT_TOOLS: set[str] = {
     "import_content",
     "cancel_import",
     "extract_pdf_text",  # PDF→текст для авто-классификации (оперирует загруженным PDF)
+}
+
+# ── W3.3: белый список subscriber-токенов (план two-zone-access §2.3) ──
+# Только публичные read-тулы контура A. Внутренние quality-тулы
+# (review_queue, list_quality_issues, review_duplicate_pairs, list_audit_log)
+# остаются для read/import/write, но ИСКЛЮЧЕНЫ из subscriber.
+# resources/* и prompts/* подписчику недоступны.
+SUBSCRIBER_TOOLS: set[str] = {
+    "search_knowledge",
+    "search_by_tags",
+    "get_entry",
+    "get_knowledge_map",
+    "list_domains",
+    "list_subjects",
+    "list_projects",
+    "list_collections",
+    "find_fragment",
+    "analyze_content",
 }
 
 # ── Methods, не требующие аутентификации ─────────────────
@@ -80,15 +101,22 @@ UNAUTHENTICATED_METHODS: set[str] = {
 class AuthInfo:
     """Результат аутентификации, сохраняется в request.state."""
     authenticated: bool = False
-    key_level: str = "none"  # "read" | "import" | "write" | "none"
+    key_level: str = "none"  # "subscriber" | "read" | "import" | "write" | "none"
     key_hash: str = ""  # sha256 первых 8 символов для аудита
+    zone: str = "both"  # W3.4: "public" | "private" | "both"
+    scope: set[str] = field(default_factory=set)  # W3.4: scope-grants (W6)
+    token_id: str = ""  # W3.4: id записи токен-стора
 
 
 def mask_key(key: str) -> str:
-    """Маскирование ключа для логов: первые 4 символа + sha256 хеш."""
+    """Маскирование ключа для логов: первые 4 символа + sha256 хеш.
+
+    W3.5: mcp_-токены маскируются префиксом key[:7] (mcp_XX_ — виден тип
+    ключа без раскрытия секрета); прочие ключи — как раньше (key[:4]).
+    """
     if len(key) < 8:
         return "[too-short]"
-    prefix = key[:4]
+    prefix = key[:7] if key.startswith("mcp_") and len(key) >= 9 else key[:4]
     key_hash = hashlib.sha256(key.encode()).hexdigest()[:12]
     return f"{prefix}...{key_hash}"
 
@@ -98,12 +126,28 @@ def _constant_time_compare(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
-def authenticate_key(provided_key: str) -> AuthInfo:
-    """Проверить API-ключ constant-time против WRITE/IMPORT/READ списков.
+def authenticate_key(provided_key: str, app_state=None) -> AuthInfo:
+    """Проверить API-ключ: сначала токен-стор (SSOT), затем env-списки.
+
+    W3.5: приоритет токен-стор > env (план §2.3). Запись в сторе проверяется
+    по key_hash (sha256 + compare_digest внутри TokenStore.get_by_key);
+    auth проверяет active + expires_at и формирует AuthInfo (level/zone/scope/token_id).
+    Неизвестный сторе ключ падает в env-списки (fallback переходного периода).
+    app_state: app.state FastAPI (источник token_store); None в unit-тестах
+    старых путей (env-списки) — совместимость с test_auth.py.
 
     Возвращает AuthInfo с уровнем доступа.
     Первый совпавший ключ определяет уровень (приоритет: write > import > read).
     """
+    # ── W3.5: токен-стор — SSOT аутентификации ──
+    store = getattr(app_state, "token_store", None) if app_state is not None else None
+    if isinstance(store, TokenStore) or (
+        store is not None and store.__class__.__name__ == "TokenStore"
+    ):
+        record = store.get_by_key(provided_key)
+        if record is not None:
+            return _auth_from_store_record(provided_key, record, store)
+
     # Проверяем write-ключи (более высокий приоритет)
     for stored_key in settings.MCP_WRITE_KEYS:
         if stored_key and _constant_time_compare(provided_key, stored_key):
@@ -150,6 +194,74 @@ def authenticate_key(provided_key: str) -> AuthInfo:
     return AuthInfo(authenticated=False, key_level="none")
 
 
+def _auth_from_store_record(provided_key: str, record, store) -> AuthInfo:
+    """W3.5: AuthInfo из записи токен-стора + префикс-сверка (v1.6).
+
+    Проверки: active → 401, expires_at → 401. Доступ выдаётся ПО ЗАПИСИ.
+    Префикс mcp_<level><zone>_ — подсказка для человека: при несовпадении
+    с записью → logger.warning (признак подмены подсказки), но права записи
+    не меняются. Env/bootstrap-ключи без префикса сверку пропускают (без warning).
+    """
+    from .token_store import LEVEL_CODES, ZONE_CODES
+
+    if not record.active:
+        logger.warning(
+            "Auth FAILED: token %s is inactive (masked=%s)",
+            record.id, mask_key(provided_key),
+        )
+        return AuthInfo(authenticated=False, key_level="none")
+
+    if record.expires_at is not None and record.expires_at < _now_utc():
+        logger.warning(
+            "Auth FAILED: token %s expired at %s (masked=%s)",
+            record.id, record.expires_at.isoformat(), mask_key(provided_key),
+        )
+        return AuthInfo(authenticated=False, key_level="none")
+
+    # v1.6: префикс-сверка (только для mcp_-ключей; env без префикса — пропуск)
+    if provided_key.startswith("mcp_") and len(provided_key) >= 9:
+        presented_prefix = provided_key[:7]  # mcp_XX_
+        expected_prefix = (
+            f"mcp_{LEVEL_CODES.get(record.level, '?')}"
+            f"{ZONE_CODES.get(record.zone, '?')}_"
+        )
+        if presented_prefix != expected_prefix:
+            logger.warning(
+                "Auth WARNING: token %s presented prefix %s != record %s — "
+                "возможна подмена подсказки; доступ по записи (%s/%s)",
+                record.id, presented_prefix, expected_prefix,
+                record.level, record.zone,
+            )
+
+    # best-effort touch (hot path — внутри TTL-кэша стора)
+    try:
+        store.touch_last_used(record.id)
+    except Exception:
+        logger.debug("touch_last_used failed for token %s", record.id, exc_info=True)
+
+    # subscriber → зона принудительно public (план §2.3)
+    zone = record.zone
+    if record.level == "subscriber":
+        zone = "public"
+
+    logger.debug(
+        "Auth SUCCESS: token %s level=%s zone=%s (masked=%s)",
+        record.id, record.level, zone, mask_key(provided_key),
+    )
+    return AuthInfo(
+        authenticated=True,
+        key_level=record.level,
+        key_hash=hashlib.sha256(provided_key.encode()).hexdigest()[:16],
+        zone=zone,
+        scope=set(record.scope or []),
+        token_id=record.id,
+    )
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def check_tool_permission(auth_info: AuthInfo, tool_name: str) -> None:
     """Проверить, разрешён ли доступ к tool с данным уровнем ключа.
 
@@ -165,6 +277,25 @@ def check_tool_permission(auth_info: AuthInfo, tool_name: str) -> None:
     # Write-ключ → доступ ко всему
     if auth_info.key_level == "write":
         return
+
+    # W3.6: Subscriber-ключ → только SUBSCRIBER_TOOLS (белый список),
+    # зона принудительно public. Внутренние quality-тулы и resources/prompts
+    # подписчику недоступны.
+    if auth_info.key_level == "subscriber":
+        auth_info.zone = "public"  # subscriber живёт только в контуре A
+        if tool_name in SUBSCRIBER_TOOLS:
+            return
+        logger.warning(
+            "Auth FORBIDDEN: subscriber-key attempted non-subscriber tool '%s' "
+            "(key_hash=%s)",
+            tool_name,
+            auth_info.key_hash,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"Subscriber key cannot access tool '{tool_name}'. "
+            f"Subscriber keys are limited to public read tools.",
+        )
 
     # Import-ключ → read-tools + import_content
     if auth_info.key_level == "import":
@@ -275,7 +406,12 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        auth_info = authenticate_key(api_key)
+        # W3.5: токен-стор живёт в app.state → root_app разрешается ДО
+        # аутентификации (та же цепочка приоритетов, что и для rate-limit).
+        root_app = self._fastapi_app or scope.get("app") or self.app
+        app_state = getattr(root_app, "state", None)
+
+        auth_info = authenticate_key(api_key, app_state=app_state)
         scope["state"]["auth"] = auth_info
 
         # ── E2: Rate limiting (batch-aware, per-key) для POST /mcp ──
@@ -292,9 +428,6 @@ class AuthMiddleware:
             raw_body = b"".join(body_chunks)
 
             # Проверяем rate limit
-            # Приоритет: self._fastapi_app (явно передан) → scope["app"] (uvicorn)
-            # → self.app (fallback — Router без .state, rate-limiter обойдётся)
-            root_app = self._fastapi_app or scope.get("app") or self.app
             rate_limit_response = await _check_rate_limit_bytes(
                 raw_body, auth_info, root_app
             )
@@ -373,6 +506,9 @@ async def _check_rate_limit_bytes(
         limiter = getattr(app_state, "rate_limiter_read", rate_limiter)
     elif auth_info.key_level == "write":
         limiter = getattr(app_state, "rate_limiter_write", rate_limiter)
+    elif auth_info.key_level == "subscriber":
+        # W3.7: отдельный bucket подписчика (~45 req/min)
+        limiter = getattr(app_state, "rate_limiter_subscriber", rate_limiter)
     else:
         limiter = rate_limiter
 
