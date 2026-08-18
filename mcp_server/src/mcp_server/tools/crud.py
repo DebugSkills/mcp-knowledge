@@ -19,6 +19,8 @@ import time
 
 from ..metrics import quality_gate_skipped, record_write_latency
 from ..models import VersionConflictError, WriteRequest
+from ..storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
+from .zone_utils import resolve_zone
 
 logger = logging.getLogger("mcp_knowledge.tools.crud")
 
@@ -76,13 +78,28 @@ async def write_knowledge(params: dict, app_state) -> dict:
     quality_duplicates: list[dict] = []
     blocked = False
 
+    # W1.4: zone — валидация значения (ValueError → ошибка тула).
+    # W2: зона резолвится ДО collision-check — get_all_knowledge_ids
+    # фильтрует по зональной коллекции (collection_for_zone).
+    try:
+        zone, _ = resolve_zone(params.get("zone"), None)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
     # 1. knowledge_id collision check (если клиент указал ID)
     provided_kid = params.get("knowledge_id")
     if provided_kid:
         try:
             qdrant = _get_qdrant(app_state)
             if qdrant and hasattr(qdrant, "get_all_knowledge_ids"):
-                existing_ids = qdrant.get_all_knowledge_ids()
+                # P2-1 W2: union по ОБЕИМ зонам — SSOT-уникальность knowledge_id
+                # глобальна (планы W2.13:151 «dup-проверка по всей базе»); иначе
+                # публичная запись могла продублировать ID приватной.
+                existing_ids: set[str] = set()
+                for _zone in (ZONE_PUBLIC, ZONE_PRIVATE):
+                    existing_ids.update(
+                        qdrant.get_all_knowledge_ids(collection_name=collection_for_zone(_zone))
+                    )
                 if provided_kid in existing_ids:
                     msg = f"knowledge_id '{provided_kid}' already exists (duplicate)"
                     quality_issues.append({"field": "knowledge_id", "severity": "critical", "message": msg})
@@ -108,6 +125,7 @@ async def write_knowledge(params: dict, app_state) -> dict:
                 content, domain, provided_kid,
                 embedder=embedder,
                 qdrant_client=qdrant,
+                collection_name=collection_for_zone(zone),
             )
             if quality_duplicates and strict:
                 msg = f"Semantic duplicates detected: {quality_duplicates}"
@@ -146,6 +164,7 @@ async def write_knowledge(params: dict, app_state) -> dict:
         tags=params.get("tags", []),
         knowledge_id=params.get("knowledge_id"),
         wait_for_index=wait_for_index,
+        zone=zone,
     )
     entry = await store.write(req)
     knowledge_id = entry.frontmatter.knowledge_id
@@ -352,17 +371,18 @@ async def delete_entry(params: dict, app_state) -> dict:
     qdrant = app_state.qdrant
     loop = asyncio.get_running_loop()
 
+    # W2: зона записи определяется ДО cascade — scroll и delete_by_knowledge_id
+    # идут в зональную коллекцию (collection_for_zone).
+    entry = await store.read(knowledge_id)
+    zone = getattr(entry.frontmatter, "zone", None) or ZONE_PRIVATE if entry else ZONE_PRIVATE
+    domain = entry.frontmatter.domain if entry else None
+
     # Шаг 0 (cascade): найти и удалить дочерние секции
     if cascade:
         try:
             from qdrant_client.models import FieldCondition, Filter, MatchValue
 
             qdrant_raw = _get_qdrant(app_state)
-            # Обёртка QdrantClient сама подставляет collection_name (хардкод),
-            # raw qdrant-client SDK требует его как kwarg. Определяем по признаку обёртки.
-            scroll_kwargs: dict = {}
-            if not hasattr(qdrant_raw, "_client"):
-                scroll_kwargs["collection_name"] = "knowledge"
             # Scroll все точки где parent_knowledge_id = knowledge_id
             child_ids: list[str] = []
             offset = None
@@ -375,7 +395,7 @@ async def delete_entry(params: dict, app_state) -> dict:
                     offset=offset,
                     with_payload=["knowledge_id"],
                     with_vectors=False,
-                    **scroll_kwargs,
+                    collection_name=collection_for_zone(zone),
                 )
                 for point in points:
                     kid = point.payload.get("knowledge_id") if point.payload else None
@@ -398,7 +418,11 @@ async def delete_entry(params: dict, app_state) -> dict:
                 # Qdrant-точки удаляем по одной (не git-операция, не блокирует)
                 for child_id in child_ids:
                     try:
-                        await loop.run_in_executor(None, qdrant.delete_by_knowledge_id, child_id)
+                        # run_in_executor НЕ принимает kwargs → ПОЗИЦИОННО
+                        await loop.run_in_executor(
+                            None, qdrant.delete_by_knowledge_id, child_id,
+                            collection_for_zone(zone),
+                        )
                     except Exception as exc:
                         logger.warning("[DELETE] cascade: failed to delete qdrant point %s: %s", child_id, exc)
 
@@ -407,15 +431,14 @@ async def delete_entry(params: dict, app_state) -> dict:
             logger.error("[DELETE] cascade scroll failed for %s: %s", knowledge_id, exc)
 
     # Шаг 1: Soft-delete Markdown SSOT
-    entry = await store.read(knowledge_id)
-    domain = entry.frontmatter.domain if entry else None
-
     deleted = await store.delete(knowledge_id)
     if not deleted:
         return {"error": f"Knowledge entry not found: '{knowledge_id}'"}
 
-    # Шаг 2: Удаление из Qdrant
-    await loop.run_in_executor(None, qdrant.delete_by_knowledge_id, knowledge_id)
+    # Шаг 2: Удаление из Qdrant (позиционно — run_in_executor не принимает kwargs)
+    await loop.run_in_executor(
+        None, qdrant.delete_by_knowledge_id, knowledge_id, collection_for_zone(zone)
+    )
 
     # Шаг 3: INDEX update (best-effort)
     if domain:

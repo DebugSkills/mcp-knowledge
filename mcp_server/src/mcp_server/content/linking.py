@@ -28,6 +28,7 @@ class CollectionRoot:
     tags: list[str] = field(default_factory=list)
     cross_subjects: list[str] = field(default_factory=list)
     content_type: str = "collection"
+    zone: str = "private"  # W1: зона доступа книги (public | private)
 
     def to_frontmatter(self) -> KnowledgeFrontmatter:
         """Создать KnowledgeFrontmatter для root-записи."""
@@ -43,6 +44,7 @@ class CollectionRoot:
             children=self.children,
             parent_knowledge_id=None,
             sequence_number=None,
+            zone=self.zone,
             created_at=now,
             updated_at=now,
         )
@@ -63,6 +65,7 @@ class ChildEntry:
     tags: list[str] = field(default_factory=list)
     cross_subjects: list[str] = field(default_factory=list)
     content_type: str = "book"
+    zone: str = "private"  # W1: зона доступа секции (наследуется от книги)
 
     def to_frontmatter(self) -> KnowledgeFrontmatter:
         """Создать KnowledgeFrontmatter для child-записи."""
@@ -77,6 +80,7 @@ class ChildEntry:
             sequence_number=self.sequence_number,
             tags=self.tags,
             cross_subjects=self.cross_subjects,
+            zone=self.zone,
             created_at=now,
             updated_at=now,
         )
@@ -155,6 +159,7 @@ def build_collection(
     section_ids: list[str],
     tags: list[str],
     cross_subjects: list[str],
+    zone: str = "private",
 ) -> CollectionRoot:
     """Создать root-коллекцию с TOC.
 
@@ -165,6 +170,7 @@ def build_collection(
         section_ids: knowledge_id всех секций-детей (в порядке sequence)
         tags: унаследованные теги коллекции
         cross_subjects: кросс-теги
+        zone: зона доступа книги (W1): public | private
     """
     collection_id = make_collection_id(domain, subject, title)
 
@@ -187,4 +193,5 @@ def build_collection(
         children=children,
         tags=tags,
         cross_subjects=cross_subjects,
+        zone=zone,
     )

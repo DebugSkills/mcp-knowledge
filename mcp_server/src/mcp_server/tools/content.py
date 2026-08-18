@@ -32,6 +32,7 @@ from ..content.linking import build_collection
 from ..content.preprocessor import ImportMeta
 from ..content.registry import get as get_preprocessor
 from ..models import KnowledgeEntry, KnowledgeFrontmatter
+from .zone_utils import resolve_zone
 
 logger = logging.getLogger("mcp_knowledge.tools.content")
 
@@ -381,6 +382,12 @@ async def _batch_write_sections(
     params.get("cleanup_orphans", False)
     params.get("wait_for_index", False)
 
+    # W1.6: zone — валидация значения (ValueError → ошибка тула)
+    try:
+        zone, _ = resolve_zone(params.get("zone"), None)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
     if not title:
         title = f"{domain}/{subject} pdf"
 
@@ -397,6 +404,7 @@ async def _batch_write_sections(
         section_ids=section_ids,
         tags=tags,
         cross_subjects=cross_subjects,
+        zone=zone,
     )
 
     # Write root collection
@@ -432,6 +440,7 @@ async def _batch_write_sections(
                 sequence_number=section.sequence_number,
                 tags=section.tags,
                 cross_subjects=meta.get("cross_subjects", []),
+                zone=zone,
             )
             entry = KnowledgeEntry(frontmatter=fm, content=section.body)
             await store.write_entry(entry)
@@ -900,6 +909,8 @@ async def import_content(params: dict, app_state) -> dict:
             replace_collection_id? (str): ID коллекции для ЗАМЕНЫ — после успешного импорта
                 старая книга удаляется (cascade). Import-first: старая цела до успеха новой.
             replace_on_partial? (bool): удалить старую книгу даже при partial_success (default false)
+            zone? (str): зона доступа книги (public | private, default private). При
+                replace_collection_id без явной zone — наследуется зона заменяемой книги (§9.8).
         }
         app_state: Application state (store, pipeline, embedder, qdrant, ...)
 
@@ -933,6 +944,13 @@ async def import_content(params: dict, app_state) -> dict:
     wait_for_index = params.get("wait_for_index", False)
     cleanup_orphans = params.get("cleanup_orphans", False)
     quality_checks = params.get("quality_checks", True)  # 6.4: опциональное отключение для mass-import
+
+    # ── W1.6: zone — валидация значения (ValueError → ошибка тула) ──
+    zone_param = params.get("zone")  # None → default private (или наследование при replace)
+    try:
+        zone, _ = resolve_zone(zone_param, None)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
     # ── Replace params (Фаза 13.x) ──────────────────────────
     replace_collection_id = params.get("replace_collection_id", "")
@@ -1000,6 +1018,13 @@ async def import_content(params: dict, app_state) -> dict:
                 "error": f"replace_collection_id is not a collection: "
                 f"{replace_collection_id} (type={existing.frontmatter.content_type})"
             }
+        # W1.6 §9.8: замена книги наследует зону заменяемой, если zone не задан явно
+        if zone_param is None:
+            zone = existing.frontmatter.zone
+            logger.info(
+                "[IMPORT] zone inherited from replaced collection %s: %s",
+                replace_collection_id, zone,
+            )
 
     # Registry lookup
     try:
@@ -1079,6 +1104,7 @@ async def import_content(params: dict, app_state) -> dict:
         section_ids=section_ids,
         tags=tags,
         cross_subjects=cross_subjects,
+        zone=zone,
     )
 
     # ── Self-replace guard ───────────────────────────────────
@@ -1132,6 +1158,7 @@ async def import_content(params: dict, app_state) -> dict:
                 sequence_number=section.sequence_number,
                 tags=section.tags,
                 cross_subjects=meta.get("cross_subjects", []),
+                zone=zone,
             )
             entry = KnowledgeEntry(frontmatter=fm, content=section.body)
 

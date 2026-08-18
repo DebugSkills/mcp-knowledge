@@ -69,7 +69,7 @@ def get_issues_store_path() -> Path:
 
 # ── Типы ────────────────────────────────────────────────────
 
-IssueType = Literal["duplicate", "missing_field", "edit_war", "broken_link", "conflicting", "orphaned"]
+IssueType = Literal["duplicate", "missing_field", "edit_war", "broken_link", "conflicting", "orphaned", "zone_violation", "sensitive"]
 IssueSeverity = Literal["info", "warn", "critical"]
 IssueStatus = Literal["open", "resolved", "ignored"]
 
@@ -181,7 +181,7 @@ def create_issue(
     Атомарность: read → append → write(tmp) → os.replace() под threading.Lock.
 
     Args:
-        issue_type: Тип проблемы (duplicate, missing_field, edit_war, broken_link, conflicting)
+        issue_type: Тип проблемы (duplicate, missing_field, edit_war, broken_link, conflicting, orphaned, zone_violation, sensitive)
         knowledge_id: ID записи знаний
         severity: Серьёзность (info, warn, critical)
         detail: Детальное описание
@@ -506,11 +506,15 @@ async def create_issue_async(
     knowledge_id: str,
     severity: IssueSeverity,
     detail: str,
+    metadata: dict | None = None,
 ) -> Issue:
-    """Async-safe обёртка create_issue: run_in_executor + threading.Lock."""
+    """Async-safe обёртка create_issue: run_in_executor + threading.Lock.
+
+    W1.7: metadata пробрасывается (сигналы zone_forced / book_partial_public).
+    """
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        None, create_issue, issue_type, knowledge_id, severity, detail
+        None, create_issue, issue_type, knowledge_id, severity, detail, metadata
     )
 
 

@@ -18,8 +18,11 @@ import re
 
 from ..content.linking import make_knowledge_id
 from ..models import KnowledgeEntry, KnowledgeFrontmatter, VersionConflictError
+from ..storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
+from .auth_zone import is_subscriber
 from .read import _HEADING_RE, _build_toc, _get_qdrant
 from .search import search_knowledge
+from .zone_utils import emit_zone_violation, is_partial_public, resolve_zone
 
 logger = logging.getLogger("mcp_knowledge.tools.fragments")
 
@@ -84,6 +87,10 @@ async def add_fragment(params: dict, app_state) -> dict:
     if getattr(root_fm, "content_type", None) != "collection":
         return {"error": f"'{collection_id}' is not a book collection"}
 
+    # W1.5: монозональность — зона секции не может быть шире зоны книги.
+    # Без явного zone → наследование зоны книги (без конфликта/issue).
+    parent_zone = getattr(root_fm, "zone", None) or ZONE_PRIVATE
+
     # NH-iter2-1: lifecycle-статус канонически в Qdrant payload — deprecate живёт
     # ТОЛЬКО в payload (quality.py:381 set_payload status=deprecated), SSOT
     # frontmatter.status НЕ обновляется. Проверяем payload с fallback на frontmatter.
@@ -92,9 +99,6 @@ async def add_fragment(params: dict, app_state) -> dict:
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
         qdrant_raw = _get_qdrant(app_state)
-        scroll_kwargs: dict = {}
-        if not hasattr(qdrant_raw, "_client"):
-            scroll_kwargs["collection_name"] = "knowledge"
         loop = asyncio.get_running_loop()
 
         def _status_scroll():
@@ -105,7 +109,7 @@ async def add_fragment(params: dict, app_state) -> dict:
                 limit=1,
                 with_payload=["status"],
                 with_vectors=False,
-                **scroll_kwargs,
+                collection_name=collection_for_zone(parent_zone),
             )
 
         points, _ = await loop.run_in_executor(None, _status_scroll)
@@ -128,14 +132,36 @@ async def add_fragment(params: dict, app_state) -> dict:
     tags = list(root_fm.tags) + list(extra_tags)
     cross_subjects = root_fm.cross_subjects
 
+    zone_param = params.get("zone")
+    zone_forced = False
+    zone_partial = False
+    if zone_param is None:
+        section_zone = parent_zone
+    else:
+        try:
+            section_zone, zone_forced = resolve_zone(zone_param, parent_zone)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        zone_partial = is_partial_public(zone_param, parent_zone)
+
     # Sequence = max+1 из TOC (M4 append-only)
-    toc = await _build_toc(collection_id, app_state)
+    toc = await _build_toc(collection_id, app_state, zone=section_zone)
     seq = max((s.get("sequence_number") or 0) for s in toc) + 1 if toc else 1
 
     # ID-формула (P0-2): sha256(body[:200]) — идентично book_preprocessor.py:107-116
     body = f"# {title}\n\n{content}"
     content_hash = hashlib.sha256(body[:200].encode()).hexdigest()
     knowledge_id = make_knowledge_id(domain, subject, title, seq, content_hash)
+
+    # W1.7: эмиссия zone_violation при конфликте (critical — принуждение, warn — partial)
+    if zone_param is not None and (zone_forced or zone_partial):
+        await emit_zone_violation(
+            knowledge_id,
+            forced=zone_forced,
+            parent_zone=parent_zone,
+            own_zone=zone_param,
+            partial_public=zone_partial,
+        )
 
     # Dup-gate (advisory, best-effort — как в crud.py:101-118)
     quality_duplicates: list[dict] = []
@@ -149,6 +175,7 @@ async def add_fragment(params: dict, app_state) -> dict:
                 body, domain, None,
                 embedder=embedder,
                 qdrant_client=qdrant_dup,
+                collection_name=collection_for_zone(section_zone),
             )
     except Exception as exc:
         logger.debug("add_fragment: dup-gate skipped: %s", exc)
@@ -164,6 +191,7 @@ async def add_fragment(params: dict, app_state) -> dict:
         sequence_number=seq,
         tags=tags,
         cross_subjects=cross_subjects,
+        zone=section_zone,  # W1.5
     )
     entry = KnowledgeEntry(frontmatter=section_fm, content=body)
     await store.write_entry(entry)
@@ -191,16 +219,22 @@ async def add_fragment(params: dict, app_state) -> dict:
         pass
 
     logger.info(
-        "add_fragment: %s seq=%d collection=%s wait_for_index=%s",
-        knowledge_id, seq, collection_id, wait_ok,
+        "add_fragment: %s seq=%d collection=%s wait_for_index=%s zone=%s",
+        knowledge_id, seq, collection_id, wait_ok, section_zone,
     )
-    return {
+    resp = {
         "fragment_id": knowledge_id,
         "collection_id": collection_id,
         "sequence_number": seq,
         "indexed": wait_ok,
         "quality_duplicates": quality_duplicates,
+        "zone": section_zone,
     }
+    if zone_forced:
+        resp["zone_forced"] = True
+    if zone_partial:
+        resp["book_partial_public"] = True
+    return resp
 
 
 async def update_fragment(params: dict, app_state) -> dict:
@@ -226,6 +260,31 @@ async def update_fragment(params: dict, app_state) -> dict:
     if getattr(entry.frontmatter, "parent_knowledge_id", None) is None:  # P1-5
         return {"error": f"'{fragment_id}' is not a book section (no parent_knowledge_id)"}
 
+    # W1.5: монозональность — zone секции против зоны книги (только при явном zone)
+    zone_param = params.get("zone")
+    zone_forced = False
+    zone_partial = False
+    update_metadata: dict | None = None
+    if zone_param is not None:
+        parent_zone = None
+        parent_entry = await store.read(entry.frontmatter.parent_knowledge_id)
+        if parent_entry is not None:
+            parent_zone = getattr(parent_entry.frontmatter, "zone", "private")
+        try:
+            final_zone, zone_forced = resolve_zone(zone_param, parent_zone)
+        except ValueError as exc:
+            return {"error": str(exc)}
+        zone_partial = is_partial_public(zone_param, parent_zone)
+        if zone_forced or zone_partial:
+            await emit_zone_violation(
+                fragment_id,
+                forced=zone_forced,
+                parent_zone=parent_zone,
+                own_zone=zone_param,
+                partial_public=zone_partial,
+            )
+        update_metadata = {"zone": final_zone}
+
     # Построить новый контент
     new_content = entry.content
     if title is not None:
@@ -248,7 +307,12 @@ async def update_fragment(params: dict, app_state) -> dict:
     except (ValueError, TypeError):
         return {"error": f"Invalid version: '{version}'"}
     try:
-        updated = await store.update(fragment_id, content=new_content, expected_version=expected_version)
+        updated = await store.update(
+            fragment_id,
+            content=new_content,
+            metadata=update_metadata,
+            expected_version=expected_version,
+        )
     except VersionConflictError as e:
         from ..metrics import optimistic_lock_conflicts
         optimistic_lock_conflicts.inc()
@@ -284,12 +348,19 @@ async def update_fragment(params: dict, app_state) -> dict:
         pass
 
     logger.info("update_fragment: %s v%d", fragment_id, updated.frontmatter.version)
-    return {
+    resp = {
         "fragment_id": fragment_id,
         "version": updated.frontmatter.version,
         "updated_at": updated.frontmatter.updated_at.isoformat(),
         "indexed": enqueued,
     }
+    if zone_param is not None:
+        resp["zone"] = updated.frontmatter.zone
+    if zone_forced:
+        resp["zone_forced"] = True
+    if zone_partial:
+        resp["book_partial_public"] = True
+    return resp
 
 
 async def delete_fragment(params: dict, app_state) -> dict:
@@ -314,9 +385,13 @@ async def delete_fragment(params: dict, app_state) -> dict:
         return {"error": f"Delete failed for '{fragment_id}'"}
 
     # Qdrant delete_by_knowledge_id (паттерн crud.py:418 — без cascade)
+    zone = getattr(entry.frontmatter, "zone", None) or ZONE_PRIVATE
     qdrant = _get_qdrant(app_state)
     try:
-        await loop.run_in_executor(None, qdrant.delete_by_knowledge_id, fragment_id)
+        def _delete():
+            qdrant.delete_by_knowledge_id(fragment_id, collection_name=collection_for_zone(zone))
+
+        await loop.run_in_executor(None, _delete)
     except Exception as exc:
         logger.warning("delete_fragment: Qdrant delete failed for %s: %s", fragment_id, exc)
 
@@ -332,6 +407,35 @@ async def delete_fragment(params: dict, app_state) -> dict:
 
     logger.info("delete_fragment: %s → .trash/ + Qdrant", fragment_id)
     return {"fragment_id": fragment_id, "deleted": True}
+
+
+async def _collection_in_public(collection_id: str, app_state) -> bool:
+    """W3 C5 оракул: существует ли коллекция в public-зоне (raw-scroll Qdrant)."""
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+    qdrant_raw = _get_qdrant(app_state)
+    loop = asyncio.get_running_loop()
+
+    def _scroll():
+        return qdrant_raw.scroll(
+            scroll_filter=Filter(must=[
+                FieldCondition(
+                    key="knowledge_id",
+                    match=MatchValue(value=collection_id),
+                ),
+                FieldCondition(
+                    key="content_type",
+                    match=MatchValue(value="collection"),
+                ),
+            ]),
+            limit=1,
+            with_payload=False,
+            with_vectors=False,
+            collection_name=collection_for_zone(ZONE_PUBLIC),
+        )
+
+    points, _ = await loop.run_in_executor(None, _scroll)
+    return bool(points)
 
 
 async def find_fragment(params: dict, app_state) -> dict:
@@ -354,9 +458,19 @@ async def find_fragment(params: dict, app_state) -> dict:
     if root is None or getattr(root.frontmatter, "content_type", None) != "collection":
         return {"error": f"Collection not found: '{collection_id}'"}
 
-    # Делегирование в search_knowledge с collection_id-фильтром
+    # W3 C5 fail-closed: subscriber видит только public-коллекции (оракул по Qdrant)
+    if is_subscriber(params) and not await _collection_in_public(collection_id, app_state):
+        return {"error": f"Collection not found: '{collection_id}'"}
+
+    # Делегирование в search_knowledge с collection_id-фильтром.
+    # _auth прокидывается — иначе subscriber-поиск утечёт в private!
     result = await search_knowledge(
-        {"query": query, "collection_id": collection_id, "top_k": limit},
+        {
+            "query": query,
+            "collection_id": collection_id,
+            "top_k": limit,
+            "_auth": params.get("_auth"),
+        },
         app_state,
     )
     if "error" in result:

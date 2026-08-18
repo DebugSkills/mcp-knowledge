@@ -80,6 +80,7 @@ class MarkdownStore:
             cross_subjects=req.cross_subjects,
             tags=req.tags,
             version=1,
+            zone=req.zone,  # W1.8: проброс зоны доступа
             created_at=now,
             updated_at=now,
         )

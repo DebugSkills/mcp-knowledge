@@ -12,6 +12,23 @@ from mcp_server.content.preprocessor import (
 from mcp_server.content.registry import get, list_types, register, reset
 
 
+@pytest.fixture(autouse=True)
+def _restore_standard_registry():
+    """Восстановить стандартные препроцессоры (book/pdf) после каждого теста.
+
+    reset() очищает глобальный реестр; тест-модули, выполняемые позже
+    (например, test_zone_mono_books.py с import_content → 'book'),
+    падают без этого восстановления.
+    """
+    yield
+    from mcp_server.content.book_preprocessor import BookPreprocessor
+    from mcp_server.content.pdf_preprocessor import PDFPreprocessor
+
+    reset()
+    register(BookPreprocessor(embedder=None, token_counter=None))
+    register(PDFPreprocessor())
+
+
 class _MockPreprocessor(ContentPreprocessor):
     content_type = "mock_type"
 

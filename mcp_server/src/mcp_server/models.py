@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -39,6 +39,10 @@ class KnowledgeFrontmatter(BaseModel):
     tags: list[str] = Field(default_factory=list, description="Свободные теги")
     version: int = Field(default=1, ge=1, description="Optimistic locking (P2)")
     status: str = Field(default="published", description="Lifecycle: published | deprecated (4.7)")
+    zone: Literal["public", "private"] = Field(
+        default="private",
+        description="Зона доступа (Фаза W1, двухконтурная модель): public | private",
+    )
     evergreen: bool = Field(default=False, description="Фундаментальное знание — медленное старение (4.5 R1)")
     source: str | None = Field(None, description="URL источника (link_health 4.5)")
     # ── Фаза 5: parent-child collection fields ──────────────
@@ -64,6 +68,14 @@ class KnowledgeFrontmatter(BaseModel):
             )
         return v
 
+    @field_validator("zone", mode="before")
+    @classmethod
+    def validate_zone(cls, v: Any) -> str:
+        """W1.1: zone ∈ {public, private}; неизвестное значение → ошибка."""
+        if v not in ("public", "private"):
+            raise ValueError(f"zone '{v}' must be 'public' or 'private'")
+        return v
+
 
 # ── Knowledge Entry ────────────────────────────────────────
 
@@ -81,6 +93,11 @@ class KnowledgeEntry(BaseModel):
             parts.append(self.frontmatter.project)
         parts.append(f"{self.frontmatter.knowledge_id}.md")
         return "/".join(parts)
+
+    @property
+    def zone(self) -> str:
+        """Зона доступа записи (W1.3)."""
+        return self.frontmatter.zone
 
 
 # ── Chunk ──────────────────────────────────────────────────
@@ -135,6 +152,9 @@ class WriteRequest(BaseModel):
     )
     wait_for_index: bool = Field(
         default=False, description="Ждать завершения индексации (GPU ≤5s)"
+    )
+    zone: str = Field(
+        default="private", description="Зона доступа (W1.2): public | private"
     )
 
 
