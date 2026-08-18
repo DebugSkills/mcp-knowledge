@@ -22,6 +22,8 @@ from fastapi import Request
 from fastapi.responses import Response
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 
+from .storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
+
 logger = logging.getLogger("mcp_knowledge.metrics")
 
 # ── Metric definitions ────────────────────────────────────
@@ -167,10 +169,13 @@ def update_dlq_metrics(dlq_instance) -> None:
 
 
 def update_collection_metrics(qdrant) -> None:
-    """Обновить метрики коллекции Qdrant."""
+    """Обновить метрики коллекции Qdrant (W2: сумма по обеим зонам)."""
     try:
-        info = qdrant.collection_info()
-        collection_size.set(info.get("points_count", 0))
+        total_points = 0
+        for zone in (ZONE_PUBLIC, ZONE_PRIVATE):
+            info = qdrant.collection_info(collection_name=collection_for_zone(zone))
+            total_points += info.get("points_count", 0)
+        collection_size.set(total_points)
     except Exception:
         pass
 

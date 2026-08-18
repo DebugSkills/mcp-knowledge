@@ -28,6 +28,7 @@ from mcp_server.quality.issues import (
     list_issues,
     update_issue_status,
 )
+from mcp_server.storage.schema import ZONE_PRIVATE, collection_for_zone
 
 logger = logging.getLogger("mcp_knowledge.tools.quality")
 
@@ -84,6 +85,7 @@ async def review_queue(params: dict, app_state) -> dict:
 
         # Scroll все точки с staleness_score, затем сортируем в Python
         # 13.15: run_in_executor — не блокируем event loop
+        # TODO: зона из контекста — W3
         points, _ = await loop.run_in_executor(
             None,
             lambda: client.scroll(
@@ -91,6 +93,7 @@ async def review_queue(params: dict, app_state) -> dict:
                 limit=limit * 3,  # берём с запасом для сортировки
                 with_payload=True,
                 with_vectors=False,
+                collection_name=collection_for_zone(ZONE_PRIVATE),
             ),
         )
 
@@ -171,6 +174,7 @@ async def review_queue_books(params: dict, app_state) -> dict:
         while True:
             _filt = scroll_filter
             _off = offset
+            # TODO: зона из контекста — W3
             points, next_offset = await loop.run_in_executor(
                 None,
                 lambda f=_filt, o=_off: client.scroll(
@@ -179,6 +183,7 @@ async def review_queue_books(params: dict, app_state) -> dict:
                     offset=o,
                     with_payload=True,
                     with_vectors=False,
+                    collection_name=collection_for_zone(ZONE_PRIVATE),
                 ),
             )
             all_points.extend(points)
@@ -246,7 +251,25 @@ async def review_queue_books(params: dict, app_state) -> dict:
         # ── R1: резолв title книг из родительских записей ──────
         parent_ids = list(books.keys())
         if parent_ids:
-            parent_titles = await _batch_resolve_book_titles(client, parent_ids, loop)
+            # W2.13: зоны книг из scroll-точек → per-zone резолв title.
+            zones_by_book: dict[str, str] = {}
+            for point in all_points:
+                pl = point.payload or {}
+                pid = pl.get("parent_knowledge_id")
+                if pid and pl.get("zone"):
+                    zones_by_book.setdefault(pid, pl["zone"])
+            if zones_by_book:
+                ids_by_zone: dict[str, list[str]] = {}
+                for pid in parent_ids:
+                    ids_by_zone.setdefault(zones_by_book.get(pid, ZONE_PRIVATE), []).append(pid)
+                parent_titles: dict[str, str] = {}
+                for zone, ids in ids_by_zone.items():
+                    parent_titles.update(
+                        await _batch_resolve_book_titles(client, ids, loop, zone=zone)
+                    )
+            else:
+                # Зоны в payload отсутствуют — единый вызов (default ZONE_PRIVATE).
+                parent_titles = await _batch_resolve_book_titles(client, parent_ids, loop)
             for parent_id, title in parent_titles.items():
                 if parent_id in books and title:
                     books[parent_id]["title"] = title
@@ -426,13 +449,17 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
                         make_deprecation_payload_update,
                     )
                     payload = make_deprecation_payload_update()
+                    # Зона записи из SSOT frontmatter (_entry_zone) — иначе deprecate
+                    # public-записи был silent no-op в private-коллекции (P1-1 W2).
+                    zone = await _entry_zone(app_state, knowledge_id)
                     await loop.run_in_executor(
                         None,
-                        lambda: qdrant.set_payload(
-                            payload=payload,
+                        lambda k=knowledge_id, p=payload, z=zone: qdrant.set_payload(
+                            payload=p,
                             points_filter=Filter(
-                                must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
+                                must=[FieldCondition(key="knowledge_id", match=MatchValue(value=k))]
                             ),
+                            collection_name=collection_for_zone(z),
                         ),
                     )
                     side_effects.append(f"Qdrant payload status set to 'deprecated' for knowledge_id={knowledge_id}")
@@ -440,7 +467,11 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
                     # Cascade: deprecate все дочерние секции (Фаза 13.14)
                     if cascade:
                         cascade_affected = await _cascade_set_payload(
-                            qdrant, knowledge_id, payload, "deprecated"
+                            qdrant,
+                            knowledge_id,
+                            payload,
+                            "deprecated",
+                            zone=zone,
                         )
                         side_effects.append(
                             f"LIFECYCLE cascade: {cascade_affected} child sections set to 'deprecated' for book {knowledge_id}"
@@ -497,13 +528,16 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
 
                     from mcp_server.quality.lifecycle import make_restore_payload_update
                     payload = make_restore_payload_update()
+                    # Зона записи из SSOT frontmatter (_entry_zone) — P1-1 W2.
+                    zone = await _entry_zone(app_state, knowledge_id)
                     await loop.run_in_executor(
                         None,
-                        lambda: qdrant.set_payload(
-                            payload=payload,
+                        lambda k=knowledge_id, p=payload, z=zone: qdrant.set_payload(
+                            payload=p,
                             points_filter=Filter(
-                                must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
+                                must=[FieldCondition(key="knowledge_id", match=MatchValue(value=k))]
                             ),
+                            collection_name=collection_for_zone(z),
                         ),
                     )
                     side_effects.append(f"Qdrant payload status set to 'published' for knowledge_id={knowledge_id}")
@@ -511,7 +545,11 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
                     # Cascade: restore все дочерние секции (Фаза 13.14)
                     if cascade:
                         cascade_affected = await _cascade_set_payload(
-                            qdrant, knowledge_id, payload, "published"
+                            qdrant,
+                            knowledge_id,
+                            payload,
+                            "published",
+                            zone=zone,
                         )
                         side_effects.append(
                             f"LIFECYCLE cascade: {cascade_affected} child sections set to 'published' for book {knowledge_id}"
@@ -579,13 +617,16 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
                         make_deprecation_payload_update,
                     )
                     payload = make_deprecation_payload_update()
+                    # Зона записи из SSOT frontmatter (_entry_zone) — P1-1 W2.
+                    zone = await _entry_zone(app_state, knowledge_id)
                     await loop.run_in_executor(
                         None,
-                        lambda: qdrant.set_payload(
-                            payload=payload,
+                        lambda k=knowledge_id, p=payload, z=zone: qdrant.set_payload(
+                            payload=p,
                             points_filter=Filter(
-                                must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
+                                must=[FieldCondition(key="knowledge_id", match=MatchValue(value=k))]
                             ),
+                            collection_name=collection_for_zone(z),
                         ),
                     )
                     side_effects.append(f"Source '{knowledge_id}' deprecated via Qdrant payload")
@@ -631,17 +672,40 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
     return {"resolved": False, "error": f"Unknown action: {action}"}
 
 
+async def _entry_zone(app_state, knowledge_id: str) -> str:
+    """Зона записи из frontmatter SSOT (best-effort).
+
+    W2.13: паттерн _get_snippet (ниже) и crud.delete_entry:372 — безопасное
+    чтение через MarkdownStore.read; при любой ошибке — ZONE_PRIVATE.
+    TODO: зона из контекста запроса — W3.
+    """
+    store = getattr(app_state, "store", None)
+    if store is None or not hasattr(store, "read"):
+        return ZONE_PRIVATE
+    try:
+        entry = await store.read(knowledge_id)
+    except Exception as exc:
+        logger.warning("Entry read failed for %s (zone→private): %s", knowledge_id, exc)
+        return ZONE_PRIVATE
+    zone = getattr(getattr(entry, "frontmatter", None), "zone", None)
+    return zone or ZONE_PRIVATE
+
+
 async def _cascade_set_payload(
     qdrant,
     parent_knowledge_id: str,
     payload: dict,
     new_status: str,
+    zone: str = ZONE_PRIVATE,
 ) -> int:
     """Фаза 13.14+13.15: применить set_payload ко всем дочерним секциям книги.
 
     Scroll по parent_knowledge_id → set_payload на каждую секцию.
     Все Qdrant-вызовы — через run_in_executor (не блокируют event loop).
     Возвращает число затронутых секций.
+
+    W2.13: зона параметризована (zone) — вызывающий резолвит её из SSOT-записи
+    (_entry_zone). TODO: зона из контекста запроса — W3.
     """
     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
@@ -660,6 +724,7 @@ async def _cascade_set_payload(
                 offset=o,
                 with_payload=["knowledge_id"],
                 with_vectors=False,
+                collection_name=collection_for_zone(zone),
             ),
         )
         for point in points:
@@ -673,6 +738,7 @@ async def _cascade_set_payload(
                             points_filter=Filter(
                                 must=[FieldCondition(key="knowledge_id", match=MatchValue(value=k))]
                             ),
+                            collection_name=collection_for_zone(zone),
                         ),
                     )
                     affected += 1
@@ -692,6 +758,7 @@ async def _batch_resolve_book_titles(
     qdrant,
     parent_ids: list[str],
     loop,
+    zone: str = ZONE_PRIVATE,
 ) -> dict[str, str]:
     """R1: резолв title книг из payload родительских записей в Qdrant.
 
@@ -699,10 +766,14 @@ async def _batch_resolve_book_titles(
     извлекает поле title из payload. Пагинированный: батчи по _PARENT_TITLE_BATCH,
     все Qdrant-вызовы через run_in_executor.
 
+    W2.13: зона параметризована (zone) — вызывающий резолвит её из payload-зон
+    scroll-точек (review_queue_books) или дефолт ZONE_PRIVATE.
+
     Args:
         qdrant: QdrantClient wrapper (app_state.qdrant).
         parent_ids: список parent_knowledge_id для резолва.
         loop: asyncio event loop.
+        zone: зона доступа (default: ZONE_PRIVATE).
 
     Returns:
         dict parent_id → title (str).
@@ -730,6 +801,7 @@ async def _batch_resolve_book_titles(
                     limit=bl,
                     with_payload=["title"],
                     with_vectors=False,
+                    collection_name=collection_for_zone(zone),
                 ),
             )
         except Exception as exc:
@@ -1186,17 +1258,17 @@ async def bulk_deprecate_duplicates(params: dict, app_state) -> dict:
             metadata={"issues_closed": None, "auto": True},
             strict=True,
         ):
-                logger.error(
-                    "[AUTO-DEDUP] strict audit failed for %s — aborting batch", target,
-                )
-                return {
-                    "resolved": False,
-                    "error": f"strict audit failed for {target} (batch aborted)",
-                    "deprecated_count": deprecated_count,
-                    "issues_closed": total_issues_closed,
-                    "side_effects": side_effects,
-                    "truncated": truncated,
-                }
+            logger.error(
+                "[AUTO-DEDUP] strict audit failed for %s — aborting batch", target,
+            )
+            return {
+                "resolved": False,
+                "error": f"strict audit failed for {target} (batch aborted)",
+                "deprecated_count": deprecated_count,
+                "issues_closed": total_issues_closed,
+                "side_effects": side_effects,
+                "truncated": truncated,
+            }
         try:
             if qdrant:
                 from qdrant_client.models import FieldCondition, Filter, MatchValue
@@ -1204,13 +1276,16 @@ async def bulk_deprecate_duplicates(params: dict, app_state) -> dict:
                 from mcp_server.quality.lifecycle import make_deprecation_payload_update
 
                 payload = make_deprecation_payload_update()
+                # Зона записи из SSOT frontmatter (_entry_zone) — P1-1 W2.
+                zone = await _entry_zone(app_state, target)
                 await loop.run_in_executor(
                     None,
-                    lambda t=target, p=payload: qdrant.set_payload(
+                    lambda t=target, p=payload, z=zone: qdrant.set_payload(
                         payload=p,
                         points_filter=Filter(
                             must=[FieldCondition(key="knowledge_id", match=MatchValue(value=t))]
                         ),
+                        collection_name=collection_for_zone(z),
                     ),
                 )
                 side_effects.append(f"Deprecated {target}")

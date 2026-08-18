@@ -10,11 +10,13 @@ import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+from mcp_server.storage.schema import ZONE_PRIVATE
 from mcp_server.tools.read import (
     _TOC_CACHE,
     _TOC_TTL,
     MAX_TOC_SECTIONS,
     _build_toc,
+    _toc_cache_key,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -143,10 +145,10 @@ class TestBuildToc:
         scroll_before = mock_scroll.call_count
 
         # Force TTL expiry by manipulating the cache entry
-        cached = _TOC_CACHE.get("book-id")
+        cached = _TOC_CACHE.get(_toc_cache_key(ZONE_PRIVATE, "book-id"))
         if cached:
             # Set timestamp to old enough that TTL expires
-            _TOC_CACHE["book-id"] = (cached[0], time.monotonic() - _TOC_TTL - 1, cached[2])
+            _TOC_CACHE[_toc_cache_key(ZONE_PRIVATE, "book-id")] = (cached[0], time.monotonic() - _TOC_TTL - 1, cached[2])
 
         await _build_toc("book-id", app_state)
         assert mock_scroll.call_count == scroll_before + 1

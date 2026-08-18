@@ -105,32 +105,56 @@ def _e2e_services_available():
 
 @pytest.fixture(scope="session")
 def _patched_collection():
-    """Monkeypatch COLLECTION_NAME = 'knowledge_e2e' на всю сессию.
-    
-    Фаза 13 (v1.0): также патчит resources.COLLECTION_NAME (иначе resources.py
-    читает свою локальную ссылку из schema.py, минуя monkeypatch qdrant_client).
-    """
-    import mcp_server.resources as res_mod
-    import mcp_server.storage.qdrant_client as qc_mod
+    """Monkeypatch зональных коллекций на e2e-имена на всю сессию.
 
-    original_qc = qc_mod.COLLECTION_NAME
-    original_res = res_mod.COLLECTION_NAME
-    qc_mod.COLLECTION_NAME = E2E_COLLECTION
-    res_mod.COLLECTION_NAME = E2E_COLLECTION
+    W2: две зоны — schema.COLLECTION_PUBLIC/PRIVATE (+ blue-green v1/v2).
+    Все call-sites идут через collection_for_zone(), читающую модульные
+    глобалы в рантайме → патч срабатывает. qdrant_client.COLLECTION_NAME
+    импортирован by-value → патчится отдельно. resources.COLLECTION_NAME
+    больше НЕ существует (W2-B1e) — не патчим.
+    """
+    import mcp_server.storage.qdrant_client as qc_mod
+    import mcp_server.storage.schema as sch
+
+    orig = {
+        "COLLECTION_PUBLIC": sch.COLLECTION_PUBLIC,
+        "COLLECTION_PRIVATE": sch.COLLECTION_PRIVATE,
+        "PUBLIC_V1": sch.PUBLIC_V1,
+        "PUBLIC_V2": sch.PUBLIC_V2,
+        "PRIVATE_V1": sch.PRIVATE_V1,
+        "PRIVATE_V2": sch.PRIVATE_V2,
+        "COLLECTION_NAME": sch.COLLECTION_NAME,
+        "qc_COLLECTION_NAME": qc_mod.COLLECTION_NAME,
+    }
+    sch.COLLECTION_PUBLIC = f"{E2E_COLLECTION}_public"
+    sch.COLLECTION_PRIVATE = f"{E2E_COLLECTION}_private"
+    sch.PUBLIC_V1 = f"{E2E_COLLECTION}_public_v1"
+    sch.PUBLIC_V2 = f"{E2E_COLLECTION}_public_v2"
+    sch.PRIVATE_V1 = f"{E2E_COLLECTION}_private_v1"
+    sch.PRIVATE_V2 = f"{E2E_COLLECTION}_private_v2"
+    sch.COLLECTION_NAME = sch.COLLECTION_PRIVATE
+    qc_mod.COLLECTION_NAME = sch.COLLECTION_PRIVATE
     yield
-    qc_mod.COLLECTION_NAME = original_qc
-    res_mod.COLLECTION_NAME = original_res
+    sch.COLLECTION_PUBLIC = orig["COLLECTION_PUBLIC"]
+    sch.COLLECTION_PRIVATE = orig["COLLECTION_PRIVATE"]
+    sch.PUBLIC_V1 = orig["PUBLIC_V1"]
+    sch.PUBLIC_V2 = orig["PUBLIC_V2"]
+    sch.PRIVATE_V1 = orig["PRIVATE_V1"]
+    sch.PRIVATE_V2 = orig["PRIVATE_V2"]
+    sch.COLLECTION_NAME = orig["COLLECTION_NAME"]
+    qc_mod.COLLECTION_NAME = orig["qc_COLLECTION_NAME"]
 
 
 @pytest.fixture(scope="session")
 def real_qdrant(_patched_collection):
     """Session-scoped QdrantClient в REST-mode.
 
-    P1-3: нормальный __init__ → swap _client на prefer_grpc=False.
-    create_collection_named("knowledge_e2e", force_recreate=True) в setup.
-    delete_collection_named("knowledge_e2e") в teardown (finally).
+    W2: setup — сброс обеих e2e-зон (delete alias + v1/v2) →
+    ensure_zonal_collections() (создаёт knowledge_e2e_public/private + алиасы).
+    teardown — удаление обеих зон (finally).
     """
     from mcp_server.storage.qdrant_client import QdrantClient
+    from mcp_server.storage.schema import COLLECTION_PRIVATE, COLLECTION_PUBLIC
     from qdrant_client import QdrantClient as QdrantSDKClient
 
     qc = QdrantClient(url=QDRANT_REST_URL)
@@ -138,11 +162,29 @@ def real_qdrant(_patched_collection):
     qc._client = QdrantSDKClient(url=QDRANT_REST_URL, prefer_grpc=False)
 
     try:
-        qc.create_collection_named(E2E_COLLECTION, force_recreate=True)
+        # Полный сброс обеих зон (идемпотентно)
+        for coll in (COLLECTION_PUBLIC, COLLECTION_PRIVATE):
+            try:
+                qc.delete_alias(coll)
+            except Exception:
+                pass
+            try:
+                qc.delete_collection_named(coll)
+            except Exception:
+                pass
+        qc.ensure_zonal_collections(force_recreate=True)
         yield qc
     finally:
         try:
-            qc.delete_collection_named(E2E_COLLECTION)
+            for coll in (COLLECTION_PUBLIC, COLLECTION_PRIVATE):
+                try:
+                    qc.delete_alias(coll)
+                except Exception:
+                    pass
+                try:
+                    qc.delete_collection_named(coll)
+                except Exception:
+                    pass
         except Exception:
             pass
         try:

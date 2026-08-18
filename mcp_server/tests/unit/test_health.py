@@ -69,8 +69,8 @@ def _make_mock_qdrant(*, collection_info_return=None, collection_info_raise=None
     else:
         client.collection_info = MagicMock(return_value=collection_info_return or {
             "name": "knowledge",
-            "points_count": 42,
-            "vectors_count": 42,
+            "points_count": 21,
+            "vectors_count": 21,
         })
     return client
 
@@ -160,6 +160,20 @@ class TestHealthReadinessHealthy:
         assert body["checks"]["embedding"]["ok"] is True
         assert body["checks"]["pipeline"]["ok"] is True
         assert body["checks"]["dlq"]["ok"] is True
+
+    def test_qdrant_zones_block_w2(self, client):
+        """W2: /health содержит zones-блок (public + private), сумма 42."""
+        set_qdrant_client(_make_mock_qdrant())
+        set_embedding_manager(_make_mock_embedder())
+        set_pipeline(_make_mock_pipeline())
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        qdrant = resp.json()["checks"]["qdrant"]
+        assert qdrant["points"] == 42  # сумма обеих зон (21 + 21)
+        assert qdrant["zones"]["public"]["collection"] == "knowledge_public"
+        assert qdrant["zones"]["public"]["points"] == 21
+        assert qdrant["zones"]["private"]["collection"] == "knowledge_private"
+        assert qdrant["zones"]["private"]["points"] == 21
 
 
 # ── E1.2: Readiness probe — degraded cases ──────────────────

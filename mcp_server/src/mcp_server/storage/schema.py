@@ -9,15 +9,21 @@ from __future__ import annotations
 
 from qdrant_client.http import models as qmodels
 
-# Alias name (search/upsert прозрачны — код Ф1/Ф2 не меняется)
-COLLECTION_ALIAS = "knowledge"
+# W2: двухконтурная модель доступа (public/private зоны)
+COLLECTION_PUBLIC  = "knowledge_public"
+COLLECTION_PRIVATE = "knowledge_private"
+PUBLIC_V1, PUBLIC_V2   = "knowledge_public_v1",  "knowledge_public_v2"
+PRIVATE_V1, PRIVATE_V2 = "knowledge_private_v1", "knowledge_private_v2"
+LEGACY_ALIAS = "knowledge"
+ZONE_PUBLIC, ZONE_PRIVATE = "public", "private"
 
-# Legacy: backward-compatible (используется как default для операций)
-COLLECTION_NAME = COLLECTION_ALIAS
-
-# Naming convention для blue-green коллекций
+# Шимы W1 (НЕ удалять! импортируются main.py:78 и test_blue_green.py; полное удаление — позже)
+COLLECTION_ALIAS = LEGACY_ALIAS
 COLLECTION_V1 = "knowledge_v1"
 COLLECTION_V2 = "knowledge_v2"
+
+# Временный обратно-совместимый алиас для resources.py/reconcile
+COLLECTION_NAME = COLLECTION_PRIVATE
 
 from ..config import settings
 
@@ -39,6 +45,7 @@ PAYLOAD_SCHEMA = {
     "parent_knowledge_id": qmodels.PayloadSchemaType.KEYWORD,  # Фаза 5: parent-child collection
     "content_type": qmodels.PayloadSchemaType.KEYWORD,  # Фаза 5: book | pdf | collection
     "sequence_number": qmodels.PayloadSchemaType.INTEGER,  # Фаза 5: порядок секции в коллекции
+    "zone": qmodels.PayloadSchemaType.KEYWORD,  # W2: public | private
 }
 
 # Индексы для payload-полей
@@ -52,6 +59,7 @@ PAYLOAD_INDEXES: list[tuple[str, qmodels.PayloadSchemaType]] = [
     ("parent_knowledge_id", qmodels.PayloadSchemaType.KEYWORD),  # Фаза 5
     ("content_type", qmodels.PayloadSchemaType.KEYWORD),  # Фаза 5
     ("sequence_number", qmodels.PayloadSchemaType.INTEGER),  # Фаза 5: сортировка TOC
+    ("zone", qmodels.PayloadSchemaType.KEYWORD),  # W2: фильтрация по зоне доступа
 ]
 
 # HNSW-параметры
@@ -67,6 +75,32 @@ OPTIMIZERS_CONFIG = qmodels.OptimizersConfigDiff(
 )
 
 
+def collection_for_zone(zone: str) -> str:
+    """Имя активной коллекции для зоны доступа (W2).
+
+    Raises:
+        ValueError: неизвестная зона (fail loud).
+    """
+    if zone == ZONE_PUBLIC:
+        return COLLECTION_PUBLIC
+    if zone == ZONE_PRIVATE:
+        return COLLECTION_PRIVATE
+    raise ValueError(f"unknown zone: {zone}")
+
+
+def blue_green_names_for_zone(zone: str) -> tuple[str, str, str]:
+    """Blue-green имена (v1, v2, alias) для зоны (W2).
+
+    Raises:
+        ValueError: неизвестная зона (fail loud).
+    """
+    if zone == ZONE_PUBLIC:
+        return (PUBLIC_V1, PUBLIC_V2, COLLECTION_PUBLIC)
+    if zone == ZONE_PRIVATE:
+        return (PRIVATE_V1, PRIVATE_V2, COLLECTION_PRIVATE)
+    raise ValueError(f"unknown zone: {zone}")
+
+
 def build_collection_params(collection_name: str | None = None) -> dict:
     """Параметры создания коллекции.
 
@@ -74,10 +108,15 @@ def build_collection_params(collection_name: str | None = None) -> dict:
     Совместим с qdrant-client >=1.13 (CreateCollection model API меняется между версиями).
 
     Args:
-        collection_name: имя коллекции (default: COLLECTION_ALIAS).
+        collection_name: имя коллекции (обязателен; W2: молчаливый дефолт убран).
+
+    Raises:
+        ValueError: collection_name не задан.
     """
+    if collection_name is None:
+        raise ValueError("collection_name is required")
     return {
-        "collection_name": collection_name or COLLECTION_ALIAS,
+        "collection_name": collection_name,
         "vectors_config": qmodels.VectorParams(
             size=VECTOR_SIZE,
             distance=DISTANCE_METRIC,
@@ -104,6 +143,7 @@ def build_payload_point(
     parent_knowledge_id: str | None = None,
     content_type: str | None = None,
     sequence_number: int | None = None,
+    zone: str = ZONE_PRIVATE,
 ) -> qmodels.PointStruct:
     """Собрать PointStruct для upsert."""
     payload = {
@@ -125,4 +165,6 @@ def build_payload_point(
         payload["content_type"] = content_type
     if sequence_number is not None:
         payload["sequence_number"] = sequence_number
+    # W2: зона доступа (не перетирать существующий ключ, если он уже есть)
+    payload.setdefault("zone", zone)
     return qmodels.PointStruct(id=point_id, vector=vector, payload=payload)

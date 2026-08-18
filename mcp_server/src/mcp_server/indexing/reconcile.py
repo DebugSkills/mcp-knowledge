@@ -19,6 +19,7 @@ from pathlib import Path
 
 from ..storage.markdown_store import MarkdownStore
 from ..storage.qdrant_client import QdrantClient
+from ..storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
 from .knowledge_index import KnowledgeIndex
 from .pipeline import IndexingPipeline
 
@@ -106,7 +107,12 @@ async def reconcile(
 
     # ── Шаг 1: Прямая сверка — Markdown → Qdrant ──────────────────
     md_paths = await store.reindex_scan()
-    qdrant_ids = qdrant.get_all_knowledge_ids()
+    # W2: union knowledge_id по ОБЕИМ зонам (public + private)
+    qdrant_ids: set[str] = set()
+    for zone in (ZONE_PUBLIC, ZONE_PRIVATE):
+        qdrant_ids |= qdrant.get_all_knowledge_ids(
+            collection_name=collection_for_zone(zone)
+        )
 
     missing_in_qdrant: list[Path] = []
 

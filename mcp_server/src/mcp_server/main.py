@@ -16,6 +16,8 @@
 - E1: Health hardening (liveness/readiness split)
 - E2: Rate limiting (token bucket, batch-aware)
 - F1: Blue-green migration at startup (legacy collection → aliases)
+- W2: Двухконтурная модель доступа — зоны public/private,
+  двухветочная зональная миграция legacy-коллекции 'knowledge'
 """
 
 import asyncio
@@ -55,6 +57,7 @@ from .metrics import metrics_endpoint, set_embed_backend
 from .progress import ImportProgressTracker
 from .rate_limit import TokenBucketLimiter
 from .storage import MarkdownStore, QdrantClient
+from .token_store import TokenStore  # W3: SSOT токенов двухконтурной модели
 from .tools.content import (  # code-2026-08-11-queue: convert/analyze операции
     _bg_analyze,
     _bg_convert,
@@ -64,72 +67,106 @@ from .tools.content import (  # code-2026-08-11-queue: convert/analyze опер�
 logger = logging.getLogger("mcp_knowledge")
 
 
-# ── F1: Legacy migration helper ──────────────────────────
+# ── W2: Legacy migration helper (двухветочная зональная) ──
 
 
 async def _migrate_legacy_collection(qdrant: QdrantClient) -> None:
-    """F1: Миграция legacy-коллекции на aliases при первом старте Ф3.
+    """W2.11: Двухветочная зональная миграция legacy-коллекции 'knowledge'.
 
-    Если коллекция "knowledge" существует как реальная коллекция (не alias),
-    переименовываем в knowledge_v1_DATETIME → создаём alias.
+    Ветка A — 'knowledge' = alias (F1 blue-green legacy): private-alias
+    наводится на коллекцию с данными (zero-copy), legacy-alias удаляется
+    (R1). Данные уже в Qdrant — reindex не нужен.
+    Ветка B — 'knowledge' = реальная коллекция (типичный случай):
+    создаётся knowledge_private_v1 + alias 'knowledge_private',
+    legacy-коллекция удаляется (SSOT — источник правды, данные не теряются).
+    Наполнение private-зоны — через существующий reconcile-механизм в
+    lifespan (фоновая задача: пустая зона → pipeline.reindex_all()).
 
-    P1-2: rollback на случай сбоя create_alias.
+    Идемпотентность: legacy отсутствует → return; partial-состояния
+    долечиваются (swap/delete пропускаются, если уже выполнены).
+    P1-2 rollback: при сбое swap — удаляется созданная коллекция.
     """
-    from .storage.schema import COLLECTION_ALIAS
+    from .storage.schema import COLLECTION_PRIVATE, LEGACY_ALIAS, PRIVATE_V1
 
-    # Проверяем: коллекция существует и это НЕ alias
-    if not qdrant._client.collection_exists(COLLECTION_ALIAS):
-        return  # ничего нет — ensure_collection уже создал
-
-    if qdrant.has_alias(COLLECTION_ALIAS):
-        logger.info("Collection '%s' already has alias — migration not needed", COLLECTION_ALIAS)
+    # 1. Legacy не существует (ни коллекции, ни алиаса) — свежая установка.
+    #    ensure_zonal_collections() (вызывается в lifespan ПОСЛЕ миграции)
+    #    создаст обе зоны с нуля.
+    if not qdrant._client.collection_exists(LEGACY_ALIAS) and not qdrant.has_alias(LEGACY_ALIAS):
+        logger.info("W2 migration: '%s' отсутствует — свежая установка, пропуск", LEGACY_ALIAS)
         return
 
-    # Legacy: коллекция "knowledge" существует как реальная
-    logger.info("⚙️  F1 migration: legacy collection 'knowledge' → aliases")
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    backup_name = f"knowledge_v1_{ts}"
-
-    try:
-        qdrant.rename_collection(COLLECTION_ALIAS, backup_name)
-        logger.info("F1 migration: renamed 'knowledge' → '%s'", backup_name)
-    except Exception as exc:
-        # Qdrant rename через alias API работает только с aliases.
-        # Если 'knowledge' — реальная коллекция (не alias) → 404 "Alias knowledge
-        # does not exists!". Тогда blue-green неприменим: деградируем в прямой
-        # доступ к коллекции (search/upsert по имени работают), F1 откладывается
-        # (P1 backlog). Без этого — restart storm на каждом старте.
-        if "does not exists" in str(exc) or "doesn't exist" in str(exc):
-            logger.warning(
-                "F1 migration skipped: '%s' is a real collection (not alias) — "
-                "blue-green deferred (P1). %s",
-                COLLECTION_ALIAS, exc,
-            )
+    # ── Ветка A: 'knowledge' — alias ──────────────────────
+    if qdrant.has_alias(LEGACY_ALIAS):
+        legacy_active = qdrant.get_active_collection(LEGACY_ALIAS)
+        if legacy_active == LEGACY_ALIAS:
+            # has_alias=True, но alias не резолвится — некогерентное состояние;
+            # повторный старт повторит попытку.
+            logger.warning("W2 migration (A): alias '%s' не резолвится — пропуск", LEGACY_ALIAS)
             return
-        logger.critical("F1 migration: rename_collection failed: %s", exc)
-        raise
-
-    try:
-        qdrant.create_alias(COLLECTION_ALIAS, backup_name)
-        logger.info("F1 migration: alias 'knowledge' → '%s' created", backup_name)
-    except Exception as exc:
-        # 🆕 P1-2: ROLLBACK — иначе alias "knowledge" не существует → всё падает
-        logger.error("F1 migration: alias create failed: %s → ROLLBACK rename", exc)
-        try:
-            qdrant.rename_collection(backup_name, COLLECTION_ALIAS)
-            logger.info("F1 migration: rollback successful — '%s' → 'knowledge'", backup_name)
-        except Exception as rollback_exc:
-            logger.critical(
-                "F1 migration: ROLLBACK FAILED! Collection '%s' orphaned, "
-                "alias 'knowledge' missing. Manual fix required: %s",
-                backup_name, rollback_exc,
+        logger.info("⚙️  W2 migration (A): '%s' — alias → перенос в private-зону", LEGACY_ALIAS)
+        # Private-alias → коллекция с данными (zero-copy: данные не двигаются).
+        private_active = qdrant.get_active_collection(COLLECTION_PRIVATE)
+        if private_active == COLLECTION_PRIVATE:
+            try:
+                qdrant.swap_alias(COLLECTION_PRIVATE, legacy_active)
+            except Exception as exc:
+                logger.error(
+                    "W2 migration (A): swap_alias('%s', '%s') failed: %s",
+                    COLLECTION_PRIVATE, legacy_active, exc,
+                )
+                raise
+            logger.info(
+                "W2 migration (A): alias '%s' → '%s' (legacy-данные в private-зоне)",
+                COLLECTION_PRIVATE, legacy_active,
             )
-            raise RuntimeError(
-                f"F1 migration failed and rollback failed: {exc}. "
-                f"Orphaned collection: {backup_name}. "
-                f"Run: qdrant_client.rename_collection('{backup_name}', 'knowledge')"
-            ) from exc
-        raise
+        else:
+            logger.info(
+                "W2 migration (A): private-зона уже настроена ('%s' → '%s') — пропуск swap",
+                COLLECTION_PRIVATE, private_active,
+            )
+        # R1: удалить legacy-alias. При сбое состояние безопасно: оба алиаса
+        # указывают на данные; повторный старт повторит удаление.
+        qdrant.delete_alias(LEGACY_ALIAS)
+        logger.info("W2 migration (A): legacy alias '%s' удалён (R1)", LEGACY_ALIAS)
+        return
+
+    # ── Ветка B: 'knowledge' — реальная коллекция ─────────
+    logger.info("⚙️  W2 migration (B): legacy коллекция '%s' → private-зона", LEGACY_ALIAS)
+    created_v1 = qdrant.create_collection_named(PRIVATE_V1)
+    private_active = qdrant.get_active_collection(COLLECTION_PRIVATE)
+    if private_active == COLLECTION_PRIVATE:
+        try:
+            qdrant.swap_alias(COLLECTION_PRIVATE, PRIVATE_V1)
+        except Exception as exc:
+            # P1-2 rollback: удалить созданную v1 (иначе останется пустая
+            # коллекция без alias; legacy при этом цел и продолжает работать).
+            if created_v1:
+                try:
+                    qdrant.delete_collection_named(PRIVATE_V1)
+                    logger.info("W2 migration (B): rollback — '%s' удалена", PRIVATE_V1)
+                except Exception as rollback_exc:
+                    logger.critical(
+                        "W2 migration (B): rollback delete '%s' failed: %s",
+                        PRIVATE_V1, rollback_exc,
+                    )
+            logger.error(
+                "W2 migration (B): swap_alias('%s', '%s') failed: %s",
+                COLLECTION_PRIVATE, PRIVATE_V1, exc,
+            )
+            raise
+        logger.info("W2 migration (B): alias '%s' → '%s' создан", COLLECTION_PRIVATE, PRIVATE_V1)
+    else:
+        logger.info(
+            "W2 migration (B): private-зона уже настроена ('%s') — пропуск swap",
+            private_active,
+        )
+    # Наполнение: pipeline на момент миграции ещё не создан → reindex
+    # делегируется существующему reconcile-механизму в lifespan (фоновая
+    # задача: пустая зона → pipeline.reindex_all() из SSOT).
+    logger.info("W2 migration (B): reindex отложен на reconcile (pipeline.reindex_all)")
+    # SSOT — источник правды: legacy-коллекция удаляется, данные не теряются.
+    qdrant.delete_collection_named(LEGACY_ALIAS)
+    logger.info("W2 migration (B): legacy коллекция '%s' удалена", LEGACY_ALIAS)
 
 
 # ── Lifespan: инициализация и останов ──────────────────────
@@ -158,22 +195,39 @@ async def lifespan(app: FastAPI):
     store = MarkdownStore()
     app.state.store = store
 
+    # ── W3.8: Token store (SSOT токенов) + bootstrap seeding ──
+    # env-ключи (MCP_READ_KEYS/MCP_IMPORT_KEYS/MCP_WRITE_KEYS) сидятся в сторе
+    # как level=read|import|write, zone=both, source=env — идемпотентно по key_hash.
+    # Приоритет аутентификации: токен-стор > env (auth.authenticate_key).
+    logger.info("🔑 Инициализация TokenStore (tokens_dir=%s)...", settings.TOKENS_DIR)
+    token_store = TokenStore(tokens_dir=settings.TOKENS_DIR)
+    try:
+        seeded = token_store.seed_from_env(
+            {
+                "read": settings.MCP_READ_KEYS,
+                "import": settings.MCP_IMPORT_KEYS,
+                "write": settings.MCP_WRITE_KEYS,
+            }
+        )
+        logger.info("🔑 TokenStore готов (seeded=%d env-токенов)", seeded)
+    except Exception as exc:
+        logger.warning("⚠️ TokenStore seeding failed (non-fatal): %s", exc)
+    app.state.token_store = token_store
+
     # 2. Qdrant gRPC-клиент (задача 1.3)
     logger.info("🗄️  Подключение к Qdrant: %s", settings.QDRANT_URL)
     qdrant = QdrantClient()
-    created = qdrant.ensure_collection(force_recreate=False)
 
-    # ── F1: Blue-green migration (legacy → aliases) ──────
-    if created:
-        # Коллекция только что создана — мигрировать нечего.
-        # Иначе _migrate_legacy_collection принял бы свежую коллекцию за legacy
-        # и попытался rename_alias (404: rename работает только с aliases).
-        logger.info("Collection '%s' created fresh — F1 migration skipped", settings.QDRANT_COLLECTION)
-    else:
-        try:
-            await _migrate_legacy_collection(qdrant)
-        except Exception as exc:
-            logger.warning("⚠️ F1 migration failed (non-fatal): %s", exc)
+    # ── W2: Двухветочная зональная миграция (legacy 'knowledge' → зоны) ──
+    # Порядок важен: СНАЧАЛА миграция legacy (если 'knowledge' существует),
+    # ЗАТЕМ ensure_zonal_collections — идемпотентно создаёт отсутствующие
+    # зоны (обе — на свежей установке; пустую public — после миграции).
+    try:
+        await _migrate_legacy_collection(qdrant)
+    except Exception as exc:
+        logger.warning("⚠️ W2 legacy migration failed (non-fatal): %s", exc)
+
+    qdrant.ensure_zonal_collections()
 
     app.state.qdrant = qdrant
     set_qdrant_client(qdrant)  # P1-2: прокидываем в health
@@ -259,11 +313,17 @@ async def lifespan(app: FastAPI):
         refill_rate=settings.RATE_LIMIT_WRITE_PER_MIN / 60.0,
         burst_size=max(5, settings.RATE_LIMIT_WRITE_PER_MIN // 10),
     )
+    # Subscriber rate limiter (W3.7: subscriber-ключи — отдельный bucket, 45 req/min)
+    app.state.rate_limiter_subscriber = TokenBucketLimiter(
+        refill_rate=settings.RATE_LIMIT_SUBSCRIBER_PER_MIN / 60.0,
+        burst_size=max(5, settings.RATE_LIMIT_SUBSCRIBER_PER_MIN // 10),
+    )
     # Общий fallback rate limiter (для неаутентифицированных)
     app.state.rate_limiter = app.state.rate_limiter_read
-    logger.info("✅ Rate limiter готов (read_burst=%d, write_burst=%d)",
+    logger.info("✅ Rate limiter готов (read_burst=%d, write_burst=%d, subscriber_burst=%d)",
                  app.state.rate_limiter_read.burst_size,
-                 app.state.rate_limiter_write.burst_size)
+                 app.state.rate_limiter_write.burst_size,
+                 app.state.rate_limiter_subscriber.burst_size)
 
     # 13.9: In-memory progress tracker for live import progress (polling)
     app.state.import_progress = ImportProgressTracker()
@@ -463,6 +523,11 @@ app = FastAPI(
 app.add_middleware(AuthMiddleware, fastapi_app=app)
 
 app.include_router(health_router)
+
+# W5: admin API токенов (kb-console backend)
+from .tokens_api import router as tokens_router
+
+app.include_router(tokens_router)
 
 
 # B2: MCP JSON-RPC 2.0 эндпоинт

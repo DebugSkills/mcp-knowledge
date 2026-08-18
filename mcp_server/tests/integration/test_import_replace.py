@@ -608,15 +608,16 @@ class TestR8ReplaceProgressTracker:
 # ═══════════════════════════════════════════════════════════
 # Реальный баг (найден в smoke 13.22): crud.delete_entry(cascade=True) вызывал
 # qdrant_raw.scroll(collection_name="knowledge", ...), а обёртка QdrantClient
-# (storage/qdrant_client.py) хардкодит коллекцию и НЕ принимает collection_name
+# (storage/qdrant_client.py) хардкодила коллекцию и НЕ принимала collection_name
 # kwarg → TypeError → except → cascade_deleted=0 (дети НЕ удалялись никогда).
-# Фикс: collection_name передаётся только raw-SDK (признак: отсутствие _client).
+# W2: обёртка теперь принимает collection_name (зональный контракт через
+# collection_for_zone + _require_collection) — scroll в cascade передаёт её явно.
 
 class _WrapperStyleQdrant:
-    """Имитация обёртки QdrantClient: scroll НЕ принимает collection_name.
+    """Имитация обёртки QdrantClient: scroll принимает collection_name (W2).
 
-    Признак обёртки — атрибут _client. Если код снова передаст collection_name
-    kwarg, Python бросит TypeError (как и на реальной обёртке) → тест FAIL.
+    Признак обёртки — атрибут _client. Сигнатура повторяет обёртку W2:
+    незнакомые kwargs → TypeError (как на реальной обёртке) → тест FAIL.
     """
 
     def __init__(self, child_ids: list[str]) -> None:
@@ -624,13 +625,14 @@ class _WrapperStyleQdrant:
         self._child_ids = child_ids
         self.delete_by_knowledge_id = MagicMock()
 
-    def scroll(  # сигнатура обёртки: без collection_name
+    def scroll(  # сигнатура обёртки W2: + collection_name
         self,
         scroll_filter=None,
         limit: int = 100,
         offset: object = None,
         with_payload: list[str] | bool = True,
         with_vectors: bool = False,
+        collection_name: str | None = None,
     ) -> tuple[list, object]:
         if offset is None:
             points = [MagicMock(payload={"knowledge_id": cid}) for cid in self._child_ids]

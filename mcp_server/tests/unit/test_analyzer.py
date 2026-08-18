@@ -60,7 +60,7 @@ def mock_app_state():
     state.qdrant = MagicMock()
 
     # scroll_unique_values для known_domains / known_subjects
-    def _fake_scroll(field, cursor=None, limit=100, max_scan=100):
+    def _fake_scroll(field, cursor=None, limit=100, max_scan=100, collection_name=None):
         if field == "domain":
             return (["engineering", "devops"], None, 2)
         elif field == "subject":

@@ -19,6 +19,9 @@ from .schema import (
     COLLECTION_NAME,
     PAYLOAD_INDEXES,
     VECTOR_SIZE,
+    ZONE_PRIVATE,
+    ZONE_PUBLIC,
+    blue_green_names_for_zone,
     build_collection_params,
 )
 
@@ -34,32 +37,60 @@ class QdrantClient:
         self._url = url
         logger.info("QdrantClient: url=%s", url)
 
+    @staticmethod
+    def _require_collection(collection_name: str | None) -> str:
+        """W2.6: зональный контракт — коллекцию обязан резолвить вызывающий.
+
+        Зону резолвит вызывающий через collection_for_zone(zone);
+        зональные методы не имеют дефолтной коллекции.
+        """
+        if collection_name is None:
+            raise ValueError("collection_name is required")
+        return collection_name
+
     # ── Collection management ─────────────────────────────
 
     def ensure_collection(self, force_recreate: bool = False) -> bool:
-        """Создать коллекцию knowledge если не существует."""
-        if self._client.collection_exists(COLLECTION_NAME):
-            if force_recreate:
-                logger.warning("Пересоздание коллекции %s", COLLECTION_NAME)
-                self._client.delete_collection(COLLECTION_NAME)
-            else:
-                logger.info("Коллекция %s уже существует", COLLECTION_NAME)
-                return False
+        """Wrapper (legacy-контракт cli.py/main.py): гарантировать зональные коллекции."""
+        return self.ensure_zonal_collections(force_recreate=force_recreate)
 
-        params = build_collection_params()
-        self._client.create_collection(**params)
+    def ensure_zonal_collections(self, force_recreate: bool = False) -> bool:
+        """W2.5: гарантировать blue-green коллекции обеих зон (public, private).
 
-        # Создаём payload-индексы для фильтрации
-        for field_name, field_type in PAYLOAD_INDEXES:
-            self._client.create_payload_index(
-                collection_name=COLLECTION_NAME,
-                field_name=field_name,
-                field_schema=field_type,
-            )
+        Для каждой зоны:
+        - определить активную коллекцию за alias через get_active_collection();
+        - если активная есть — она остаётся (idempotent);
+        - если нет — создать v1 и атомарно привязать alias → v1.
 
-        logger.info("Коллекция %s создана (dim=%d, distance=COSINE, HNSW)",
-                     COLLECTION_NAME, VECTOR_SIZE)
-        return True
+        Args:
+            force_recreate: пересоздать v1, если она существует без активной
+                коллекции за alias (игнорируется, если активная уже есть).
+
+        Returns:
+            True, если была создана хотя бы одна коллекция (контракт main.py:164).
+        """
+        created_any = False
+        for zone in (ZONE_PUBLIC, ZONE_PRIVATE):
+            v1, _v2, alias = blue_green_names_for_zone(zone)
+
+            # Активная коллекция за alias: если есть — сохранить как есть
+            try:
+                candidate = self.get_active_collection(alias)
+            except Exception:
+                candidate = alias  # fallback: alias не настроен
+
+            if candidate != alias:
+                logger.info("Зона '%s': активная коллекция '%s' уже существует", zone, candidate)
+                continue
+
+            # Активной нет — создать v1 и привязать alias
+            self.create_collection_named(v1, force_recreate=force_recreate)
+            self.swap_alias(alias, v1)
+            created_any = True
+            logger.info("Зона '%s': коллекция '%s' создана, alias '%s' → '%s'",
+                        zone, v1, alias, v1)
+
+        return created_any
 
     # ── F1: Blue-green alias management ────────────────────
 
@@ -129,6 +160,24 @@ class QdrantClient:
         except Exception:
             pass
         return False
+
+    def delete_alias(self, alias_name: str) -> None:
+        """W2.11: удалить alias (идемпотентно — отсутствующий alias не ошибка).
+
+        Использует update_collection_aliases (transport-agnostic: gRPC/REST),
+        как swap_alias. Повторный вызов после удаления — no-op.
+        """
+        if not self.has_alias(alias_name):
+            logger.info("Alias '%s' не существует — delete пропущен", alias_name)
+            return
+        self._client.update_collection_aliases(
+            change_aliases_operations=[
+                qmodels.DeleteAliasOperation(
+                    delete_alias=qmodels.DeleteAlias(alias_name=alias_name)
+                )
+            ],
+        )
+        logger.info("Alias '%s' удалён", alias_name)
 
     def rename_collection(self, old_name: str, new_name: str) -> None:
         """Переименовать коллекцию (для legacy migration).
@@ -205,15 +254,20 @@ class QdrantClient:
             wait=True,
         )
 
-    def delete_by_knowledge_id(self, knowledge_id: str) -> None:
+    def delete_by_knowledge_id(
+        self,
+        knowledge_id: str,
+        collection_name: str | None = None,
+    ) -> None:
         """Удалить все точки (чанки) записи.
 
         wait=True — синхронное удаление (qdrant-client 1.18.0 default wait=False):
         без него точка может оставаться видимой для поиска сразу после delete
         (eventual consistency) → тест-изоляция и cleanup ломаются.
         """
+        collection_name = self._require_collection(collection_name)
         self._client.delete(
-            collection_name=COLLECTION_NAME,
+            collection_name=collection_name,
             points_selector=qmodels.FilterSelector(
                 filter=qmodels.Filter(
                     must=[
@@ -227,25 +281,32 @@ class QdrantClient:
             wait=True,
         )
 
-    def set_payload(self, payload: dict, points_filter: qmodels.Filter | None = None) -> None:
+    def set_payload(
+        self,
+        payload: dict,
+        points_filter: qmodels.Filter | None = None,
+        collection_name: str | None = None,
+    ) -> None:
         """Обновить payload для точек по фильтру (lifecycle: deprecated|published).
 
-        Обёртка над raw set_payload — collection_name захардкожен (как в scroll).
-        Используется quality-инструментами (resolve_quality_issue: deprecate/restore).
+        Обёртка над raw set_payload — зону резолвит вызывающий
+        (quality-инструменты: resolve_quality_issue: deprecate/restore).
 
         ВАЖНО: raw SDK (qdrant-client 1.18) принимает selector позиционным
         аргументом `points` (Filter/FilterSelector/PointIdsList), НЕ `points_filter`.
         """
+        collection_name = self._require_collection(collection_name)
         self._client.set_payload(
-            collection_name=COLLECTION_NAME,
+            collection_name=collection_name,
             payload=payload,
             points=points_filter,
         )
 
-    def delete_all(self) -> None:
+    def delete_all(self, collection_name: str | None = None) -> None:
         """Удалить все точки (для сине-зелёного reindex)."""
+        collection_name = self._require_collection(collection_name)
         self._client.delete(
-            collection_name=COLLECTION_NAME,
+            collection_name=collection_name,
             points_selector=qmodels.FilterSelector(
                 filter=qmodels.Filter()  # пустой фильтр = все точки
             ),
@@ -264,6 +325,7 @@ class QdrantClient:
         exclude_content_types: list[str] | None = None,
         exclude_statuses: list[str] | None = None,
         offset: int = 0,
+        collection_name: str | None = None,
     ) -> list[qmodels.ScoredPoint]:
         """Семантический поиск по вектору.
 
@@ -281,6 +343,7 @@ class QdrantClient:
         Returns:
             list[qmodels.ScoredPoint] с payload (и векторами если with_vectors=True).
         """
+        collection_name = self._require_collection(collection_name)
         query_filter = None
         must_conditions = []
         must_not_conditions = []
@@ -323,7 +386,7 @@ class QdrantClient:
             )
 
         results = self._client.query_points(
-            collection_name=COLLECTION_NAME,
+            collection_name=collection_name,
             query=vector,
             limit=top_k,
             offset=offset,
@@ -339,8 +402,10 @@ class QdrantClient:
         tags: list[str],
         match_all: bool = True,
         limit: int = 500,
+        collection_name: str | None = None,
     ) -> list[qmodels.ScoredPoint]:
         """Поиск по тегам через payload filter (без embedding, без GPU)."""
+        collection_name = self._require_collection(collection_name)
         if match_all:
             # AND: все теги должны присутствовать — N отдельных MatchValue условий
             must_conditions = [
@@ -363,7 +428,7 @@ class QdrantClient:
             query_filter = qmodels.Filter(should=should_conditions)
 
         results = self._client.scroll(
-            collection_name=COLLECTION_NAME,
+            collection_name=collection_name,
             scroll_filter=query_filter,
             limit=limit,
             with_payload=True,
@@ -378,6 +443,7 @@ class QdrantClient:
         offset: object = None,
         with_payload: list[str] | bool = True,
         with_vectors: bool = False,
+        collection_name: str | None = None,
     ) -> tuple[list[qmodels.Record], object]:
         """Scroll по payload-фильтру (для list_collections и обходов).
 
@@ -387,12 +453,14 @@ class QdrantClient:
             offset: курсор пагинации (None = с начала).
             with_payload: список полей payload или True (все).
             with_vectors: возвращать ли векторы.
+            collection_name: имя зональной коллекции (обязателен).
 
         Returns:
             (points, next_page_offset) — как в qdrant SDK.
         """
+        collection_name = self._require_collection(collection_name)
         return self._client.scroll(
-            collection_name=COLLECTION_NAME,
+            collection_name=collection_name,
             scroll_filter=scroll_filter,
             limit=limit,
             offset=offset,
@@ -402,13 +470,14 @@ class QdrantClient:
 
     # ── Reconciliation helpers ────────────────────────────
 
-    def get_all_knowledge_ids(self) -> set[str]:
+    def get_all_knowledge_ids(self, collection_name: str | None = None) -> set[str]:
         """Получить все knowledge_id в Qdrant (для reconciliation, задача 2.9)."""
+        collection_name = self._require_collection(collection_name)
         ids = set()
         offset = None
         while True:
             points, offset = self._client.scroll(
-                collection_name=COLLECTION_NAME,
+                collection_name=collection_name,
                 limit=1000,
                 offset=offset,
                 with_payload=["knowledge_id"],
@@ -422,16 +491,17 @@ class QdrantClient:
                 break
         return ids
 
-    def collection_info(self) -> dict:
+    def collection_info(self, collection_name: str | None = None) -> dict:
         """Информация о коллекции для /health.
 
         Фаза 12 fix: REST-mode Qdrant (qdrant-client 1.18) возвращает
         CollectionInfo без vectors_count — используем indexed_vectors_count
         как fallback (getattr безопасен для gRPC и REST).
         """
-        info = self._client.get_collection(COLLECTION_NAME)
+        collection_name = self._require_collection(collection_name)
+        info = self._client.get_collection(collection_name)
         return {
-            "name": COLLECTION_NAME,
+            "name": collection_name,
             "points_count": getattr(info, "points_count", 0),
             "vectors_count": getattr(
                 info,
@@ -448,12 +518,14 @@ class QdrantClient:
         cursor: str | None = None,
         limit: int = 100,
         max_scan: int = 50_000,
+        collection_name: str | None = None,
     ) -> tuple[list[str], str | None, int]:
         """Собрать уникальные значения поля через Qdrant scroll().
 
         Используется для list_domains/subjects/projects.
         Returns: (results, next_cursor, total_unique_count)
         """
+        collection_name = self._require_collection(collection_name)
         must_conditions = []
         if domain_filter:
             must_conditions.append(
@@ -485,7 +557,7 @@ class QdrantClient:
 
         while len(results) < limit and total_scanned < max_scan:
             points, next_offset = self._client.scroll(
-                collection_name=COLLECTION_NAME,
+                collection_name=collection_name,
                 limit=min(1000, limit * 2),
                 offset=offset,
                 scroll_filter=scroll_filter,

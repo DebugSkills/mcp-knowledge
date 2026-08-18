@@ -9,6 +9,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from .config import settings
+from .storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
 
 logger = logging.getLogger("mcp_knowledge.health")
 
@@ -117,17 +118,31 @@ async def _run_deep_checks() -> dict:
 
 
 def _check_qdrant() -> dict:
-    """Проверить доступность Qdrant."""
+    """Проверить доступность Qdrant (по зонам: public + private)."""
     if _qdrant_client is None:
         return {"ok": False, "connected": False, "error": "client not initialized"}
 
     try:
-        info = _qdrant_client.collection_info()
+        zones = {}
+        total_points = 0
+        total_vectors = 0
+        for zone in (ZONE_PUBLIC, ZONE_PRIVATE):
+            info = _qdrant_client.collection_info(collection_name=collection_for_zone(zone))
+            points = info.get("points_count") or 0
+            vectors = info.get("vectors_count") or 0
+            zones[zone] = {
+                "collection": collection_for_zone(zone),
+                "points": points,
+                "vectors": vectors,
+            }
+            total_points += points
+            total_vectors += vectors
         return {
             "ok": True,
             "connected": True,
-            "points": info.get("points_count", 0),
-            "vectors": info.get("vectors_count", 0),
+            "points": total_points,
+            "vectors": total_vectors,
+            "zones": zones,
         }
     except Exception as e:  # noqa: BLE001
         logger.warning("Health: Qdrant unreachable: %s", e)

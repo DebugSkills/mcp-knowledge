@@ -24,6 +24,7 @@ from mcp_server.health import (
     set_qdrant_client,
 )
 from mcp_server.rate_limit import TokenBucketLimiter
+from mcp_server.storage.schema import ZONE_PRIVATE, collection_for_zone
 
 # ═══════════════════════════════════════════════════════════════
 # S10: Rate-limit 429 — POST /mcp с burst=0 → MCP_RATE_LIMITED
@@ -188,7 +189,7 @@ async def test_s11a_optimistic_lock_conflict_returns_mcp_conflict(e2e_http_app):
     # Cleanup: ждём обработки update-задач воркером (иначе drain при pl.stop()
     # перезапишет точку ПОСЛЕ delete → мусор в коллекции) → удаляем из Qdrant
     await e2e_http_app.app.state.pipeline.wait_for_index(S11_KNOWLEDGE_ID, timeout=10.0)
-    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S11_KNOWLEDGE_ID)
+    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S11_KNOWLEDGE_ID, collection_name=collection_for_zone(ZONE_PRIVATE))
 
 
 @pytest.mark.e2e
@@ -251,7 +252,7 @@ async def test_s11b_optimistic_lock_conflicts_metric_incremented(e2e_http_app):
     # Cleanup: ждём обработки update-задач воркером (иначе drain при pl.stop()
     # перезапишет точку ПОСЛЕ delete → мусор в коллекции) → удаляем из Qdrant
     await e2e_http_app.app.state.pipeline.wait_for_index(s11b_kid, timeout=10.0)
-    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(s11b_kid)
+    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(s11b_kid, collection_name=collection_for_zone(ZONE_PRIVATE))
 
 
 # ═══════════════════════════════════════════════════════════════

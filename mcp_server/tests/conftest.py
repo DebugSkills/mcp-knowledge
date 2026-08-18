@@ -96,6 +96,7 @@ def mock_qdrant() -> MagicMock:
         exclude_content_types: list[str] | None = None,
         exclude_statuses: list[str] | None = None,
         offset: int = 0,
+        collection_name: str | None = None,
     ):
         points = _search_points_store[offset:offset + top_k]
         results = []
@@ -119,7 +120,8 @@ def mock_qdrant() -> MagicMock:
     client.search = _fake_search
 
     # search_by_tags()
-    def _fake_search_by_tags(tags, match_all: bool = True, limit: int = 500):
+    def _fake_search_by_tags(tags, match_all: bool = True, limit: int = 500,
+                             collection_name: str | None = None):
         point = MagicMock()
         point.id = 2
         point.score = 1.0
@@ -137,7 +139,8 @@ def mock_qdrant() -> MagicMock:
 
     # scroll_unique_values()
     def _fake_scroll_unique_values(field, domain_filter=None, subject_filter=None,
-                                   cursor=None, limit=100, max_scan=100):
+                                   cursor=None, limit=100, max_scan=100,
+                                   collection_name=None):
         if field == "domain":
             return (["engineering", "devops"], None, 2)
         elif field == "subject":
@@ -163,7 +166,8 @@ def mock_qdrant() -> MagicMock:
 
     # scroll() — for list_collections / reconciliation / _build_toc
     def _fake_scroll(limit=100, offset=None, scroll_filter=None,
-                     with_payload=None, with_vectors=False):
+                     with_payload=None, with_vectors=False,
+                     collection_name=None):
         # Check if filtering by parent_knowledge_id → return section points
         if scroll_filter is not None:
             from qdrant_client.http.models import MatchValue

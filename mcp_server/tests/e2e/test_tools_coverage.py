@@ -24,6 +24,7 @@ import json
 from pathlib import Path
 
 import pytest
+from mcp_server.storage.schema import ZONE_PRIVATE, collection_for_zone
 
 # ═══════════════════════════════════════════════════════════════
 # S13: delete_entry через HTTP /mcp tools/call
@@ -108,7 +109,7 @@ async def test_s13_delete_entry_via_http(e2e_http_app):
     assert "error" in get_data2, f"Expected error after delete, got: {get_data2}"
 
     # Step 6: Verify point absent from Qdrant
-    all_ids = e2e_http_app.app.state.qdrant.get_all_knowledge_ids()
+    all_ids = e2e_http_app.app.state.qdrant.get_all_knowledge_ids(collection_name=collection_for_zone(ZONE_PRIVATE))
     assert S13_KNOWLEDGE_ID not in all_ids, (
         f"Point {S13_KNOWLEDGE_ID} still in Qdrant: {all_ids}"
     )
@@ -219,8 +220,8 @@ async def test_s14_list_domains_subjects_projects_via_http(e2e_http_app):
     # Cleanup
     await e2e_http_app.app.state.pipeline.wait_for_index(S14_KNOWLEDGE_A, timeout=10.0)
     await e2e_http_app.app.state.pipeline.wait_for_index(S14_KNOWLEDGE_B, timeout=10.0)
-    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S14_KNOWLEDGE_A)
-    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S14_KNOWLEDGE_B)
+    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S14_KNOWLEDGE_A, collection_name=collection_for_zone(ZONE_PRIVATE))
+    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S14_KNOWLEDGE_B, collection_name=collection_for_zone(ZONE_PRIVATE))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -393,13 +394,13 @@ async def test_s16_import_content_via_http(e2e_http_app):
     collection_id = import_data["collection_id"]
     await e2e_http_app.app.state.pipeline.wait_for_index(collection_id, timeout=10.0)
     # Удаляем коллекцию из Qdrant
-    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(collection_id)
+    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(collection_id, collection_name=collection_for_zone(ZONE_PRIVATE))
     # Удаляем children
     root = await e2e_http_app.app.state.store.read(collection_id)
     if root and root.frontmatter.children:
         for child_ref in root.frontmatter.children:
             cid = child_ref["knowledge_id"]
-            e2e_http_app.app.state.qdrant.delete_by_knowledge_id(cid)
+            e2e_http_app.app.state.qdrant.delete_by_knowledge_id(cid, collection_name=collection_for_zone(ZONE_PRIVATE))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -539,7 +540,7 @@ async def test_s18_resources_read_kb_uri_via_http(e2e_http_app):
 
     # Cleanup
     await e2e_http_app.app.state.pipeline.wait_for_index(S18_KNOWLEDGE_ID, timeout=10.0)
-    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S18_KNOWLEDGE_ID)
+    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S18_KNOWLEDGE_ID, collection_name=collection_for_zone(ZONE_PRIVATE))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -913,7 +914,7 @@ async def test_s21_fragment_lifecycle_via_http(e2e_http_app):
     assert cascade_result["deleted"] is True
 
     # Verify Qdrant cleanup: collection + fragments removed
-    all_ids = e2e_http_app.app.state.qdrant.get_all_knowledge_ids()
+    all_ids = e2e_http_app.app.state.qdrant.get_all_knowledge_ids(collection_name=collection_for_zone(ZONE_PRIVATE))
     assert collection_id not in all_ids, f"Collection {collection_id} still in Qdrant after cascade delete"
     assert frag2_id not in all_ids, f"frag2 ({frag2_id}) still in Qdrant after cascade delete"
 
@@ -1151,7 +1152,7 @@ async def test_s22_fragment_edge_cases_via_http(e2e_http_app):
 
     # Cleanup standalone
     await e2e_http_app.app.state.pipeline.wait_for_index(S22_STANDALONE_ID, timeout=10.0)
-    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S22_STANDALONE_ID)
+    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S22_STANDALONE_ID, collection_name=collection_for_zone(ZONE_PRIVATE))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1352,7 +1353,7 @@ async def test_s23_quality_lifecycle_via_http(e2e_http_app):
     await asyncio.sleep(3.5)  # rate-limit refill
     for kid in [S23_KNOWLEDGE_A, S23_KNOWLEDGE_B]:
         await e2e_http_app.app.state.pipeline.wait_for_index(kid, timeout=10.0)
-        e2e_http_app.app.state.qdrant.delete_by_knowledge_id(kid)
+        e2e_http_app.app.state.qdrant.delete_by_knowledge_id(kid, collection_name=collection_for_zone(ZONE_PRIVATE))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1788,4 +1789,4 @@ async def test_s26_auto_deprecate_gate_via_http(e2e_http_app):
     await asyncio.sleep(3.5)  # rate-limit refill
     for kid in [S26_KNOWLEDGE_A, S26_KNOWLEDGE_B]:
         await e2e_http_app.app.state.pipeline.wait_for_index(kid, timeout=10.0)
-        e2e_http_app.app.state.qdrant.delete_by_knowledge_id(kid)
+        e2e_http_app.app.state.qdrant.delete_by_knowledge_id(kid, collection_name=collection_for_zone(ZONE_PRIVATE))

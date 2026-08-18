@@ -23,6 +23,7 @@ import logging
 import httpx
 
 from ..config import settings as global_settings
+from ..storage.schema import ZONE_PRIVATE, collection_for_zone
 from .keywords import deduplicate_tags, extract_keywords
 
 logger = logging.getLogger("mcp_knowledge.content.analyzer")
@@ -237,10 +238,12 @@ async def analyze_content(params: dict, app_state) -> dict:
         try:
             import asyncio
             loop = asyncio.get_running_loop()
+            # TODO: зона из контекста — W3
             domains, _, _ = await loop.run_in_executor(
                 None,
                 lambda: qdrant.scroll_unique_values(
                     "domain", limit=50, max_scan=1000,
+                    collection_name=collection_for_zone(ZONE_PRIVATE),
                 ),
             )
             known_domains = list(domains) if domains else []
@@ -249,10 +252,12 @@ async def analyze_content(params: dict, app_state) -> dict:
 
         try:
             loop = asyncio.get_running_loop()
+            # TODO: зона из контекста — W3
             subjects, _, _ = await loop.run_in_executor(
                 None,
                 lambda: qdrant.scroll_unique_values(
                     "subject", limit=50, max_scan=1000,
+                    collection_name=collection_for_zone(ZONE_PRIVATE),
                 ),
             )
             known_subjects = list(subjects) if subjects else []

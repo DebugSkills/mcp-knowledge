@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from urllib.parse import unquote
 
-from .storage.schema import COLLECTION_NAME
+from .storage.schema import ZONE_PRIVATE, collection_for_zone
 
 logger = logging.getLogger("mcp_knowledge.resources")
 
@@ -128,6 +128,7 @@ async def _collect_unique_values(
     field: str,
     domain_filter: str | None = None,
     max_points: int = 10_000,
+    zone: str = ZONE_PRIVATE,  # TODO: зона из контекста — W3
 ) -> set[str]:
     """Собрать уникальные значения поля через Qdrant scroll().
 
@@ -136,6 +137,7 @@ async def _collect_unique_values(
         field: payload-поле для агрегации (domain, subject)
         domain_filter: опциональный фильтр по domain
         max_points: максимум точек для обхода
+        zone: зона данных (default: private; из контекста запроса — W3)
 
     Returns:
         Множество уникальных значений
@@ -160,7 +162,7 @@ async def _collect_unique_values(
             )
 
         points, offset = qdrant._client.scroll(
-            collection_name=COLLECTION_NAME,
+            collection_name=collection_for_zone(zone),
             limit=1000,
             offset=offset,
             scroll_filter=scroll_filter,
@@ -193,6 +195,7 @@ async def _collect_knowledge_ids(
     domain: str,
     subject: str,
     max_points: int = 10_000,
+    zone: str = ZONE_PRIVATE,  # TODO: зона из контекста — W3
 ) -> set[str]:
     """Собрать knowledge_id для конкретного domain/subject."""
     from qdrant_client.http import models as qmodels
@@ -216,7 +219,7 @@ async def _collect_knowledge_ids(
 
     while total_scanned < max_points:
         points, offset = qdrant._client.scroll(
-            collection_name=COLLECTION_NAME,
+            collection_name=collection_for_zone(zone),
             limit=1000,
             offset=offset,
             scroll_filter=scroll_filter,

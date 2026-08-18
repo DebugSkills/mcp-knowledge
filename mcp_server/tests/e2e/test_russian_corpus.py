@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from mcp_server.storage.schema import ZONE_PRIVATE, collection_for_zone
 
 # ═══════════════════════════════════════════════════════════════
 # S1: write → index → search → get_entry (read-after-write sync)
@@ -238,7 +239,7 @@ async def test_s4_reconcile_orphan_delete(e2e_app_state, real_qdrant, e2e_store,
     real_qdrant.upsert_points([orphan_point])
 
     # Verify orphan exists
-    all_ids = real_qdrant.get_all_knowledge_ids()
+    all_ids = real_qdrant.get_all_knowledge_ids(collection_name=collection_for_zone(ZONE_PRIVATE))
     assert "e2e-s4-orphan" in all_ids, "Orphan point not injected"
 
     # Step 3: Reconcile
@@ -248,7 +249,7 @@ async def test_s4_reconcile_orphan_delete(e2e_app_state, real_qdrant, e2e_store,
     assert rec_result["deleted_orphans"] >= 1, f"Expected orphans deleted, got {rec_result}"
 
     # Step 4: Verify orphan removed, real entry preserved
-    all_ids_after = real_qdrant.get_all_knowledge_ids()
+    all_ids_after = real_qdrant.get_all_knowledge_ids(collection_name=collection_for_zone(ZONE_PRIVATE))
     assert "e2e-s4-orphan" not in all_ids_after, "Orphan was not deleted"
     assert "e2e-s4-real" in all_ids_after, "Real entry was deleted by mistake"
 
@@ -541,7 +542,7 @@ async def test_s7b_dlq_record_and_replay(e2e_app_state, e2e_pipeline, e2e_store,
     assert result2["indexed"] is True, f"Re-index failed: {result2}"
 
     # Verify in Qdrant
-    all_ids = real_qdrant.get_all_knowledge_ids()
+    all_ids = real_qdrant.get_all_knowledge_ids(collection_name=collection_for_zone(ZONE_PRIVATE))
     assert "e2e-s7-dlq" in all_ids, "Entry not found in Qdrant after re-index"
 
     # replay_all = проверка очистки DLQ

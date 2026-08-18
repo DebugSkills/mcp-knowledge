@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from mcp_server.storage.schema import ZONE_PRIVATE, collection_for_zone
 
 # ═══════════════════════════════════════════════════════════════
 # S9a: Liveness probe — всегда 200
@@ -172,7 +173,7 @@ async def test_s9d_metrics_after_write_and_search(e2e_http_app):
     # Cleanup: ждём обработки задач воркером (иначе drain при pl.stop()
     # перезапишет точку ПОСЛЕ delete → мусор в коллекции) → удаляем из Qdrant
     await e2e_http_app.app.state.pipeline.wait_for_index(S9D_KNOWLEDGE_ID, timeout=10.0)
-    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S9D_KNOWLEDGE_ID)
+    e2e_http_app.app.state.qdrant.delete_by_knowledge_id(S9D_KNOWLEDGE_ID, collection_name=collection_for_zone(ZONE_PRIVATE))
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -16,6 +16,7 @@ import asyncio
 import logging
 
 from ..metrics import quality_gate_skipped
+from ..storage.schema import ZONE_PRIVATE, collection_for_zone
 
 logger = logging.getLogger("mcp_knowledge.quality.dup_gate")
 
@@ -83,6 +84,7 @@ async def check_duplicates(
     embedder=None,         # SentenceTransformer (BGE-M3) — внедряется из app_state
     qdrant_client=None,    # QdrantClient — внедряется из app_state
     threshold: float = DUP_SIMILARITY_THRESHOLD,
+    collection_name: str | None = None,  # W2: зона записи; None → PRIVATE (default)
 ) -> list[dict]:
     """Проверяет контент на семантические дубликаты.
 
@@ -99,6 +101,7 @@ async def check_duplicates(
         embedder: SentenceTransformer instance.
         qdrant_client: QdrantClient instance.
         threshold: cosine-порог.
+        collection_name: зональная коллекция для поиска (None → ZONE_PRIVATE).
 
     Returns:
         список [{knowledge_id, score}] дубликатов.
@@ -107,6 +110,9 @@ async def check_duplicates(
         logger.warning("Embedder or Qdrant client not available, skipping dup check")
         quality_gate_skipped.labels(gate="dup_gate", reason="embedder_unavailable").inc()
         return []
+
+    if collection_name is None:
+        collection_name = collection_for_zone(ZONE_PRIVATE)
 
     # Шаг 1: извлекаем репрезентативный текст (заголовок + первый чанк)
     representative = _extract_representative_text(content)
@@ -130,6 +136,7 @@ async def check_duplicates(
             top_k=SEARCH_TOP_K,
             filters={"domain": domain} if domain else None,
             with_vectors=True,
+            collection_name=collection_name,
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("Qdrant search failed for dup-gate: %s", exc)

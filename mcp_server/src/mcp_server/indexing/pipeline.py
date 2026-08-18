@@ -27,7 +27,11 @@ from ..storage.schema import (
     COLLECTION_ALIAS,
     COLLECTION_V1,
     COLLECTION_V2,
+    ZONE_PRIVATE,
+    ZONE_PUBLIC,
+    blue_green_names_for_zone,
     build_payload_point,
+    collection_for_zone,
 )
 from .chunker import MarkdownChunker
 from .dlq import DeadLetterQueue
@@ -169,23 +173,67 @@ class IndexingPipeline:
         return result
 
     async def reindex_all(self) -> dict:
-        """Полный переиндекс из Markdown SSOT (задача 1.9).
+        """Полный переиндекс обеих зон доступа из Markdown SSOT (W2.6).
 
-        Обходит все .md в knowledge/, chunking → embed → Qdrant.
+        Для каждой зоны (public, private) — blue-green переиндекс своей пары
+        коллекций. Результат агрегируется в плоский контракт
+        {total_docs, total_chunks, failed} + вложенный zones{}.
         """
-        logger.info("reindex_all: начало полного переиндекса")
-        
+        logger.info("reindex_all: начало полного переиндекса (обе зоны)")
+        zones: dict[str, dict] = {}
+        total_docs = 0
+        total_chunks = 0
+        failed = 0
 
-        # Очищаем Qdrant
-        self._qdrant.delete_all()
+        for zone in (ZONE_PUBLIC, ZONE_PRIVATE):
+            zone_result = await self.reindex_zone(zone)
+            zones[zone] = zone_result
+            total_docs += zone_result.get("total_docs", 0)
+            total_chunks += zone_result.get("total_chunks", 0)
+            failed += zone_result.get("failed", 0)
 
-        return await self._reindex_from_ssot()
+        return {
+            "total_docs": total_docs,
+            "total_chunks": total_chunks,
+            "failed": failed,
+            "zones": zones,
+        }
+
+    async def reindex_zone(self, zone: str) -> dict:
+        """W2.7: Blue-green переиндекс одной зоны доступа.
+
+        Args:
+            zone: "public" | "private" (неизвестная зона → ValueError).
+
+        Returns:
+            {total_docs, total_chunks, failed, active, target,
+             alias_swapped, elapsed_sec}
+        """
+        v1, v2, alias = blue_green_names_for_zone(zone)  # ValueError на unknown zone
+
+        result = await self.reindex_blue_green(
+            alias_name=alias,
+            collection_v1=v1,
+            collection_v2=v2,
+            zone_filter=zone,
+        )
+        reindex_result = result.get("reindex_result", {})
+        return {
+            "total_docs": reindex_result.get("total_docs", 0),
+            "total_chunks": reindex_result.get("total_chunks", 0),
+            "failed": reindex_result.get("failed", 0),
+            "active": result.get("active"),
+            "target": result.get("target"),
+            "alias_swapped": result.get("alias_swapped", False),
+            "elapsed_sec": result.get("elapsed_sec"),
+        }
 
     async def reindex_blue_green(
         self,
         alias_name: str | None = None,
         collection_v1: str | None = None,
         collection_v2: str | None = None,
+        zone_filter: str | None = None,
     ) -> dict:
         """F1: Zero-downtime blue-green reindex через Qdrant Collection Aliases.
 
@@ -201,6 +249,8 @@ class IndexingPipeline:
                 Для тестов: передать "knowledge_e2e_alias" (НЕ имя существующей коллекции).
             collection_v1: имя первой blue-green коллекции (default: COLLECTION_V1).
             collection_v2: имя второй blue-green коллекции (default: COLLECTION_V2).
+            zone_filter: W2.8 — фильтр зоны ("public"/"private");
+                None = все файлы (обратная совместимость с admin.py/e2e).
 
         Returns:
             {active, target, alias_swapped, reindex_result, elapsed_sec}
@@ -226,7 +276,7 @@ class IndexingPipeline:
         self._qdrant.create_collection_named(target, force_recreate=True)
 
         # 3. Заполнить новую коллекцию
-        reindex_result = await self._reindex_into(target)
+        reindex_result = await self._reindex_into(target, zone_filter=zone_filter)
 
         # 4. Атомарный swap alias
         self._qdrant.swap_alias(alias, target)
@@ -249,19 +299,39 @@ class IndexingPipeline:
         logger.info("reindex_blue_green: завершено — %s", result)
         return result
 
-    async def _reindex_into(self, collection_name: str) -> dict:
+    async def _reindex_into(
+        self,
+        collection_name: str,
+        zone_filter: str | None = None,
+    ) -> dict:
         """F1: Переиндексировать все документы в заданную коллекцию.
 
         Args:
             collection_name: имя коллекции (knowledge_v1 или knowledge_v2)
+            zone_filter: W2.8 — фильтр зоны ("public"/"private").
+                None = все файлы (обратная совместимость).
 
         Returns:
             {total_docs, total_chunks, failed, elapsed_sec}
         """
-        logger.info("[REINDEX] blue_green start collection=%s", collection_name)
+        logger.info("[REINDEX] blue_green start collection=%s zone_filter=%s",
+                     collection_name, zone_filter)
         t0 = datetime.now(timezone.utc)
 
         paths = await self._store.reindex_scan()
+
+        # W2.8: зональная фильтрация ДО индексации (zone_filter=None = все файлы)
+        if zone_filter is not None:
+            zone_paths = []
+            for path in paths:
+                try:
+                    entry = self._store._parse_file(path)
+                    if getattr(entry.frontmatter, "zone", ZONE_PRIVATE) == zone_filter:
+                        zone_paths.append(path)
+                except Exception as e:
+                    logger.error("[REINDEX] zone-filter parse error file=%s: %s", path, e)
+            paths = zone_paths
+
         total_docs = len(paths)
         total_chunks = 0
         failed = 0
@@ -413,11 +483,14 @@ class IndexingPipeline:
             await self._handle_batch_failure(batch, str(e))
             return
 
-        # Собираем Qdrant points
-        points = []
+        # Собираем Qdrant points, группируя по зональным коллекциям (W2.9):
+        # батч может содержать записи разных зон → upsert по группам
+        points_by_collection: dict[str, list] = {}
         for (item, ch), vector in zip(chunk_map, vectors):
             entry: KnowledgeEntry = item["entry"]
             fm = entry.frontmatter
+            zone = getattr(fm, "zone", ZONE_PRIVATE)
+            collection = collection_for_zone(zone)
 
             point = build_payload_point(
                 point_id=str(uuid.uuid4()),
@@ -436,12 +509,19 @@ class IndexingPipeline:
                 parent_knowledge_id=getattr(fm, "parent_knowledge_id", None),
                 content_type=getattr(fm, "content_type", None),
                 sequence_number=getattr(fm, "sequence_number", None),
+                zone=zone,
             )
-            points.append(point)
+            points_by_collection.setdefault(collection, []).append(point)
 
-        # Upsert в Qdrant
+        # Upsert в Qdrant — по группам зон
         try:
-            await loop.run_in_executor(None, self._qdrant.upsert_points, points)
+            for collection, points in points_by_collection.items():
+                await loop.run_in_executor(
+                    None,
+                    lambda c=collection, pts=points: self._qdrant.upsert_points(
+                        pts, collection_name=c
+                    ),
+                )
             self.stats["processed"] += len(batch)
         except Exception as e:
             logger.error("Qdrant upsert failed: %s", e)
@@ -510,6 +590,13 @@ class IndexingPipeline:
         total = len(chunks)
         indexed = 0
 
+        # W2.4: явный приоритет — переданная коллекция, иначе резолв по зоне
+        # (резолв ТОЛЬКО для write-пути)
+        if collection_name is None:
+            collection_name = collection_for_zone(getattr(fm, "zone", ZONE_PRIVATE))
+
+        zone = getattr(fm, "zone", ZONE_PRIVATE)
+
         for start in range(0, total, batch_size):
             batch = chunks[start : start + batch_size]
             texts = [ch.content for ch in batch]
@@ -534,6 +621,7 @@ class IndexingPipeline:
                     parent_knowledge_id=getattr(fm, "parent_knowledge_id", None),
                     content_type=getattr(fm, "content_type", None),
                     sequence_number=getattr(fm, "sequence_number", None),
+                    zone=zone,
                 )
                 points.append(point)
 

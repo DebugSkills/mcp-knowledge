@@ -10,6 +10,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from mcp_server.storage.schema import COLLECTION_PRIVATE
 from mcp_server.tools.fragments import (
     _rewrite_heading,
     _sanitize_fragment_title,
@@ -430,7 +431,7 @@ class TestDeleteFragment:
         assert result.get("deleted") is True
         assert app_state.data_version == v_before + 1
         # Qdrant delete called (without cascade)
-        app_state.qdrant.delete_by_knowledge_id.assert_called_once_with("test-section")
+        app_state.qdrant.delete_by_knowledge_id.assert_called_once_with("test-section", collection_name=COLLECTION_PRIVATE)
 
 
 # ── find_fragment tests ────────────────────────────────────
