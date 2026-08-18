@@ -42,6 +42,8 @@ AUDIT_ACTIONS: frozenset[str] = frozenset({
     "auto_deprecate", "resolve_issue",
     # Фаза 3 (1a): история полных сканов + фиксация FP-решений оператора
     "scan_completed", "fp_rejection",
+    # W4: курирование public-слоя (двухконтурная модель доступа)
+    "set_zone",
 })
 
 

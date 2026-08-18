@@ -39,6 +39,7 @@ from mcp_server.quality.scoring import (
     StalenessInput,
     staleness_score,
 )
+from mcp_server.storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
 
 logger = logging.getLogger("mcp_knowledge.quality.scanner")
 
@@ -53,6 +54,17 @@ MAX_PAIRS_PER_BUCKET: int = 500  # макс пар для проверки в о
 # Лимит dup-issues на одну запись (13.14): книга на 15K секций даёт тысячи пар
 # с одинаковым fm_i → 15K+ issues на один knowledge_id (засорение issues + CPU 120%).
 MAX_ISSUES_PER_KNOWLEDGE: int = 10
+
+# ── W4.3: sensitive-эвристики (план §2.5) ──────────────────────
+# Путь-маркеры (флаг, НЕ блок, НЕ deprecate) — тот же набор, что в
+# tools/admin.py check_promo_readiness.
+_SENSITIVE_PATH_MARKERS = ("partners/", "_private/", "review-", ".trash/")
+# Контент-маркеры: «цена» встречается в учебных текстах → порог ≥2
+# совпадений (решение §9.3). `$` из плана намеренно исключён — одиночный
+# доллар даёт массовые FP на bash-переменных в инженерных текстах.
+_SENSITIVE_CONTENT_RE = re.compile(
+    r"₽|руб\.|USD|маржа|гонорар|оклад|цена|договор", re.IGNORECASE,
+)
 
 async def run_scan(
     knowledge_dir: Path | None = None,
@@ -247,6 +259,16 @@ async def run_scan(
     )
     metrics["issues_created"] = issue_count
 
+    # Шаг 5.4 (W4.3): sensitive-сканер — эвристики путей/контента.
+    # Флаг (severity=warn): НЕ блокирует скан, НЕ deprecate (план §2.5).
+    if progress and pid:
+        progress.set_phase(pid, "sensitive", "Sensitive-сканер (пути/контент)...")
+    sensitive_count = await loop.run_in_executor(
+        None, _create_sensitive_issues, entries, progress, pid, cancel_event,
+    )
+    if sensitive_count:
+        logger.info("Sensitive scan: %d record(s) flagged", sensitive_count)
+
     # Шаг 5.5 (P0): auto-clear — закрыть open missing_field issues записей,
     # чьё условие исчезло (score упал ниже REVIEW_THRESHOLD). Накопленные
     # issues никогда не чистились (Д3) — этот шаг разрывает цикл.
@@ -363,26 +385,30 @@ async def _load_deprecated_kids(qdrant_client) -> set[str]:
             must=[FieldCondition(key="status", match=MatchValue(value="deprecated"))]
         )
         deprecated: set[str] = set()
-        offset = None
-        while True:
-            _filt, _off = scroll_filter, offset
-            points, next_offset = await loop.run_in_executor(
-                None,
-                lambda f=_filt, o=_off: qdrant_client.scroll(
-                    scroll_filter=f,
-                    limit=1000,
-                    offset=o,
-                    with_payload=True,
-                    with_vectors=False,
-                ),
-            )
-            for p in points:
-                kid = (p.payload or {}).get("knowledge_id")
-                if kid:
-                    deprecated.add(kid)
-            if next_offset is None or len(points) == 0:
-                break
-            offset = next_offset
+        # P1-2 W2: deprecated-set — union по ОБЕИМ зонам (public + private),
+        # иначе public-deprecated записи пересоздавали dup-issues (re-detection loop).
+        for zone in (ZONE_PUBLIC, ZONE_PRIVATE):
+            offset = None
+            while True:
+                _filt, _off = scroll_filter, offset
+                points, next_offset = await loop.run_in_executor(
+                    None,
+                    lambda f=_filt, o=_off, z=zone: qdrant_client.scroll(
+                        scroll_filter=f,
+                        limit=1000,
+                        offset=o,
+                        with_payload=True,
+                        with_vectors=False,
+                        collection_name=collection_for_zone(z),
+                    ),
+                )
+                for p in points:
+                    kid = (p.payload or {}).get("knowledge_id")
+                    if kid:
+                        deprecated.add(kid)
+                if next_offset is None or len(points) == 0:
+                    break
+                offset = next_offset
         logger.info("Loaded %d deprecated knowledge_ids for dup-scan skip", len(deprecated))
         return deprecated
     except Exception as exc:  # noqa: BLE001
@@ -464,16 +490,18 @@ async def _update_qdrant_payloads(
     loop = asyncio.get_running_loop()
     pid = progress_id
 
-    def _do_batch(batch: list[tuple[str, dict]]) -> list[str]:
+    def _do_batch(batch: list[tuple[str, dict, str]]) -> list[str]:
         """Синхронный set_payload для батча (выполняется в executor)."""
         errors: list[str] = []
-        for knowledge_id, payload_update in batch:
+        for knowledge_id, payload_update, zone in batch:
             try:
+                # Зона из frontmatter записи (резолвится при подготовке батча) — P1-2 W2.
                 client.set_payload(
                     payload=payload_update,
                     points_filter=Filter(
                         must=[FieldCondition(key="knowledge_id", match=MatchValue(value=knowledge_id))]
                     ),
+                    collection_name=collection_for_zone(zone),
                 )
             except Exception as exc:  # noqa: BLE001
                 msg = f"Failed to set_payload for {knowledge_id}: {exc}"
@@ -482,10 +510,12 @@ async def _update_qdrant_payloads(
         return errors
 
     # Подготовка батчей
-    batches: list[list[tuple[str, dict]]] = []
-    current_batch: list[tuple[str, dict]] = []
+    batches: list[list[tuple[str, dict, str]]] = []
+    current_batch: list[tuple[str, dict, str]] = []
     for _filepath, frontmatter, score in scored:
         knowledge_id = frontmatter.knowledge_id
+        # Зона из frontmatter (public/private), default — private (P1-2 W2).
+        zone = getattr(frontmatter, "zone", None) or ZONE_PRIVATE
         flags: list[str] = []
         if score >= REVIEW_THRESHOLD:
             flags.append("needs_review")
@@ -493,7 +523,7 @@ async def _update_qdrant_payloads(
             PAYLOAD_STALENESS_SCORE: score,
             PAYLOAD_QUALITY_FLAGS: flags,
         }
-        current_batch.append((knowledge_id, payload_update))
+        current_batch.append((knowledge_id, payload_update, zone))
         if len(current_batch) >= BATCH_SIZE:
             batches.append(current_batch)
             current_batch = []
@@ -559,17 +589,21 @@ async def _update_scores_with_dup(
         # Пересчитываем score с реальным dup_count
         new_score = _compute_score_with_dup(frontmatter, now, dc, _filepath)
 
+        # Зона из frontmatter записи (public/private), default — private (P1-2 W2).
+        zone = getattr(frontmatter, "zone", None) or ZONE_PRIVATE
+
         # Обновляем Qdrant payload
         try:
             await loop.run_in_executor(
                 None,
-                lambda k=kid, s=new_score: client.set_payload(
+                lambda k=kid, s=new_score, z=zone: client.set_payload(
                     payload={
                         PAYLOAD_STALENESS_SCORE: s,
                     },
                     points_filter=Filter(
                         must=[FieldCondition(key="knowledge_id", match=MatchValue(value=k))]
                     ),
+                    collection_name=collection_for_zone(z),
                 ),
             )
             updated += 1
@@ -834,6 +868,91 @@ def _create_issues_for_problems(
             progress.log(
                 progress_id, "info",
                 f"issues: {batch_end}/{total} entries processed, {count} issues",
+            )
+    return count
+
+
+# ── W4.3: sensitive-сканер (план §2.5) ─────────────────────────
+
+
+def _check_sensitive(path_str: str, content: str) -> dict | None:
+    """Sensitive-эвристики: путь или контент (W4.3, план §2.5).
+
+    Порог (решение §9.3): path_flag (PARTNERS/|_private/|REVIEW-*|.trash/)
+    ИЛИ ≥2 контент-совпадений → issue-payload. «цена» встречается в
+    учебных текстах → одиночное совпадение НЕ флагается.
+
+    Returns:
+        {"type": "sensitive", "severity": "warn", "metadata": {...}} или None.
+    """
+    path_flag = any(m in path_str.lower() for m in _SENSITIVE_PATH_MARKERS)
+    matches = _SENSITIVE_CONTENT_RE.findall(content)
+    if path_flag or len(matches) >= 2:
+        return {
+            "type": "sensitive",
+            "severity": "warn",
+            "metadata": {
+                # sorted → детерминированный metadata (metadata-refresh в
+                # create_issue сравнивает dict'ы; нестабильный порядок set
+                # вызывал бы лишние перезаписи стора на каждом скане)
+                "matched": sorted(set(matches))[:10],
+                "path_flag": bool(path_flag),
+            },
+        }
+    return None
+
+
+def _create_sensitive_issues(
+    entries: list[tuple[Path, KnowledgeFrontmatter, dict]],
+    progress=None,
+    progress_id: str | None = None,
+    cancel_event=None,  # 13.18: asyncio.Event для отмены (проверяется между батчами)
+) -> int:
+    """W4.3: создаёт sensitive-issues по эвристикам путей/контента.
+
+    Паттерн — как _create_issues_for_problems: синхронная функция в
+    executor, батчи ~500, cancel между батчами. Флаг (severity=warn):
+    НЕ блокирует скан, НЕ deprecate. Идемпотентность: стабильный detail
+    → детерминированный issue_id (одна open issue на запись); детали
+    живут в metadata (create_issue делает metadata-refresh при перескане).
+
+    Args:
+        entries: результат _scan_filesystem — (Path, frontmatter, meta).
+
+    Returns:
+        int: число записей с созданным/подтверждённым sensitive-флагом.
+    """
+    BATCH_SIZE = 500
+    count = 0
+    total = len(entries)
+    for batch_start in range(0, total, BATCH_SIZE):
+        # 13.18: проверка отмены между батчами
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        batch = entries[batch_start:batch_start + BATCH_SIZE]
+        for filepath, frontmatter, _meta in batch:
+            try:
+                content = filepath.read_text(encoding="utf-8")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Sensitive scan: failed to read %s: %s", filepath, exc)
+                continue
+            payload = _check_sensitive(str(filepath), content)
+            if payload is None:
+                continue
+            create_issue(
+                issue_type="sensitive",
+                knowledge_id=frontmatter.knowledge_id,
+                severity="warn",
+                detail="Sensitive markers detected (path or content heuristics)",
+                metadata=payload["metadata"],
+            )
+            count += 1
+        # Batch progress log
+        if progress and progress_id:
+            batch_end = min(batch_start + BATCH_SIZE, total)
+            progress.log(
+                progress_id, "info",
+                f"sensitive: {batch_end}/{total} entries processed, {count} flagged",
             )
     return count
 
