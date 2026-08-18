@@ -14,6 +14,8 @@ from typing import Any, Self
 
 import httpx
 
+_NOT_SET = object()  # W5: sentinel «не трогать поле» (patch_token)
+
 logger = logging.getLogger("kb_console.mcp_client")
 
 
@@ -419,6 +421,101 @@ class MCPClient:
             return response.json().get("data_version", 0)
         except (json.JSONDecodeError, ValueError):
             return 0
+
+    # ── W5: token admin API (/tokens) ─────────────────────────
+
+    async def list_tokens(self) -> list[dict[str, Any]]:
+        """GET /tokens — список токенов (без key_hash/plaintext)."""
+        url = f"{self.base_url}/tokens"
+        try:
+            response = await self._client.get(url, headers=self._headers(), timeout=5.0)
+        except httpx.HTTPError:
+            return []
+        if response.status_code != 200:
+            return []
+        try:
+            return response.json().get("tokens", [])
+        except (json.JSONDecodeError, ValueError):
+            return []
+
+    async def create_token(
+        self,
+        level: str,
+        zone: str = "both",
+        note: str = "",
+        expires_at: str | None = None,
+    ) -> dict[str, Any] | None:
+        """POST /tokens — создать токен; возвращает {id, plaintext, mask} (один раз)."""
+        url = f"{self.base_url}/tokens"
+        body: dict[str, Any] = {"level": level, "zone": zone, "note": note}
+        if expires_at:
+            body["expires_at"] = expires_at
+        try:
+            response = await self._client.post(
+                url, json=body, headers=self._headers(), timeout=10.0,
+            )
+        except httpx.HTTPError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            return response.json()
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    async def revoke_token(self, token_id: str) -> bool:
+        """POST /tokens/{id}/revoke — отозвать токен."""
+        url = f"{self.base_url}/tokens/{token_id}/revoke"
+        try:
+            response = await self._client.post(url, headers=self._headers(), timeout=5.0)
+        except httpx.HTTPError:
+            return False
+        return response.status_code == 200
+
+    async def patch_token(
+        self,
+        token_id: str,
+        note: str | None = None,
+        expires_at: str | None | object = _NOT_SET,
+        active: bool | None = None,
+    ) -> dict[str, Any] | None:
+        """PATCH /tokens/{id} — обновить note/expires_at/active."""
+        url = f"{self.base_url}/tokens/{token_id}"
+        body: dict[str, Any] = {}
+        if note is not None:
+            body["note"] = note
+        if expires_at is not _NOT_SET:
+            body["expires_at"] = expires_at
+        if active is not None:
+            body["active"] = active
+        if not body:
+            return None
+        try:
+            response = await self._client.patch(
+                url, json=body, headers=self._headers(), timeout=5.0,
+            )
+        except httpx.HTTPError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            return response.json()
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    async def rotate_token(self, token_id: str) -> dict[str, Any] | None:
+        """POST /tokens/{id}/rotate — rotate (revoke + create с теми же параметрами)."""
+        url = f"{self.base_url}/tokens/{token_id}/rotate"
+        try:
+            response = await self._client.post(url, headers=self._headers(), timeout=10.0)
+        except httpx.HTTPError:
+            return None
+        if response.status_code != 200:
+            return None
+        try:
+            return response.json()
+        except (json.JSONDecodeError, ValueError):
+            return None
 
     async def get_scan_progress(self) -> dict[str, Any] | None:
         """GET /quality/scan/progress — снапшот живого прогресса quality scan.

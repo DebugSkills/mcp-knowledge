@@ -37,16 +37,22 @@
 
 | Key Level | Access | `.env` Variable |
 |-----------|--------|-----------------|
+| **subscriber-token** | Только public-контур: 10 read-тулов, rate-limit 45/мин | **НЕ в `.env`** — токен-стор (`data/tokens.jsonl`) |
 | **read-key** | `search_knowledge`, `search_by_tags`, `get_entry`, `get_knowledge_map`, `list_*`, `list_collections`, `analyze_content`, resources, prompts | `MCP_READ_KEYS=["..."]` |
 | **import-key** | All read tools + `import_content` (без delete/reindex/write) | `MCP_IMPORT_KEYS=["..."]` |
 | **write-key** | All read tools + `write_knowledge`, `update_entry`, `delete_entry`, `reindex` | `MCP_WRITE_KEYS=["..."]` |
 
+> **W3 (2026-08-18):** добавлен токен-стор. Приоритет аутентификации: **токен-стор > env-списки**. env-ключи автоматически сидятся в стор как `source="env"` (управляются по-прежнему только через `.env`/revoke). Subscriber-токены — ТОЛЬКО в сторе.
+
 ### 2.2 Key Format
 
-- **Recommended:** 64-character hex string (`openssl rand -hex 32`)
-- **Minimum:** 32 characters
-- **Format:** Any string accepted; stored as plain text in `.env` (not hashed)
-- **Masking:** Logs show only first 4 chars + SHA256[:12] — e.g., `a1b2...e3f4g5h6i7j8`
+- **Env-ключи:** 64-character hex string (`openssl rand -hex 32`)
+- **Токены (W3):** `mcp_<уровень><зона>_<32 base62>` — самодокументируемый префикс:
+  - уровень: `s`=subscriber, `r`=read, `i`=import, `w`=write; зона: `a`=public, `b`=private, `x`=обе.
+  - Примеры: `mcp_sa_…` (подписчик, public), `mcp_rb_…` (чтение, private), `mcp_wa_…` (запись, public).
+  - Префикс — подсказка для человека; правомочность определяется **только по sha256-хешу** (префикс можно подделать — доступ не выдастся).
+- **Хранение:** env-ключи — plain text в `.env`; токены — **только sha256** в `data/tokens.jsonl` (plaintext не хранится и не логируется).
+- **Masking:** env-ключи в логах — первые 4 символа + SHA256[:12]; токены — префикс `mcp_XX_` + хеш.
 
 ### 2.3 Naming Convention (for human reference — NOT in `.env`)
 
@@ -65,6 +71,26 @@ monitoring      prod            prod-monitor-2026-08
 ---
 
 ## 3. 0-Downtime Rotation Procedure
+
+### 3.0 Токен-стор: ротация токенов (W3/W5, рекомендуемый путь)
+
+Для **токенов** (subscriber/read/import/write в `data/tokens.jsonl`) процедура проще — нет `.env`-циклов и перезапуска сервера:
+
+```bash
+# CLI (в контейнере или хосте):
+python -m mcp_server.cli token list                      # найти token_id
+python -m mcp_server.cli token rotate <token_id>          # revoke старого + новый plaintext ОДИН раз
+python -m mcp_server.cli token revoke <token_id>          # просто отозвать
+```
+
+**Или через kb-console** → «Токены»: кнопки `Rotate` / `Отозвать` / `Edit` (note, срок действия).
+
+- Новый ключ печатается один раз (в UI — диалог с копированием); в сторе — только sha256.
+- Ротация мгновенная: `rotate` = revoke + create с теми же параметрами; старый ключ перестаёт работать сразу.
+- **Авто-деактивация (Q9):** subscriber-токены без использования 90+ дней деактивируются автоматически (за 7 дней UI показывает баннер «скоро деактивация»). env-ключи (`source="env"`) этим не затрагиваются.
+- Просроченные `expires_at` — доступ отклоняется при аутентификации.
+
+> Ротация env-ключей (read/import/write из `.env`) — см. Step 1-4 ниже (нужен рестарт контейнера).
 
 ### Principle: Overlap-based rotation
 

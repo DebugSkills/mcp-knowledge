@@ -77,6 +77,14 @@ def page_quality() -> None:
     build_quality()
 
 
+@ui.page("/tokens")
+def page_tokens() -> None:
+    """Страница «Токены» — управление subscriber/read/import/write токенами (W5)."""
+    render_header("tokens")
+    from .pages.tokens import build_tokens
+    build_tokens()
+
+
 # ── Start ───────────────────────────────────────────────────
 
 # Глобальный request logger для отладки upload.

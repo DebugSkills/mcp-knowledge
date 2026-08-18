@@ -160,17 +160,25 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 
 ---
 
-## 6. Права доступа (read / import / write)
+## 6. Права доступа (subscriber / read / import / write)
 
-Сервер поддерживает трёхуровневую систему ключей (X-API-Key header):
+Сервер поддерживает четырёхуровневую систему ключей (X-API-Key header):
 
-| Уровень | Переменная `.env` | Доступ |
-|---------|-------------------|--------|
-| **read** | `MCP_READ_KEYS=["..."]` | Поиск, чтение, browse, ресурсы, промпты, `analyze_content`, `list_collections`, `find_fragment` |
+| Уровень | Источник | Доступ |
+|---------|----------|--------|
+| **subscriber** | Токен-стор (`data/tokens.jsonl`, CLI/UI «Токены») | **Только public-контур**: 10 read-тулов (см. §7), `zone` принудительно `public`, rate-limit 45 req/min |
+| **read** | `MCP_READ_KEYS=["..."]` | Поиск, чтение, browse, ресурсы, промпты, `analyze_content`, `list_collections`, `find_fragment` (обе зоны) |
 | **import** | `MCP_IMPORT_KEYS=["..."]` | Read + `import_content`, `extract_pdf_text`, `cancel_import` (импорт книг без права delete/reindex/write) |
-| **write** | `MCP_WRITE_KEYS=["..."]` | Полный доступ: read + import + `write_knowledge`, `update_entry`, `delete_entry`, `reindex`, `resolve_quality_issue`, `run_quality_scan`, `add_fragment`, `update_fragment`, `delete_fragment` |
+| **write** | `MCP_WRITE_KEYS=["..."]` | Полный доступ: read + import + `write_knowledge`, `update_entry`, `delete_entry`, `reindex`, `resolve_quality_issue`, `run_quality_scan`, `add_fragment`, `update_fragment`, `delete_fragment`, `set_zone` |
+
+**Токен-стор (W3/W5):** приоритет аутентификации — токен-стор > env-списки. Токены:
+- Формат: `mcp_<уровень><зона>_<32 base62>` (`mcp_sa_` = подписчик/public, `mcp_rb_` = чтение/private, `mcp_ix_` = импорт/обе, `mcp_wa_` = запись/public); префикс — подсказка для человека, правомочность — по sha256.
+- Создание: CLI `python -m mcp_server.cli token create` или kb-console → «Токены» (UI).
+- Авто-деактивация (Q9): subscriber-токены без использования 90+ дней деактивируются автоматически; за 7 дней — warning-баннер в UI.
+- env-ключи (`source=env`) авто-деактивацией НЕ трогаются.
 
 **Рекомендация:**
+- Внешнему читателю / подписчику → **subscriber-токен** (видит только публичный слой)
 - AI-агенту, который только читает БЗ → **read-ключ**
 - kb-console для импорта → **import-ключ** (не write — безопаснее)
 - Администратору для реиндексации → **write-ключ**
@@ -179,21 +187,21 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 
 ---
 
-## 7. Таблица 30 инструментов
+## 7. Таблица 31 инструмента
 
 | # | Tool | Уровень | Назначение |
 |:--|------|:-------:|-----------|
-| 1 | `search_knowledge` | read | Семантический поиск (Ollama embed) |
-| 2 | `search_by_tags` | read | Поиск по тегам (payload-фильтр Qdrant) |
-| 3 | `get_entry` | read | Получить полную запись (frontmatter + Markdown) |
-| 4 | `get_knowledge_map` | read | Структурная карта: domains → subjects → IDs |
-| 5 | `list_collections` | read | Список книг/коллекций с метаданными |
-| 6 | `write_knowledge` | write | Создать: Markdown SSOT → chunk → embed → Qdrant |
+| 1 | `search_knowledge` | read / **subscriber** | Семантический поиск (Ollama embed); subscriber — только public-зона |
+| 2 | `search_by_tags` | read / **subscriber** | Поиск по тегам (payload-фильтр Qdrant); subscriber — только public |
+| 3 | `get_entry` | read / **subscriber** | Получить полную запись (frontmatter + Markdown); subscriber на private → «not found» |
+| 4 | `get_knowledge_map` | read / **subscriber** | Структурная карта: domains → subjects → IDs; subscriber — из public-коллекции |
+| 5 | `list_collections` | read / **subscriber** | Список книг/коллекций с метаданными; subscriber — только public-книги |
+| 6 | `write_knowledge` | write | Создать: Markdown SSOT → chunk → embed → Qdrant (+ `zone` public/private) |
 | 7 | `update_entry` | write | Обновить с optimistic locking (version check) |
 | 8 | `delete_entry` | write | Удалить: SSOT + Qdrant + Git commit |
-| 9 | `list_domains` | read | Список доменов (пагинация) |
-| 10 | `list_subjects` | read | Список тем в домене |
-| 11 | `list_projects` | read | Список проектов |
+| 9 | `list_domains` | read / **subscriber** | Список доменов (пагинация) |
+| 10 | `list_subjects` | read / **subscriber** | Список тем в домене |
+| 11 | `list_projects` | read / **subscriber** | Список проектов |
 | 12 | `reindex` | write | Перестроить индекс: все .md → Qdrant (blue-green) |
 | 13 | `review_queue` | read | Топ устаревших записей (staleness_score DESC) |
 | 14 | `review_queue_books` | read | Топ устаревших КНИГ (агрегат по parent, доля устаревших секций) |
@@ -201,18 +209,21 @@ mcp-knowledge сервер реализует **JSON-RPC 2.0 поверх HTTP**
 | 16 | `resolve_quality_issue` | write | Разрешить: merge/deprecate/restore/resolve/ignore (cascade). **Фаза 3:** `marks_fp=True` для action=resolve — явный FP-сигнал «не дубль» (пишет `fp_rejection` в audit, закрывает авто-гейт); restore переоткрывает dup-issues записи + пишет restore-audit (`restored_by_operator` — cooldown-щит авто) |
 | 17 | `run_quality_scan` | write | Периодический quality scan (для cron, фоновая задача с lock). Мгновенный ответ `{scanned, status: started|already_running|error, scan_id}`; прогресс — GET `/quality/scan/progress` (**13.27:** состояние пишется в `scan_state.json`, переживает рестарт сервера; прерванный скан авто-возобновляется при старте) |
 | 18 | `cancel_quality_scan` | write | Отменить активный scan, освободить lock |
-| 19 | `import_content` | import | Декомпозиция + batch запись: content → book collection. **PDF (Фаза 13.21):** `content_type="pdf"` + `pdf_path` (путь с сервера после POST /upload) или base64-контент → асинхронная очередь импортов (ответ `{import_id, status: started|queued}`, прогресс в GET /imports/{id}/progress, лог в /imports/{id}/log, отмена POST /imports/{id}/cancel). Лимиты: ≤2000 страниц, ≤100 МБ (base64 ~96 МБ), OCR для сканов, encrypted → ошибка |
-| 20 | `analyze_content` | read | AI-анализ контента (Ollama LLM + TF-IDF fallback) |
+| 19 | `import_content` | import | Декомпозиция + batch запись: content → book collection (+ `zone` для книги/секций). **PDF (Фаза 13.21):** `content_type="pdf"` + `pdf_path` (путь с сервера после POST /upload) или base64-контент → асинхронная очередь импортов (ответ `{import_id, status: started|queued}`, прогресс в GET /imports/{id}/progress, лог в /imports/{id}/log, отмена POST /imports/{id}/cancel). Лимиты: ≤2000 страниц, ≤100 МБ (base64 ~96 МБ), OCR для сканов, encrypted → ошибка |
+| 20 | `analyze_content` | read / **subscriber** | AI-анализ контента (Ollama LLM + TF-IDF fallback) |
 | 21 | `extract_pdf_text` | import | Конвертировать PDF → текст (pdfplumber + OCR fallback) |
 | 22 | `cancel_import` | import | Отменить активный импорт (PDF/книга), освободить lock |
 | 23 | `add_fragment` | write | Добавить раздел в книгу: создаёт секцию с ID и sequence, индексирует, обновляет TOC |
 | 24 | `update_fragment` | write | Обновить раздел книги: изменить содержание и/или заголовок с optimistic locking |
 | 25 | `delete_fragment` | write | Удалить раздел книги: soft-delete (→ .trash/) + удаление из Qdrant, без cascade |
-| 26 | `find_fragment` | read | Найти разделы внутри книги по семантическому запросу, возвращает fragment_id/title/score/snippet |
+| 26 | `find_fragment` | read / **subscriber** | Найти разделы внутри книги по семантическому запросу; subscriber на private-книгу → «Collection not found» |
 | 27 | `bulk_resolve_issues` | write | Пакетно резолвить/игнорировать issues по фильтру (P0): чистит шум за один вызов (`types`/`knowledge_id`/`status`/`action=ignore|resolve`); меняет только issues.jsonl, не контент |
 | 28 | `bulk_deprecate_duplicates` | write | Пакетно скрыть записи-дубликаты (Фаза 1 dedup): обратимый deprecate + закрытие всех dup-issues + audit.jsonl. **Фаза 3:** `actor="auto"` — серверный гейт авто-режима (config `AUTO_DEDUP_ENABLED` + FP=0 за N сканов + `filter={hash_only: True}` обязателен + cooldown-щит + cap `MAX_PER_SCAN` + strict-audit abort) |
 | 29 | `review_duplicate_pairs` | read | Ревью-очередь dup-пар (Фаза 2): 🟢/🟡/🔴 ранжирование R1-R6, сниппеты для diff. **Фаза 3:** `filter={hash_only: True}` — только строгие R1 (exact content-hash), никогда cosine |
 | 30 | `list_audit_log` | read | Журнал действий по качеству + статус авто-гейта (Фаза 3): записи audit.jsonl (deprecate/restore/bulk/auto/fp_rejection/scan_completed) + `fp_stats` (scans_in_window/rejections/fp_free) + `auto_dedup_enabled/config`. Фильтры: `action`, `actor` (для «только auto»), `knowledge_id`, `limit` |
+| 31 | `set_zone` | write | Переложить запись/книгу между зонами public/private (курирование public-слоя, каскад секций, audit) |
+
+**Subscriber-доступ (10 тулов):** `search_knowledge`, `search_by_tags`, `get_entry`, `get_knowledge_map`, `list_domains`, `list_subjects`, `list_projects`, `list_collections`, `find_fragment`, `analyze_content` — всё только по public-контуру; `resources/*`, `prompts/*`, quality-тулы и `tools/list` (возвращает только 10) — недоступны.
 
 ---
 
@@ -419,6 +430,42 @@ curl -s -X POST http://localhost:8000/mcp \
   -H "X-API-Key: ${MCP_API_KEY}" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 -m json.tool
 ```
+
+---
+
+## 8.1 Подписчик (subscriber-токен, W3/W5)
+
+Подписчик — внешний читатель с доступом **только к публичному слою** базы знаний (public-контур).
+
+**Как получить ключ:**
+1. Оператор создаёт subscriber-токен: kb-console → «Токены» → «Создать токен» (уровень = подписчик) — **или** CLI:
+   ```bash
+   python -m mcp_server.cli token create --level subscriber --zone public \
+     --note "Boosty Практик: Иван" --expires 2027-01-01
+   # → 🔑 mcp_sa_<32 base62> (показывается ОДИН раз)
+   ```
+2. Токен выдаётся подписчику; у оператора остаётся только префикс-подсказка `mcp_sa_` (секрет не хранится — в сторе только sha256).
+
+**Что видит подписчик (10 тулов, всё — public-зона):**
+`search_knowledge`, `search_by_tags`, `get_entry`, `get_knowledge_map`, `list_domains`, `list_subjects`, `list_projects`, `list_collections`, `find_fragment`, `analyze_content`.
+- Приватные записи не видны: `get_entry` на private → «Knowledge entry not found» (существование не разглашается), `find_fragment` на private-книгу → «Collection not found».
+- `tools/list` возвращает только 10 тулов; `resources/*`, `prompts/*` → 403.
+- Rate-limit: 45 запросов/мин (отдельный bucket).
+
+**Подключение** — то же, что в §1-§5, но с subscriber-ключом:
+```jsonc
+// kilo.jsonc → mcpServers
+"mcp-knowledge": {
+  "type": "http",
+  "url": "http://localhost:8000/mcp",
+  "headers": { "X-API-Key": "mcp_sa_…" }
+}
+```
+
+**Жизненный цикл (Q9):**
+- Авто-деактивация: subscriber-токен без использования **90 дней** деактивируется автоматически; за 7 дней до этого kb-console показывает баннер «скоро деактивация».
+- Отзыв/ротация — оператором (kb-console «Токены» или CLI `token revoke|rotate`).
+- Продление: оператор обновляет `expires_at` (PATCH) или выдаёт новый токен.
 
 ---
 

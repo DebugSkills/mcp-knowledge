@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from . import books, import_page, quality, search, status
+from . import books, import_page, quality, search, status, tokens
 
 # ROUTES: (путь, метка, функция-построитель)
 # Используется header.py и app.py для регистрации @ui.page.
@@ -19,6 +19,7 @@ ROUTES: list[tuple[str, str, Callable[[], None]]] = [
     ("/import", "Импорт", import_page.build_import),
     ("/search", "Поиск", search.build_search),
     ("/quality", "Качество", quality.build_quality),  # Фаза 13.14
+    ("/tokens", "Токены", tokens.build_tokens),  # W5
 ]
 
 # PAGES оставлен для обратной совместимости (если где-то ещё используется).
