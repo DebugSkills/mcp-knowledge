@@ -67,6 +67,7 @@ omit = [
     "*/tests/*",
     "*/__init__.py",
 ]
+branch = true    # V2 (13.26): branch coverage — ловит мёртвые ветки (регрессия len>4000)
 
 [tool.coverage.report]
 fail_under = 85       # Фаза 7.3: coverage regression gate (tools/content.py ≥86%)
@@ -78,4 +79,21 @@ exclude_lines = [
     "def __repr__",
     "class .*\\bProtocol\\):",
     "@(abc\\.)?abstractmethod",
+]
+
+# V3 (13.26): статическая проверка типов — ловит класс «дрейф сигнатур»
+# (missing required arg, Chunk vs str) до запуска тестов.
+# Прагматичный режим: untyped-функции не блокируют (легаси), библиотеки без
+# стабов игнорируются. Точность увеличивается по мере аннотирования.
+[tool.mypy]
+python_version = "3.11"
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+warn_unused_ignores = false
+check_untyped_defs = false
+disallow_untyped_defs = false
+show_error_codes = true
+exclude = [
+    "tests/",
+    "kb-console/",
 ]

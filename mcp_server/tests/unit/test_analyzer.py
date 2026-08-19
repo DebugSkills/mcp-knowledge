@@ -336,3 +336,219 @@ async def test_llm_disabled_uses_tfidf_directly(mock_app_state, sample_content):
     assert result["subject"] == ""
     assert result["content_type"] == "book"
     assert isinstance(result["tags"], list)
+
+
+# ═══════════════════════════════════════════════════════════════
+# V2 (13.26): branch coverage — добивка непокрытых веток
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestNormalizeHelpersBranch:
+    """_normalize_domain_or_subject / _normalize_tag_list — edge-ветки."""
+
+    def test_normalize_domain_non_str_returns_empty(self):
+        from mcp_server.content.analyzer import _normalize_domain_or_subject
+
+        assert _normalize_domain_or_subject(123) == ""
+        assert _normalize_domain_or_subject(None) == ""
+
+    def test_normalize_domain_truncated_to_max_len(self):
+        from mcp_server.content.analyzer import _normalize_domain_or_subject
+
+        assert len(_normalize_domain_or_subject("a" * 150)) == 100
+        assert len(_normalize_domain_or_subject("x" * 10, max_len=5)) == 5
+
+    def test_normalize_tag_list_non_list_returns_empty(self):
+        from mcp_server.content.analyzer import _normalize_tag_list
+
+        assert _normalize_tag_list("not-a-list") == []
+        assert _normalize_tag_list(None) == []
+
+    def test_normalize_tag_list_skips_non_str_dedup_cap(self):
+        from mcp_server.content.analyzer import _normalize_tag_list
+
+        # 42/None пропускаются, "a" дублируется, лишние обрезаются по max_tags
+        tags = _normalize_tag_list(
+            ["a", 42, None, " b ", "a", "c", "d", "e"], max_tags=3
+        )
+        assert tags == ["a", "b", "c"]
+
+
+class TestLLMExceptionBranches:
+    """_llm_analyze — exception/parse-ветки (fallback-цепочка)."""
+
+    def _settings(self):
+        return SimpleNamespace(
+            OLLAMA_URL="http://localhost:11434",
+            OLLAMA_CHAT_MODEL="test-model",
+            ANALYZE_LLM_NUM_CTX=2048,
+            ANALYZE_TIMEOUT=1.0,
+        )
+
+    def _client_raising(self, exc: Exception):
+        mock = MagicMock(spec=httpx.AsyncClient)
+
+        async def _post(*args, **kwargs):
+            raise exc
+
+        mock.post = _post
+        mock.__aenter__ = AsyncMock(return_value=mock)
+        mock.__aexit__ = AsyncMock(return_value=None)
+        return mock
+
+    @pytest.mark.asyncio
+    async def test_llm_timeout_exception(self):
+        from mcp_server.content.analyzer import _llm_analyze
+
+        with patch(
+            "httpx.AsyncClient",
+            return_value=self._client_raising(httpx.TimeoutException("t")),
+        ):
+            res = await _llm_analyze("frag", self._settings(), [], [])
+        assert res["success"] is False
+        assert "timeout" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_llm_connect_error_exception(self):
+        from mcp_server.content.analyzer import _llm_analyze
+
+        with patch(
+            "httpx.AsyncClient",
+            return_value=self._client_raising(httpx.ConnectError("c")),
+        ):
+            res = await _llm_analyze("frag", self._settings(), [], [])
+        assert res["success"] is False
+        assert "connection" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_llm_generic_exception(self):
+        from mcp_server.content.analyzer import _llm_analyze
+
+        with patch(
+            "httpx.AsyncClient",
+            return_value=self._client_raising(RuntimeError("boom")),
+        ):
+            res = await _llm_analyze("frag", self._settings(), [], [])
+        assert res["success"] is False
+        assert "request failed" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_llm_response_parse_failure(self):
+        from mcp_server.content.analyzer import _llm_analyze
+
+        mock = MagicMock(spec=httpx.AsyncClient)
+
+        async def _post(*args, **kwargs):
+            return httpx.Response(200, content=b"{not valid json")
+
+        mock.post = _post
+        mock.__aenter__ = AsyncMock(return_value=mock)
+        mock.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("httpx.AsyncClient", return_value=mock):
+            res = await _llm_analyze("frag", self._settings(), [], [])
+        assert res["success"] is False
+        assert "parse failed" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_llm_empty_content(self):
+        from mcp_server.content.analyzer import _llm_analyze
+
+        mock = _make_mock_async_client({"message": {"content": "   "}})
+        with patch("httpx.AsyncClient", return_value=mock):
+            res = await _llm_analyze("frag", self._settings(), [], [])
+        assert res["success"] is False
+        assert "empty" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_llm_non_dict_json(self):
+        from mcp_server.content.analyzer import _llm_analyze
+
+        # json.loads успешен, но результат — список, не dict
+        mock = _make_mock_async_client({"message": {"content": "[1, 2, 3]"}})
+        with patch("httpx.AsyncClient", return_value=mock):
+            res = await _llm_analyze("frag", self._settings(), [], [])
+        assert res["success"] is False
+        assert "non-dict" in res["error"]
+
+
+class TestAnalyzeContentEdgeBranches:
+    """analyze_content — входные edge-ветки и known-контекст."""
+
+    @pytest.mark.asyncio
+    async def test_missing_content_returns_error(self, mock_app_state):
+        from mcp_server.content.analyzer import analyze_content
+
+        result = await analyze_content({}, mock_app_state)
+        assert result.get("error")
+        assert "content" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_qdrant_none_skips_known_context(self, mock_app_state, sample_content):
+        from mcp_server.content.analyzer import analyze_content
+
+        mock_app_state.qdrant = None  # нет Qdrant → known-context пропускается
+        llm_result = {
+            "content_type": "book",
+            "domain": "programming",
+            "subject": "python",
+            "tags": ["python"],
+        }
+        mock_client = _make_mock_async_client(_make_ollama_response(llm_result))
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await analyze_content({"content": sample_content}, mock_app_state)
+        assert result["source"] == "llm"
+        assert result["domain"] == "programming"
+
+    @pytest.mark.asyncio
+    async def test_known_context_scroll_exception_ignored(self, mock_app_state, sample_content):
+        from mcp_server.content.analyzer import analyze_content
+
+        def _raise(*args, **kwargs):
+            raise RuntimeError("qdrant down")
+
+        mock_app_state.qdrant.scroll_unique_values = _raise
+        llm_result = {
+            "content_type": "book",
+            "domain": "devops",
+            "subject": "docker",
+            "tags": ["docker"],
+        }
+        mock_client = _make_mock_async_client(_make_ollama_response(llm_result))
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            result = await analyze_content({"content": sample_content}, mock_app_state)
+        assert result["source"] == "llm"
+        assert result["domain"] == "devops"
+
+    @pytest.mark.asyncio
+    async def test_validation_exception_falls_back(self, mock_app_state, sample_content):
+        from mcp_server.content.analyzer import analyze_content
+
+        # _validate_and_normalize падает (внутренняя ошибка) → fallback с llm_error
+        llm_result = {
+            "content_type": "book",
+            "domain": "x",
+            "subject": "y",
+            "tags": ["t"],
+        }
+        mock_client = _make_mock_async_client(_make_ollama_response(llm_result))
+        with patch("httpx.AsyncClient", return_value=mock_client), patch(
+            "mcp_server.content.analyzer._validate_and_normalize",
+            side_effect=RuntimeError("validation bug"),
+        ):
+            result = await analyze_content({"content": sample_content}, mock_app_state)
+        assert result["source"] == "tfidf"
+        assert "Validation failed" in result.get("llm_error", "")
+
+    @pytest.mark.asyncio
+    async def test_tfidf_fallback_keyword_exception(self, mock_app_state):
+        from mcp_server.content.analyzer import analyze_content
+
+        mock_app_state.settings.ANALYZE_LLM_ENABLED = False
+        with patch(
+            "mcp_server.content.analyzer.extract_keywords",
+            side_effect=RuntimeError("keywords down"),
+        ):
+            result = await analyze_content({"content": "текст для анализа"}, mock_app_state)
+        assert result["source"] == "tfidf"
+        assert result["tags"] == []

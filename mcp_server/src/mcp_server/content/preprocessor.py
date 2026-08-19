@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -61,5 +62,14 @@ class ContentPreprocessor(ABC):
         """Проверка пригодности контента (non-empty, размер, кодировка)."""
 
     @abstractmethod
-    async def decompose(self, content: str, metadata: ImportMeta) -> list[Section]:
-        """Декомпозиция контента в упорядоченный список семантических секций."""
+    async def decompose(
+        self,
+        content: str,
+        metadata: ImportMeta,
+        cancel_event: asyncio.Event | None = None,
+    ) -> list[Section]:
+        """Декомпозиция контента в упорядоченный список семантических секций.
+
+        cancel_event: опциональный сигнал отмены (PDF-импорт); реализации,
+        не поддерживающие отмену, игнорируют аргумент (V3 13.26: единый контракт).
+        """

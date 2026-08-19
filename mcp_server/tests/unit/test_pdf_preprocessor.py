@@ -302,14 +302,14 @@ class TestKnowledgeIdValidation:
     KNOWLEDGE_ID_RE = r"^[a-z0-9][a-z0-9_-]{2,127}$"
     HEX8_RE = r"-[a-f0-9]{8}$"
 
-    def test_make_sections_from_text_knowledge_id_valid(self, preprocessor):
+    async def test_make_sections_from_text_knowledge_id_valid(self, preprocessor):
         """Bug 13.22: _make_sections_from_text передавал сырой title вместо content_hash."""
         meta = ImportMeta(
             domain="devops",
             subject="ai",
             title="1-3 AI роли, которые усиливают преподавателя",
         )
-        sections = preprocessor._make_sections_from_text(
+        sections = await preprocessor._make_sections_from_text(
             body="Тестовый текст для проверки генерации knowledge_id",
             title="Раздел 1",
             seq=1,
@@ -344,3 +344,31 @@ class TestKnowledgeIdValidation:
             assert re.search(self.HEX8_RE, kid), (
                 f"knowledge_id={kid!r} does not end with 8 hex chars"
             )
+
+    async def test_fallback_per_page_oversized_page_chunked(self, preprocessor):
+        """Regression 13.25: страница >4000 символов → hybrid_split(embedder=None)
+        без TypeError 'missing positional argument: embedder' и без coroutine leak."""
+        meta = ImportMeta(domain="devops", subject="ai", title="Oversized PDF")
+        # Одна страница >4000 символов (обычный текст, без заголовков)
+        big_page = "Абзац первый. " + ("Текст с содержимым страницы. " * 400)
+        full_text = big_page + "\n\n" + "Короткая вторая страница."
+        sections = await preprocessor._fallback_per_page(full_text, meta)
+        assert len(sections) > 0, "Should produce sections"
+        # Если chunking сработал — страница может дать >1 секции, но хотя бы одна есть
+        for s in sections:
+            kid = s.meta["knowledge_id"]
+            assert re.match(self.KNOWLEDGE_ID_RE, kid)
+            assert re.search(self.HEX8_RE, kid)
+
+    async def test_make_sections_from_text_oversized_chunked(self, preprocessor):
+        """Regression 13.25: body >4000 символов → hybrid_split(embedder=None)
+        без TypeError/coroutine-leak."""
+        meta = ImportMeta(domain="devops", subject="ai", title="Big body")
+        big_body = "Заголовок раздела.\n\n" + ("Содержимое секции. " * 400)
+        sections = await preprocessor._make_sections_from_text(
+            body=big_body,
+            title="Раздел 1",
+            seq=1,
+            metadata=meta,
+        )
+        assert len(sections) > 0, "Should produce at least one section"

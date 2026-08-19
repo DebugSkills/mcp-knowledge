@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 
@@ -77,6 +78,7 @@ class BookPreprocessor(ContentPreprocessor):
         self,
         content: str,
         metadata: ImportMeta,
+        cancel_event: "asyncio.Event | None" = None,  # noqa: ARG002 — V3 13.26: единый контракт (книги не поддерживают отмену)
     ) -> list[Section]:
         """Декомпозиция книги в список Section через hybrid_split + keywords."""
         logger.info(

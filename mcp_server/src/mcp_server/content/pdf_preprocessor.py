@@ -495,11 +495,15 @@ class PDFPreprocessor(ContentPreprocessor):
 
             # Chunking oversized текста
             if len(pt) > 4000:
-                chunks = hybrid_split(pt, max_tokens=512, token_counter=None)
+                chunks = await hybrid_split(
+                    pt, embedder=None, max_tokens=512, token_counter=None
+                )
+                # hybrid_split возвращает Chunk[] — нормализуем до текста
+                chunk_texts = [c.body for c in chunks]
             else:
-                chunks = [pt]
+                chunk_texts = [pt]
 
-            for chunk_idx, chunk in enumerate(chunks):
+            for chunk_idx, chunk in enumerate(chunk_texts):
                 section_title = (
                     f"Страница {seq}" if chunk_idx == 0
                     else f"Страница {seq} (часть {chunk_idx + 1})"
@@ -512,7 +516,9 @@ class PDFPreprocessor(ContentPreprocessor):
                     seq,
                     content_hash,
                 )
-                keywords = extract_keywords(chunk, top_n=5)
+                # V3 13.26: extract_keywords ждёт list[str] — одна строка ломала
+                # извлечение (итерировались символы) — теги были мёртвыми
+                keywords = extract_keywords([chunk], top_n=5)[0]
                 # Flatten: ensure keywords is list[str] not list[list]
                 flat_keywords = [
                     k for k in keywords if isinstance(k, str)
@@ -563,7 +569,7 @@ class PDFPreprocessor(ContentPreprocessor):
             if body:
                 seq += 1
                 sections.extend(
-                    self._make_sections_from_text(body, heading_text, seq, metadata)
+                    await self._make_sections_from_text(body, heading_text, seq, metadata)
                 )
 
             # Двигаемся дальше
@@ -573,7 +579,7 @@ class PDFPreprocessor(ContentPreprocessor):
         if remaining.strip():
             seq += 1
             sections.extend(
-                self._make_sections_from_text(
+                await self._make_sections_from_text(
                     remaining, "Последний раздел", seq, metadata
                 )
             )
@@ -584,7 +590,7 @@ class PDFPreprocessor(ContentPreprocessor):
 
         return sections
 
-    def _make_sections_from_text(
+    async def _make_sections_from_text(
         self,
         body: str,
         title: str,
@@ -597,11 +603,15 @@ class PDFPreprocessor(ContentPreprocessor):
         sections: list[Section] = []
 
         if len(body) > 4000:
-            chunks = hybrid_split(body, max_tokens=512, token_counter=None)
+            chunks = await hybrid_split(
+                body, embedder=None, max_tokens=512, token_counter=None
+            )
+            # hybrid_split возвращает Chunk[] — нормализуем до текста
+            chunk_texts = [c.body for c in chunks]
         else:
-            chunks = [body]
+            chunk_texts = [body]
 
-        for chunk_idx, chunk in enumerate(chunks):
+        for chunk_idx, chunk in enumerate(chunk_texts):
             section_title = title if chunk_idx == 0 else f"{title} (часть {chunk_idx + 1})"
             content_hash = hashlib.sha256(chunk[:200].encode()).hexdigest()
             knowledge_id = make_knowledge_id(
@@ -611,7 +621,8 @@ class PDFPreprocessor(ContentPreprocessor):
                 seq,
                 content_hash,
             )
-            keywords = extract_keywords(chunk, top_n=5)
+            # V3 13.26: extract_keywords ждёт list[str] — иначе теги мертвы
+            keywords = extract_keywords([chunk], top_n=5)[0]
             # Flatten: ensure keywords is list[str] not list[list]
             flat_keywords = [
                 k for k in keywords if isinstance(k, str)

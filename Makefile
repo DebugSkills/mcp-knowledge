@@ -63,6 +63,12 @@ test:
 lint:
 	$(DOCKER_COMPOSE) exec mcp-server ruff check src/ tests/
 
+# V3 (13.26): статическая проверка типов — контент-пайплайн (гейт 0 ошибок).
+# Расширение scope на весь src — P2 (77 ошибок легаси в 17 файлах).
+.PHONY: typecheck
+typecheck:
+	$(DOCKER_COMPOSE) exec mcp-server mypy src/mcp_server/content src/mcp_server/tools/content.py
+
 clean:
 	$(DOCKER_COMPOSE) down -v
 

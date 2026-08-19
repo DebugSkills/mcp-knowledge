@@ -449,3 +449,115 @@ class TestRealTokenizerAccuracy:
         assert token_count != char_estimate, (
             f"Real tokens ({token_count}) should differ from char/4 estimate ({char_estimate})"
         )
+
+
+class TestV2BranchCoverage:
+    """V2 (13.26): branch coverage — добивка непокрытых веток splitting.py."""
+
+    def test_structural_split_with_preamble(self):
+        """Текст до первого заголовка → preamble включается в первую секцию."""
+        content = "Preamble text here.\n\n# Section One\nBody one.\n\n## Section Two\nBody two."
+        chunks = structural_split(content)
+        assert len(chunks) == 2
+        assert chunks[0].body.startswith("Preamble text here.")
+        assert chunks[0].title == "Section One"
+        # body секции включает строку заголовка (граница match.start())
+        assert chunks[1].body.strip() == "## Section Two\nBody two."
+
+    def test_embed_paragraphs_empty_returns_empty(self):
+        from mcp_server.content.splitting import _embed_paragraphs
+
+        assert _embed_paragraphs([], MagicMock()) == []
+
+    @pytest.mark.asyncio
+    async def test_embed_paragraphs_async_batching(self):
+        """>CLUSTER_BATCH_SIZE параграфов → батчинг (2+ вызова embed_sync)."""
+        from mcp_server.content.splitting import (
+            CLUSTER_BATCH_SIZE,
+            embed_paragraphs_async,
+        )
+
+        n = CLUSTER_BATCH_SIZE + 5
+        paragraphs = [f"paragraph {i}" for i in range(n)]
+        batch_sizes: list[int] = []
+        embedder = MagicMock()
+
+        def _embed(batch):
+            batch_sizes.append(len(batch))
+            return [[0.1]] * len(batch)
+
+        embedder.embed_sync = _embed
+
+        result = await embed_paragraphs_async(paragraphs, embedder)
+
+        assert len(result) == n
+        assert batch_sizes == [CLUSTER_BATCH_SIZE, 5]  # 64 + 5 → два батча
+
+    def test_cosine_clustering_multiple_embeddings(self):
+        """Косинусная кластеризация при n>1 (sklearn)."""
+        import numpy as np
+
+        pytest.importorskip("sklearn")
+        from mcp_server.content.splitting import _cosine_clustering
+
+        emb = np.array([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]])
+        labels = _cosine_clustering(emb)
+        assert len(labels) == 3
+        assert labels[0] == labels[1]  # близкие параграфы → один кластер
+        assert labels[0] != labels[2]
+
+    def test_merge_clustered_paragraphs_empty(self):
+        from mcp_server.content.splitting import _merge_clustered_paragraphs
+
+        assert _merge_clustered_paragraphs([], []) == []
+
+    def test_recursive_split_single_long_sentence_truncates(self):
+        """Одно предложение > max_tokens → обрезка (не бесконечный цикл)."""
+        chunk = Chunk(
+            title="t",
+            body="word " * 5000,  # без пунктуации — одно «предложение»
+            sequence_number=1,
+        )
+        result = recursive_split(chunk, max_tokens=512, token_counter=None)
+        assert len(result) == 1
+        assert len(result[0].body) <= 512 * 4  # char-count fallback: 4 симв/токен
+
+    @pytest.mark.asyncio
+    async def test_hybrid_split_token_counter_oversized_detection(self):
+        """token_counter сообщает oversized → need_clustering, embedder=None → без кластеризации."""
+        from mcp_server.content.splitting import hybrid_split
+
+        token_counter = MagicMock()
+        token_counter.count_tokens = lambda text: 1000  # всегда > max_tokens=512
+
+        content = "# A\n\nbody a.\n\n## B\n\nbody b."
+        chunks = await hybrid_split(
+            content=content,
+            embedder=None,
+            token_counter=token_counter,
+            max_tokens=512,
+        )
+        assert len(chunks) >= 1
+        # Поскольку embedder=None — clustering не вызывался (нет embed), но путь
+        # oversized-детекции пройден (иначе был бы 1 chunk без recursive split)
+
+    @pytest.mark.asyncio
+    async def test_hybrid_split_clustering_exception_falls_back(self):
+        """Ошибка эмбеддинга → warning + structural result (fallback без краха)."""
+        from unittest.mock import patch
+
+        from mcp_server.content.splitting import hybrid_split
+
+        content = "Параграф один.\n\nПараграф два.\n\nПараграф три."
+        embedder = MagicMock()
+        with patch(
+            "mcp_server.content.splitting.embed_paragraphs_async",
+            side_effect=RuntimeError("embedding failed"),
+        ):
+            chunks = await hybrid_split(
+                content=content,
+                embedder=embedder,
+                token_counter=None,
+                max_tokens=512,
+            )
+        assert len(chunks) >= 1
