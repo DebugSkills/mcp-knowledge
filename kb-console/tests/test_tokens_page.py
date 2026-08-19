@@ -148,3 +148,30 @@ def test_days_old_handles_z_suffix():
         (datetime.now(UTC) - timedelta(days=2)).isoformat().replace("+00:00", "Z"),
         datetime.now(UTC),
     ) is not None
+
+
+# ── регрессия: expires_at без зоны (naive datetime) ───────────
+
+
+def test_days_old_naive_expires_at_no_zone():
+    """Регрессия: expires_at без зоны (оператор ввёл только дату) →
+    fromisoformat даёт naive datetime → раньше TypeError (naive - aware)."""
+    base = datetime.now(UTC)
+    val = _days_old("2026-12-12T00:00:00", base)
+    assert val is not None
+    assert val < 0  # будущая дата → отрицательное число дней
+
+
+def test_days_old_aware_expires_at_with_zone():
+    """Контроль: expires_at с зоной +00:00 — как и раньше, не падает."""
+    base = datetime.now(UTC)
+    val = _days_old("2026-12-12T00:00:00+00:00", base)
+    assert val is not None
+    assert val < 0
+
+
+def test_status_badge_naive_expired_expires_at():
+    """Регрессия: expired-строка БЕЗ зоны (прошлая дата) → '⏳ expired', не TypeError."""
+    label, color = _status_badge(_rec(expires_at="2020-01-01T00:00:00"))
+    assert "expired" in label
+    assert color == "grey"

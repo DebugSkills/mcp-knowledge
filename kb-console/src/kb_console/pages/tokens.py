@@ -53,6 +53,10 @@ def _days_old(ts_str: str | None, base: datetime) -> float | None:
         dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))  # noqa: FURB162 — py3.11 fromisoformat не парсит 'Z'
     except ValueError:
         return None
+    if dt.tzinfo is None:
+        # expires_at может прийти без зоны (оператор ввёл только дату) →
+        # fromisoformat даёт naive → трактуем как UTC, иначе naive - aware TypeError
+        dt = dt.replace(tzinfo=UTC)
     return (base - dt).total_seconds() / 86400.0
 
 
