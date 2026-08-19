@@ -149,9 +149,9 @@ def build_tokens() -> None:
                 with ui.row().classes("items-center gap-2"):
                     ui.label(f"• {rec['id']} ({rec.get('note') or 'без заметки'}) — {item['days']} дн.")
                     ui.button(
-                        "Отозвать", size="sm", color="negative",
+                        "Отозвать", color="negative",
                         on_click=lambda tid=rec["id"]: _confirm_revoke(tid),
-                    )
+                    ).props("dense")
 
     # ── таблица ─────────────────────────────────────────────
     @ui.refreshable
@@ -199,11 +199,11 @@ def build_tokens() -> None:
                         if rec.get("source") == "env":
                             ui.badge("env", color="grey-5").tooltip("Задан через env-переменную; управляется только через env/revoke")
                         ui.space()
-                        ui.button("Edit", size="sm", on_click=lambda r=rec: _edit_dialog(r))
-                        ui.button("Rotate", size="sm", color="warning",
-                                  on_click=lambda r=rec: _confirm_rotate(r))
-                        ui.button("Отозвать", size="sm", color="negative",
-                                  on_click=lambda r=rec: _confirm_revoke(r["id"]))
+                        ui.button("Edit", on_click=lambda r=rec: _edit_dialog(r)).props("dense")
+                        ui.button("Rotate", color="warning",
+                                  on_click=lambda r=rec: _confirm_rotate(r)).props("dense")
+                        ui.button("Отозвать", color="negative",
+                                  on_click=lambda r=rec: _confirm_revoke(r["id"])).props("dense")
 
     # ── create: живой предпросмотр префикса (v1.5) ──────────
     _create_state: dict = {"level": "subscriber", "zone": "public"}
