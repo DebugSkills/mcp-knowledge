@@ -491,6 +491,64 @@ async def test_tools_call_passes_explicit_timeout():
     assert call_kwargs.get("timeout") == 30.0
 
 
+# ── Tests: set_zone wrapper (code-2026-08-19-zone-ui) ─────────
+
+
+@pytest.mark.asyncio
+async def test_set_zone_default_timeout_is_120():
+    """set_zone должен использовать per-call timeout 120.0 по умолчанию.
+
+    Каскад на сервере (N delete_by_knowledge_id wait=True + git-flush)
+    может занимать >60s на больших книгах (7000+ секций) — дефолт выше,
+    чем у update_entry (60s). P1-фикс критика: динамический timeout.
+    """
+    client = MCPClient(base_url="http://test")
+    mock_call = AsyncMock(return_value={"ok": True})
+    client._call = mock_call
+
+    await client.set_zone("kid-1", "public")
+
+    assert mock_call.call_count == 1
+    call_kwargs = mock_call.call_args.kwargs
+    assert call_kwargs.get("timeout") == 120.0, (
+        f"set_zone должен передавать timeout=120.0 в _call по умолчанию, "
+        f"получено: {call_kwargs.get('timeout')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_zone_passes_explicit_timeout():
+    """set_zone пробрасывает явный timeout (динамический: max(120, N*0.05))."""
+    client = MCPClient(base_url="http://test")
+    mock_call = AsyncMock(return_value={"ok": True})
+    client._call = mock_call
+
+    await client.set_zone("kid-1", "private", reason="test", timeout=350.0)
+
+    call_kwargs = mock_call.call_args.kwargs
+    assert call_kwargs.get("timeout") == 350.0
+
+
+@pytest.mark.asyncio
+async def test_set_zone_calls_tool_with_name_and_params():
+    """set_zone вызывает _call('tools/call', {name: 'set_zone', arguments: ...})."""
+    client = MCPClient(base_url="http://test")
+    mock_call = AsyncMock(return_value={"ok": True})
+    client._call = mock_call
+
+    await client.set_zone("kid-1", "public", reason="curation")
+
+    args, _kwargs = mock_call.call_args
+    assert args[0] == "tools/call"
+    body = args[1]
+    assert body["name"] == "set_zone"
+    assert body["arguments"] == {
+        "knowledge_id": "kid-1",
+        "zone": "public",
+        "reason": "curation",
+    }
+
+
 # ── Tests: cancel_quality_scan (13.18) ──────────────────────
 
 

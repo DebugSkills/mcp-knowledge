@@ -758,6 +758,32 @@ class MCPClient:
             params["cascade"] = cascade
         return await self.tools_call("delete_entry", params)
 
+    async def set_zone(
+        self,
+        knowledge_id: str,
+        zone: str,
+        reason: str = "",
+        timeout: float = 120.0,
+    ) -> dict[str, Any]:
+        """Переложить запись/книгу между зонами (каскад на сервере, 1 git-коммит).
+
+        code-2026-08-19-zone-ui: переключатель зоны в диалоге книги kb-console.
+
+        Args:
+            knowledge_id: ID записи (книги) — секции переносятся каскадом.
+            zone: целевая зона: "public" | "private".
+            reason: причина перекладки (для audit.jsonl).
+            timeout: per-call таймаут, сек. Динамический (P1-фикс критика):
+                большие книги (каскад = N delete_by_knowledge_id wait=True
+                в Qdrant + git-flush; у книги 7000+ секций может занять >60s).
+                Вызывающая сторона считает max(120.0, section_count * 0.05).
+
+        Returns:
+            {"knowledge_id": ..., "zone": ..., "sections_moved": N, ...}
+        """
+        params = {"knowledge_id": knowledge_id, "zone": zone, "reason": reason}
+        return await self.tools_call("set_zone", params, timeout=timeout)
+
     # ── 13.21: PDF import ──────────────────────────────────
 
     async def upload_pdf(self, file_path: str, filename: str = "") -> dict[str, Any]:

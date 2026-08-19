@@ -907,3 +907,21 @@ class TestMCPClientAuditMethodsPhase3:
         call = quality_client._captured[0]
         assert call["tool"] == "review_duplicate_pairs"
         assert call["args"]["filter"] == {"hash_only": True}
+
+
+# ── Import page: zone select (code-2026-08-19-zone-ui) ──
+
+
+def test_import_page_has_zone_select():
+    """Форма импорта содержит zone_select и передаёт zone в params.
+
+    P2 (critic): inspect.getsource на build_import (НЕ do_import —
+    do_import вложена в build_import и недоступна для getsource).
+    """
+    import inspect
+
+    from kb_console.pages import import_page
+
+    src = inspect.getsource(import_page.build_import)
+    assert "zone_select" in src, "build_import должна создавать ui.select зоны доступа"
+    assert 'params["zone"]' in src, "do_import должна передавать zone в params"

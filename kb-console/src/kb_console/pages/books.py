@@ -28,6 +28,7 @@ render_book_detail / show_book_dialog переиспользуются стра�
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 
 from nicegui import ui
 
@@ -68,6 +69,7 @@ async def render_book_detail(
     client: MCPClient,
     collection_id: str,
     initial_section_id: str | None = None,
+    on_zone_loaded: Callable[[str], None] | None = None,
 ) -> None:
     """Отрисовать в container: TOC книги (постранично) или контент найденной секции.
 
@@ -77,6 +79,9 @@ async def render_book_detail(
         collection_id: knowledge_id коллекции.
         initial_section_id: Если задан — открыть эту секцию вместо TOC
             (Фаза 13.13: кнопка «Открыть фрагмент» в поиске).
+        on_zone_loaded: Optional колбэк (code-2026-08-19-zone-ui) — вызывается
+            после загрузки entry с его зоной (public/private) для обновления
+            бейджа/переключателя в show_book_dialog. search.py не передаёт — безопасно.
     """
     container.clear()
     try:
@@ -89,6 +94,10 @@ async def render_book_detail(
         with container:
             ui.label(f"❌ {entry['error']}").classes("text-negative")
         return
+
+    # code-2026-08-19-zone-ui: проброс зоны в show_book_dialog (бейдж/переключатель)
+    if on_zone_loaded is not None:
+        on_zone_loaded(entry.get("zone", "private"))
 
     title = entry.get("title") or collection_id
     children = entry.get("children") or []
@@ -268,7 +277,12 @@ async def render_book_detail(
         _render_toc_page(0)
 
 
-async def show_book_dialog(collection_id: str, title: str | None = None, initial_section_id: str | None = None) -> None:
+async def show_book_dialog(
+    collection_id: str,
+    title: str | None = None,
+    initial_section_id: str | None = None,
+    section_count: int = 0,
+) -> None:
     """Открыть модальный диалог с содержимым книги или конкретной секции.
 
     Диалог создаётся прямо здесь (как в search.py — проверенный паттерн).
@@ -279,20 +293,76 @@ async def show_book_dialog(collection_id: str, title: str | None = None, initial
         title: Заголовок диалога (опционально, fallback на collection_id).
         initial_section_id: Если задан — открыть эту секцию вместо TOC
             (Фаза 13.13: кнопка «Открыть фрагмент» в поиске).
+        section_count: Число секций книги (из карточки списка, для расчёта
+            динамического timeout set_zone; неизвестен → консервативно 300).
     """
     import asyncio
     client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
     current_title: str = title or collection_id
+    current_zone: str = "private"
 
     async def _close() -> None:
         dialog.close()
         await client.close()
+
+    # ── Зона доступа (code-2026-08-19-zone-ui) ──────────────
+    def _apply_zone_ui(zone: str) -> None:
+        """Обновить бейдж/кнопку зоны через closure (P1-фикс 3: НЕ перерисовывать TOC).
+
+        После set_zone секции индексируются асинхронно (wait_for_index=False),
+        поэтому полная перерисовка render_book_detail показала бы пустой TOC
+        в новой зоне. Обновляем только бейдж и подпись кнопки.
+        """
+        nonlocal current_zone
+        current_zone = zone or "private"
+        is_public = current_zone == "public"
+        zone_badge.set_text("🌍 public" if is_public else "🔒 private")
+        zone_badge.set_background_color("green" if is_public else "grey")
+        zone_toggle_btn.set_text("🔒 В private" if is_public else "🌍 В public")
+        zone_toggle_btn.set_icon("lock" if is_public else "public")
+
+    async def _do_set_zone() -> None:
+        """Переложить книгу в другую зону (каскад секций на сервере, 1 git-коммит)."""
+        nonlocal current_zone
+        target_zone = "public" if current_zone == "private" else "private"
+        zone_toggle_btn.disable()
+        ui.notify("Перекладываю книгу…", type="info")
+        # P1-фикс 1 (динамический timeout): каскад = N delete_by_knowledge_id
+        # wait=True + git-flush; у книги 7000+ секций может занять >60s.
+        # section_count из карточки списка; неизвестен → консервативно 300.
+        count = section_count if section_count and section_count > 0 else 300
+        timeout = max(120.0, count * 0.05)
+        try:
+            result = await client.set_zone(collection_id, target_zone, timeout=timeout)
+        except Exception as exc:
+            # Честное сообщение (P1-фикс 1): client-timeout НЕ отменяет серверную
+            # операцию — не говорим «ошибка», предлагаем обновить список позже.
+            ui.notify(
+                f"Не удалось дождаться ответа ({exc}). "
+                f"Операция может продолжаться на сервере — обновите список позже",
+                type="warning",
+            )
+            zone_toggle_btn.enable()
+            return
+        if result.get("error"):
+            ui.notify(f"Ошибка: {result['error']}", type="negative")
+            zone_toggle_btn.enable()
+            return
+        _apply_zone_ui(target_zone)
+        cache.invalidate("books")
+        ui.notify(
+            f"Книга в {target_zone} (секций: {result.get('sections_moved', 0)})",
+            type="positive",
+        )
+        zone_toggle_btn.enable()
 
     with ui.dialog() as dialog, ui.card().classes("w-[720px] max-w-[90vw]"), ui.column().classes("w-full"):
         with ui.row().classes("items-center w-full justify-between"):
             with ui.row().classes("items-center gap-2"):
                 ui.icon("menu_book").classes("text-h6 text-primary")
                 title_label = ui.label(current_title).classes("text-h6")
+                # code-2026-08-19-zone-ui: бейдж зоны (обновляется через on_zone_loaded)
+                zone_badge = ui.badge("", color="grey")
             with ui.row().classes("items-center gap-2"):
                 rename_btn = ui.button("Переименовать", icon="edit").props("flat dense")
                 add_section_btn = ui.button("Добавить раздел", icon="add").props("flat dense")
@@ -378,11 +448,26 @@ async def show_book_dialog(collection_id: str, title: str | None = None, initial
                     rename_dialog.open()
                 rename_btn.on("click", _do_rename)
                 ui.button(icon="close", on_click=_close).props("flat round dense")
+        # Вторая строка хедера: зона доступа + переключатель (P2 критика: 720px тесен)
+        with ui.row().classes("items-center justify-end gap-2"):
+            ui.label("Зона доступа:").classes("text-caption text-grey")
+            zone_toggle_btn = ui.button("🌍 В public", icon="public").props("flat dense")
+            zone_toggle_btn.tooltip(
+                "Переложить книгу между зонами (каскад секций на сервере, "
+                "1 git-коммит). Большие книги могут занимать минуты"
+            )
+            zone_toggle_btn.on("click", _do_set_zone)
         detail_container = ui.column().classes("w-full")
         with ui.row().classes("q-mt-md"):
             ui.button("Закрыть", on_click=_close).props("flat")
     dialog.on("hide", lambda: asyncio.create_task(client.close()))
-    await render_book_detail(detail_container, client, collection_id, initial_section_id=initial_section_id)
+    await render_book_detail(
+        detail_container,
+        client,
+        collection_id,
+        initial_section_id=initial_section_id,
+        on_zone_loaded=_apply_zone_ui,
+    )
     dialog.open()
 
 
@@ -437,16 +522,22 @@ def build_books() -> None:
 
                 with ui.card().classes("w-full"), ui.row().classes("items-center w-full"), ui.column().classes("flex-1"):
                     ui.label(b.get("title", b.get("collection_id", "—"))).classes("text-subtitle1")
+                    # code-2026-08-19-zone-ui: бейдж зоны (list_collections возвращает zone)
+                    zone_val = b.get("zone", "private")
                     ui.label(
                         f"{b.get('domain', '—')}/{b.get('subject', '—')}"
                         + (f"  ·  {b.get('project')}" if b.get("project") else "")
+                        + f"  ·  {'🌍 public' if zone_val == 'public' else '🔒 private'}"
                     ).classes("text-caption text-grey")
                     with ui.row().classes("items-center"):
                         with ui.row().classes("items-center"):
                             ui.icon("article").classes("text-caption text-grey q-mr-xs")
                             ui.label(f"{b.get('section_count', 0)} секций").classes("text-caption text-grey q-mr-md")
-                        async def _open_btn(cid: str = cid, t: str = btitle) -> None:
-                            await _open_book(cid, t)
+                        async def _open_btn(
+                            cid: str = cid, t: str = btitle,
+                            sc: int = b.get("section_count", 0),
+                        ) -> None:
+                            await _open_book(cid, t, section_count=sc)
                         ui.button("Открыть", on_click=_open_btn, icon="menu_book").props("flat dense")
                         async def _replace_btn(
                             cid: str = cid, t: str = btitle,
@@ -507,14 +598,14 @@ def build_books() -> None:
 
                         ui.button("Удалить", on_click=_delete_btn, icon="delete").props("color=negative flat dense")
 
-    async def _open_book(collection_id: str, title: str = "") -> None:
+    async def _open_book(collection_id: str, title: str = "", section_count: int = 0) -> None:
         """Открыть модалку книги (вызов напрямую, без обёрток view_container).
 
         ВАЖНО: в async-обработчиках NiceGUI контекст слота сохраняется через
         contextvar — обёртки (спиннер/clear в view_container) создавали dialog
         внутри view_container, и его clear() удалял диалог из DOM. Паттерн как в search.py.
         """
-        await show_book_dialog(collection_id, title)
+        await show_book_dialog(collection_id, title, section_count=section_count)
 
     # Таймер безопасности: закрыть MCPClient при дисконнекте
     def _cleanup() -> None:

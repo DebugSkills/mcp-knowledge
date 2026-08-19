@@ -114,6 +114,20 @@ async def test_get_entry_happy_path(app_state):
     assert "content" in result
 
 
+async def test_get_entry_includes_zone(app_state):
+    """A3: get_entry returns zone (code-2026-08-19-zone-ui).
+
+    Additive-поле для kb-console (бейдж зоны в диалоге книги).
+    """
+    result = await get_entry(
+        {"knowledge_id": "ru-test-entry"},
+        app_state,
+    )
+    assert "error" not in result
+    assert "zone" in result, f"get_entry должен возвращать zone, получено: {sorted(result)}"
+    assert result["zone"] in ("public", "private")
+
+
 async def test_get_entry_not_found(app_state):
     """A3: nonexistent ID returns error."""
     result = await get_entry(
@@ -415,6 +429,21 @@ async def test_list_collections_happy_path(app_state):
     # section_count from _build_toc (Qdrant scroll by parent_knowledge_id)
     assert isinstance(c["section_count"], int)
     assert c["section_count"] == 3
+
+
+async def test_list_collections_includes_zone(app_state):
+    """list_collections returns zone per collection (code-2026-08-19-zone-ui).
+
+    Additive-поле: kb-console использует его для бейджа зоны в карточке
+    книги и префилла zone_select при замене (P1-фикс критика).
+    """
+    result = await list_collections({}, app_state)
+    assert "error" not in result
+    items = result["results"]
+    assert len(items) >= 1
+    c = items[0]
+    assert "zone" in c, f"list_collections должен возвращать zone, получено: {sorted(c)}"
+    assert c["zone"] in ("public", "private")
 
 
 async def test_list_collections_domain_filter(app_state):

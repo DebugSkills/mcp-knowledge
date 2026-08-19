@@ -200,12 +200,35 @@ def build_import() -> None:
         placeholder="python, tutorial, basics",
     ).classes("w-full q-mb-md")
 
+    # code-2026-08-19-zone-ui: выбор зоны доступа (public/private).
+    # P1-фикс критика (replace-футган): при выборе книги в replace_select
+    # зона подставляется автоматически из заменяемой книги (явное > неявное).
+    zone_select = ui.select(
+        label="Зона доступа",
+        options={"private": "🔒 Private", "public": "🌍 Public"},
+        value="private",
+    ).classes("w-48")
+    zone_select.tooltip(
+        "Private — только для авторизованных; Public — видна подписчикам. "
+        "При замене книги зона подставится автоматически из заменяемой"
+    )
+
     replace_select = ui.select(
         label="Заменить существующую книгу (опционально)",
         options={},
         value=None,
         with_input=True,
     ).classes("w-full q-mb-md")
+
+    # cid → zone для префилла zone_select при выборе заменяемой книги
+    _replace_zones: dict[str, str] = {}
+
+    def _on_replace_change(e) -> None:
+        """P1-фикс критика: префилл зоны из заменяемой книги (не понижаем public → private)."""
+        zone = _replace_zones.get(replace_select.value or "", "private")
+        zone_select.value = zone
+
+    replace_select.on_value_change(_on_replace_change)
 
     # ── Асинхронная загрузка опций для replace_select ──────
     async def _load_replace_options() -> None:
@@ -224,6 +247,8 @@ def build_import() -> None:
                     f"{b.get('section_count', 0)} сек.)"
                 )
                 opts[label] = cid
+                # code-2026-08-19-zone-ui: зона книги для префилла zone_select
+                _replace_zones[cid] = b.get("zone", "private")
             replace_select.options = opts
             replace_select.update()
             await client.close()
@@ -686,6 +711,9 @@ def build_import() -> None:
             params["title"] = title
         if tags:
             params["tags"] = tags
+        # code-2026-08-19-zone-ui: зона доступа (единый params — PDF-флоу покрыт
+        # автоматически, сервер резолвит zone до PDF-ветки content.py).
+        params["zone"] = zone_select.value
         # 13.9: идентификатор импорта для живого прогресса (poll GET /imports/{id}/progress).
         # code-2026-08-11-queue: единый base_id (upload_id для PDF / uuid4 для текста) —
         # convert/analyze операции идут с суффиксами ":convert"/":analyze", import — как есть.

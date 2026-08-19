@@ -118,6 +118,8 @@ async def list_collections(params: dict, app_state) -> dict:
             "tags": payload.get("tags", []),
             "section_count": section_count,
             "updated_at": max_updated,
+            # code-2026-08-19-zone-ui: бейдж зоны в карточке книги + префилл replace
+            "zone": payload.get("zone", ZONE_PRIVATE),
         })
 
     logger.info(

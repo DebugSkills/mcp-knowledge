@@ -382,3 +382,33 @@ async def test_fragment_lifecycle_connected_flow(lifecycle_client):
         assert actual["args"] == expected_args, (
             f"Call {i}: expected args={expected_args}, got {actual['args']}"
         )
+
+
+# ── Zone toggle in book dialog (code-2026-08-19-zone-ui) ──
+
+def test_show_book_dialog_has_zone_toggle():
+    """Диалог книги содержит переключатель зоны (set_zone) + бейдж + проброс zone.
+
+    P1-фикс критика: НЕ перерисовывать TOC после set_zone (пустой TOC в новой зоне
+    при wait_for_index=False) — обновление только через closure (бейдж/кнопка).
+    """
+    import inspect
+
+    from kb_console.pages import books
+
+    src = inspect.getsource(books.show_book_dialog)
+    assert "set_zone" in src, "show_book_dialog должна вызывать client.set_zone"
+    assert "zone_badge" in src, "show_book_dialog должна содержать бейдж зоны"
+    assert "on_zone_loaded" in src, (
+        "show_book_dialog должна пробрасывать on_zone_loaded в render_book_detail"
+    )
+
+
+def test_render_book_detail_accepts_zone_callback():
+    """render_book_detail принимает optional on_zone_loaded (search.py не передаёт — безопасно)."""
+    import inspect
+
+    from kb_console.pages import books
+
+    src = inspect.getsource(books.render_book_detail)
+    assert "on_zone_loaded" in src, "render_book_detail должна принимать on_zone_loaded"

@@ -199,6 +199,8 @@ async def get_entry(params: dict, app_state) -> dict:
         "parent_knowledge_id": getattr(fm, "parent_knowledge_id", None),
         "sequence_number": getattr(fm, "sequence_number", None),
         "children": children,
+        # code-2026-08-19-zone-ui: бейдж зоны в kb-console (диалог книги)
+        "zone": getattr(fm, "zone", ZONE_PRIVATE),
     }
 
 
