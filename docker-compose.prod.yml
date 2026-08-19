@@ -54,6 +54,7 @@ services:
       - ./knowledge:/app/knowledge           # SSOT (read-write: write_knowledge + git commit)
       - ./data/dlq:/app/data/dlq
       - ./data/quality:/app/data/quality
+      - ./data/tokens:/app/data/tokens       # токен-стор (TokenStore): переживает пересоздание контейнера
     env_file:
       - .env
     environment:
