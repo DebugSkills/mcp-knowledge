@@ -358,6 +358,15 @@ class TestNormalizeHelpersBranch:
         assert len(_normalize_domain_or_subject("a" * 150)) == 100
         assert len(_normalize_domain_or_subject("x" * 10, max_len=5)) == 5
 
+    def test_normalize_domain_slugifies_space(self):
+        """Регрессия: LLM-классификация вернула 'physical training' (с пробелом) —
+        domain/subject с пробелами персистят в Qdrant и feedback loop'ом закрепляются."""
+        from mcp_server.content.analyzer import _normalize_domain_or_subject
+
+        assert _normalize_domain_or_subject("Physical Training") == "physical-training"
+        assert _normalize_domain_or_subject("физическая культура") == "fizicheskaya-kultura"
+        assert _normalize_domain_or_subject("MCP/Client!!") == "mcp-client"
+
     def test_normalize_tag_list_non_list_returns_empty(self):
         from mcp_server.content.analyzer import _normalize_tag_list
 

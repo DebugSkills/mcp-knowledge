@@ -237,3 +237,34 @@ class TestPytestDeprecationWarningStrict:
         with warnings.catch_warnings():
             warnings.simplefilter("error", DeprecationWarning)
             await store.delete(entry.frontmatter.knowledge_id)
+
+
+class TestGenerateId:
+    """_generate_id: авто-ID для write_knowledge — класс ошибок паттерна ID."""
+
+    def _generate(self, domain, subject, content):
+        from mcp_server.storage.markdown_store import MarkdownStore
+        return MarkdownStore._generate_id(domain, subject, content)
+
+    def test_basic(self):
+        kid = self._generate("engineering", "python", "## Clean Code\ncontent")
+        assert kid == "engineering-python-clean-code"
+
+    def test_subject_with_space_slugified(self):
+        kid = self._generate("pedagogics", "physical training", "## Основы\ncontent")
+        assert " " not in kid
+        assert kid.startswith("pedagogics-physical-training-")
+
+    def test_max_length_127(self):
+        kid = self._generate("d" * 60, "s" * 60, "## " + "t" * 200 + "\ncontent")
+        assert len(kid) <= 127  # паттерн '^[a-z0-9][a-z0-9_-]{2,127}$'
+
+    def test_empty_domain_subject(self):
+        kid = self._generate("", "", "content without title")
+        assert kid.startswith("domain-subject-")
+        assert len(kid.split("-")[-1]) == 8  # fallback-хэш
+
+    def test_cyrillic_title_transliterated(self):
+        kid = self._generate("pedagogics", "physical training", "## Введение\ncontent")
+        assert " " not in kid
+        assert "vvedenie" in kid or "vvied" in kid

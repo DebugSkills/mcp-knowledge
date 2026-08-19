@@ -140,9 +140,14 @@ def make_knowledge_id(
     # иначе knowledge_id не пройдёт паттерн '^[a-z0-9][a-z0-9_-]{2,127}$'.
     d = slugify(domain, 40) or "domain"
     s = slugify(subject, 40) or "subject"
-    if content_hash:
-        return f"{d}-{s}-{title_slug}-{content_hash[:8]}"
-    return f"{d}-{s}-{title_slug}-{sequence_number:03d}"
+    suffix = content_hash[:8] if content_hash else f"{sequence_number:03d}"
+    result = f"{d}-{s}-{title_slug}-{suffix}"
+    if len(result) > 127:
+        # Паттерн допускает ≤127 символов: урезаем title_slug, сохраняя суффикс (уникальность)
+        budget = 127 - len(d) - len(s) - len(suffix) - 3  # 3 разделителя '-'
+        title_slug = title_slug[: max(budget, 0)]
+        result = f"{d}-{s}-{title_slug}-{suffix}"
+    return result
 
 
 def make_collection_id(
@@ -154,7 +159,12 @@ def make_collection_id(
     slug = slugify(title if title else "collection", 40)
     d = slugify(domain, 40) or "domain"
     s = slugify(subject, 40) or "subject"
-    return f"{d}-{s}-{slug}-collection"
+    result = f"{d}-{s}-{slug}-collection"
+    if len(result) > 127:
+        budget = 127 - len(d) - len(s) - len("-collection") - 2  # 2 разделителя '-'
+        slug = slug[: max(budget, 0)]
+        result = f"{d}-{s}-{slug}-collection"
+    return result
 
 
 def build_collection(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from mcp_server.content.linking import (
     ChildEntry,
     CollectionRoot,
@@ -10,6 +12,8 @@ from mcp_server.content.linking import (
     make_knowledge_id,
     slugify,
 )
+
+_KB_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{2,127}$")
 
 
 class TestSlugify:
@@ -99,6 +103,41 @@ class TestMakeCollectionId:
         cid = make_collection_id("", "", "Title")
         assert cid.startswith("domain-subject-")
         assert " " not in cid
+
+
+class TestKnowledgeIdPatternGuarantees:
+    """Стратегический контракт: ЛЮБОЙ сгенерированный ID проходит паттерн
+    '^[a-z0-9][a-z0-9_-]{2,127}$' (класс ошибок импорта 2026-08-19)."""
+
+    def test_max_length_knowledge_id(self):
+        kid = make_knowledge_id("d" * 40, "s" * 40, "t" * 40, 1, "abcdef12xyz")
+        assert len(kid) <= 127
+        assert _KB_ID_PATTERN.match(kid)
+        assert kid.endswith("abcdef12")  # суффикс-хэш сохранён
+
+    def test_max_length_knowledge_id_sequence(self):
+        kid = make_knowledge_id("d" * 40, "s" * 40, "t" * 40, 1)
+        assert len(kid) <= 127
+        assert _KB_ID_PATTERN.match(kid)
+        assert kid.endswith("001")  # sequence-суффикс сохранён
+
+    def test_max_length_collection_id(self):
+        cid = make_collection_id("d" * 40, "s" * 40, "t" * 40)
+        assert len(cid) <= 127
+        assert _KB_ID_PATTERN.match(cid)
+        assert cid.endswith("-collection")
+
+    def test_all_id_generators_match_pattern(self):
+        """Случайные комбинации входов (включая кириллицу/спецсимволы/пробелы)."""
+        cases = [
+            make_knowledge_id("eng", "physical training", "Основы", 1, "abc12345"),
+            make_knowledge_id("педагогика", "физкультура", "Алгоритм", 2),
+            make_collection_id("pedagogics", "physical training", "ПЕДАГОГИЧЕСКИ Й АЛГОРИТМ"),
+            make_collection_id("", "", ""),
+            make_knowledge_id("", "", "", 1, "a" * 40),
+        ]
+        for kid in cases:
+            assert _KB_ID_PATTERN.match(kid), f"ID не прошёл паттерн: {kid!r}"
 
 
 class TestBuildCollection:

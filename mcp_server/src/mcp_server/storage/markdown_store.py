@@ -300,12 +300,12 @@ class MarkdownStore:
         title_match = re.search(r"^##\s+(.+)$", content, re.MULTILINE)
         slug = ""
         if title_match:
-            slug = re.sub(r"[^a-z0-9]+", "-", title_match.group(1).lower().strip())[:40]
-            slug = slug.strip("-")
+            slug = slugify(title_match.group(1), 40)
         if not slug:
             slug = hashlib.sha256(content[:200].encode()).hexdigest()[:8]
 
-        return f"{slugify(domain, 40) or 'domain'}-{slugify(subject, 40) or 'subject'}-{slug}"[:128]
+        # Паттерн knowledge_id: '^[a-z0-9][a-z0-9_-]{2,127}$' — максимум 127 символов
+        return f"{slugify(domain, 40) or 'domain'}-{slugify(subject, 40) or 'subject'}-{slug}"[:127].rstrip("-")
 
     async def flush(self, message: str) -> None:
         """Публичный метод: git add && git commit с защитой от гонки."""

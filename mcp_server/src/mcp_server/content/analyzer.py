@@ -25,18 +25,21 @@ import httpx
 from ..config import settings as global_settings
 from ..storage.schema import ZONE_PRIVATE, collection_for_zone
 from .keywords import deduplicate_tags, extract_keywords
+from .linking import slugify
 
 logger = logging.getLogger("mcp_knowledge.content.analyzer")
 
 
 def _normalize_domain_or_subject(value: str, max_len: int = 100) -> str:
-    """Нормализовать domain/subject: strip, lowercase, обрезка до max_len."""
+    """Нормализовать domain/subject: slugify — strip/lower/транслит/пробелы→'-'.
+
+    Без slugify LLM-классификация возвращает "physical training" (с пробелом) →
+    domain/subject с пробелами персистят в Qdrant payload и feedback loop'ом
+    закрепляются (scroll_unique_values → LLM их предпочитает).
+    """
     if not isinstance(value, str):
         return ""
-    cleaned = value.strip().lower()
-    if len(cleaned) > max_len:
-        cleaned = cleaned[:max_len]
-    return cleaned
+    return slugify(value, max_len)
 
 
 def _normalize_tag_list(tags: object, max_tags: int = 10) -> list[str]:
