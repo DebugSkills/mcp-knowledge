@@ -27,7 +27,7 @@ COLLECTION_NAME = COLLECTION_PRIVATE
 
 from ..config import settings
 
-VECTOR_SIZE = settings.EMBEDDING_DIM  # 768 nomic-embed-text (был 1024 mxbai)
+VECTOR_SIZE = settings.EMBEDDING_DIM  # 1024 mxbai-embed-large (русская семантика); bge-m3 F16 отбракован (NaN)
 DISTANCE_METRIC = qmodels.Distance.COSINE
 
 # Payload-поля с индексами для фильтрации

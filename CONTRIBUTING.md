@@ -10,7 +10,7 @@
 
 `mcp-knowledge` — семантическая база знаний для AI-агентов по протоколу **MCP**
 (Model Context Protocol). Хранение: Markdown SSOT → chunk → Ollama embed
-(`nomic-embed-text`, 768d) → Qdrant vector search. **20 MCP Tools**, air-gap
+(`mxbai-embed-large`, 1024d) → Qdrant vector search. **20 MCP Tools**, air-gap
 совместимость, production-ready (health, rate-limit, blue-green reindex, quality system).
 
 ### Компоненты

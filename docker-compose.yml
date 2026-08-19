@@ -52,8 +52,11 @@ services:
     environment:
       - EMBEDDING_BACKEND=ollama
       - OLLAMA_URL=http://localhost:11434
-      # nomic-embed-text (8192 токенов) вместо mxbai (512) — учебники/книги не влазят в mxbai
-      - OLLAMA_MODEL=nomic-embed-text
+      # mxbai-embed-large: русская семантика OK (релевантное 0.70 vs нерелевантное 0.50-0.59),
+      # 1024-dim. Лимит ctx 512 токенов (~650 символов русского) → чанки ≤480c (CHUNK_MAX_TOKENS=120).
+      # bge-m3 (Ollama registry, F16) — NaN-баг на реальных текстах (500 "unsupported value: NaN"),
+      # nomic-embed-text — англоцентричный (коллапс русского: релевантное ≈ нерелевантное).
+      - OLLAMA_MODEL=mxbai-embed-large
       # EMBEDDING_MODEL — имя HF-токенизатора для chunker (не Ollama-модель!)
       - EMBEDDING_MODEL=BAAI/bge-m3
       # Контейнерный qdrant v1.13.4 (dev==prod), опубликован на хост 6333

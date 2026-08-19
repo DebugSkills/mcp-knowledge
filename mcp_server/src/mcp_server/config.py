@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     # Embedding
     EMBEDDING_BACKEND: str = "auto"  # auto | ollama | gpu | cpu
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
-    EMBEDDING_DIM: int = 768  # nomic-embed-text (был 1024 для mxbai) — зависимо от OLLAMA_MODEL
+    EMBEDDING_DIM: int = 1024  # mxbai-embed-large (русская семантика); bge-m3 F16 из Ollama — NaN-баг, отбракован
     MODELS_CACHE_DIR: str = "/app/models_cache"
     OLLAMA_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "mxbai-embed-large"
@@ -43,7 +43,10 @@ class Settings(BaseSettings):
     KNOWLEDGE_ROOT: str = "/app/knowledge"  # Псевдоним для MarkdownStore (тот же путь)
 
     # Chunking (#13, #20)
-    CHUNK_MAX_TOKENS: int = 512
+    # 120 токенов × ~4 симв/токен (fallback) ≈ 480 символов + заголовок секции ≤ ~540c.
+    # Лимит mxbai-embed-large = 512 токенов (~650 символов русского) — чанк обязан
+    # влезать БЕЗ обрезки, иначе Ollama 500/NaN. Был 512 (чанки до 2048c — не влезали).
+    CHUNK_MAX_TOKENS: int = 120
     CHUNK_OVERLAP: int = 80
 
     # Pipeline

@@ -1,12 +1,14 @@
 """Ollama embedder adapter — замена BGE-M3 для air-gap среды (4.3 дополнение).
 
 Использует локальный Ollama API вместо sentence-transformers:
-- mxbai-embed-large (1024-dim, 669 MB) — primary
-- nomic-embed-text (768-dim, 274 MB) — fallback
+- mxbai-embed-large (1024-dim, 669 MB) — primary (русская семантика OK)
+- nomic-embed-text (768-dim, 274 MB) — fallback (англоцентричный; для collection dim 1024
+  использовать НЕЛЬЗЯ — только если коллекции пересозданы под 768)
+- bge-m3 (1024-dim) — проверен 2026-08-19: сборка F16 из registry.ollama.ai даёт NaN
+  на реальных текстах ("json: unsupported value: NaN") — НЕ использовать.
 
 Преимущества:
 - Нет зависимостей torch/transformers (только httpx/requests)
-- 274 MB vs 3 GB disk
 - Air-gap: Ollama работает полностью офлайн
 - 1024-dim векторы совместимы с Qdrant (авто-ресайз при миграции)
 
@@ -29,6 +31,7 @@ FALLBACK_EMBED_MODEL: str = "nomic-embed-text"
 MODEL_DIMS: dict[str, int] = {
     "mxbai-embed-large": 1024,
     "nomic-embed-text": 768,
+    "bge-m3": 1024,
 }
 
 

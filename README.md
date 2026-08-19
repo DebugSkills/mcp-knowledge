@@ -12,7 +12,7 @@
 
 </div>
 
-Хранение: Markdown SSOT → chunk → Ollama embed (nomic-embed-text) → Qdrant vector search. **20 MCP Tools**, air-gap совместимость (одноархивный deploy-bundle), production-ready (health, rate-limit, blue-green reindex, quality system). Веб-консоль **kb-console** (NiceGUI, :8085) для диагностики и обслуживания. Подключение AI-агентов (Kilo/Claude/Cline) — через **stdio-мост** (`mcp-stdio/bridge.py`, см. `docs/mcp-client-guide.md`). MCP-протокол: JSON-RPC 2.0 over HTTP (`POST /mcp`), `ping` → `{"result":{}}`, `notifications/initialized` → 204 (Фаза 13.21).
+Хранение: Markdown SSOT → chunk → Ollama embed (mxbai-embed-large, русская семантика) → Qdrant vector search. **20 MCP Tools**, air-gap совместимость (одноархивный deploy-bundle), production-ready (health, rate-limit, blue-green reindex, quality system). Веб-консоль **kb-console** (NiceGUI, :8085) для диагностики и обслуживания. Подключение AI-агентов (Kilo/Claude/Cline) — через **stdio-мост** (`mcp-stdio/bridge.py`, см. `docs/mcp-client-guide.md`). MCP-протокол: JSON-RPC 2.0 over HTTP (`POST /mcp`), `ping` → `{"result":{}}`, `notifications/initialized` → 204 (Фаза 13.21).
 
 ## 💎 Почему это ценно для сообщества
 
@@ -50,7 +50,7 @@ mcp-stdio/bridge.py │    │  диаг. :8085 → :8000
 ├────────────────────────────────────────────────────┤
 │  Pipeline: chunk → embed → upsert (async worker)   │
 │  Qdrant (vector DB, REST 6333 / gRPC 6334)         │
-│  Ollama (nomic-embed-text 768d, системный сервис)   │
+│  Ollama (mxbai-embed-large 1024d, русская семантика)  │
 ├────────────────────────────────────────────────────┤
 │  Quality System (Фаза 4)                           │
 │  gates scoring scanner lifecycle dup-gate issues   │
