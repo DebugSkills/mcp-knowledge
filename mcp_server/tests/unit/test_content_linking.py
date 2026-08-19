@@ -60,6 +60,22 @@ class TestMakeKnowledgeId:
         assert kid.startswith("eng-py-")
         assert "funktsii" in kid or "funkc" in kid
 
+    def test_subject_with_space_slugified(self):
+        """Регрессия: subject с пробелом (авто-классификация) ломал knowledge_id
+        (паттерн '^[a-z0-9][a-z0-9_-]{2,127}$')."""
+        kid = make_knowledge_id(
+            "pedagogics", "physical training", "Основы", 1, "abc12345xyz"
+        )
+        assert " " not in kid
+        assert kid.startswith("pedagogics-physical-training-osnovy-")
+        assert kid == "pedagogics-physical-training-osnovy-abc12345"
+
+    def test_subject_cyrillic_slugified(self):
+        kid = make_knowledge_id("pedagogics", "физическая культура", "Введение", 1)
+        assert " " not in kid
+        assert kid.startswith("pedagogics-fizicheskaya-kultura-")
+        assert len(kid.split("-")[-1]) == 3
+
 
 class TestMakeCollectionId:
     """Генерация knowledge_id для root-коллекции."""
@@ -71,6 +87,18 @@ class TestMakeCollectionId:
     def test_cyrillic(self):
         cid = make_collection_id("eng", "py", "Чистый код")
         assert cid.endswith("-collection")
+
+    def test_subject_with_space_slugified(self):
+        """Регрессия: subject 'physical training' → 'physical-training'."""
+        cid = make_collection_id("pedagogics", "physical training", "ПЕДАГОГИЧЕСКИ Й АЛГОРИТМ")
+        assert " " not in cid
+        assert cid.startswith("pedagogics-physical-training-")
+        assert cid.endswith("-collection")
+
+    def test_empty_domain_subject_fallback(self):
+        cid = make_collection_id("", "", "Title")
+        assert cid.startswith("domain-subject-")
+        assert " " not in cid
 
 
 class TestBuildCollection:

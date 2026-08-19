@@ -26,6 +26,7 @@ import git
 import yaml
 
 from ..config import settings
+from ..content.linking import slugify
 from ..models import (
     KnowledgeEntry,
     KnowledgeFrontmatter,
@@ -304,7 +305,7 @@ class MarkdownStore:
         if not slug:
             slug = hashlib.sha256(content[:200].encode()).hexdigest()[:8]
 
-        return f"{domain}-{subject}-{slug}"[:128]
+        return f"{slugify(domain, 40) or 'domain'}-{slugify(subject, 40) or 'subject'}-{slug}"[:128]
 
     async def flush(self, message: str) -> None:
         """Публичный метод: git add && git commit с защитой от гонки."""

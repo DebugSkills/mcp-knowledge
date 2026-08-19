@@ -135,9 +135,14 @@ def make_knowledge_id(
         content_hash: опциональный хеш для уникальности (8 hex chars)
     """
     title_slug = slugify(title if title else "section", 40)
+    # domain/subject тоже слагфицируются: subject может прийти с пробелом/кириллицей
+    # от авто-классификации (напр. "physical training" → "physical-training"),
+    # иначе knowledge_id не пройдёт паттерн '^[a-z0-9][a-z0-9_-]{2,127}$'.
+    d = slugify(domain, 40) or "domain"
+    s = slugify(subject, 40) or "subject"
     if content_hash:
-        return f"{domain}-{subject}-{title_slug}-{content_hash[:8]}"
-    return f"{domain}-{subject}-{title_slug}-{sequence_number:03d}"
+        return f"{d}-{s}-{title_slug}-{content_hash[:8]}"
+    return f"{d}-{s}-{title_slug}-{sequence_number:03d}"
 
 
 def make_collection_id(
@@ -147,7 +152,9 @@ def make_collection_id(
 ) -> str:
     """Сгенерировать knowledge_id для root-коллекции."""
     slug = slugify(title if title else "collection", 40)
-    return f"{domain}-{subject}-{slug}-collection"
+    d = slugify(domain, 40) or "domain"
+    s = slugify(subject, 40) or "subject"
+    return f"{d}-{s}-{slug}-collection"
 
 
 def build_collection(
