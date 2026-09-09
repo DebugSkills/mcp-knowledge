@@ -52,3 +52,9 @@ plans
 
 # Ansible vault (секреты; пример — vault.yml.example)
 ansible/inventory/group_vars/all/vault.yml
+
+# Внутренние контентные материалы (НЕ для публичной репы)
+docs/mcp-perspektivy-slide.md
+docs/mcp-perspektivy-slide.pdf
+docs/pedagogicheskiy-algoritm-nauchnogo-issledovaniya-ksa.md
+docs/pedagogicheskiy-algoritm-nauchnogo-issledovaniya-ksa.pdf
