@@ -29,7 +29,12 @@ os.environ.setdefault("DLQ_DIR", "/tmp/test-e2e-dlq")
 
 E2E_COLLECTION = "knowledge_e2e"
 QDRANT_REST_URL = "http://localhost:6333"
-OLLAMA_BASE_URL = "http://localhost:11434"
+# Ollama-КОНТЕЙНЕР проекта (bridge 127.0.0.1:11435), НЕ host-ollama (11434 —
+# чужие проекты; после миграции моделей проекта на host нет). setdefault:
+# (1) env-параметризация для запуска против другого инстанса,
+# (2) инжект OLLAMA_URL в env ДО импортов mcp_server (см. блок ниже) —
+#     тестируемый settings видит тот же URL, что и e2e-фикстуры.
+OLLAMA_BASE_URL = os.environ.setdefault("OLLAMA_URL", "http://localhost:11435")
 # Текущий embedder проекта (миграция на mxbai-embed-large, 2026-08-19):
 # mxbai-embed-large (1024-dim, русская семантика OK; ctx 512 токенов → чанки ≤480c).
 # bge-m3 (Ollama F16) отбракован: NaN на реальных текстах.
@@ -102,7 +107,7 @@ def _e2e_services_available():
         if not any(m.startswith(OLLAMA_MODEL) for m in models):
             pytest.skip(f"E2E requires Ollama model '{OLLAMA_MODEL}'")
     except Exception:
-        pytest.skip("E2E requires Ollama at localhost:11434")
+        pytest.skip(f"E2E requires Ollama at {OLLAMA_BASE_URL}")
 
 
 @pytest.fixture(scope="session")

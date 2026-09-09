@@ -1,0 +1,65 @@
+---
+# Установка nvidia-container-toolkit из официального репозитория NVIDIA.
+
+- name: Проба драйвера NVIDIA перед установкой toolkit
+  ansible.builtin.command:
+    cmd: nvidia-smi
+  register: mcp_kb_host_prepare__nvidia_smi_now
+  changed_when: false
+  failed_when: false
+
+# Warn-only: toolkit ставится и без драйвера, но GPU в контейнерах
+# заработает только после установки/загрузки драйвера. (без ignore_errors — правило lint)
+- name: Предупредить, если драйвер NVIDIA не работает (не блокируя установку)
+  ansible.builtin.debug:
+    msg: "{{ 'Драйвер NVIDIA работает' if mcp_kb_host_prepare__nvidia_smi_now.rc == 0 else mcp_kb_host_prepare__driver_warn }}"
+  vars:
+    mcp_kb_host_prepare__driver_warn: >-
+      ВНИМАНИЕ: nvidia-smi не отвечает. nvidia-container-toolkit будет установлен,
+      но GPU в контейнерах не заработает, пока не установлен/не загружен драйвер.
+
+- name: Создать каталог /etc/apt/keyrings
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+# ВАЖНО: ключ кладётся как есть, БЕЗ gpg --dearmor. Опыт переноса показал:
+# dearmor-путь приводил к NO_PUBKEY DDCAE044F796ECB0 (битый keyring после
+# ручного gpg). apt >= 2.4 (Debian 12) принимает ключ напрямую.
+- name: Скачать GPG-ключ NVIDIA в keyrings (как есть, без dearmor)
+  ansible.builtin.get_url:
+    url: "{{ mcp_kb_host_prepare__nvidia_gpg_url }}"
+    dest: /etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg
+    mode: '0644'
+
+- name: Скачать файл репозитория nvidia-container-toolkit
+  ansible.builtin.get_url:
+    url: "{{ mcp_kb_host_prepare__nvidia_repo_url }}"
+    dest: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    mode: '0644'
+
+# ВАЖНО: ansible_architecture возвращает x86_64, а apt ожидает amd64 —
+# единственный надёжный источник: dpkg --print-architecture.
+- name: Определить архитектуру пакета (dpkg --print-architecture)
+  ansible.builtin.command:
+    cmd: dpkg --print-architecture
+  register: mcp_kb_host_prepare__dpkg_arch
+  changed_when: false
+
+- name: Подставить реальную архитектуру в nvidia-container-toolkit.list
+  ansible.builtin.replace:
+    path: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    regexp: '\$\(ARCH\)'
+    replace: '{{ mcp_kb_host_prepare__dpkg_arch.stdout }}'
+  register: mcp_kb_host_prepare__toolkit_list_arch
+
+- name: Обновить кеш apt после добавления репозитория NVIDIA
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: "{{ 0 if mcp_kb_host_prepare__toolkit_list_arch is changed else 3600 }}"
+
+- name: Установить nvidia-container-toolkit
+  ansible.builtin.apt:
+    name: nvidia-container-toolkit
+    state: present

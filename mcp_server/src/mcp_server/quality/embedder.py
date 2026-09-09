@@ -12,7 +12,7 @@
 - Air-gap: Ollama работает полностью офлайн
 - 1024-dim векторы совместимы с Qdrant (авто-ресайз при миграции)
 
-API: POST http://localhost:11434/api/embed
+API: POST http://localhost:11435/api/embed (ollama-контейнер compose)
 """
 
 from __future__ import annotations
@@ -23,7 +23,9 @@ logger = logging.getLogger("mcp_knowledge.quality.embedder")
 
 # ── Конфигурация ─────────────────────────────────────────────
 
-OLLAMA_BASE_URL: str = "http://localhost:11434"
+# ollama-контейнер проекта (bridge 127.0.0.1:11435); 11434 — host-ollama других
+# проектов. Защита standalone-запуска сканера от случайного попадания на host.
+OLLAMA_BASE_URL: str = "http://localhost:11435"
 DEFAULT_EMBED_MODEL: str = "mxbai-embed-large"
 FALLBACK_EMBED_MODEL: str = "nomic-embed-text"
 

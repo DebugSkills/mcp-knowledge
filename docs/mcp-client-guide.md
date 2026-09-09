@@ -523,7 +523,7 @@ grep MCP_WRITE_KEYS .env
 
 Проверьте логи сервера: `docker compose logs mcp-server --tail 50`. Возможные причины:
 - Qdrant не отвечает → `docker compose ps qdrant`
-- Embedder не загрузился → проверьте Ollama: `curl http://localhost:11434/api/tags`
+- Embedder не загрузился → проверьте ollama-контейнер: `docker compose ps ollama`, `curl http://localhost:11435/api/tags`
 - Pipeline worker упал → перезапустите сервер: `docker compose restart mcp-server`
 
 ### 9.5 Пустой tools list

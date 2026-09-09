@@ -1,0 +1,15 @@
+---
+# HTTP-proxy для демона docker (dockerd тянет образы через прокси).
+# Выполняется только если mcp_kb_host_prepare__proxy не пуст.
+
+- name: Настроить proxy для сервиса docker (drop-in systemd)
+  ansible.builtin.template:
+    src: http-proxy.conf.j2
+    dest: /etc/systemd/system/docker.service.d/http-proxy.conf
+    mode: '0644'
+  notify: Перезапустить docker
+
+- name: Перечитать unit-файлы systemd (daemon-reload)
+  ansible.builtin.systemd:
+    daemon_reload: true
+  changed_when: false

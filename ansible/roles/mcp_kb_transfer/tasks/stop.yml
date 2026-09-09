@@ -1,0 +1,11 @@
+---
+# Этап stop: СТАРЫЙ хост (mcp_kb_old). Окно cutover.
+# Останавливает compose-стек, после чего данные больше не меняются —
+# можно выполнять финальный rsync (этап cutover на новом хосте).
+
+- name: Остановить compose на старом хосте
+  ansible.builtin.command:
+    cmd: docker compose -f {{ mcp_kb_transfer__compose_file }} stop
+    chdir: "{{ mcp_kb_transfer__old_root }}/{{ mcp_kb_transfer__repo_name }}"
+  register: stop_result
+  changed_when: stop_result.stdout | length > 0

@@ -1,0 +1,10 @@
+---
+- name: Упаковать стек на старом хосте (docker save)
+  hosts: mcp_kb_old
+  gather_facts: false
+  become: true
+  roles:
+    - role: mcp_kb_transfer
+      tags: [transfer]
+      vars:
+        mcp_kb_transfer__stage: pack

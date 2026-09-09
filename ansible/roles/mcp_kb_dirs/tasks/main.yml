@@ -1,6 +1,7 @@
 ---
 # Role: mcp_kb_dirs
-# Назначение: создание структуры каталогов /opt/mcp-knowledge/ + bare-remote
+# Назначение: создание структуры каталогов deploy_root + bare-remote
+# Корень — {{ deploy_root }} из inventory/group_vars/all.yml (по умолчанию /opt/mcp-knowledge).
 
 - name: Создать рабочую директорию
   ansible.builtin.file:
@@ -10,14 +11,20 @@
     group: "1000"
     mode: '0755'
   loop:
-    - /opt/mcp-knowledge/data/qdrant/snapshots
-    - /opt/mcp-knowledge/data/dlq
-    - /opt/mcp-knowledge/data/quality
-    - /opt/mcp-knowledge/data/backups
-    - /opt/mcp-knowledge/models_cache
-    - /opt/mcp-knowledge/scripts
+    - "{{ deploy_root }}/data/qdrant/snapshots"
+    - "{{ deploy_root }}/data/dlq"
+    - "{{ deploy_root }}/data/quality"
+    - "{{ deploy_root }}/data/backups"
+    - "{{ deploy_root }}/data/ollama/models"
+    - "{{ deploy_root }}/data/tokens"
+    - "{{ deploy_root }}/data/pdf_cache"
+    - "{{ deploy_root }}/data/logs"
+    - "{{ deploy_root }}/models_cache"
+    - "{{ deploy_root }}/scripts"
 
-- name: Создать bare-репозиторий для бэкапа SSOT
+# noqa обоснование: ansible.builtin.git не умеет создавать пустой bare-репозиторий
+# (только clone), поэтому git init --bare через command с creates=-гардом идемпотентности
+- name: Создать bare-репозиторий для бэкапа SSOT  # noqa: command-instead-of-module
   ansible.builtin.command:
-    cmd: git init --bare /opt/mcp-knowledge-bare/knowledge.git
-    creates: /opt/mcp-knowledge-bare/knowledge.git/HEAD
+    cmd: git init --bare {{ deploy_root }}-bare/knowledge.git
+    creates: "{{ deploy_root }}-bare/knowledge.git/HEAD"

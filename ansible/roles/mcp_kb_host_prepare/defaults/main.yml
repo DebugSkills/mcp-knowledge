@@ -1,0 +1,31 @@
+---
+# Role: mcp_kb_host_prepare — defaults
+# Все переменные роли имеют префикс mcp_kb_host_prepare__
+
+mcp_kb_host_prepare__install_docker: true
+
+mcp_kb_host_prepare__docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+mcp_kb_host_prepare__install_nvidia_driver: true
+mcp_kb_host_prepare__nvidia_driver_package: nvidia-driver
+mcp_kb_host_prepare__nvidia_reboot: true      # reboot после установки драйвера
+
+# deb822-файл источников APT (Debian 12): один путь для stat и replace в nvidia_driver.yml
+mcp_kb_host_prepare__debian_sources_path: /etc/apt/sources.list.d/debian.sources
+
+mcp_kb_host_prepare__install_nvidia_toolkit: true
+
+mcp_kb_host_prepare__nvidia_gpg_url: https://nvidia.github.io/libnvidia-container/gpgkey
+mcp_kb_host_prepare__nvidia_repo_url: https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list
+
+mcp_kb_host_prepare__docker_gpg_url: https://download.docker.com/linux/debian/gpg
+mcp_kb_host_prepare__docker_repo: deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable
+
+# Прокси наследуется из group_vars/all.yml (docker_proxy/docker_no_proxy)
+mcp_kb_host_prepare__proxy: "{{ docker_proxy | default('') }}"
+mcp_kb_host_prepare__no_proxy: "{{ docker_no_proxy | default('localhost,127.0.0.1,::1') }}"

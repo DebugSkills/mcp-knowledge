@@ -1,0 +1,48 @@
+---
+# Этап pack: СТАРЫЙ хост (mcp_kb_old).
+# Сохраняет docker-образы в tar + манифесты (образы/модели ollama) в staging
+# для последующего переноса этапом bulk на новый хост. Idempotent (creates).
+
+- name: Создать staging каталог
+  ansible.builtin.file:
+    path: "{{ mcp_kb_transfer__staging }}"
+    state: directory
+    mode: '0755'
+
+- name: Сохранить образы в tar (docker save)
+  ansible.builtin.command:
+    cmd: docker save {{ mcp_kb_transfer__images | join(' ') }} -o {{ mcp_kb_transfer__staging }}/images.tar
+    chdir: "{{ mcp_kb_transfer__old_root }}/{{ mcp_kb_transfer__repo_name }}"
+    creates: "{{ mcp_kb_transfer__staging }}/images.tar"
+
+# shell, а не command: нужна переадресация '>' в файл
+- name: Посчитать sha256 образа
+  ansible.builtin.shell: sha256sum {{ mcp_kb_transfer__staging }}/images.tar > {{ mcp_kb_transfer__staging }}/images.tar.sha256
+  args:
+    creates: "{{ mcp_kb_transfer__staging }}/images.tar.sha256"
+
+# shell: переадресация '>' в файл; changed_when: false — это только снимок
+- name: Манифест docker images
+  ansible.builtin.shell: docker images --format 'table {{ "{{.Repository}}:{{.Tag}}" }}\t{{ "{{.Size}}" }}' > {{ mcp_kb_transfer__staging }}/manifest-images.txt
+  args:
+    creates: "{{ mcp_kb_transfer__staging }}/manifest-images.txt"
+  changed_when: false
+
+# shell: переадресация + подавление stderr; best-effort (ollama может быть не запущен)
+- name: Манифест ollama моделей
+  ansible.builtin.shell: docker compose exec -T ollama ollama list > {{ mcp_kb_transfer__staging }}/manifest-ollama.txt 2>/dev/null
+  args:
+    chdir: "{{ mcp_kb_transfer__old_root }}/{{ mcp_kb_transfer__repo_name }}"
+    creates: "{{ mcp_kb_transfer__staging }}/manifest-ollama.txt"
+  changed_when: false
+  failed_when: false
+
+- name: Показать размер staging
+  ansible.builtin.command:
+    cmd: du -sh {{ mcp_kb_transfer__staging }}
+  changed_when: false
+  register: staging_size
+
+- name: Вывести размер
+  ansible.builtin.debug:
+    var: staging_size.stdout

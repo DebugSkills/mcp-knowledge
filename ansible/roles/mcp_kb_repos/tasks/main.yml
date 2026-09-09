@@ -1,27 +1,30 @@
 ---
 # Role: mcp_kb_repos
 # Назначение: клонирование двух git-репозиториев (mcp-knowledge + knowledge)
+# Корень — {{ deploy_root }} из inventory/group_vars/all.yml (по умолчанию /opt/mcp-knowledge).
 
 - name: Клонировать репо кода (mcp-knowledge)
   ansible.builtin.git:
-    repo: "{{ mcp_knowledge_repo_url }}"
-    dest: /opt/mcp-knowledge/mcp-knowledge
-    version: main
-    update: yes
+    repo: "{{ mcp_kb_repos__mcp_knowledge_repo_url }}"
+    dest: "{{ deploy_root }}/mcp-knowledge"
+    version: "{{ mcp_kb_repos__version }}"
+    update: "{{ mcp_kb_repos__update }}"
 
 - name: Клонировать репо знаний (knowledge)
   ansible.builtin.git:
-    repo: "{{ knowledge_repo_url }}"
-    dest: /opt/mcp-knowledge/knowledge
-    version: main
-    update: yes
+    repo: "{{ mcp_kb_repos__knowledge_repo_url }}"
+    dest: "{{ deploy_root }}/knowledge"
+    version: "{{ mcp_kb_repos__version }}"
+    update: "{{ mcp_kb_repos__update }}"
 
-- name: Добавить backup remote в knowledge
+# noqa обоснование: ansible.builtin.git не управляет remote-секциями репозитория
+- name: Добавить backup remote в knowledge  # noqa: command-instead-of-module
   ansible.builtin.command:
-    cmd: git remote add backup /opt/mcp-knowledge-bare/knowledge.git
-    chdir: /opt/mcp-knowledge/knowledge
+    cmd: git remote add backup {{ deploy_root }}-bare/knowledge.git
+    chdir: "{{ deploy_root }}/knowledge"
   register: remote_result
-  failed_when: 
-    - remote_result.rc != 0
-    - "'already exists' not in remote_result.stderr"
+  # success = remote добавлен (rc==0) ИЛИ уже существует ('already exists' в stderr).
+  # ВАЖНО: one-liner с 'and', не список — список в failed_when трактуется как OR
+  # и валидировал задачу как failed при любом исходе.
+  failed_when: remote_result.rc != 0 and 'already exists' not in remote_result.stderr
   changed_when: remote_result.rc == 0

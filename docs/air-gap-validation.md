@@ -28,9 +28,9 @@ cd staging
 ./scripts/offline-deploy.sh import --src /path/to/markdown_dir
 ```
 
-Требования на изолированном хосте: **Docker** (сеть не нужна — образы из архива) и **Ollama** (системный сервис; модели доставляются в bundle и размещаются автоматически). Python не требуется — всё работает в контейнерах.
+Требования на изолированном хосте: **Docker** (сеть не нужна — образы из архива) и **GPU-драйвер NVIDIA** (ollama работает контейнером compose на GPU хоста; модели доставляются в bundle и размещаются в volume `./data/ollama/models`). Python не требуется — всё работает в контейнерах.
 
-Топология: qdrant — контейнер из compose (6333 REST / 6334 gRPC), mcp-server — контейнер с `network_mode: host` (видит Ollama на `localhost:11434` и qdrant на `localhost:6333`), Ollama — системный сервис хоста. E2E-тесты изолированы от прод-данных (коллекция `knowledge_e2e` создаётся и удаляется).
+Топология: qdrant — контейнер из compose (6333 REST / 6334 gRPC), ollama — контейнер из compose (bridge, публикует `127.0.0.1:11435`; host-ollama на 11434 — другие проекты), mcp-server — контейнер с `network_mode: host` (видит ollama на `localhost:11435` и qdrant на `localhost:6333`). E2E-тесты изолированы от прод-данных (коллекция `knowledge_e2e` создаётся и удаляется).
 
 > ⚠️ При первом deploy в `.env` попадают ключи-заглушки — **замените** `MCP_READ_KEYS` / `MCP_WRITE_KEYS` / `MCP_API_KEY`.
 

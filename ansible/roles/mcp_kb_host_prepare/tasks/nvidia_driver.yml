@@ -1,0 +1,48 @@
+---
+# Установка проприетарного драйвера NVIDIA из репозитория Debian (non-free).
+# Весь файл выполняется только если nvidia-smi не работает (драйвер отсутствует).
+
+- name: Проверить наличие deb822-файла источников (stat)
+  ansible.builtin.stat:
+    path: "{{ mcp_kb_host_prepare__debian_sources_path }}"
+  register: mcp_kb_host_prepare__debian_sources_stat
+
+# Debian 12 по умолчанию использует deb822 (debian.sources). Полная замена строки
+# Components идемпотентна: повторная подстановка даёт идентичный текст → changed=0.
+# Путь единый со stat выше — через mcp_kb_host_prepare__debian_sources_path.
+- name: Включить main contrib non-free non-free-firmware в debian.sources (deb822)
+  ansible.builtin.replace:
+    path: "{{ mcp_kb_host_prepare__debian_sources_path }}"
+    regexp: '(?m)^Components:.*$'
+    replace: 'Components: main contrib non-free non-free-firmware'
+  when: mcp_kb_host_prepare__debian_sources_stat.stat.exists
+  register: mcp_kb_host_prepare__sources_deb822
+
+# Fallback для хостов со старым форматом sources.list (без debian.sources).
+- name: Добавить non-free репозиторий (fallback для классического sources.list)
+  ansible.builtin.apt_repository:
+    repo: deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+    state: present
+    filename: mcp-kb-nonfree
+  when: not mcp_kb_host_prepare__debian_sources_stat.stat.exists
+  register: mcp_kb_host_prepare__sources_legacy
+
+- name: Обновить кеш apt после включения non-free
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: "{{ 0 if (mcp_kb_host_prepare__sources_deb822 is changed or mcp_kb_host_prepare__sources_legacy is changed) else 3600 }}"
+
+- name: Установить драйвер NVIDIA и прошивки
+  ansible.builtin.apt:
+    name:
+      - "{{ mcp_kb_host_prepare__nvidia_driver_package }}"
+      - firmware-misc-nonfree
+    state: present
+  register: mcp_kb_host_prepare__driver_install
+
+- name: Перезагрузить хост после установки драйвера
+  ansible.builtin.reboot:
+    reboot_timeout: 600
+  when:
+    - mcp_kb_host_prepare__nvidia_reboot
+    - mcp_kb_host_prepare__driver_install is changed

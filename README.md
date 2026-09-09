@@ -69,11 +69,11 @@ mcp-stdio/bridge.py │    │  диаг. :8085 → :8000
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e mcp_server/ && pip install -e kb-console/   # kb-console для E2E S20
 
-# Запуск (dev: host-network, хостовые Qdrant+Ollama)
+# Запуск (dev: mcp-server host-network; Qdrant и Ollama — контейнеры compose)
 cp .env.example .env && docker compose up -d mcp-server
 docker compose up -d kb-console      # → http://localhost:8085
 
-# Тесты (нужны запущенные Qdrant :6333 и Ollama :11434)
+# Тесты (нужны запущенные Qdrant :6333 и Ollama :11435 — ollama-контейнер)
 make e2e-slow                        # E2E S1-S20 (32 + S20 4/4)
 .venv/bin/python -m pytest mcp_server/tests -q   # полный suite (629)
 make console-test                    # unit + smoke kb-console (66)
@@ -162,7 +162,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | Переменная | Default | Описание |
 |-----------|---------|----------|
 | `EMBEDDING_BACKEND` | `ollama` | Прод-эмбеддер (Ollama, без torch) |
-| `OLLAMA_URL` / `OLLAMA_MODEL` | `http://localhost:11434` / `mxbai-embed-large` | Эмбеддер |
+| `OLLAMA_URL` / `OLLAMA_MODEL` | `http://localhost:11435` / `mxbai-embed-large` | Эмбеддер (ollama-контейнер; 11434 — host-ollama других проектов) |
 | `EMBEDDING_MODEL` | `BAAI/bge-m3` | HF-токенизатор chunker (НЕ Ollama-модель; fallback без transformers) |
 | `QDRANT_URL` / `QDRANT_PREFER_GRPC` | `http://localhost:6333` / `true` | Qdrant (REST; gRPC при контейнерной сети) |
 | `KNOWLEDGE_DIR` | `knowledge/` | Markdown SSOT |
@@ -170,7 +170,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | `MCP_IMPORT_KEYS` | `[]` | Import-ключи (read + import_content, без delete/reindex) |
 | `MCP_API_KEY` | — | Ключ kb-console (должен входить в read/import/write keys) |
 | `MCP_SERVER_URL` / `CONSOLE_PORT` | `http://localhost:8000` / `8085` | kb-console: адрес сервера / порт UI |
-| `OLLAMA_CHAT_MODEL` | `qwen2.5:7b` | LLM для analyze_content (рекомендации) |
+| `OLLAMA_CHAT_MODEL` | `qwen2.5:7b` | LLM для analyze_content (ollama-контейнер; текстовая — VL не влезает в 8GB на 0.20.2) |
 | `ANALYZE_FRAGMENT_CHARS` / `ANALYZE_TIMEOUT` | `8000` / `60s` | Лимиты анализа контента |
 | `RATE_LIMIT_READ_PER_MIN` / `RATE_LIMIT_WRITE_PER_MIN` | `100` / `20` | Rate-limit (429) |
 | `REVIEW_THRESHOLD` | 0.45 | Порог для review-очереди |

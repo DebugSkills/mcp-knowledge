@@ -1,24 +1,24 @@
 ---
 # Role: mcp_kb_docker
-# Назначение: docker compose up + health-check
+# Назначение: docker compose up + health-check (mcp-server, qdrant, ollama)
 
 - name: Копировать .env из шаблона
   ansible.builtin.template:
-    src: .env.j2
-    dest: /opt/mcp-knowledge/mcp-knowledge/.env
+    src: "{{ playbook_dir | dirname }}/templates/.env.j2"
+    dest: "{{ deploy_root }}/{{ repo_name }}/.env"
     mode: '0600'
 
 - name: Запустить docker compose
   ansible.builtin.command:
-    cmd: docker compose up -d --wait
-    chdir: /opt/mcp-knowledge/mcp-knowledge
+    cmd: docker compose -f {{ compose_file }} up -d --wait
+    chdir: "{{ deploy_root }}/{{ repo_name }}"
   register: compose_result
   changed_when: "'Running' in compose_result.stdout or 'Starting' in compose_result.stdout"
 
 - name: Проверить health mcp-server
   ansible.builtin.uri:
     url: http://localhost:8000/health
-    return_content: yes
+    return_content: true
   register: health_result
   until: health_result.status == 200
   retries: 10
@@ -27,8 +27,17 @@
 - name: Проверить health Qdrant
   ansible.builtin.uri:
     url: http://localhost:6333/healthz
-    return_content: yes
+    return_content: true
   register: qdrant_health
   until: qdrant_health.status == 200
+  retries: 10
+  delay: 5
+
+- name: Проверить health Ollama
+  ansible.builtin.uri:
+    url: http://localhost:11435/api/tags
+    return_content: true
+  register: ollama_health
+  until: ollama_health.status == 200
   retries: 10
   delay: 5

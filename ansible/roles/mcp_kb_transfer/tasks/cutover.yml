@@ -1,0 +1,115 @@
+---
+# Этап cutover: НОВЫЙ хост (mcp_kb_new). ВЫПОЛНЯЕТСЯ ПОСЛЕ stop на old.
+# Финальный rsync С --delete (данные на old заморожены) + запуск стека + health-гейты.
+#
+# ПАТТЕРН SYNCHRONIZE old→new: как в bulk.yml —
+# rsync на OLD через delegate_to + mode: push, dest = хост play (NEW).
+
+- name: Проверить наличие группы mcp_kb_old в inventory
+  ansible.builtin.assert:
+    that:
+      - groups['mcp_kb_old'] is defined
+      - groups['mcp_kb_old'] | length > 0
+    fail_msg: "inventory должен содержать группу mcp_kb_old (старый хост): synchronize пушит old → new"
+
+# ОДИН проход rsync со всеми exclude (см. комментарий в bulk.yml)
+- name: Финальный rsync с --delete
+  ansible.posix.synchronize:
+    src: "{{ mcp_kb_transfer__old_root }}/"
+    dest: "{{ mcp_kb_transfer__new_root }}/"
+    mode: push
+    delete: true
+    rsync_opts: "{{ mcp_kb_transfer__excludes | map('regex_replace', '^', '--exclude=') | list }}"
+  delegate_to: "{{ groups['mcp_kb_old'][0] }}"
+
+- name: Запустить compose
+  ansible.builtin.command:
+    cmd: docker compose -f {{ mcp_kb_transfer__compose_file }} up -d --wait
+    chdir: "{{ mcp_kb_transfer__new_root }}/{{ mcp_kb_transfer__repo_name }}"
+  register: up_result
+  changed_when: "'Started' in up_result.stdout or 'Running' in up_result.stdout or 'Creating' in up_result.stdout"
+
+- name: Health mcp-server live
+  ansible.builtin.uri:
+    url: http://localhost:8000/health/live
+  register: h1
+  until: h1.status == 200
+  retries: 15
+  delay: 5
+
+- name: Health mcp-server полный
+  ansible.builtin.uri:
+    url: http://localhost:8000/health
+  register: h2
+  until: h2.status == 200
+  retries: 10
+  delay: 5
+
+- name: Health qdrant
+  ansible.builtin.uri:
+    url: http://localhost:6333/healthz
+  register: h3
+  until: h3.status == 200
+  retries: 10
+  delay: 5
+
+- name: Ollama модели (assert mxbai + qwen2.5)
+  ansible.builtin.uri:
+    url: http://localhost:11435/api/tags
+    return_content: true
+  register: h4
+  until: h4.status == 200
+  retries: 10
+  delay: 5
+
+- name: Assert наличие моделей в ollama
+  ansible.builtin.assert:
+    that:
+      - "'mxbai-embed-large' in h4.content"
+      - "'qwen2.5:7b' in h4.content"
+    fail_msg: "Модели mxbai-embed-large/qwen2.5:7b не найдены в ollama-контейнере"
+
+- name: Health kb-console
+  ansible.builtin.uri:
+    url: http://localhost:8085/
+  register: h5
+  until: h5.status == 200
+  retries: 10
+  delay: 5
+
+# Строка 'inference compute id=GPU' появляется в логе ollama ТОЛЬКО при загрузке
+# модели в память (первый inference). На свежеподнятом стеке её может ещё не быть →
+# сначала warm-up embed-запрос, который гарантированно заставляет ollama загрузить
+# модель и записать строку с фактическим устройством (GPU/CPU).
+- name: Warm-up embed (загрузить модель на GPU)
+  ansible.builtin.uri:
+    url: http://localhost:11435/api/embed
+    method: POST
+    body_format: json
+    body: '{"model": "mxbai-embed-large", "input": ["warmup"]}'
+  register: warmup
+  until: warmup.status == 200
+  retries: 10
+  delay: 3
+
+- name: Пауза 3с — ollama пишет строку загрузки модели асинхронно
+  ansible.builtin.wait_for:
+    timeout: 3
+
+# shell: pipe + 2>&1; failed_when: false — пустой вывод ловит assert ниже с понятным сообщением.
+# --since 15m: окно покрывает и старт стека (compose up + health-гейты выше), и warm-up запрос.
+- name: Проверить GPU в ollama-логе
+  ansible.builtin.shell: set -o pipefail; docker logs mcp-knowledge-ollama --since 15m 2>&1 | grep 'inference compute' | tail -1
+  changed_when: false
+  failed_when: false
+  register: gpu_log
+
+- name: Assert GPU доступен
+  ansible.builtin.assert:
+    that: "'id=GPU' in gpu_log.stdout"
+    fail_msg: "GPU НЕ используется: {{ gpu_log.stdout }} (id=CPU — проверьте драйвер/VRAM)"
+    success_msg: "GPU доступен: {{ gpu_log.stdout | truncate(120) }}"
+
+- name: Перенос завершён
+  ansible.builtin.debug:
+    msg: "✅ Перенос завершён. Выполните search-smoke вручную (M5): поиск 'MkDocs настройка' должен дать топ engineering/mkdocs ≈0.88"

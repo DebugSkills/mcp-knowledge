@@ -1,0 +1,14 @@
+---
+galaxy_info:
+  author: DebugSkills / Svyazi infra
+  description: >-
+    Подготовка нового хоста для mcp-knowledge с нуля: docker из официального
+    репозитория, проприетарный драйвер NVIDIA, nvidia-container-toolkit,
+    регистрация nvidia runtime, HTTP-proxy для dockerd.
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+dependencies: []

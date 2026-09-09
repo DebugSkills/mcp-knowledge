@@ -1,0 +1,14 @@
+---
+- name: Полный деплой mcp-knowledge (fresh-install)
+  hosts: mcp_kb_new
+  gather_facts: true
+  become: true
+  roles:
+    - role: mcp_kb_dirs
+      tags: [dirs]
+    - role: mcp_kb_repos
+      tags: [repos]
+    - role: mcp_kb_docker
+      tags: [docker]
+    - role: mcp_kb_cron
+      tags: [cron]

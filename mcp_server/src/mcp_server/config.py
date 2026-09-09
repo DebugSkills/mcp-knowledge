@@ -16,10 +16,14 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
     EMBEDDING_DIM: int = 1024  # mxbai-embed-large (русская семантика); bge-m3 F16 из Ollama — NaN-баг, отбракован
     MODELS_CACHE_DIR: str = "/app/models_cache"
-    OLLAMA_URL: str = "http://localhost:11434"
+    # 11435 — ollama-КОНТЕЙНЕР этого compose (bridge 127.0.0.1:11435:11434);
+    # 11434 занят host-ollama других проектов (после миграции моделей проекта там нет).
+    OLLAMA_URL: str = "http://localhost:11435"
     OLLAMA_MODEL: str = "mxbai-embed-large"
 
     # Content Analysis (Фаза 13.8: AI-рекомендации)
+    # qwen2.5:7b — chat-модель в ollama-контейнере (ТЕКСТОВАЯ; qwen2.5vl vision
+    # не влезает в 8GB GPU на ollama 0.20.2; analyzer шлёт текст-онли).
     OLLAMA_CHAT_MODEL: str = "qwen2.5:7b"
     ANALYZE_FRAGMENT_CHARS: int = 8000
     ANALYZE_TIMEOUT: float = 60.0

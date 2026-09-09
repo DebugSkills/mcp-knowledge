@@ -1,0 +1,20 @@
+---
+- name: Cutover — остановить старый стек
+  hosts: mcp_kb_old
+  gather_facts: false
+  become: true
+  roles:
+    - role: mcp_kb_transfer
+      tags: [transfer, stop]
+      vars:
+        mcp_kb_transfer__stage: stop
+
+- name: Cutover — финальный rsync + запуск на новом
+  hosts: mcp_kb_new
+  gather_facts: false
+  become: true
+  roles:
+    - role: mcp_kb_transfer
+      tags: [transfer, cutover]
+      vars:
+        mcp_kb_transfer__stage: cutover

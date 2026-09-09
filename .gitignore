@@ -38,7 +38,7 @@ NOTES.md
 .knowledge/
 .roomodes
 .kilo/
-AGENTS.md
+# AGENTS.md — рукописная публичная инструкция (создание скиллов), НЕ игнорируем
 .board.md
 .boardData.md
 .roo/
@@ -49,3 +49,6 @@ plans
 # Throwaway artifacts (реверсивное удаление)
 .trash/
 .playwright-mcp/
+
+# Ansible vault (секреты; пример — vault.yml.example)
+ansible/inventory/group_vars/all/vault.yml

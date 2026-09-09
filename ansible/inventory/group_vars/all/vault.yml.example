@@ -1,0 +1,6 @@
+---
+# Пример. Реальные значения — в vault.yml (ansible-vault create, в .gitignore)
+vault_mcp_read_keys: '["read-key"]'
+vault_mcp_write_keys: '["write-key"]'
+vault_mcp_import_keys: '["import-key"]'
+vault_mcp_console_key: "console-key"

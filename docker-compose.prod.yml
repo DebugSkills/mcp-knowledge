@@ -7,12 +7,16 @@
 #
 # Топология:
 #   - qdrant        — контейнер в этом compose (порты 6333 REST / 6334 gRPC)
-#   - mcp-server    — network_mode: host (Ollama на хосте слушает 127.0.0.1:11434);
-#                     видит qdrant через localhost:6333 (REST, QDRANT_PREFER_GRPC=false)
-#   - Ollama        — системный сервис хоста + модели из bundle (~/.ollama/models)
+#   - ollama        — контейнер в этом compose (bridge, публикует 127.0.0.1:11435;
+#                     модели проекта: mxbai-embed-large + qwen2.5vl:7b в volume
+#                     ./data/ollama/models). Host-ollama на 11434 — другие проекты,
+#                     сервером НЕ используется
+#   - mcp-server    — network_mode: host; видит ollama через localhost:11435
+#                     и qdrant через localhost:6333 (REST, QDRANT_PREFER_GRPC=false)
 #
 # Данные (volume на хосте, сохраняются при пересоздании контейнеров):
 #   - ./data/qdrant      — Qdrant storage
+#   - ./data/ollama      — блобы моделей ollama (root-owned, пишет только контейнер)
 #   - ./knowledge        — Markdown SSOT (read-write: write_knowledge + git)
 #   - ./data/quality     — отчётные артефакты quality
 #   - ./data/dlq         — dead-letter queue
@@ -42,13 +46,60 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  # ollama — LLM-движок проекта (эмбеддинги mxbai + chat qwen2.5vl) на GPU хоста.
+  ollama:
+    image: ollama/ollama:0.20.2          # пиннинг = версия, КОТОРОЙ ПОСТРОЕН ИНДЕКС Qdrant (host 2026-08-19; host с тех пор 0.33.3 даёт другие векторы!)
+    container_name: mcp-knowledge-ollama-prod
+    # НЕ host-net: host-ollama (другие проекты) остаётся на 11434. Внутри контейнера
+    # слушаем 0.0.0.0 (иначе дефолтный bind 127.0.0.1 контейнера недоступен docker-proxy),
+    # наружу публикуем ТОЛЬКО loopback хоста: 127.0.0.1:11435.
+    ports:
+      - "127.0.0.1:11435:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      # VRAM 8GB (RTX 2060 SUPER) — GPU SHARED с host-ollama (runner ~622MiB):
+      # mxbai 0.67 + qwen2.5vl 5.97 (VL на ~1.3GB тяжелее текстовой qwen2.5:7b —
+      # vision-энкодер) = 6.64GB weights + KV/CUDA-ctx ~0.3-1GB → ОДНОВРЕМЕННО обе
+      # НЕ влезают. MAX_LOADED_MODELS=1: embed-запрос выгружает qwen и наоборот
+      # (эмбеддинги частые, analyze редкий; re-load qwen ~5-10s с диска — приемлемо).
+      # keep_alive 30m держит mxbai горячим между поисками (дефолт 5m).
+      # =2 — только если host-runner освободит VRAM (проверить nvidia-smi), риск OOM.
+      - OLLAMA_KEEP_ALIVE=30m
+      - OLLAMA_MAX_LOADED_MODELS=1
+    volumes:
+      # ОТДЕЛЬНЫЙ от host-ollama каталог (/usr/share/ollama/.ollama НЕ трогаем):
+      # блобы 2 моделей ~6.64GB (mxbai 0.67 + qwen2.5vl 5.97); контейнер работает от root → root-owned файлы, ок
+      # (каталог пишет ТОЛЬКО контейнер, host-ollama его не видит)
+      - ./data/ollama/models:/root/.ollama/models
+    # В образе НЕТ curl → TCP-probe как у qdrant (внутри контейнера канонический 11434)
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/11434'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    # Потолок (НЕ резерв): GPU-режим RSS ~0.5-1GB; CPU-fallback qwen ~5-6GB + mxbai + KV.
+    # Хост 110GB (94 avail) → 16g безопасен
+    mem_limit: 16g
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
   mcp-server:
     image: mcp-knowledge-server:prod
     container_name: mcp-knowledge-server
-    # host-сеть: Ollama на хосте слушает ТОЛЬКО 127.0.0.1:11434 (loopback).
-    # Альтернатива (если на проде OLLAMA_HOST=0.0.0.0): обычная сеть +
-    # OLLAMA_URL=http://host.docker.internal:11434 + QDRANT_URL=http://qdrant:6334
-    # и QDRANT_PREFER_GRPC=true (gRPC внутри docker-сети).
+    # host-сеть: доступ к loopback-ПОРТАМ хоста, куда публикуют свои порты
+    # bridge-контейнеры этого compose: ollama → 127.0.0.1:11435, qdrant → 6333
+    # (из host-сети DNS-имена bridge-сервисов недоступны → localhost:<port>).
+    # Host-ollama на 11434 (другие проекты) сервером НЕ используется.
     network_mode: host
     volumes:
       - ./knowledge:/app/knowledge           # SSOT (read-write: write_knowledge + git commit)
@@ -59,14 +110,21 @@ services:
       - .env
     environment:
       - EMBEDDING_BACKEND=ollama
-      - OLLAMA_URL=http://localhost:11434
+      # ollama-контейнер этого compose (bridge-публикация 127.0.0.1:11435)
+      - OLLAMA_URL=http://localhost:11435
       - OLLAMA_MODEL=mxbai-embed-large
+      # Chat для analyze_content (ollama-контейнер): qwen2.5:7b ТЕКСТОВАЯ —
+      # qwen2.5vl (vision) НЕ влезает в 8GB GPU на ollama 0.20.2 (буфер 7.35GB → OOM);
+      # analyzer шлёт /api/chat текст-онли (VL избыточна).
+      - OLLAMA_CHAT_MODEL=qwen2.5:7b
       # EMBEDDING_MODEL — имя HF-токенизатора для chunker (НЕ Ollama-модель!)
       - EMBEDDING_MODEL=BAAI/bge-m3
       - QDRANT_URL=http://localhost:6333
       - QDRANT_PREFER_GRPC=false
     depends_on:
       qdrant:
+        condition: service_healthy
+      ollama:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health/live"]

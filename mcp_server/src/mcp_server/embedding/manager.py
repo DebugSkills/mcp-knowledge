@@ -135,8 +135,8 @@ class EmbeddingManager:
                     logger.debug("Lazy embed retry failed: %s", exc)
             if not self._initialized:
                 raise RuntimeError(
-                    "Embedding недоступна: Ollama не запущена "
-                    "(выполните: sudo systemctl start ollama)"
+                    "Embedding недоступна: ollama-контейнер не запущена "
+                    "(выполните: docker compose up -d ollama)"
                 )
 
         t0 = time.monotonic()

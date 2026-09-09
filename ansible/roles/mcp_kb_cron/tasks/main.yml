@@ -4,13 +4,13 @@
 
 - name: Копировать backup.sh
   ansible.builtin.copy:
-    src: "{{ playbook_dir }}/../scripts/backup.sh"
+    src: "{{ playbook_dir }}/../../scripts/backup.sh"
     dest: /opt/mcp-knowledge/scripts/backup.sh
     mode: '0755'
 
 - name: Копировать quality_scan.sh
   ansible.builtin.copy:
-    src: "{{ playbook_dir }}/../scripts/quality_scan.sh"
+    src: "{{ playbook_dir }}/../../scripts/quality_scan.sh"
     dest: /opt/mcp-knowledge/scripts/quality_scan.sh
     mode: '0755'
 

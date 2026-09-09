@@ -1,0 +1,8 @@
+---
+- name: Проверить допустимый stage
+  ansible.builtin.assert:
+    that: mcp_kb_transfer__stage in ['pack', 'bulk', 'stop', 'cutover']
+    fail_msg: "stage должен быть pack|bulk|stop|cutover, получено {{ mcp_kb_transfer__stage }}"
+
+- name: Выполнить этап {{ mcp_kb_transfer__stage }}
+  ansible.builtin.include_tasks: "{{ mcp_kb_transfer__stage }}.yml"

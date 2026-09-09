@@ -30,6 +30,31 @@ class TestQualityScanCronSettings:
         assert settings.QUALITY_SCAN_CRON_ENABLED is False
 
 
+class TestOllamaTopologyDefaults:
+    """Дефолты Ollama-топологии (code-2026-09-08-001: контейнер на 11435).
+
+    11434 занят host-ollama других проектов; после M3 (ollama rm) моделей
+    проекта на host нет → bare-запуск без env НЕ должен попадать на 11434.
+    """
+
+    def test_ollama_defaults(self, monkeypatch):
+        """Дефолты: OLLAMA_URL=11435 (контейнер), chat=qwen2.5:7b, embed=mxbai."""
+        # delenv: локальный shell может экспортировать OLLAMA_* (напр. 11434)
+        for var in ("OLLAMA_URL", "OLLAMA_MODEL", "OLLAMA_CHAT_MODEL"):
+            monkeypatch.delenv(var, raising=False)
+        settings = Settings(_env_file=None)
+        assert settings.OLLAMA_URL == "http://localhost:11435"
+        assert settings.OLLAMA_MODEL == "mxbai-embed-large"
+        assert settings.OLLAMA_CHAT_MODEL == "qwen2.5:7b"
+
+    def test_ollama_env_override(self, monkeypatch):
+        """Env-переопределение OLLAMA_URL (откат/миграция — 1 строка env)."""
+        monkeypatch.setenv("OLLAMA_URL", "http://localhost:11434")
+        monkeypatch.delenv("OLLAMA_CHAT_MODEL", raising=False)
+        settings = Settings(_env_file=None)
+        assert settings.OLLAMA_URL == "http://localhost:11434"
+
+
 class TestAutoDedupSettings:
     """Фаза 3 (2a): флаги авто-deprecate."""
 

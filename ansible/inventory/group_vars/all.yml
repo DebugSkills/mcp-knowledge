@@ -1,0 +1,29 @@
+---
+# Общие переменные деплоя mcp-knowledge (несекретные)
+deploy_root: /opt/mcp-knowledge        # родительский каталог (basename 'mcp-knowledge' сохраняется!)
+repo_name: mcp-knowledge               # compose project name = basename
+compose_file: docker-compose.yml       # переносим работающий dev-стек
+old_root: /kvm/mcp-knowledge           # текущий хост (источник)
+staging: /opt/mcp-kb-transfer          # промежуточный каталог переноса на новом хосте
+min_free_gb: 30
+
+# Ollama-контейнер (новая топология, миграция code-2026-09-08-001)
+ollama_url: http://localhost:11435
+ollama_model: mxbai-embed-large
+ollama_chat_model: qwen2.5:7b
+embedding_backend: ollama
+tokenizer: BAAI/bge-m3
+
+# Qdrant (контейнерный, host-net mcp-server → localhost)
+qdrant_url: http://localhost:6333
+
+# Docker-прокси (пусто = прямая сеть)
+docker_proxy: ""
+docker_no_proxy: "localhost,127.0.0.1,::1"
+
+# Список образов для docker save/load (пиннинг!)
+transfer_images:
+  - mcp-knowledge-mcp-server:latest
+  - kb-console:prod
+  - qdrant/qdrant:v1.13.4
+  - ollama/ollama:0.20.2

@@ -1,0 +1,59 @@
+---
+# Установка docker из официального репозитория Docker (Debian bookworm).
+# Весь файл выполняется только если docker отсутствует (поба rc != 0 из preflight).
+
+- name: Установить базовые зависимости apt (ca-certificates, curl, gnupg)
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+    state: present
+
+- name: Создать каталог /etc/apt/keyrings
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+
+- name: Скачать GPG-ключ docker (ASCII) во временный файл
+  ansible.builtin.get_url:
+    url: "{{ mcp_kb_host_prepare__docker_gpg_url }}"
+    dest: /tmp/docker-key.asc
+    mode: '0644'
+
+# ВАЖНО: ключ docker распространяется в ASCII-armored виде — для keyrings
+# обязателен gpg --dearmor. creates= гарантирует идемпотентность.
+- name: Конвертировать ключ docker в бинарный keyring (gpg --dearmor)
+  ansible.builtin.command:
+    argv:
+      - gpg
+      - --dearmor
+      - --output
+      - /etc/apt/keyrings/docker.gpg
+      - /tmp/docker-key.asc
+  args:
+    creates: /etc/apt/keyrings/docker.gpg
+
+- name: Добавить репозиторий docker (docker.list)
+  ansible.builtin.template:
+    src: docker.list.j2
+    dest: /etc/apt/sources.list.d/docker.list
+    mode: '0644'
+  register: mcp_kb_host_prepare__docker_list
+
+- name: Обновить кеш apt после добавления репозитория docker
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: "{{ 0 if mcp_kb_host_prepare__docker_list is changed else 3600 }}"
+
+- name: Установить пакеты docker
+  ansible.builtin.apt:
+    name: "{{ mcp_kb_host_prepare__docker_packages }}"
+    state: present
+
+- name: Включить и запустить сервис docker
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started

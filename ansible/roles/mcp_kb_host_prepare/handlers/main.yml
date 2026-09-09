@@ -1,0 +1,8 @@
+---
+# Handlers роли mcp_kb_host_prepare
+
+- name: Перезапустить docker
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+    daemon_reload: true

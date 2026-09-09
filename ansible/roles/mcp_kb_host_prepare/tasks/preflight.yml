@@ -1,0 +1,29 @@
+---
+# Preflight: сбор фактов, проверка ОС, пробы уже установленных компонентов.
+
+- name: Собрать факты об установленных пакетах
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Проверить, что хост — Debian 12 (bookworm)
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == 'Debian'
+      - ansible_distribution_major_version == '12'
+    fail_msg: >-
+      Роль тестирована только на Debian 12 (bookworm).
+      Текущий хост: {{ ansible_distribution }} {{ ansible_distribution_version }}.
+
+- name: Проба драйвера NVIDIA (nvidia-smi)
+  ansible.builtin.command:
+    cmd: nvidia-smi
+  register: mcp_kb_host_prepare__nvidia_smi_probe
+  changed_when: false
+  failed_when: false
+
+- name: Проба docker (docker --version)
+  ansible.builtin.command:
+    cmd: docker --version
+  register: mcp_kb_host_prepare__docker_probe
+  changed_when: false
+  failed_when: false

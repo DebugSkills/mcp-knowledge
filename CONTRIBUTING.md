@@ -41,7 +41,7 @@ cp .env.example .env
 #    .env.example содержит ТОЛЬКО плейсхолдеры changeme-*.
 #    Сгенерируйте свои ключи:  openssl rand -hex 32
 
-# 3) Запуск (dev: host-network, хостовые Qdrant + Ollama)
+# 3) Запуск (dev: mcp-server host-network; Qdrant и Ollama — контейнеры compose)
 docker compose up -d mcp-server
 docker compose up -d kb-console      # → http://localhost:8085
 ```
@@ -86,7 +86,7 @@ docs(13.21): синхронизация документации по PDF-имп
 Минимальный набор перед отправкой PR:
 
 ```bash
-make e2e-slow                        # E2E S1-S20 (нужны Qdrant :6333 + Ollama :11434)
+make e2e-slow                        # E2E S1-S20 (нужны Qdrant :6333 + Ollama :11435)
 .venv/bin/python -m pytest mcp_server/tests -q   # полный suite (~629)
 make console-test                    # unit + smoke kb-console (~66)
 .venv/bin/python -m pytest mcp-stdio/tests -q    # stdio-мост (~19)

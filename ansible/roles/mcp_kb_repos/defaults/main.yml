@@ -1,0 +1,10 @@
+---
+# Role: mcp_kb_repos — defaults
+# Все переменные роли имеют префикс mcp_kb_repos__
+# URL — SSH-доступ (git@github.com): требуют deploy-key на целевом хосте.
+
+mcp_kb_repos__mcp_knowledge_repo_url: "git@github.com:DebugSkills/mcp-knowledge.git"
+mcp_kb_repos__knowledge_repo_url: "git@github.com:DebugSkills/knowledge.git"
+mcp_kb_repos__version: "main"
+# false = clone-once + pin (повторные прогоны деплоя не тянут upstream-обновления)
+mcp_kb_repos__update: false

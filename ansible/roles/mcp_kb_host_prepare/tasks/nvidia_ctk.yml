@@ -1,0 +1,26 @@
+---
+# Регистрация nvidia runtime в docker через nvidia-ctk.
+# ВАЖНО: daemon.json старого хоста НЕ копируется целиком (там мёртвый mirror :5000) —
+# nvidia-ctk добавляет ТОЛЬКО секцию runtimes в существующий/новый daemon.json.
+
+- name: Проверить наличие /etc/docker/daemon.json
+  ansible.builtin.stat:
+    path: /etc/docker/daemon.json
+  register: mcp_kb_host_prepare__daemon_json_stat
+
+- name: Прочитать /etc/docker/daemon.json (если существует)
+  ansible.builtin.slurp:
+    src: /etc/docker/daemon.json
+  register: mcp_kb_host_prepare__daemon_json
+  when: mcp_kb_host_prepare__daemon_json_stat.stat.exists
+
+- name: Определить, сконфигурирован ли уже nvidia runtime
+  ansible.builtin.set_fact:
+    mcp_kb_host_prepare__has_nvidia_runtime: "{{ 'nvidia' in (mcp_kb_host_prepare__daemon_json.content | default('') | b64decode) }}"
+
+- name: Сконфигурировать nvidia runtime для docker (nvidia-ctk runtime configure)
+  ansible.builtin.command:
+    cmd: nvidia-ctk runtime configure --runtime=docker
+  when: not (mcp_kb_host_prepare__has_nvidia_runtime | bool)
+  changed_when: true
+  notify: Перезапустить docker

@@ -1,0 +1,26 @@
+---
+mcp_kb_transfer__stage: pack
+mcp_kb_transfer__old_root: "/kvm/mcp-knowledge"
+mcp_kb_transfer__new_root: "/opt/mcp-knowledge"
+mcp_kb_transfer__staging: "/opt/mcp-kb-transfer"
+mcp_kb_transfer__repo_name: "mcp-knowledge"
+mcp_kb_transfer__compose_file: "docker-compose.yml"
+mcp_kb_transfer__images:
+  - mcp-knowledge-mcp-server:latest
+  - kb-console:prod
+  - qdrant/qdrant:v1.13.4
+  - ollama/ollama:0.20.2
+# Зарезервированный флаг: удалить VL-модель из ollama (не влезает в 8GB VRAM).
+# Пока не используется задачами — пометка для будущей реализации.
+mcp_kb_transfer__drop_vl_model: false
+mcp_kb_transfer__min_free_gb: 30
+mcp_kb_transfer__excludes:
+  - .venv
+  - artifacts
+  - mcp-kb-airgap-bundle.tar.gz
+  - .trash
+  - __pycache__
+  - .pytest_cache
+  - .playwright-mcp
+  - node_modules
+  - "*.pyc"

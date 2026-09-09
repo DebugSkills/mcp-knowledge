@@ -1,0 +1,8 @@
+---
+- name: Подготовка нового хоста для mcp-knowledge (docker + GPU)
+  hosts: mcp_kb_new
+  gather_facts: true
+  become: true
+  roles:
+    - role: mcp_kb_host_prepare
+      tags: [host_prepare]

@@ -1,0 +1,43 @@
+---
+# Role: mcp_kb_host_prepare
+# Подготовка НОВОГО хоста с нуля: docker + nvidia-driver + nvidia-container-toolkit + GPU runtime.
+# Порядок: preflight → docker → nvidia_driver → toolkit → nvidia_ctk → proxy → (flush) → verify.
+# ВНИМАНИЕ: гранулярные теги (docker, toolkit, ...) зависят от проб из preflight —
+# запускайте роль целиком (тег host_prepare по умолчанию в плейбуке).
+
+- name: Preflight — факты о пакетах, проверка Debian 12, пробы docker/nvidia-smi
+  ansible.builtin.include_tasks: preflight.yml
+  tags: [host_prepare, preflight]
+
+- name: Установить docker из официального репозитория (если отсутствует)
+  ansible.builtin.include_tasks: docker.yml
+  when:
+    - mcp_kb_host_prepare__install_docker
+    - mcp_kb_host_prepare__docker_probe.rc != 0
+  tags: [host_prepare, docker]
+
+- name: Установить драйвер NVIDIA + прошивки, перезагрузить хост (если драйвера нет)
+  ansible.builtin.include_tasks: nvidia_driver.yml
+  when:
+    - mcp_kb_host_prepare__install_nvidia_driver
+    - mcp_kb_host_prepare__nvidia_smi_probe.rc != 0
+  tags: [host_prepare, nvidia_driver]
+
+- name: Установить nvidia-container-toolkit из репозитория NVIDIA
+  ansible.builtin.include_tasks: toolkit.yml
+  when: mcp_kb_host_prepare__install_nvidia_toolkit
+  tags: [host_prepare, toolkit]
+
+- name: Зарегистрировать nvidia runtime в docker через nvidia-ctk
+  ansible.builtin.include_tasks: nvidia_ctk.yml
+  when: mcp_kb_host_prepare__install_nvidia_toolkit
+  tags: [host_prepare, nvidia_ctk]
+
+- name: Настроить HTTP-proxy для docker-сервиса (если задан)
+  ansible.builtin.include_tasks: proxy.yml
+  when: mcp_kb_host_prepare__proxy | length > 0
+  tags: [host_prepare, proxy]
+
+- name: Верификация — flush_handlers, docker info/compose/nvidia-smi
+  ansible.builtin.include_tasks: verify.yml
+  tags: [host_prepare, verify]

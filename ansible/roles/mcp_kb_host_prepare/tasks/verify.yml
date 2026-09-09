@@ -1,0 +1,49 @@
+---
+# Финальная верификация: docker с nvidia runtime, compose plugin, рабочий nvidia-smi.
+
+- name: Сбросить отложенные обработчики (перезапуск docker) перед проверками
+  ansible.builtin.meta: flush_handlers
+
+- name: Собрать информацию docker (docker info)
+  ansible.builtin.command:
+    cmd: docker info
+  register: mcp_kb_host_prepare__docker_info
+  changed_when: false
+
+- name: Проверить, что nvidia runtime зарегистрирован в docker
+  ansible.builtin.assert:
+    that:
+      - "'nvidia' in mcp_kb_host_prepare__docker_info.stdout"
+    fail_msg: >-
+      nvidia runtime не найден в 'docker info'.
+      Проверьте шаг nvidia-ctk (tasks/nvidia_ctk.yml) и логи systemctl status docker.
+
+- name: Проверить docker compose plugin (docker compose version)
+  ansible.builtin.command:
+    cmd: docker compose version
+  register: mcp_kb_host_prepare__compose_version
+  changed_when: false
+
+- name: Убедиться, что docker compose доступен
+  ansible.builtin.assert:
+    that:
+      - mcp_kb_host_prepare__compose_version.rc == 0
+    fail_msg: docker compose plugin недоступен — проверьте docker-compose-plugin
+
+- name: Проверить драйвер NVIDIA (nvidia-smi)
+  ansible.builtin.command:
+    cmd: nvidia-smi
+  register: mcp_kb_host_prepare__nvidia_smi_check
+  changed_when: false
+
+- name: Убедиться, что драйвер NVIDIA работает
+  ansible.builtin.assert:
+    that:
+      - mcp_kb_host_prepare__nvidia_smi_check.rc == 0
+    fail_msg: nvidia-smi недоступен — драйвер не установлен или не загружен (нужен reboot?)
+
+- name: ГОТОВО — хост подготовлен для mcp-knowledge
+  ansible.builtin.debug:
+    msg: >-
+      ГОТОВО: docker + nvidia runtime + GPU драйвер активны.
+      Хост готов к переносу стека mcp-knowledge (часть 3/3).

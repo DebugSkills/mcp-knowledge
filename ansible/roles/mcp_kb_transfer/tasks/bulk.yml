@@ -1,0 +1,99 @@
+---
+# Этап bulk: НОВЫЙ хост (mcp_kb_new). Первый проход, ПОВТОРЯЕМЫЙ (rsync без --delete).
+# Можно гонять сколько угодно раз до окна cutover — стек на old продолжает работать.
+#
+# ПАТТЕРН SYNCHRONIZE old→new (важно):
+#   Play нацелен на mcp_kb_new; rsync запускается НА СТАРОМ хосте через
+#   delegate_to: groups['mcp_kb_old'][0] + mode: push.
+#   src — путь на OLD (где выполняется rsync), dest — адресуется как хост play (NEW).
+#   Требование: rsync установлен на обоих хостах, old имеет SSH-доступ к new.
+
+- name: Проверить наличие группы mcp_kb_old в inventory
+  ansible.builtin.assert:
+    that:
+      - groups['mcp_kb_old'] is defined
+      - groups['mcp_kb_old'] | length > 0
+    fail_msg: "inventory должен содержать группу mcp_kb_old (старый хост): synchronize пушит old → new"
+
+# command без pipe: последняя строка парсится Jinja-ом в assert ниже
+- name: Проверить свободное место
+  ansible.builtin.command:
+    cmd: df -BG --output=avail /opt
+  changed_when: false
+  register: df_out
+
+- name: Assert минимум свободного места
+  ansible.builtin.assert:
+    that: (df_out.stdout_lines | last | trim | replace('G', '') | int) >= mcp_kb_transfer__min_free_gb
+    fail_msg: "Мало места на /opt: {{ df_out.stdout_lines | last | trim }} (нужно >= {{ mcp_kb_transfer__min_free_gb }}G)"
+
+- name: Создать целевые каталоги
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ mcp_kb_transfer__new_root }}"
+    - "{{ mcp_kb_transfer__staging }}"
+
+# rsync выполняется на OLD (delegate_to), пушит staging → NEW (хост play)
+- name: Перенести staging (образы) со старого хоста
+  ansible.posix.synchronize:
+    src: "{{ mcp_kb_transfer__staging }}/"
+    dest: "{{ mcp_kb_transfer__staging }}/"
+    mode: push
+  delegate_to: "{{ groups['mcp_kb_old'][0] }}"
+
+# Верификация переноса: чек-сумма сгенерирована на этапе pack (sha256sum images.tar);
+# ловит битый tar после rsync ДО docker load. chdir не влияет на -c (в .sha256
+# абсолютный путь /opt/mcp-kb-transfer/images.tar), оставлен для единообразия.
+- name: Проверить целостность images.tar (sha256)
+  ansible.builtin.command:
+    cmd: sha256sum -c {{ mcp_kb_transfer__staging }}/images.tar.sha256
+    chdir: "{{ mcp_kb_transfer__staging }}"
+  changed_when: false
+  register: sha_check
+  failed_when: sha_check.rc != 0
+
+- name: Загрузить образы (docker load), если ещё не загружены
+  ansible.builtin.stat:
+    path: "{{ mcp_kb_transfer__staging }}/.images-loaded"
+  register: loaded_marker
+
+- name: Docker load образов
+  ansible.builtin.command:
+    cmd: docker load -i {{ mcp_kb_transfer__staging }}/images.tar
+  when: not loaded_marker.stat.exists
+  register: load_result
+  # задача выполняется только при отсутствии маркера — реальная загрузка = change
+  changed_when: true
+
+- name: Маркер загрузки образов
+  ansible.builtin.file:
+    path: "{{ mcp_kb_transfer__staging }}/.images-loaded"
+    state: touch
+    mode: '0644'
+  when: not loaded_marker.stat.exists
+
+# ОДИН проход rsync со всеми exclude (map: '.venv' → '--exclude=.venv').
+# НЕ loop: при loop каждый проход содержал бы только один exclude и копировал
+# остальные исключённые каталоги (.venv, node_modules, .trash...) в других итерациях.
+# rsync выполняется на OLD (delegate_to), mode: push — old → new.
+- name: Bulk-rsync кода и данных (БЕЗ --delete)
+  ansible.posix.synchronize:
+    src: "{{ mcp_kb_transfer__old_root }}/"
+    dest: "{{ mcp_kb_transfer__new_root }}/"
+    mode: push
+    delete: false
+    rsync_opts: "{{ mcp_kb_transfer__excludes | map('regex_replace', '^', '--exclude=') | list }}"
+  delegate_to: "{{ groups['mcp_kb_old'][0] }}"
+
+- name: Проверить наличие .env
+  ansible.builtin.stat:
+    path: "{{ mcp_kb_transfer__new_root }}/{{ mcp_kb_transfer__repo_name }}/.env"
+  register: env_stat
+
+- name: Предупредить о .env
+  ansible.builtin.debug:
+    msg: "⚠️ .env НЕ перенесён — секреты идут только по SSH (rsync уже должен был его захватить если файл существует). Проверьте вручную."
+  when: not env_stat.stat.exists
