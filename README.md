@@ -6,13 +6,13 @@
 
 🔗 [debugskills.ru](https://debugskills.ru/) · 🤝 Проект сообщества **DebugSkills**
 
-🛠️ **20 MCP Tools** · 🧠 Markdown SSOT → Ollama embed → Qdrant · 🌐 air-gap ready · 🏭 production-ready
+🛠️ **31 MCP Tool** · 🧠 Markdown SSOT → Ollama embed → Qdrant · 🌐 air-gap ready · 🏭 production-ready
 
 ---
 
 </div>
 
-Хранение: Markdown SSOT → chunk → Ollama embed (mxbai-embed-large, русская семантика) → Qdrant vector search. **20 MCP Tools**, air-gap совместимость (одноархивный deploy-bundle), production-ready (health, rate-limit, blue-green reindex, quality system). Веб-консоль **kb-console** (NiceGUI, :8085) для диагностики и обслуживания. Подключение AI-агентов (Kilo/Claude/Cline) — через **stdio-мост** (`mcp-stdio/bridge.py`, см. `docs/mcp-client-guide.md`). MCP-протокол: JSON-RPC 2.0 over HTTP (`POST /mcp`), `ping` → `{"result":{}}`, `notifications/initialized` → 204 (Фаза 13.21).
+Хранение: Markdown SSOT → chunk → Ollama embed (mxbai-embed-large, русская семантика) → Qdrant vector search. **31 MCP Tool**, air-gap совместимость (одноархивный deploy-bundle), production-ready (health, rate-limit, blue-green reindex, quality system). Веб-консоль **kb-console** (NiceGUI, :8085) для диагностики и обслуживания. Подключение AI-агентов (Kilo/Claude/Cline) — через **stdio-мост** (`mcp-stdio/bridge.py`, см. `docs/mcp-client-guide.md`). MCP-протокол: JSON-RPC 2.0 over HTTP (`POST /mcp`), `ping` → `{"result":{}}`, `notifications/initialized` → 204 (Фаза 13.21).
 
 ## 💎 Почему это ценно для сообщества
 
@@ -45,7 +45,7 @@ mcp-stdio/bridge.py │    │  диаг. :8085 → :8000
 │             /imports/{id}/remove · /imports/remove- │
 │             finished · /quality/scan/progress      │
 ├────────────────────────────────────────────────────┤
-│  Tools (20)                                        │
+│  Tools (31)                                        │
 │  search read crud browse admin quality import analyze │
 ├────────────────────────────────────────────────────┤
 │  Pipeline: chunk → embed → upsert (async worker)   │
@@ -60,7 +60,7 @@ mcp-stdio/bridge.py │    │  диаг. :8085 → :8000
 └────────────────────────────────────────────────────┘
 ```
 
-**kb-console** — отдельный самодостаточный контейнер (образ `kb-console:prod`): страницы **Статус** (health-карточки, метрики, 30 инструментов), **Книги** (список коллекций + оглавление), **Импорт** (загрузка материалов через `import_content`), **Поиск** (по корпусу), **Качество** (запуск quality-скана с живым прогрессом, review-очередь устаревших книг, issues, dedup-ревью 🟢/🟡). Может жить на клиентских хостах (`MCP_SERVER_URL` из env). Руководство: `kb-console/USER_GUIDE.md`.
+**kb-console** — отдельный самодостаточный контейнер (образ `kb-console:prod`): страницы **Статус** (health-карточки, метрики, 31 инструмент), **Книги** (список коллекций + оглавление), **Импорт** (загрузка материалов через `import_content`), **Поиск** (по корпусу), **Качество** (запуск quality-скана с живым прогрессом, review-очередь устаревших книг, issues, dedup-ревью 🟢/🟡). Может жить на клиентских хостах (`MCP_SERVER_URL` из env). Руководство: `kb-console/USER_GUIDE.md`.
 
 ## 🚀 Быстрый старт
 
@@ -82,6 +82,8 @@ make console-test                    # unit + smoke kb-console (66)
 
 ## 📦 Продовый деплой (air-gap, одноархивный bundle)
 
+> ⚠️ **Legacy-путь:** `offline-deploy.sh` готовит модели в **host-ollama** (системный сервис, 11434). После миграции 2026-09 прод-топология — ollama-КОНТЕЙНЕР compose (:11435). Для новых развёртываний используйте `docker compose -f docker-compose.prod.yml up -d` + `ansible/` (перенос). Air-gap скрипт будет доработан под контейнерную топологию отдельной задачей.
+
 ```bash
 make bundle                          # машина с интернетом → mcp-kb-airgap-bundle.tar.gz (~1.2 GB)
 # перенос архива на изолированный хост (USB/диск):
@@ -92,51 +94,66 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 ```
 Подробности: `docs/air-gap-validation.md` (в bundle — `DEPLOYMENT.md`), руководство консоли — `USER_GUIDE.md`.
 
-## 🛠️ MCP Tools (20)
+## 🛠️ MCP Tools (31)
 
 ### 🔍 Search & Read
 | # | Tool | Назначение |
 |---|------|-----------|
-| 1 | `search_knowledge` | Семантический поиск (Ollama embed) |
-| 2 | `search_by_tags` | Поиск по тегам (payload-фильтр Qdrant) |
+| 1 | `search_knowledge` | Семантический поиск (Ollama embed; exclude deprecated по умолчанию) |
+| 2 | `search_by_tags` | Поиск по тегам (payload-фильтр Qdrant, AND/OR) |
 | 3 | `get_entry` | Получить полную запись (frontmatter + Markdown) |
 | 4 | `get_knowledge_map` | Структурная карта: domains → subjects → IDs |
+| 5 | `find_fragment` | Поиск разделов внутри книги-коллекции |
 
 ### ✍️ Write
 | # | Tool | Назначение |
 |---|------|-----------|
-| 5 | `write_knowledge` | Создать: Markdown SSOT → chunk → embed → Qdrant |
-| 6 | `update_entry` | Обновить с optimistic locking (version check) |
-| 7 | `delete_entry` | Удалить: SSOT + Qdrant + Git commit |
+| 6 | `write_knowledge` | Создать: Markdown SSOT → chunk → embed → Qdrant |
+| 7 | `update_entry` | Обновить с optimistic locking (version check) |
+| 8 | `delete_entry` | Удалить: SSOT + Qdrant + Git commit (cascade для книг) |
+
+### 📚 Книги (fragments)
+| # | Tool | Назначение |
+|---|------|-----------|
+| 9 | `list_collections` | Список книг/коллекций (title, domain/subject, tags, section_count) |
+| 10 | `add_fragment` | Добавить раздел в книгу (секция с ID + sequence, TOC) |
+| 11 | `update_fragment` | Обновить раздел книги (optimistic locking) |
+| 12 | `delete_fragment` | Удалить раздел книги (soft-delete → .trash/) |
 
 ### 🧭 Browse
 | # | Tool | Назначение |
 |---|------|-----------|
-| 5 | `list_collections` | Список книг/коллекций с метаданными (title, domain/subject, tags, section_count) |
-| 9 | `list_domains` | Список доменов (пагинация) |
-| 10 | `list_subjects` | Список тем в домене |
-| 11 | `list_projects` | Список проектов (domain/subject опционально) |
+| 13 | `list_domains` | Список доменов (пагинация) |
+| 14 | `list_subjects` | Список тем в домене |
+| 15 | `list_projects` | Список проектов (domain/subject опционально) |
 
 ### ⚙️ Admin
 | # | Tool | Назначение |
 |---|------|-----------|
-| 12 | `reindex` | Перестроить индекс: все .md → Qdrant (blue-green, zero-downtime) |
+| 16 | `reindex` | Перестроить индекс: все .md → Qdrant (blue-green, zero-downtime) |
+| 17 | `set_zone` | Переложить запись public/private (курирование public-слоя) |
 
-### 🩺 Quality (Фаза 4 + 13.14)
+### 🩺 Quality
 | # | Tool | Назначение |
 |---|------|-----------|
-| 13 | `review_queue` | Топ устаревших записей (staleness_score DESC) |
-| 14 | `review_queue_books` | Топ устаревших КНИГ (агрегат по parent, доля устаревших секций) |
-| 15 | `list_quality_issues` | Проблемы: дубликаты, edit-wars, битые ссылки |
-| 16 | `resolve_quality_issue` | Разрешить: merge/deprecate/restore/resolve/ignore (cascade для книг) |
-| 17 | `run_quality_scan` | Периодический scan (для cron, daily; фоновая задача с lock) |
-| 18 | `cancel_quality_scan` | Отменить активный scan, освободить lock (Фаза 13.18) |
+| 18 | `review_queue` | Топ устаревших записей (staleness_score DESC) |
+| 19 | `review_queue_books` | Топ устаревших КНИГ (агрегат по parent) |
+| 20 | `list_quality_issues` | Проблемы: дубликаты, edit-wars, битые ссылки |
+| 21 | `resolve_quality_issue` | Разрешить: merge/deprecate/restore/resolve/ignore (cascade) |
+| 22 | `bulk_resolve_issues` | Пакетный resolve/ignore issues (чистка шума) |
+| 23 | `review_duplicate_pairs` | Ревью-очередь dup-пар 🟢/🟡/🔴 (R1-R6) |
+| 24 | `bulk_deprecate_duplicates` | Пакетный deprecate дублей (Фаза 1/3 dedup, авто-гейт) |
+| 25 | `list_audit_log` | Журнал действий по качеству (deprecate/restore/auto) |
+| 26 | `run_quality_scan` | Периодический scan (cron, daily; фоновая задача с lock) |
+| 27 | `cancel_quality_scan` | Отменить активный scan, освободить lock |
 
-### 📥 Import (Фаза 5 + 13.8)
+### 📥 Import
 | # | Tool | Назначение |
 |---|------|-----------|
-| 19 | `import_content` | Декомпозиция + batch запись: content → collection (book, cross_subjects, wait_for_index) |
-| 20 | `analyze_content` | AI-анализ контента: рекомендации content_type/domain/subject/tags (Ollama LLM + TF-IDF) |
+| 28 | `import_content` | Декомпозиция + batch запись: content → collection (book, replace, wait_for_index) |
+| 29 | `analyze_content` | AI-анализ контента: рекомендации content_type/domain/subject/tags (Ollama LLM + TF-IDF) |
+| 30 | `extract_pdf_text` | Конвертировать PDF → текст (pdfplumber + OCR fallback) |
+| 31 | `cancel_import` | Отменить активный импорт (PDF/книга), освободить lock |
 
 ## 💬 MCP Prompts
 
@@ -180,7 +197,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 
 | Фаза | Статус | Ключевой результат |
 |------|:------:|-------------------|
-| 0-4 | ✅ | Scaffolding → Quality System (20 tools, 3 промпта, gates) |
+| 0-4 | ✅ | Scaffolding → Quality System (31 tools, 3 промпта, gates) |
 | 9 | ✅ | Idempotent E2E-сьют (S1-S8), фикс latent dup-gate бага |
 | 12 | ✅ | HTTP-level E2E (S9-S12: health/metrics/429/409/503) + observability-метрики |
 | 13 | ✅ | Полное E2E-покрытие (S13-S19) + 24 quality unit-теста + 2 прод-фикса |
@@ -203,8 +220,13 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | 13.22 | ✅ | Атомарная замена книги: replace_collection_id в import_content + HITL в консоли + batch-delete (1 git-commit на каскад) |
 | 13.23 | ✅ | Qdrant-бэкап: sparse-фикс, снапшоты только своих коллекций, healthcheck /dev/tcp |
 | 13.24 | ✅ | Advisory P2-фиксы: task-ref в hide, import asyncio наверх, +3 теста render_import_progress |
+| 13.25 | ✅ | P0: чистка шума quality-скана (orphan-cap, embedding-дубли, auto-clear) + `bulk_resolve_issues` |
+| 13.26 | ✅ | Фрагментные операции с книгами: add/update/delete/find_fragment + on-the-fly TOC |
+| W1-W6 | ✅ | **Двухзонная модель доступа**: зоны public/private (frontmatter `zone`, default private), 2 Qdrant-коллекции + blue-green + fail-loud + миграция legacy, subscriber-токены (TokenStore, CLI, admin API, UI «Токены»), set_zone + sensitive-сканер, изоляция подписчиков |
+| Dedup 1-3 | ✅ | Фаза 1 (metadata+signals dup-issues, bulk_deprecate_duplicates, UI) → Фаза 2 (Review Queue 🟢/🟡 R1-R6, diff-viewer) → Фаза 3 (авто-гейт, см. 13.28); dup_factor выведен из staleness |
 | 13.27 | ✅ | Прогресс скана: панель только на «Качестве» (построение при загрузке страницы, кнопка заблокирована на время скана, on_done однократно), персистентность scan_state.json + авто-resume прерванного скана после рестарта |
 | 13.28 | ✅ | **Фаза 3 dedup: авто-deprecate 🟢-пачек (exact content-hash ONLY).** Серверный гейт целиком внутри `bulk_deprecate_duplicates` при `actor="auto"`: `AUTO_DEDUP_ENABLED` (по умолчанию **false**) + FP=0 за `AUTO_DEDUP_FP_FREE_SCANS=2` полных скана (`scan_completed`/`fp_rejection` в audit.jsonl) + `filter={hash_only}` (R1-предикат, cosine НИКОГДА не авто) + cooldown-щит `AUTO_DEDUP_RESTORE_COOLDOWN_SCANS=3` после restore (`restored_by_operator`) + cap `AUTO_DEDUP_MAX_PER_SCAN=100` + strict-audit (сбой аудита = abort пачки). Restore переоткрывает dup-issues (пара снова в Review Queue). UI «Качество»: панель «Журнал действий» (`list_audit_log`) со статусом гейта, ♻️ per-record restore, «Не дубль» → `marks_fp=True`. **Hot-reload НЕТ — флаги читаются при старте, изменение требует рестарта.** Включение: утром под присмотром, НЕ перед ночным cron 03:00 |
+| 2026-09 | ✅ | **Ollama в Docker (миграция)**: сервис ollama 0.20.2 в compose на 127.0.0.1:11435 (пиннинг под индекс Qdrant; host-ollama 11434 — другие проекты), GPU через nvidia runtime, chat qwen2.5:7b; Ansible-инфраструктура переноса на новый хост (`ansible/`: host_prepare + transfer pack/bulk/stop/cutover) |
 
 ## 🧪 Тесты (актуальные цифры)
 
@@ -240,4 +262,4 @@ a2e6479 feat(phase12): HTTP-level E2E S9-S12 + 5 observability metrics
 
 ---
 
-*Актуально на 2026-08-08. 20 MCP Tools, 565 тестов mcp_server + 56 kb-console + 21 mcp-stdio, kb-console :8085, stdio-мост v1.1 (ping/notifications по MCP spec, HTTP 204 → без ответа), MCP_MAX_REQUEST_SIZE 128 МБ, qdrant ulimits 65535.*
+*Актуально на 2026-09-09. 31 MCP Tool, 629 тестов mcp_server + 66 kb-console + 19 mcp-stdio, kb-console :8085, ollama-контейнер :11435 (0.20.2, пиннинг под индекс Qdrant), stdio-мост v1.1 (ping/notifications по MCP spec, HTTP 204 → без ответа), MCP_MAX_REQUEST_SIZE 128 МБ, qdrant ulimits 65535.*
