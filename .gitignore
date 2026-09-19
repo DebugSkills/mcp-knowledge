@@ -58,3 +58,13 @@ docs/mcp-perspektivy-slide.md
 docs/mcp-perspektivy-slide.pdf
 docs/pedagogicheskiy-algoritm-nauchnogo-issledovaniya-ksa.md
 docs/pedagogicheskiy-algoritm-nauchnogo-issledovaniya-ksa.pdf
+
+# Приватные материалы: операционный runbook, доступы/инфра (только в .knowledge, НЕ публиковать)
+ansible/RUNBOOK.md
+ansible/**/RUNBOOK.md
+ansible/**/runbook*.md
+private/
+*.private.md
+secrets/
+*.key
+*.pem

@@ -23,7 +23,7 @@ mcp_kb_host_prepare__install_docker: true
 mcp_kb_host_prepare__install_nvidia_driver: true
 mcp_kb_host_prepare__install_nvidia_toolkit: true
 mcp_kb_host_prepare__nvidia_driver_package: nvidia-driver
-mcp_kb_host_prepare__nvidia_reboot: false     # локальный запуск: reboot вручную (см. RUNBOOK §4)
+mcp_kb_host_prepare__nvidia_reboot: false     # локальный запуск: reboot вручную (см. приватный runbook)
 
 # ─── deploy (Сценарий A) ───
 deploy_root: /opt/mcp-knowledge
