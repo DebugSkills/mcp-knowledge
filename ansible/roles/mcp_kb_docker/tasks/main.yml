@@ -8,12 +8,24 @@
     dest: "{{ deploy_root }}/{{ repo_name }}/.env"
     mode: '0600'
 
+# Явный build перед up: сценарий обновления (git pull → build → up) обязан пересобирать
+# образы mcp-server/kb-console из клона (up строит образ только при его отсутствии).
+# changed_when: false — build идемпотентен на уровне compose (кеш слоёв: без изменений
+# в контексте пересборки нет), а always-changed ломал бы идемпотентность dry-run'ов;
+# фактический перезапуск изменённых сервисов отслеживает задача up ниже.
+- name: Собрать образы из клона (mcp-server, kb-console)
+  ansible.builtin.command:
+    cmd: docker compose -f {{ compose_file }} build
+    chdir: "{{ deploy_root }}/{{ repo_name }}"
+  register: build_result
+  changed_when: false
+
 - name: Запустить docker compose
   ansible.builtin.command:
     cmd: docker compose -f {{ compose_file }} up -d --wait
     chdir: "{{ deploy_root }}/{{ repo_name }}"
   register: compose_result
-  changed_when: "'Running' in compose_result.stdout or 'Starting' in compose_result.stdout"
+  changed_when: compose_result.stdout is search('Started|Running|Creating|Created|Built')
 
 - name: Проверить health mcp-server
   ansible.builtin.uri:

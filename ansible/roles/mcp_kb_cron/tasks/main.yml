@@ -1,23 +1,44 @@
 ---
 # Role: mcp_kb_cron
 # Назначение: cron-задачи для бэкапа и quality scan
+#
+# Источник скриптов — git-КЛОН на целевом хосте ({{ deploy_root }}/{{ repo_name }}/scripts/),
+# НЕ контроллер: скрипты приходят вместе с репо кода (роль mcp_kb_repos).
+# Git хранит scripts/*.sh с mode 100644 → после клона exec-бита НЕТ; задачи ниже
+# (copy с remote_src и src==dest) только доводят права до 0755 — идемпотентно
+# (прогон 1: changed=1, далее changed=0), см. trace_id code-2026-09-19-001.
 
-- name: Копировать backup.sh
+- name: Установить права 0755 на backup.sh из клона
   ansible.builtin.copy:
-    src: "{{ playbook_dir }}/../../scripts/backup.sh"
-    dest: /opt/mcp-knowledge/scripts/backup.sh
+    src: "{{ deploy_root }}/{{ repo_name }}/scripts/backup.sh"
+    dest: "{{ deploy_root }}/{{ repo_name }}/scripts/backup.sh"
+    remote_src: true
     mode: '0755'
 
-- name: Копировать quality_scan.sh
+- name: Установить права 0755 на quality_scan.sh из клона
   ansible.builtin.copy:
-    src: "{{ playbook_dir }}/../../scripts/quality_scan.sh"
-    dest: /opt/mcp-knowledge/scripts/quality_scan.sh
+    src: "{{ deploy_root }}/{{ repo_name }}/scripts/quality_scan.sh"
+    dest: "{{ deploy_root }}/{{ repo_name }}/scripts/quality_scan.sh"
+    remote_src: true
     mode: '0755'
+
+# quality_scan.sh берёт ключ из env: MCP_WRITE_KEY (по умолчанию dev-write-key-001 →
+# на проде с vault-ключами 401). Ключ передаём через crontab-env (см. README → M2):
+# vault_cron_write_key — ОДИНОЧНЫЙ ключ (один из элементов JSON-списка
+# vault_mcp_write_keys), задать в inventory/group_vars/all/vault.yml.
+# Если переменная не задана — в crontab попадает пустое значение, и скрипт
+# откатывается на дефолт (хуже не будет: бэкапу ключ не нужен — он ходит в Qdrant).
+- name: Добавить MCP_WRITE_KEY в crontab (env для quality_scan.sh)
+  ansible.builtin.cron:
+    name: MCP_WRITE_KEY
+    env: true
+    value: "{{ vault_cron_write_key | default('') }}"
+    user: root
 
 - name: Настроить cron для ежедневного бэкапа
   ansible.builtin.cron:
     name: "MCP Knowledge — daily backup"
-    job: "/opt/mcp-knowledge/scripts/backup.sh >> /var/log/mcp-backup.log 2>&1"
+    job: "{{ deploy_root }}/{{ repo_name }}/scripts/backup.sh >> /var/log/mcp-backup.log 2>&1"
     hour: "3"
     minute: "0"
     user: root
@@ -25,7 +46,7 @@
 - name: Настроить cron для weekly quality scan
   ansible.builtin.cron:
     name: "MCP Knowledge — weekly quality scan"
-    job: "/opt/mcp-knowledge/scripts/quality_scan.sh >> /var/log/mcp-quality.log 2>&1"
+    job: "{{ deploy_root }}/{{ repo_name }}/scripts/quality_scan.sh >> /var/log/mcp-quality.log 2>&1"
     weekday: "1"
     hour: "4"
     minute: "0"

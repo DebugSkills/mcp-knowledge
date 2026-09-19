@@ -1,9 +1,27 @@
 ---
 # Role: mcp_kb_dirs
-# Назначение: создание структуры каталогов deploy_root + bare-remote
+# Назначение: создание структуры каталогов deploy_root под fresh-install из git-клона
 # Корень — {{ deploy_root }} из inventory/group_vars/all.yml (по умолчанию /opt/mcp-knowledge).
+#
+# ⚠️ Роль НАМЕРЕННО не создаёт НИЧЕГО внутри {{ deploy_root }}/{{ repo_name }}/ (каталог клона):
+# (а) deploy.yml запускает mcp_kb_dirs ДО mcp_kb_repos, а git clone требует пустой или
+#     несуществующий целевой каталог — иначе «fatal: ... уже существует и не является
+#     пустым каталогом»;
+# (б) data/qdrant и data/ollama/models создаёт сам Docker при первом `up` (bind-mount) —
+#     лэйаут как на текущем dev-хосте (data/qdrant там root-owned, создан Docker'ом);
+# (в) data/backups создаёт backup.sh — `mkdir -p "$BACKUP_DIR"` (scripts/backup.sh:204).
+#
+# Создаются только каталоги ВНЕ клона, нужные до docker compose up (эти же пути создают
+# и сам {{ deploy_root }} — он нужен до клонирования):
+# - ../... в compose (mcp-server, host-net) → {{ deploy_root }}/data/{dlq,quality,logs,pdf_cache,tokens},
+#   {{ deploy_root }}/models_cache
+# Двух расходящихся data/-деревьев быть не должно: qdrant-снапшоты и backups живут
+# ТОЛЬКО в data/ клона (оттуда их забирает backup.sh), но создают их Docker/backup.sh,
+# а не эта роль.
+# {{ deploy_root }}/scripts больше НЕ создаётся: cron-скрипты берутся из клона
+# ({{ deploy_root }}/{{ repo_name }}/scripts/), отдельная копия не нужна (роль mcp_kb_cron).
 
-- name: Создать рабочую директорию
+- name: Создать каталоги данных mcp-server (пути ../ относительно compose-файла)
   ansible.builtin.file:
     path: "{{ item }}"
     state: directory
@@ -11,16 +29,12 @@
     group: "1000"
     mode: '0755'
   loop:
-    - "{{ deploy_root }}/data/qdrant/snapshots"
-    - "{{ deploy_root }}/data/dlq"
-    - "{{ deploy_root }}/data/quality"
-    - "{{ deploy_root }}/data/backups"
-    - "{{ deploy_root }}/data/ollama/models"
-    - "{{ deploy_root }}/data/tokens"
-    - "{{ deploy_root }}/data/pdf_cache"
-    - "{{ deploy_root }}/data/logs"
-    - "{{ deploy_root }}/models_cache"
-    - "{{ deploy_root }}/scripts"
+    - "{{ deploy_root }}/data/dlq"        # compose: ../data/dlq
+    - "{{ deploy_root }}/data/quality"    # compose: ../data/quality
+    - "{{ deploy_root }}/data/logs"       # compose: ../data/logs
+    - "{{ deploy_root }}/data/pdf_cache"  # compose: ../data/pdf_cache
+    - "{{ deploy_root }}/data/tokens"     # compose: ../data/tokens (TokenStore)
+    - "{{ deploy_root }}/models_cache"    # compose: ../models_cache (HF-токенизатор)
 
 # noqa обоснование: ansible.builtin.git не умеет создавать пустой bare-репозиторий
 # (только clone), поэтому git init --bare через command с creates=-гардом идемпотентности
