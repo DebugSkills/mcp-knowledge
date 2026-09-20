@@ -48,10 +48,13 @@ cd staging
 
 **На клиентском хосте** (отдельно от сервера) — контейнер самодостаточен:
 ```bash
+# CONSOLE_HOST=0.0.0.0 нужен только в bridge-режиме (docker-proxy ходит на IP
+# контейнера); экспозицию держим loopback-публикацией хоста.
 docker run -d --name kb-console \
   -e MCP_SERVER_URL=http://<server-ip>:8000 \
   -e MCP_API_KEY=<ключ из .env сервера> \
-  -p 8085:8085 kb-console:prod
+  -e CONSOLE_HOST=0.0.0.0 \
+  -p 127.0.0.1:8085:8085 kb-console:prod
 ```
 Открыть `http://localhost:8085`. Ключ `MCP_API_KEY` должен входить в `MCP_READ_KEYS` (чтение/поиск) или `MCP_WRITE_KEYS` (импорт).
 

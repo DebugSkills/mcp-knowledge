@@ -14,10 +14,13 @@ docker compose up -d            # dev
 
 **На клиентском хосте** (отдельно от сервера):
 ```bash
+# CONSOLE_HOST=0.0.0.0 обязателен в bridge-режиме (docker-proxy ходит на IP
+# контейнера, 127.0.0.1 внутри через -p недоступен); наружу публикуем loopback.
 docker run -d --name kb-console \
   -e MCP_SERVER_URL=http://<server-ip>:8000 \
   -e MCP_API_KEY=<ключ из .env сервера> \
-  -p 8085:8085 kb-console:prod
+  -e CONSOLE_HOST=0.0.0.0 \
+  -p 127.0.0.1:8085:8085 kb-console:prod
 ```
 → открыть `http://localhost:8085`
 

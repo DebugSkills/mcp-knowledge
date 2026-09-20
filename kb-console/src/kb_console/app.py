@@ -13,7 +13,7 @@ from nicegui import core, ui
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .components.header import render_header
-from .config import CONSOLE_PORT
+from .config import CONSOLE_HOST, CONSOLE_PORT
 
 
 class RequestLogMiddleware(BaseHTTPMiddleware):
@@ -91,7 +91,7 @@ def page_tokens() -> None:
 core.app.add_middleware(RequestLogMiddleware)
 
 ui.run(
-    host="0.0.0.0",
+    host=CONSOLE_HOST,
     port=CONSOLE_PORT,
     title="MCP Knowledge Console",
     reload=False,

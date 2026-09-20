@@ -80,6 +80,27 @@ make console-test                    # unit + smoke kb-console (66)
 .venv/bin/python -m pytest mcp-stdio/tests -q    # stdio-мост (19)
 ```
 
+## 🌐 Сетевая экспозиция (порты)
+
+Security-by-default: всё, кроме MCP API, слушает только loopback (`code-2026-09-20-001`, audit P1 У-1/У-2).
+
+| Порт | Сервис | Интерфейс | Защита / внешний доступ |
+|---|---|---|---|
+| 8000 | mcp-server (MCP API) | `0.0.0.0` | API-key (read/import/write уровни); файрвол allow-list |
+| 8085 | kb-console | `127.0.0.1` (`CONSOLE_HOST`) | собственной авторизации нет → loopback-only; доступ извне `ssh -L 8085:127.0.0.1:8085` |
+| 6333 / 6334 | Qdrant REST / gRPC | `127.0.0.1` | прямой доступ обходит MCP-auth и зонную модель; отладка `ssh -L 6333:127.0.0.1:6333` |
+| 11435 | ollama | `127.0.0.1` | уже loopback (11434 — host-ollama других проектов) |
+
+kb-console на **клиентском** хосте (bridge-режим `docker run`): docker-proxy ходит на IP контейнера, поэтому приложение на `127.0.0.1` внутри контейнера через `-p` недоступно — ставим `CONSOLE_HOST=0.0.0.0`, а экспозицию держим loopback-публикацией хоста:
+
+```bash
+docker run -d --name kb-console \
+  -e MCP_SERVER_URL=http://<server-ip>:8000 \
+  -e MCP_API_KEY=<ключ> \
+  -e CONSOLE_HOST=0.0.0.0 \
+  -p 127.0.0.1:8085:8085 kb-console:prod
+```
+
 ## 📦 Продовый деплой (air-gap, одноархивный bundle)
 
 > ⚠️ **Legacy-путь:** `offline-deploy.sh` готовит модели в **host-ollama** (системный сервис, 11434). После миграции 2026-09 прод-топология — ollama-КОНТЕЙНЕР compose (:11435). Для новых развёртываний используйте `docker compose -f docker-compose.prod.yml up -d` + `ansible/` (перенос). Air-gap скрипт будет доработан под контейнерную топологию отдельной задачей.
@@ -187,6 +208,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | `MCP_IMPORT_KEYS` | `[]` | Import-ключи (read + import_content, без delete/reindex) |
 | `MCP_API_KEY` | — | Ключ kb-console (должен входить в read/import/write keys) |
 | `MCP_SERVER_URL` / `CONSOLE_PORT` | `http://localhost:8000` / `8085` | kb-console: адрес сервера / порт UI |
+| `CONSOLE_HOST` | `127.0.0.1` | адрес kb-console (loopback; `0.0.0.0` — только bridge docker run с `-p 127.0.0.1:8085:8085`) |
 | `OLLAMA_CHAT_MODEL` | `qwen2.5:7b` | LLM для analyze_content (ollama-контейнер; текстовая — VL не влезает в 8GB на 0.20.2) |
 | `ANALYZE_FRAGMENT_CHARS` / `ANALYZE_TIMEOUT` | `8000` / `60s` | Лимиты анализа контента |
 | `RATE_LIMIT_READ_PER_MIN` / `RATE_LIMIT_WRITE_PER_MIN` | `100` / `20` | Rate-limit (429) |
