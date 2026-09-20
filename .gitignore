@@ -68,3 +68,9 @@ private/
 secrets/
 *.key
 *.pem
+
+# Особенности конкретного железа/хоста (приватно, вне публичной репы)
+ansible/HARDWARE*.md
+ansible/**/HARDWARE*.md
+ansible/hardware/
+docs/hardware-*.md

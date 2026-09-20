@@ -1,8 +1,352 @@
 ---
+# Подготовка НОВОГО хоста для mcp-knowledge с нуля: docker + драйвер NVIDIA + nvidia-container-toolkit + GPU runtime.
+# Самодостаточный single-file плейбук: бывшая роль mcp_kb_host_prepare инлайнена (trace code-2026-09-19-003).
+# Порядок: preflight → docker → nvidia_driver → toolkit → nvidia_ctk → proxy → (flush) → verify.
+# ВНИМАНИЕ: гранулярные теги (docker, toolkit, ...) зависят от проб из preflight —
+# запускайте плейбук целиком (тег host_prepare по умолчанию на всех блоках).
+#
+# Параметры mcp_kb_host_prepare__* (бывшие defaults роли) — в inventory/group_vars/all.yml.
+# Приоритет: extra vars > host_vars/*.yml > group_vars/all.yml (host_vars переопределяет дефолты);
+# точечное переопределение на запуск — extra vars: -e mcp_kb_host_prepare__<имя>=<значение>.
+
 - name: Подготовка нового хоста для mcp-knowledge (docker + GPU)
   hosts: mcp_kb_new
   gather_facts: true
   become: true
-  roles:
-    - role: mcp_kb_host_prepare
-      tags: [host_prepare]
+
+  handlers:
+    - name: Перезапустить docker
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+        daemon_reload: true
+
+  tasks:
+    # ─── Preflight: сбор фактов, проверка ОС, пробы уже установленных компонентов ───
+    - name: Preflight — факты о пакетах, проверка Debian 12, пробы docker/nvidia-smi
+      tags: [host_prepare, preflight]
+      block:
+        - name: Собрать факты об установленных пакетах
+          ansible.builtin.package_facts:
+            manager: auto
+
+        - name: Проверить, что хост — Debian 12 (bookworm)
+          ansible.builtin.assert:
+            that:
+              - ansible_distribution == 'Debian'
+              - ansible_distribution_major_version == '12'
+            fail_msg: >-
+              Плейбук тестирован только на Debian 12 (bookworm).
+              Текущий хост: {{ ansible_distribution }} {{ ansible_distribution_version }}.
+
+        - name: Проба драйвера NVIDIA (nvidia-smi)
+          ansible.builtin.command:
+            cmd: nvidia-smi
+          register: mcp_kb_host_prepare__nvidia_smi_probe
+          changed_when: false
+          failed_when: false
+
+        - name: Проверить, что драйвер NVIDIA установлен (автоустановка выключена)
+          ansible.builtin.assert:
+            that:
+              - mcp_kb_host_prepare__nvidia_smi_probe.rc == 0
+            fail_msg: >-
+              nvidia-smi не работает, а автоматическая установка драйвера отключена
+              (mcp_kb_host_prepare__install_nvidia_driver: false).
+              Установите драйвер ВРУЧНУЮ: включить non-free в /etc/apt/sources.list.d/debian.sources,
+              'apt install nvidia-driver firmware-misc-nonfree', reboot, проверить 'nvidia-smi'.
+              См. приватный RUNBOOK (Сценарий B). Либо включите install_nvidia_driver: true.
+          when: not (mcp_kb_host_prepare__install_nvidia_driver | bool)
+
+        - name: Проба docker (docker --version)
+          ansible.builtin.command:
+            cmd: docker --version
+          register: mcp_kb_host_prepare__docker_probe
+          changed_when: false
+          failed_when: false
+
+    # ─── Docker из официального репозитория Docker (Debian bookworm) ───
+    # Блок выполняется только если docker отсутствует (проба rc != 0 из preflight).
+    - name: Установить docker из официального репозитория (если отсутствует)
+      when:
+        - mcp_kb_host_prepare__install_docker
+        - mcp_kb_host_prepare__docker_probe.rc != 0
+      tags: [host_prepare, docker]
+      block:
+        - name: Установить базовые зависимости apt (ca-certificates, curl, gnupg)
+          ansible.builtin.apt:
+            name:
+              - ca-certificates
+              - curl
+              - gnupg
+            state: present
+
+        - name: Создать каталог /etc/apt/keyrings
+          ansible.builtin.file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: '0755'
+
+        - name: Скачать GPG-ключ docker (ASCII) во временный файл
+          ansible.builtin.get_url:
+            url: "{{ mcp_kb_host_prepare__docker_gpg_url }}"
+            dest: /tmp/docker-key.asc
+            mode: '0644'
+
+        # ВАЖНО: ключ docker распространяется в ASCII-armored виде — для keyrings
+        # обязателен gpg --dearmor. creates= гарантирует идемпотентность.
+        - name: Конвертировать ключ docker в бинарный keyring (gpg --dearmor)
+          ansible.builtin.command:
+            argv:
+              - gpg
+              - --dearmor
+              - --output
+              - /etc/apt/keyrings/docker.gpg
+              - /tmp/docker-key.asc
+          args:
+            creates: /etc/apt/keyrings/docker.gpg
+
+        - name: Добавить репозиторий docker (docker.list)
+          ansible.builtin.template:
+            src: "{{ playbook_dir | dirname }}/templates/docker.list.j2"
+            dest: /etc/apt/sources.list.d/docker.list
+            mode: '0644'
+          register: mcp_kb_host_prepare__docker_list
+
+        - name: Обновить кеш apt после добавления репозитория docker
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: "{{ 0 if mcp_kb_host_prepare__docker_list is changed else 3600 }}"
+
+        - name: Установить пакеты docker
+          ansible.builtin.apt:
+            name: "{{ mcp_kb_host_prepare__docker_packages }}"
+            state: present
+
+        - name: Включить и запустить сервис docker
+          ansible.builtin.systemd:
+            name: docker
+            enabled: true
+            state: started
+
+    # ─── Драйвер NVIDIA из репозитория Debian (non-free) — только при сознательном включении ───
+    # Блок выполняется только если включена автоустановка и nvidia-smi не работает (драйвер отсутствует).
+    - name: Установить драйвер NVIDIA + прошивки, перезагрузить хост (если драйвера нет)
+      when:
+        - mcp_kb_host_prepare__install_nvidia_driver
+        - mcp_kb_host_prepare__nvidia_smi_probe.rc != 0
+      tags: [host_prepare, nvidia_driver]
+      block:
+        - name: Проверить наличие deb822-файла источников (stat)
+          ansible.builtin.stat:
+            path: "{{ mcp_kb_host_prepare__debian_sources_path }}"
+          register: mcp_kb_host_prepare__debian_sources_stat
+
+        # Debian 12 по умолчанию использует deb822 (debian.sources). Полная замена строки
+        # Components идемпотентна: повторная подстановка даёт идентичный текст → changed=0.
+        # Путь единый со stat выше — через mcp_kb_host_prepare__debian_sources_path.
+        - name: Включить main contrib non-free non-free-firmware в debian.sources (deb822)
+          ansible.builtin.replace:
+            path: "{{ mcp_kb_host_prepare__debian_sources_path }}"
+            regexp: '(?m)^Components:.*$'
+            replace: 'Components: main contrib non-free non-free-firmware'
+          when: mcp_kb_host_prepare__debian_sources_stat.stat.exists
+          register: mcp_kb_host_prepare__sources_deb822
+
+        # Fallback для хостов со старым форматом sources.list (без debian.sources).
+        - name: Добавить non-free репозиторий (fallback для классического sources.list)
+          ansible.builtin.apt_repository:
+            repo: deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+            state: present
+            filename: mcp-kb-nonfree
+          when: not mcp_kb_host_prepare__debian_sources_stat.stat.exists
+          register: mcp_kb_host_prepare__sources_legacy
+
+        - name: Обновить кеш apt после включения non-free
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: "{{ 0 if (mcp_kb_host_prepare__sources_deb822 is changed or mcp_kb_host_prepare__sources_legacy is changed) else 3600 }}"
+
+        - name: Установить драйвер NVIDIA и прошивки
+          ansible.builtin.apt:
+            name:
+              - "{{ mcp_kb_host_prepare__nvidia_driver_package }}"
+              - firmware-misc-nonfree
+            state: present
+          register: mcp_kb_host_prepare__driver_install
+
+        - name: Перезагрузить хост после установки драйвера
+          ansible.builtin.reboot:
+            reboot_timeout: 600
+          when:
+            - mcp_kb_host_prepare__nvidia_reboot
+            - mcp_kb_host_prepare__driver_install is changed
+
+    # ─── nvidia-container-toolkit из официального репозитория NVIDIA ───
+    - name: Установить nvidia-container-toolkit из репозитория NVIDIA
+      when: mcp_kb_host_prepare__install_nvidia_toolkit
+      tags: [host_prepare, toolkit]
+      block:
+        - name: Проба драйвера NVIDIA перед установкой toolkit
+          ansible.builtin.command:
+            cmd: nvidia-smi
+          register: mcp_kb_host_prepare__nvidia_smi_now
+          changed_when: false
+          failed_when: false
+
+        # Warn-only: toolkit ставится и без драйвера, но GPU в контейнерах
+        # заработает только после установки/загрузки драйвера. (без ignore_errors — правило lint)
+        - name: Предупредить, если драйвер NVIDIA не работает (не блокируя установку)
+          ansible.builtin.debug:
+            msg: "{{ 'Драйвер NVIDIA работает' if mcp_kb_host_prepare__nvidia_smi_now.rc == 0 else mcp_kb_host_prepare__driver_warn }}"
+          vars:
+            mcp_kb_host_prepare__driver_warn: >-
+              ВНИМАНИЕ: nvidia-smi не отвечает. nvidia-container-toolkit будет установлен,
+              но GPU в контейнерах не заработает, пока не установлен/не загружен драйвер.
+
+        - name: Создать каталог /etc/apt/keyrings
+          ansible.builtin.file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: '0755'
+
+        # ВАЖНО: ключ кладётся как есть, БЕЗ gpg --dearmor. Опыт переноса показал:
+        # dearmor-путь приводил к NO_PUBKEY DDCAE044F796ECB0 (битый keyring после
+        # ручного gpg). apt >= 2.4 (Debian 12) принимает ключ напрямую.
+        - name: Скачать GPG-ключ NVIDIA в keyrings (как есть, без dearmor)
+          ansible.builtin.get_url:
+            url: "{{ mcp_kb_host_prepare__nvidia_gpg_url }}"
+            dest: /etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg
+            mode: '0644'
+
+        - name: Скачать файл репозитория nvidia-container-toolkit
+          ansible.builtin.get_url:
+            url: "{{ mcp_kb_host_prepare__nvidia_repo_url }}"
+            dest: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+            mode: '0644'
+
+        # ВАЖНО: ansible_architecture возвращает x86_64, а apt ожидает amd64 —
+        # единственный надёжный источник: dpkg --print-architecture.
+        - name: Определить архитектуру пакета (dpkg --print-architecture)
+          ansible.builtin.command:
+            cmd: dpkg --print-architecture
+          register: mcp_kb_host_prepare__dpkg_arch
+          changed_when: false
+
+        - name: Подставить реальную архитектуру в nvidia-container-toolkit.list
+          ansible.builtin.replace:
+            path: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+            regexp: '\$\(ARCH\)'
+            replace: '{{ mcp_kb_host_prepare__dpkg_arch.stdout }}'
+          register: mcp_kb_host_prepare__toolkit_list_arch
+
+        - name: Обновить кеш apt после добавления репозитория NVIDIA
+          ansible.builtin.apt:
+            update_cache: true
+            cache_valid_time: "{{ 0 if mcp_kb_host_prepare__toolkit_list_arch is changed else 3600 }}"
+
+        - name: Установить nvidia-container-toolkit
+          ansible.builtin.apt:
+            name: nvidia-container-toolkit
+            state: present
+
+    # ─── Регистрация nvidia runtime в docker через nvidia-ctk ───
+    # ВАЖНО: daemon.json старого хоста НЕ копируется целиком (там мёртвый mirror :5000) —
+    # nvidia-ctk добавляет ТОЛЬКО секцию runtimes в существующий/новый daemon.json.
+    - name: Зарегистрировать nvidia runtime в docker через nvidia-ctk
+      when: mcp_kb_host_prepare__install_nvidia_toolkit
+      tags: [host_prepare, nvidia_ctk]
+      block:
+        - name: Проверить наличие /etc/docker/daemon.json
+          ansible.builtin.stat:
+            path: /etc/docker/daemon.json
+          register: mcp_kb_host_prepare__daemon_json_stat
+
+        - name: Прочитать /etc/docker/daemon.json (если существует)
+          ansible.builtin.slurp:
+            src: /etc/docker/daemon.json
+          register: mcp_kb_host_prepare__daemon_json
+          when: mcp_kb_host_prepare__daemon_json_stat.stat.exists
+
+        - name: Определить, сконфигурирован ли уже nvidia runtime
+          ansible.builtin.set_fact:
+            mcp_kb_host_prepare__has_nvidia_runtime: "{{ 'nvidia' in (mcp_kb_host_prepare__daemon_json.content | default('') | b64decode) }}"
+
+        - name: Сконфигурировать nvidia runtime для docker (nvidia-ctk runtime configure)
+          ansible.builtin.command:
+            cmd: nvidia-ctk runtime configure --runtime=docker
+          when: not (mcp_kb_host_prepare__has_nvidia_runtime | bool)
+          changed_when: true
+          notify: Перезапустить docker
+
+    # ─── HTTP-proxy для демона docker (dockerd тянет образы через прокси) ───
+    # Блок выполняется только если mcp_kb_host_prepare__proxy не пуст.
+    - name: Настроить HTTP-proxy для docker-сервиса (если задан)
+      when: mcp_kb_host_prepare__proxy | length > 0
+      tags: [host_prepare, proxy]
+      block:
+        - name: Настроить proxy для сервиса docker (drop-in systemd)
+          ansible.builtin.template:
+            src: "{{ playbook_dir | dirname }}/templates/http-proxy.conf.j2"
+            dest: /etc/systemd/system/docker.service.d/http-proxy.conf
+            mode: '0644'
+          notify: Перезапустить docker
+
+        - name: Перечитать unit-файлы systemd (daemon-reload)
+          ansible.builtin.systemd:
+            daemon_reload: true
+          changed_when: false
+
+    # ─── Финальная верификация: docker с nvidia runtime, compose plugin, рабочий nvidia-smi ───
+    - name: Верификация — flush_handlers, docker info/compose/nvidia-smi
+      tags: [host_prepare, verify]
+      block:
+        - name: Сбросить отложенные обработчики (перезапуск docker) перед проверками
+          ansible.builtin.meta: flush_handlers
+
+        - name: Собрать информацию docker (docker info)
+          ansible.builtin.command:
+            cmd: docker info
+          register: mcp_kb_host_prepare__docker_info
+          changed_when: false
+
+        - name: Проверить, что nvidia runtime зарегистрирован в docker
+          ansible.builtin.assert:
+            that:
+              - "'nvidia' in mcp_kb_host_prepare__docker_info.stdout"
+            fail_msg: >-
+              nvidia runtime не найден в 'docker info'.
+              Проверьте блок nvidia_ctk выше в этом плейбуке и логи systemctl status docker.
+
+        - name: Проверить docker compose plugin (docker compose version)
+          ansible.builtin.command:
+            cmd: docker compose version
+          register: mcp_kb_host_prepare__compose_version
+          changed_when: false
+
+        - name: Убедиться, что docker compose доступен
+          ansible.builtin.assert:
+            that:
+              - mcp_kb_host_prepare__compose_version.rc == 0
+            fail_msg: docker compose plugin недоступен — проверьте docker-compose-plugin
+
+        - name: Проверить драйвер NVIDIA (nvidia-smi)
+          ansible.builtin.command:
+            cmd: nvidia-smi
+          register: mcp_kb_host_prepare__nvidia_smi_check
+          changed_when: false
+
+        - name: Убедиться, что драйвер NVIDIA работает
+          ansible.builtin.assert:
+            that:
+              - mcp_kb_host_prepare__nvidia_smi_check.rc == 0
+            fail_msg: >-
+              nvidia-smi недоступен — драйвер не установлен или не загружен (нужен reboot?).
+              Установите драйвер ВРУЧНУЮ (non-free + nvidia-driver + reboot, см. приватный
+              RUNBOOK, Сценарий B) либо включите mcp_kb_host_prepare__install_nvidia_driver: true.
+
+        - name: ГОТОВО — хост подготовлен для mcp-knowledge
+          ansible.builtin.debug:
+            msg: >-
+              ГОТОВО: docker + nvidia runtime + GPU драйвер активны.
+              Хост готов к деплою (playbooks/deploy.yml).

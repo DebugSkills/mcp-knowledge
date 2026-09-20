@@ -1,14 +1,203 @@
 ---
+# Полный деплой mcp-knowledge (fresh-install) на подготовленный хост (playbooks/host-prepare.yml).
+# Самодостаточный single-file плейбук: бывшие роли mcp_kb_dirs / mcp_kb_repos / mcp_kb_docker /
+# mcp_kb_cron инлайнены в секции-блоки (trace code-2026-09-19-003).
+# Порядок: dirs → repos → docker → cron. Теги ролей сохранены как теги секций:
+# --tags dirs|repos|docker|cron.
+#
+# Параметры mcp_kb_repos__* (бывшие defaults роли) — в inventory/group_vars/all.yml.
+# Шаблон .env — ansible/templates/.env.j2.
+
 - name: Полный деплой mcp-knowledge (fresh-install)
   hosts: mcp_kb_new
   gather_facts: true
   become: true
-  roles:
-    - role: mcp_kb_dirs
+
+  tasks:
+    # ─── dirs: создание структуры каталогов deploy_root (бывшая роль mcp_kb_dirs) ───
+    # Корень — {{ deploy_root }} из inventory/group_vars/all.yml (по умолчанию /opt/mcp-knowledge).
+    #
+    # ⚠️ Секция НАМЕРЕННО не создаёт НИЧЕГО внутри {{ deploy_root }}/{{ repo_name }}/ (каталог клона):
+    # (а) деплой запускает dirs ДО repos, а git clone требует пустой или
+    #     несуществующий целевой каталог — иначе «fatal: ... уже существует и не является
+    #     пустым каталогом»;
+    # (б) data/qdrant и data/ollama/models создаёт сам Docker при первом `up` (bind-mount) —
+    #     лэйаут как на текущем dev-хосте (data/qdrant там root-owned, создан Docker'ом);
+    # (в) data/backups создаёт backup.sh — `mkdir -p "$BACKUP_DIR"` (scripts/backup.sh:204).
+    #
+    # Создаются только каталоги ВНЕ клона, нужные до docker compose up (эти же пути создают
+    # и сам {{ deploy_root }} — он нужен до клонирования):
+    # - ../... в compose (mcp-server, host-net) → {{ deploy_root }}/data/{dlq,quality,logs,pdf_cache,tokens},
+    #   {{ deploy_root }}/models_cache
+    # Двух расходящихся data/-деревьев быть не должно: qdrant-снапшоты и backups живут
+    # ТОЛЬКО в data/ клона (оттуда их забирает backup.sh), но создают их Docker/backup.sh,
+    # а не эта секция.
+    # {{ deploy_root }}/scripts больше НЕ создаётся: cron-скрипты берутся из клона
+    # ({{ deploy_root }}/{{ repo_name }}/scripts/), отдельная копия не нужна (секция cron).
+    - name: Создать структуру каталогов deploy_root вне git-клона
       tags: [dirs]
-    - role: mcp_kb_repos
+      block:
+        - name: Создать каталоги данных mcp-server (пути ../ относительно compose-файла)
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            owner: "1000"
+            group: "1000"
+            mode: '0755'
+          loop:
+            - "{{ deploy_root }}/data/dlq"        # compose: ../data/dlq
+            - "{{ deploy_root }}/data/quality"    # compose: ../data/quality
+            - "{{ deploy_root }}/data/logs"       # compose: ../data/logs
+            - "{{ deploy_root }}/data/pdf_cache"  # compose: ../data/pdf_cache
+            - "{{ deploy_root }}/data/tokens"     # compose: ../data/tokens (TokenStore)
+            - "{{ deploy_root }}/models_cache"    # compose: ../models_cache (HF-токенизатор)
+
+        # noqa обоснование: ansible.builtin.git не умеет создавать пустой bare-репозиторий
+        # (только clone), поэтому git init --bare через command с creates=-гардом идемпотентности
+        - name: Создать bare-репозиторий для бэкапа SSOT  # noqa: command-instead-of-module
+          ansible.builtin.command:
+            cmd: git init --bare {{ deploy_root }}-bare/knowledge.git
+            creates: "{{ deploy_root }}-bare/knowledge.git/HEAD"
+
+    # ─── repos: клонирование git-репозиториев (бывшая роль mcp_kb_repos) ───
+    # Клонирование двух git-репозиториев (mcp-knowledge + knowledge).
+    # Корень — {{ deploy_root }} из inventory/group_vars/all.yml (по умолчанию /opt/mcp-knowledge).
+    # Параметры mcp_kb_repos__* — в inventory/group_vars/all.yml.
+    - name: Клонировать репозитории кода и знаний (mcp-knowledge + knowledge)
       tags: [repos]
-    - role: mcp_kb_docker
+      block:
+        - name: Клонировать репо кода (mcp-knowledge)
+          ansible.builtin.git:
+            repo: "{{ mcp_kb_repos__mcp_knowledge_repo_url }}"
+            dest: "{{ deploy_root }}/mcp-knowledge"
+            version: "{{ mcp_kb_repos__version }}"
+            update: "{{ mcp_kb_repos__update }}"
+
+        - name: Клонировать репо знаний (knowledge)
+          ansible.builtin.git:
+            repo: "{{ mcp_kb_repos__knowledge_repo_url }}"
+            dest: "{{ deploy_root }}/knowledge"
+            version: "{{ mcp_kb_repos__version }}"
+            update: "{{ mcp_kb_repos__update }}"
+
+        # noqa обоснование: ansible.builtin.git не управляет remote-секциями репозитория
+        - name: Добавить backup remote в knowledge  # noqa: command-instead-of-module
+          ansible.builtin.command:
+            cmd: git remote add backup {{ deploy_root }}-bare/knowledge.git
+            chdir: "{{ deploy_root }}/knowledge"
+          register: remote_result
+          # success = remote добавлен (rc==0) ИЛИ уже существует ('already exists' в stderr).
+          # ВАЖНО: one-liner с 'and', не список — список в failed_when трактуется как OR
+          # и валидировал задачу как failed при любом исходе.
+          failed_when: remote_result.rc != 0 and 'already exists' not in remote_result.stderr
+          changed_when: remote_result.rc == 0
+
+    # ─── docker: docker compose up + health-check (бывшая роль mcp_kb_docker) ───
+    # Запуск стека (mcp-server, qdrant, ollama) и проверка health-эндпоинтов.
+    - name: Запустить стек через docker compose и проверить health (mcp-server, qdrant, ollama)
       tags: [docker]
-    - role: mcp_kb_cron
+      block:
+        - name: Копировать .env из шаблона
+          ansible.builtin.template:
+            src: "{{ playbook_dir | dirname }}/templates/.env.j2"
+            dest: "{{ deploy_root }}/{{ repo_name }}/.env"
+            mode: '0600'
+
+        # Явный build перед up: сценарий обновления (git pull → build → up) обязан пересобирать
+        # образы mcp-server/kb-console из клона (up строит образ только при его отсутствии).
+        # changed_when: false — build идемпотентен на уровне compose (кеш слоёв: без изменений
+        # в контексте пересборки нет), а always-changed ломал бы идемпотентность dry-run'ов;
+        # фактический перезапуск изменённых сервисов отслеживает задача up ниже.
+        - name: Собрать образы из клона (mcp-server, kb-console)
+          ansible.builtin.command:
+            cmd: docker compose -f {{ compose_file }} build
+            chdir: "{{ deploy_root }}/{{ repo_name }}"
+          register: build_result
+          changed_when: false
+
+        - name: Запустить docker compose
+          ansible.builtin.command:
+            cmd: docker compose -f {{ compose_file }} up -d --wait
+            chdir: "{{ deploy_root }}/{{ repo_name }}"
+          register: compose_result
+          changed_when: compose_result.stdout is search('Started|Running|Creating|Created|Built')
+
+        - name: Проверить health mcp-server
+          ansible.builtin.uri:
+            url: http://localhost:8000/health
+            return_content: true
+          register: health_result
+          until: health_result.status == 200
+          retries: 10
+          delay: 5
+
+        - name: Проверить health Qdrant
+          ansible.builtin.uri:
+            url: http://localhost:6333/healthz
+            return_content: true
+          register: qdrant_health
+          until: qdrant_health.status == 200
+          retries: 10
+          delay: 5
+
+        - name: Проверить health Ollama
+          ansible.builtin.uri:
+            url: http://localhost:11435/api/tags
+            return_content: true
+          register: ollama_health
+          until: ollama_health.status == 200
+          retries: 10
+          delay: 5
+
+    # ─── cron: cron-задачи для бэкапа и quality scan (бывшая роль mcp_kb_cron) ───
+    # Источник скриптов — git-КЛОН на целевом хосте ({{ deploy_root }}/{{ repo_name }}/scripts/),
+    # НЕ контроллер: скрипты приходят вместе с репо кода (секция repos).
+    # Git хранит scripts/*.sh с mode 100644 → после клона exec-бита НЕТ; задачи ниже
+    # (copy с remote_src и src==dest) только доводят права до 0755 — идемпотентно
+    # (прогон 1: changed=1, далее changed=0), см. trace_id code-2026-09-19-001.
+    - name: Настроить cron-задачи для бэкапа и quality scan
       tags: [cron]
+      block:
+        - name: Установить права 0755 на backup.sh из клона
+          ansible.builtin.copy:
+            src: "{{ deploy_root }}/{{ repo_name }}/scripts/backup.sh"
+            dest: "{{ deploy_root }}/{{ repo_name }}/scripts/backup.sh"
+            remote_src: true
+            mode: '0755'
+
+        - name: Установить права 0755 на quality_scan.sh из клона
+          ansible.builtin.copy:
+            src: "{{ deploy_root }}/{{ repo_name }}/scripts/quality_scan.sh"
+            dest: "{{ deploy_root }}/{{ repo_name }}/scripts/quality_scan.sh"
+            remote_src: true
+            mode: '0755'
+
+        # quality_scan.sh берёт ключ из env: MCP_WRITE_KEY (по умолчанию dev-write-key-001 →
+        # на проде с vault-ключами 401). Ключ передаём через crontab-env (см. README → M2):
+        # vault_cron_write_key — ОДИНОЧНЫЙ ключ (один из элементов JSON-списка
+        # vault_mcp_write_keys), задать в inventory/group_vars/all/vault.yml.
+        # Если переменная не задана — в crontab попадает пустое значение, и скрипт
+        # откатывается на дефолт (хуже не будет: бэкапу ключ не нужен — он ходит в Qdrant).
+        - name: Добавить MCP_WRITE_KEY в crontab (env для quality_scan.sh)
+          ansible.builtin.cron:
+            name: MCP_WRITE_KEY
+            env: true
+            value: "{{ vault_cron_write_key | default('') }}"
+            user: root
+
+        - name: Настроить cron для ежедневного бэкапа
+          ansible.builtin.cron:
+            name: "MCP Knowledge — daily backup"
+            job: "{{ deploy_root }}/{{ repo_name }}/scripts/backup.sh >> /var/log/mcp-backup.log 2>&1"
+            hour: "3"
+            minute: "0"
+            user: root
+
+        - name: Настроить cron для weekly quality scan
+          ansible.builtin.cron:
+            name: "MCP Knowledge — weekly quality scan"
+            job: "{{ deploy_root }}/{{ repo_name }}/scripts/quality_scan.sh >> /var/log/mcp-quality.log 2>&1"
+            weekday: "1"
+            hour: "4"
+            minute: "0"
+            user: root

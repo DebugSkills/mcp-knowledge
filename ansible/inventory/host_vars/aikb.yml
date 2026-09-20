@@ -20,10 +20,13 @@ ansible_python_interpreter: /usr/bin/python3
 
 # ─── mcp_kb_host_prepare (Сценарий B) ───
 mcp_kb_host_prepare__install_docker: true
-mcp_kb_host_prepare__install_nvidia_driver: true
+# драйвер NVIDIA на aikb уже установлен ВРУЧНУЮ (nvidia-smi работает)
+mcp_kb_host_prepare__install_nvidia_driver: false
 mcp_kb_host_prepare__install_nvidia_toolkit: true
 mcp_kb_host_prepare__nvidia_driver_package: nvidia-driver
-mcp_kb_host_prepare__nvidia_reboot: false     # локальный запуск: reboot вручную (см. приватный runbook)
+# применяется только при mcp_kb_host_prepare__install_nvidia_driver: true;
+# локальный запуск: reboot вручную (см. приватный runbook)
+mcp_kb_host_prepare__nvidia_reboot: false
 
 # ─── deploy (Сценарий A) ───
 deploy_root: /opt/mcp-knowledge
