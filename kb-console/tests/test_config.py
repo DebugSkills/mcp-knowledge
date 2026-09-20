@@ -18,7 +18,11 @@ def _config_value(var: str, env: dict[str, str] | None = None) -> str:
     """Получить значение переменной модуля kb_console.config в чистом env."""
     code = f"from kb_console import config; print(getattr(config, '{var}'))"
     run_env = os.environ.copy()
+    # Чистим ВСЕ влияющие env (иначе утечка окружения разработчика ломает
+    # тесты: прецедент CONSOLE_HOST; auth-переменные — code-2026-09-20-002 P1-4).
     run_env.pop("CONSOLE_HOST", None)
+    run_env.pop("CONSOLE_PASSWORD", None)
+    run_env.pop("CONSOLE_AUTH", None)
     if env:
         run_env.update(env)
     result = subprocess.run(
@@ -44,6 +48,23 @@ def test_console_host_env_override():
 def test_console_host_custom_bind():
     """Произвольный адрес привязки тоже читается из env."""
     assert _config_value("CONSOLE_HOST", env={"CONSOLE_HOST": "192.168.1.10"}) == "192.168.1.10"
+
+
+def test_console_password_default_empty():
+    """Без env CONSOLE_PASSWORD пароль пуст → auth выключен (поведение 001 сохранено)."""
+    assert _config_value("CONSOLE_PASSWORD") == ""
+
+
+def test_console_password_env_override():
+    """CONSOLE_PASSWORD из env читается на импорте."""
+    assert _config_value("CONSOLE_PASSWORD", env={"CONSOLE_PASSWORD": "s3cret"}) == "s3cret"
+
+
+def test_console_auth_default_and_values():
+    """CONSOLE_AUTH: default auto; допустимые off/required читаются из env."""
+    assert _config_value("CONSOLE_AUTH") == "auto"
+    assert _config_value("CONSOLE_AUTH", env={"CONSOLE_AUTH": "off"}) == "off"
+    assert _config_value("CONSOLE_AUTH", env={"CONSOLE_AUTH": "required"}) == "required"
 
 
 if __name__ == "__main__":

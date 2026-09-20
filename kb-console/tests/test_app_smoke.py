@@ -28,6 +28,11 @@ def _start_console(port: int) -> subprocess.Popen:
     env = os.environ.copy()
     env["CONSOLE_PORT"] = str(port)
     env["MCP_SERVER_URL"] = "http://localhost:8000"
+    # Auth гарантированно off независимо от окружения разработчика
+    # (экспортированный CONSOLE_PASSWORD иначе даст 401 на всех страницах;
+    # прецедент pop CONSOLE_HOST — code-2026-09-20-002 P1-4).
+    env.pop("CONSOLE_PASSWORD", None)
+    env.pop("CONSOLE_AUTH", None)
     # NiceGUI определяет запуск внутри pytest (helpers.is_pytest) и требует
     # NICEGUI_SCREEN_TEST_PORT — задаём его явно (штатный тестовый механизм).
     env["NICEGUI_SCREEN_TEST_PORT"] = str(port)

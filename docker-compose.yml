@@ -157,6 +157,8 @@ services:
       - MCP_API_KEY=${MCP_API_KEY:-}
       - CONSOLE_PORT=8085
       - CONSOLE_HOST=127.0.0.1   # loopback (audit P1 У-1); 0.0.0.0 — только bridge docker run + -p 127.0.0.1:8085:8085
+      - CONSOLE_PASSWORD=${CONSOLE_PASSWORD:-}   # HTTP Basic auth: пусто = auth off (code-2026-09-20-002)
+      - CONSOLE_AUTH=${CONSOLE_AUTH:-auto}       # interlock: auto | off | required
     # NiceGUI-клиент лёгкий — 512 МБ достаточно.
     mem_limit: 512m
     cpus: 1
@@ -166,8 +168,11 @@ services:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      # curl в python:3.11-slim отсутствует → проверка через urllib
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8085/', timeout=3)"]
+      # curl в python:3.11-slim отсутствует → проверка через urllib.
+      # Auth-aware (code-2026-09-20-002): при заданном CONSOLE_PASSWORD корень
+      # за Basic-auth — креды собираются из env контейнера; при пустом пароле
+      # auth off, заголовок безвреден.
+      test: ["CMD", "python", "-c", "import base64,os,urllib.request;req=urllib.request.Request('http://localhost:8085/',headers={'Authorization':'Basic '+base64.b64encode((':'+os.environ.get('CONSOLE_PASSWORD','')).encode()).decode()});urllib.request.urlopen(req,timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3

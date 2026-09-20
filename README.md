@@ -76,7 +76,7 @@ docker compose up -d kb-console      # → http://localhost:8085
 # Тесты (нужны запущенные Qdrant :6333 и Ollama :11435 — ollama-контейнер)
 make e2e-slow                        # E2E S1-S20 (32 + S20 4/4)
 .venv/bin/python -m pytest mcp_server/tests -q   # полный suite (629)
-make console-test                    # unit + smoke kb-console (66)
+make console-test                    # unit + smoke kb-console (165)
 .venv/bin/python -m pytest mcp-stdio/tests -q    # stdio-мост (19)
 ```
 
@@ -87,7 +87,7 @@ Security-by-default: всё, кроме MCP API, слушает только loo
 | Порт | Сервис | Интерфейс | Защита / внешний доступ |
 |---|---|---|---|
 | 8000 | mcp-server (MCP API) | `0.0.0.0` | API-key (read/import/write уровни); файрвол allow-list |
-| 8085 | kb-console | `127.0.0.1` (`CONSOLE_HOST`) | собственной авторизации нет → loopback-only; доступ извне `ssh -L 8085:127.0.0.1:8085` |
+| 8085 | kb-console | `127.0.0.1` (`CONSOLE_HOST`) | HTTP Basic (опционально, `CONSOLE_PASSWORD`; interlock `CONSOLE_AUTH`) + loopback-only; доступ извне `ssh -L 8085:127.0.0.1:8085` |
 | 6333 / 6334 | Qdrant REST / gRPC | `127.0.0.1` | прямой доступ обходит MCP-auth и зонную модель; отладка `ssh -L 6333:127.0.0.1:6333` |
 | 11435 | ollama | `127.0.0.1` | уже loopback (11434 — host-ollama других проектов) |
 
@@ -98,8 +98,20 @@ docker run -d --name kb-console \
   -e MCP_SERVER_URL=http://<server-ip>:8000 \
   -e MCP_API_KEY=<ключ> \
   -e CONSOLE_HOST=0.0.0.0 \
+  -e CONSOLE_PASSWORD=<пароль> \
   -p 127.0.0.1:8085:8085 kb-console:prod
+# без пароля: -e CONSOLE_AUTH=off  (иначе WARN в логах при каждом старте — bind 0.0.0.0)
 ```
+
+### 🔐 Доступ и авторизация kb-console (code-2026-09-20-002)
+
+Аутентификация — HTTP Basic (pure-ASGI middleware, закрывает HTTP **и** websocket/Socket.IO — обход через WS невозможен; skip-путей нет, статика `/_nicegui/*` за auth):
+
+- `CONSOLE_PASSWORD` — пароль (username игнорируется, один оператор; constant-time сравнение; пароль НЕ логируется). Пусто → auth off.
+- `CONSOLE_AUTH` — interlock: `auto` (default; пароль задан → auth ON; пусто + bind≠loopback → WARN в логах) · `off` (явно выключено, warn подавлен) · `required` (пустой пароль → старт падает — рекомендовано для прода). Невалидное значение → ошибка старта со списком допустимых.
+- Ротация пароля = смена env + рестарт контейнера (как MCP-ключи).
+- ⚠️ **TLS-инвариант:** Basic без TLS передаёт креды base64 в каждом запросе → сетевой доступ только `ssh -L` или TLS-фасад (Caddy/nginx `basic_auth` поверх — без изменения приложения). Прямая публикация :8085 в сеть без TLS запрещена.
+- 📎 **Safari-нюанс:** Safari не прикладывает cached Basic-креды к WS-upgrade → консоль работает через engine.io HTTP-polling (он тоже за auth — дыры нет), но медленнее. Chromium/Firefox используют полный WS-транспорт. Известное поведение, не баг.
 
 ## 📦 Продовый деплой (air-gap, одноархивный bundle)
 
@@ -209,6 +221,8 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | `MCP_API_KEY` | — | Ключ kb-console (должен входить в read/import/write keys) |
 | `MCP_SERVER_URL` / `CONSOLE_PORT` | `http://localhost:8000` / `8085` | kb-console: адрес сервера / порт UI |
 | `CONSOLE_HOST` | `127.0.0.1` | адрес kb-console (loopback; `0.0.0.0` — только bridge docker run с `-p 127.0.0.1:8085:8085`) |
+| `CONSOLE_PASSWORD` | `""` | пароль HTTP Basic консоли (пусто = auth off; ротация = env + рестарт) |
+| `CONSOLE_AUTH` | `auto` | interlock auth: `auto` (warn при non-loopback без пароля) · `off` · `required` (fail-fast) |
 | `OLLAMA_CHAT_MODEL` | `qwen2.5:7b` | LLM для analyze_content (ollama-контейнер; текстовая — VL не влезает в 8GB на 0.20.2) |
 | `ANALYZE_FRAGMENT_CHARS` / `ANALYZE_TIMEOUT` | `8000` / `60s` | Лимиты анализа контента |
 | `RATE_LIMIT_READ_PER_MIN` / `RATE_LIMIT_WRITE_PER_MIN` | `100` / `20` | Rate-limit (429) |
@@ -257,7 +271,7 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | Unit + integration (сервер) | 629 passed (2 pre-existing failures не связаны: s15 reindex blue-green, delete cascade) |
 | E2E S1-S19 (реальные Qdrant+Ollama) | 43 passed (e2e-набор: http-contract S9-S12, mcp-protocol, russian-corpus, tools-coverage, console-client) |
 | Конкурентный гейт (50× GET /imports) | PASS — регрессия Content-Length (pure ASGI middleware) закрыта |
-| kb-console unit + smoke | 66/66 |
+| kb-console unit + smoke | 165/165 |
 | mcp-stdio bridge tests | 19/19 (unit 18 + smoke 1) |
 | Ruff | 0 ошибок |
 
@@ -284,4 +298,4 @@ a2e6479 feat(phase12): HTTP-level E2E S9-S12 + 5 observability metrics
 
 ---
 
-*Актуально на 2026-09-09. 31 MCP Tool, 629 тестов mcp_server + 66 kb-console + 19 mcp-stdio, kb-console :8085, ollama-контейнер :11435 (0.20.2, пиннинг под индекс Qdrant), stdio-мост v1.1 (ping/notifications по MCP spec, HTTP 204 → без ответа), MCP_MAX_REQUEST_SIZE 128 МБ, qdrant ulimits 65535.*
+*Актуально на 2026-09-20. 31 MCP Tool, 629 тестов mcp_server + 165 kb-console + 19 mcp-stdio, kb-console :8085 (loopback + HTTP Basic auth `CONSOLE_PASSWORD`/`CONSOLE_AUTH`), ollama-контейнер :11435 (0.20.2, пиннинг под индекс Qdrant), stdio-мост v1.1 (ping/notifications по MCP spec, HTTP 204 → без ответа), MCP_MAX_REQUEST_SIZE 128 МБ, qdrant ulimits 65535.*

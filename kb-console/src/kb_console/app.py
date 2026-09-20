@@ -12,8 +12,9 @@ from __future__ import annotations
 from nicegui import core, ui
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from .auth import ConsoleAuthMiddleware, resolve_auth_mode
 from .components.header import render_header
-from .config import CONSOLE_HOST, CONSOLE_PORT
+from .config import CONSOLE_AUTH, CONSOLE_HOST, CONSOLE_PASSWORD, CONSOLE_PORT
 
 
 class RequestLogMiddleware(BaseHTTPMiddleware):
@@ -86,6 +87,18 @@ def page_tokens() -> None:
 
 
 # ── Start ───────────────────────────────────────────────────
+
+# Interlock-режим auth: module-level ДО ui.run — невалидный CONSOLE_AUTH
+# (ValueError) или required без пароля (RuntimeError) роняют процесс на
+# старте, а не на первом запросе.
+AUTH_MODE = resolve_auth_mode(CONSOLE_PASSWORD, CONSOLE_AUTH, CONSOLE_HOST)
+
+# Порядок middleware: Starlette add_middleware = insert(0) → последний
+# добавленный = самый внешний. ConsoleAuth регистрируем ПЕРВОЙ (внутренняя),
+# RequestLog — ПОСЛЕДНЕЙ (внешняя) → RequestLog логирует и 401-отказы
+# (brute-force-видимость в [REQ]-логах). Безусловная регистрация:
+# режим off = чистый транзит (нулевой оверхед).
+core.app.add_middleware(ConsoleAuthMiddleware, password=CONSOLE_PASSWORD, mode=AUTH_MODE)
 
 # Глобальный request logger для отладки upload.
 core.app.add_middleware(RequestLogMiddleware)

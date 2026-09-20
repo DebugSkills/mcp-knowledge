@@ -44,7 +44,7 @@ cd staging
 - **Импорт** — загрузка материалов (Markdown) через `import_content` (поля: content, content_type, domain, subject, tags).
 - **Поиск** — пробный поиск по корпусу (`search_knowledge`) с результатами (title/score/domain/subject).
 
-Запускается автоматически как сервис `kb-console` в `docker-compose.prod.yml` (host-сеть, `MCP_SERVER_URL=http://localhost:8000`). Проверка после deploy: `curl -sf http://localhost:8085/` (входит в `verify`).
+Запускается автоматически как сервис `kb-console` в `docker-compose.prod.yml` (host-сеть, `MCP_SERVER_URL=http://localhost:8000`). Проверка после deploy: `curl -sf http://localhost:8085/` (входит в `verify`). Опциональный HTTP Basic auth: `CONSOLE_PASSWORD`/`CONSOLE_AUTH` (code-2026-09-20-002) — при заданном пароле проверка с кредами `curl -sf -u :$CONSOLE_PASSWORD http://localhost:8085/`; сетевой доступ — только `ssh -L` или TLS-фасад (Basic без TLS = креды base64).
 
 **На клиентском хосте** (отдельно от сервера) — контейнер самодостаточен:
 ```bash
@@ -54,9 +54,11 @@ docker run -d --name kb-console \
   -e MCP_SERVER_URL=http://<server-ip>:8000 \
   -e MCP_API_KEY=<ключ из .env сервера> \
   -e CONSOLE_HOST=0.0.0.0 \
+  -e CONSOLE_PASSWORD=<пароль> \
   -p 127.0.0.1:8085:8085 kb-console:prod
+# без пароля: -e CONSOLE_AUTH=off  (иначе WARN в логах при каждом старте — bind 0.0.0.0)
 ```
-Открыть `http://localhost:8085`. Ключ `MCP_API_KEY` должен входить в `MCP_READ_KEYS` (чтение/поиск) или `MCP_WRITE_KEYS` (импорт).
+Открыть `http://localhost:8085` (браузер спросит пароль Basic auth — username любой). Ключ `MCP_API_KEY` должен входить в `MCP_READ_KEYS` (чтение/поиск) или `MCP_WRITE_KEYS` (импорт).
 
 ---
 
