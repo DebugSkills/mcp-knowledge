@@ -17,6 +17,10 @@ tokenizer: BAAI/bge-m3
 # Qdrant (контейнерный, host-net mcp-server → localhost)
 qdrant_url: http://localhost:6333
 
+# kb-console auth (002): auto → auth ON при непустом vault_console_password;
+# для прода рекомендуется "required" (fail-fast, если пароль не задан).
+console_auth_mode: "auto"
+
 # Docker-прокси (пусто = прямая сеть)
 docker_proxy: ""
 docker_no_proxy: "localhost,127.0.0.1,::1"

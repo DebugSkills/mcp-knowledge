@@ -4,3 +4,5 @@ vault_mcp_read_keys: '["read-key"]'
 vault_mcp_write_keys: '["write-key"]'
 vault_mcp_import_keys: '["import-key"]'
 vault_mcp_console_key: "console-key"
+# Пароль kb-console (HTTP Basic). Сгенерировать: openssl rand -hex 16
+vault_console_password: "<сгенерируйте: openssl rand -hex 16>"
