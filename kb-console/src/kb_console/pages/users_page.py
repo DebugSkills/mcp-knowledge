@@ -28,9 +28,12 @@ from ..core.users import ROLES, UserStore
 
 
 def _users_store() -> UserStore:
-    from ..app import USERS_STORE
+    # runtime, НЕ app: при `python -m kb_console.app` модуль app живёт в двух
+    # экземплярах (__main__ + kb_console.app) — import app даёт второй
+    # add_middleware на работающем приложении → RuntimeError 500 (smoke Ф4).
+    from ..core import runtime
 
-    return USERS_STORE
+    return runtime.USERS_STORE
 
 
 def _gen_password() -> str:
