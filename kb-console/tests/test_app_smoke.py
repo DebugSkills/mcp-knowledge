@@ -33,6 +33,11 @@ def _start_console(port: int) -> subprocess.Popen:
     # прецедент pop CONSOLE_HOST — code-2026-09-20-002 P1-4).
     env.pop("CONSOLE_PASSWORD", None)
     env.pop("CONSOLE_AUTH", None)
+    # kb-console-roles Ф2: users-стор не должен включаться от окружения
+    # разработчика (иначе per-user auth даст 401 на всех страницах).
+    env.pop("CONSOLE_USERS_FILE", None)
+    env.pop("CONSOLE_ADMIN_USER", None)
+    env.pop("CONSOLE_ADMIN_PASSWORD", None)
     # NiceGUI определяет запуск внутри pytest (helpers.is_pytest) и требует
     # NICEGUI_SCREEN_TEST_PORT — задаём его явно (штатный тестовый механизм).
     env["NICEGUI_SCREEN_TEST_PORT"] = str(port)

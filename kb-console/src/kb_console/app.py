@@ -14,7 +14,16 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from .auth import ConsoleAuthMiddleware, resolve_auth_mode
 from .components.header import render_header
-from .config import CONSOLE_AUTH, CONSOLE_HOST, CONSOLE_PASSWORD, CONSOLE_PORT
+from .config import (
+    CONSOLE_ADMIN_PASSWORD,
+    CONSOLE_ADMIN_USER,
+    CONSOLE_AUTH,
+    CONSOLE_HOST,
+    CONSOLE_PASSWORD,
+    CONSOLE_PORT,
+    CONSOLE_USERS_FILE,
+)
+from .core.users import UserStore
 
 
 class RequestLogMiddleware(BaseHTTPMiddleware):
@@ -88,17 +97,30 @@ def page_tokens() -> None:
 
 # ── Start ───────────────────────────────────────────────────
 
+# kb-console-roles Ф2: users-стор + bootstrap админа из env (идемпотентно).
+USERS_STORE = UserStore(users_file=CONSOLE_USERS_FILE or None)
+USERS_STORE.bootstrap_from_env(CONSOLE_ADMIN_USER, CONSOLE_ADMIN_PASSWORD)
+_USERS_PRESENT = USERS_STORE.has_users()
+
 # Interlock-режим auth: module-level ДО ui.run — невалидный CONSOLE_AUTH
-# (ValueError) или required без пароля (RuntimeError) роняют процесс на
-# старте, а не на первом запросе.
-AUTH_MODE = resolve_auth_mode(CONSOLE_PASSWORD, CONSOLE_AUTH, CONSOLE_HOST)
+# (ValueError) или required без пароля и без юзеров (RuntimeError) роняют
+# процесс на старте, а не на первом запросе. Непустой users-стор → per-user
+# auth ON; CONSOLE_PASSWORD при этом игнорируется (warning в interlock).
+AUTH_MODE = resolve_auth_mode(
+    CONSOLE_PASSWORD, CONSOLE_AUTH, CONSOLE_HOST, users_present=_USERS_PRESENT
+)
 
 # Порядок middleware: Starlette add_middleware = insert(0) → последний
 # добавленный = самый внешний. ConsoleAuth регистрируем ПЕРВОЙ (внутренняя),
 # RequestLog — ПОСЛЕДНЕЙ (внешняя) → RequestLog логирует и 401-отказы
 # (brute-force-видимость в [REQ]-логах). Безусловная регистрация:
 # режим off = чистый транзит (нулевой оверхед).
-core.app.add_middleware(ConsoleAuthMiddleware, password=CONSOLE_PASSWORD, mode=AUTH_MODE)
+core.app.add_middleware(
+    ConsoleAuthMiddleware,
+    password=CONSOLE_PASSWORD,
+    mode=AUTH_MODE,
+    users=USERS_STORE,
+)
 
 # Глобальный request logger для отладки upload.
 core.app.add_middleware(RequestLogMiddleware)

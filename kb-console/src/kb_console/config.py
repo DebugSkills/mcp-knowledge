@@ -51,4 +51,28 @@ CONSOLE_AUTH: str = os.environ.get("CONSOLE_AUTH", "auto")
 - off: явно выключено (warn подавлен); заданный пароль игнорируется;
 - required: пустой пароль → RuntimeError на старте (fail-fast, прод).
 Невалидное значение → ValueError со списком допустимых (на старте).
+
+kb-console-roles Ф2: непустой users-стор перекрывает пароль — auto и
+required дают per-user auth ON; CONSOLE_PASSWORD игнорируется с warning.
+"""
+
+CONSOLE_USERS_FILE: str = os.environ.get("CONSOLE_USERS_FILE", "/app/data/console/users.jsonl")
+"""Путь к users.jsonl (учётные записи консоли; default — docker-volume).
+
+Volume `./data/console:/app/data/console` в compose (паттерн data/tokens):
+файл переживает пересоздание контейнера. Секретов нет — только pbkdf2-хэши.
+Ручные правки файла подхватываются через TTL (~5 мин) без рестарта.
+"""
+
+CONSOLE_ADMIN_USER: str = os.environ.get("CONSOLE_ADMIN_USER", "")
+"""Bootstrap-админ (kb-console-roles Ф2): seed при отсутствии активного админа.
+
+Идемпотентно: есть активный админ → env игнорируется. Пароль
+CONSOLE_ADMIN_PASSWORD обязателен, иначе bootstrap пропускается.
+"""
+
+CONSOLE_ADMIN_PASSWORD: str = os.environ.get("CONSOLE_ADMIN_PASSWORD", "")
+"""Пароль bootstrap-админа CONSOLE_ADMIN_USER (НЕ логируется).
+
+Ротация: /users-страница (reset-password) — env-пароль больше не нужен.
 """

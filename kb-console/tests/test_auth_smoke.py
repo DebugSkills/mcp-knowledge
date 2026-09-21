@@ -32,6 +32,11 @@ def _start_console(port: int) -> subprocess.Popen:
     # P1-4: чистим auth-env до установки своих значений.
     env.pop("CONSOLE_PASSWORD", None)
     env.pop("CONSOLE_AUTH", None)
+    # kb-console-roles Ф2: bootstrap-админ/stor из окружения не должны
+    # включать per-user ветку (иначе legacy-пароль test будет отклонён).
+    env.pop("CONSOLE_USERS_FILE", None)
+    env.pop("CONSOLE_ADMIN_USER", None)
+    env.pop("CONSOLE_ADMIN_PASSWORD", None)
     env["CONSOLE_PORT"] = str(port)
     env["CONSOLE_HOST"] = "127.0.0.1"
     env["MCP_SERVER_URL"] = "http://localhost:8000"

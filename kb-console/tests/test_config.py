@@ -23,6 +23,10 @@ def _config_value(var: str, env: dict[str, str] | None = None) -> str:
     run_env.pop("CONSOLE_HOST", None)
     run_env.pop("CONSOLE_PASSWORD", None)
     run_env.pop("CONSOLE_AUTH", None)
+    # kb-console-roles Ф2: новые users-env (P1-4-паттерн).
+    run_env.pop("CONSOLE_USERS_FILE", None)
+    run_env.pop("CONSOLE_ADMIN_USER", None)
+    run_env.pop("CONSOLE_ADMIN_PASSWORD", None)
     if env:
         run_env.update(env)
     result = subprocess.run(
