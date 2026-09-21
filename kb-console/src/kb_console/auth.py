@@ -248,7 +248,7 @@ class ConsoleAuthMiddleware:
         """Per-user verify: pbkdf2 в executor + identity в scope-state.
 
         True → запрос пропущен; False → reject (без деталей, существует ли
-        юзер — не раскрываем).
+        юзер — не раскрываем). Логины фиксируются в users_audit.jsonl (Ф3.3).
         """
         creds = parse_basic_credentials(authorization)
         if creds is None:
@@ -259,7 +259,9 @@ class ConsoleAuthMiddleware:
             None, self._users.verify, username, password
         )
         if record is None:
+            self._users.log_login(username, ok=False)
             return False
+        self._users.log_login(username, ok=True)
         scope.setdefault("state", {})["user"] = {
             "id": record.id,
             "username": record.username,

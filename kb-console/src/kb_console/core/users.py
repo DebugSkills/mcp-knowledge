@@ -104,9 +104,11 @@ class UserStore:
         users_file: str | None = None,
         cache_ttl_sec: float = DEFAULT_CACHE_TTL_SEC,
         pbkdf2_iterations: int = DEFAULT_PBKDF2_ITERATIONS,
+        audit_file: str | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._users_file = users_file or os.environ.get("CONSOLE_USERS_FILE") or _DEFAULT_USERS_FILE
+        self._audit_file = audit_file
         self._cache_ttl = cache_ttl_sec
         self._iterations = pbkdf2_iterations
         self._records: list[UserRecord] | None = None
@@ -121,6 +123,13 @@ class UserStore:
     @property
     def store_path(self) -> Path:
         return Path(self._users_file)
+
+    @property
+    def audit_path(self) -> Path:
+        """users_audit.jsonl — рядом с users.jsonl (Ф3.3), либо явный путь."""
+        if self._audit_file:
+            return Path(self._audit_file)
+        return self.store_path.parent / "users_audit.jsonl"
 
     @property
     def store_version(self) -> int:
@@ -166,6 +175,37 @@ class UserStore:
         self._verify_cache.clear()
         self._records = None  # следующий доступ перечитает файл
 
+    # ── Аудит (Ф3.3): users_audit.jsonl ─────────────────────
+
+    def _audit(
+        self, event: str, target: str, actor: str = "system",
+        details: dict | None = None,
+    ) -> None:
+        """Best-effort append в users_audit.jsonl (ошибки — warning, не бросаем).
+
+        События: user_create/user_reset/role_change/user_deactivate/
+        user_activate (из мутаций) + login_ok/login_fail (log_login).
+        Отдельный журнал от серверного audit.jsonl (quality-действия).
+        """
+        record = {
+            "ts": _now_iso(),
+            "event": event,
+            "actor": actor,
+            "target": target,
+            "details": details or {},
+        }
+        try:
+            path = self.audit_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as e:
+            logger.warning("users_audit write failed: %s", e)
+
+    def log_login(self, username: str, *, ok: bool) -> None:
+        """Зафиксировать исход логина (вызывается middleware)."""
+        self._audit("login_ok" if ok else "login_fail", username, actor=username)
+
     # ── Чтение ──────────────────────────────────────────────
 
     def list_users(self) -> list[UserRecord]:
@@ -192,7 +232,8 @@ class UserStore:
     # ── Мутации ─────────────────────────────────────────────
 
     def create_user(
-        self, username: str, password: str, role: str, note: str = ""
+        self, username: str, password: str, role: str, note: str = "",
+        actor: str = "system",
     ) -> UserRecord:
         if not username or not password:
             raise ValueError("username и password обязательны")
@@ -212,9 +253,10 @@ class UserStore:
             self._save_locked(records)
             self._mutate()
             logger.info("User created: %s (role=%s)", username, role)
+            self._audit("user_create", username, actor=actor, details={"role": role})
             return rec
 
-    def set_password(self, username: str, new_password: str) -> None:
+    def set_password(self, username: str, new_password: str, actor: str = "system") -> None:
         if not new_password:
             raise ValueError("пароль не может быть пустым")
         with self._lock:
@@ -226,8 +268,9 @@ class UserStore:
             self._save_locked(records)
             self._mutate()
             logger.info("Password reset for user: %s", username)
+            self._audit("user_reset", username, actor=actor)
 
-    def set_role(self, username: str, role: str) -> None:
+    def set_role(self, username: str, role: str, actor: str = "system") -> None:
         if role not in ROLES:
             raise ValueError(f"Unknown role: {role!r}. Expected one of {list(ROLES)}")
         with self._lock:
@@ -235,12 +278,14 @@ class UserStore:
             rec = next((r for r in records if r.username == username), None)
             if rec is None:
                 raise KeyError(f"нет такого пользователя: {username!r}")
+            old = rec.role
             rec.role = role
             self._save_locked(records)
             self._mutate()
             logger.info("Role changed: %s → %s", username, role)
+            self._audit("role_change", username, actor=actor, details={"old": old, "new": role})
 
-    def set_active(self, username: str, active: bool) -> None:
+    def set_active(self, username: str, active: bool, actor: str = "system") -> None:
         with self._lock:
             records = self._load()
             rec = next((r for r in records if r.username == username), None)
@@ -250,6 +295,9 @@ class UserStore:
             self._save_locked(records)
             self._mutate()
             logger.info("User %s: active=%s", username, active)
+            self._audit(
+                "user_activate" if active else "user_deactivate", username, actor=actor
+            )
 
     # ── Bootstrap (env → seed admin, идемпотентно) ──────────
 

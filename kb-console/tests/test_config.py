@@ -27,6 +27,10 @@ def _config_value(var: str, env: dict[str, str] | None = None) -> str:
     run_env.pop("CONSOLE_USERS_FILE", None)
     run_env.pop("CONSOLE_ADMIN_USER", None)
     run_env.pop("CONSOLE_ADMIN_PASSWORD", None)
+    # kb-console-roles Ф3.1: per-role ключи (P1-4-паттерн).
+    run_env.pop("MCP_API_KEY_ADMIN", None)
+    run_env.pop("MCP_API_KEY_EDITOR", None)
+    run_env.pop("MCP_API_KEY_CONTRIBUTOR", None)
     if env:
         run_env.update(env)
     result = subprocess.run(

@@ -38,6 +38,10 @@ def _start_console(port: int) -> subprocess.Popen:
     env.pop("CONSOLE_USERS_FILE", None)
     env.pop("CONSOLE_ADMIN_USER", None)
     env.pop("CONSOLE_ADMIN_PASSWORD", None)
+    # kb-console-roles Ф3.1: per-role ключи не должны утекать в smoke.
+    env.pop("MCP_API_KEY_ADMIN", None)
+    env.pop("MCP_API_KEY_EDITOR", None)
+    env.pop("MCP_API_KEY_CONTRIBUTOR", None)
     # NiceGUI определяет запуск внутри pytest (helpers.is_pytest) и требует
     # NICEGUI_SCREEN_TEST_PORT — задаём его явно (штатный тестовый механизм).
     env["NICEGUI_SCREEN_TEST_PORT"] = str(port)

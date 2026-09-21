@@ -76,3 +76,32 @@ CONSOLE_ADMIN_PASSWORD: str = os.environ.get("CONSOLE_ADMIN_PASSWORD", "")
 
 Ротация: /users-страница (reset-password) — env-пароль больше не нужен.
 """
+
+# ── kb-console-roles Ф3.1: маппинг роль→MCP-ключ ────────────
+
+MCP_API_KEY_ADMIN: str = os.environ.get("MCP_API_KEY_ADMIN", "")
+"""Write-ключ для роли admin (env сервера; пусто → fallback MCP_API_KEY)."""
+
+MCP_API_KEY_EDITOR: str = os.environ.get("MCP_API_KEY_EDITOR", "")
+"""Editor-ключ (mcp_e*-префикс, Ф1) для роли editor; пусто → fallback."""
+
+MCP_API_KEY_CONTRIBUTOR: str = os.environ.get("MCP_API_KEY_CONTRIBUTOR", "")
+"""Import-ключ для роли contributor; пусто → fallback MCP_API_KEY."""
+
+
+def api_key_for_role(
+    role: str,
+    *,
+    base: str = MCP_API_KEY,
+    admin: str = MCP_API_KEY_ADMIN,
+    editor: str = MCP_API_KEY_EDITOR,
+    contributor: str = MCP_API_KEY_CONTRIBUTOR,
+) -> str:
+    """Ключ MCP-сервера по роли пользователя консоли (Ф3.1).
+
+    Fallback-цепочка: per-role env → MCP_API_KEY (legacy-инсталляции с
+    одним ключом работают бит-в-бит — все роли получают его). Неизвестная
+    роль → base (безопасный дефолт, не пустота). Ключи НЕ логировать.
+    """
+    per_role = {"admin": admin, "editor": editor, "contributor": contributor}
+    return per_role.get(role) or base

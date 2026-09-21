@@ -95,12 +95,26 @@ def page_tokens() -> None:
     build_tokens()
 
 
+@ui.page("/users")
+def page_users() -> None:
+    """Страница «Пользователи» — учётные записи консоли (admin-only, Ф3.2)."""
+    render_header("users")
+    from .pages.users_page import build_users
+    build_users()
+
+
 # ── Start ───────────────────────────────────────────────────
 
 # kb-console-roles Ф2: users-стор + bootstrap админа из env (идемпотентно).
 USERS_STORE = UserStore(users_file=CONSOLE_USERS_FILE or None)
 USERS_STORE.bootstrap_from_env(CONSOLE_ADMIN_USER, CONSOLE_ADMIN_PASSWORD)
 _USERS_PRESENT = USERS_STORE.has_users()
+
+# Ф3.2: стор в runtime-модуле для identity-хелперов (импорт app.py из
+# unit-контекста невозможен — ui.run side-effect; runtime чист).
+from .core import runtime as _runtime
+
+_runtime.USERS_STORE = USERS_STORE
 
 # Interlock-режим auth: module-level ДО ui.run — невалидный CONSOLE_AUTH
 # (ValueError) или required без пароля и без юзеров (RuntimeError) роняют

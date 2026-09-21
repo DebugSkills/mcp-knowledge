@@ -15,11 +15,18 @@ def render_header(active: str) -> None:
     Args:
         active: slug активной страницы ("status", "books", "import", "search").
                 Соответствует последнему сегменту пути (без /).
+
+    kb-console-roles Ф3.2: пункты с min_role выше роли текущего
+    пользователя скрыты (ROUTES 4-tuple; legacy = admin → видно всё).
     """
+    from ..core.identity import ROLE_LEVEL, current_role
     from ..pages import ROUTES  # lazy import: ломает circular chain pages↔components
 
+    role = ROLE_LEVEL.get(current_role(), 0)
     with ui.row().classes("items-center gap-2 q-mb-md w-full") as _header:
-        for path, label, _builder in ROUTES:
+        for path, label, _builder, min_role in ROUTES:
+            if role < ROLE_LEVEL.get(min_role, 0):
+                continue
             slug = path.lstrip("/")
             is_active = slug == active
             btn = ui.button(

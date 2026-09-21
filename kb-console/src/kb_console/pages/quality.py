@@ -26,6 +26,7 @@ from nicegui import ui
 from ..components.progress_panel import build_scan_progress
 from ..config import MCP_API_KEY, MCP_SERVER_URL, REFRESH_SECONDS
 from ..core.data_cache import cache
+from ..core.identity import is_admin
 from ..core.mcp_client import MCPClient
 
 # Фаза 1 dedup: выбранные issue_id для пакетного скрытия дублей (сессия)
@@ -475,10 +476,12 @@ def _render_review_pairs(data: dict, refresh_fn) -> None:
                 f"(без антонимов, standalone)"
             ).classes("text-body2")
             ui.space()
-            ui.button(
-                f"✅ Утвердить все ({len(green)})",
-                on_click=lambda g=green: _approve_green_batch(g, refresh_fn),
-            ).props("flat dense color=positive")
+            # P2-2 (Ф3.2): bulk-операции — admin-only (EDITOR_TOOLS без bulk_*)
+            if is_admin():
+                ui.button(
+                    f"✅ Утвердить все ({len(green)})",
+                    on_click=lambda g=green: _approve_green_batch(g, refresh_fn),
+                ).props("flat dense color=positive")
 
     # 🟡 Сомнительные — каждая пара с diff
     for pair in yellow:
@@ -659,8 +662,9 @@ def _render_issues(data: dict, refresh_fn) -> None:
     ui.label(f"Всего issues: {total}").classes("text-subtitle2 q-mb-sm")
 
     # P0 (B1): bulk-кнопки «Игнорировать все <тип>» — чистка накопленного шума
+    # P2-2 (Ф3.2): bulk-ряд целиком admin-only (server: bulk_* ∉ EDITOR_TOOLS)
     types_present = sorted({i.get("type", "") for i in issues if i.get("type")})
-    if types_present:
+    if types_present and is_admin():
         with ui.row().classes("gap-2 q-mb-sm items-center"):
             for itype in types_present:
                 count = sum(1 for i in issues if i.get("type") == itype)

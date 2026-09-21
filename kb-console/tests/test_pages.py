@@ -130,17 +130,21 @@ def test_routes_registry_exists():
     """ROUTES должен существовать в pages/__init__.py после реализации."""
     from kb_console.pages import ROUTES
     assert isinstance(ROUTES, list)
-    assert len(ROUTES) == 6
+    assert len(ROUTES) == 7
     paths = {r[0] for r in ROUTES}
-    assert paths == {"/status", "/books", "/import", "/search", "/quality", "/tokens"}
+    assert paths == {
+        "/status", "/books", "/import", "/search", "/quality", "/tokens", "/users",
+    }
     labels = {r[1] for r in ROUTES}
-    assert labels == {"Статус", "Книги", "Импорт", "Поиск", "Качество", "Токены"}
+    assert labels == {
+        "Статус", "Книги", "Импорт", "Поиск", "Качество", "Токены", "Пользователи",
+    }
 
 
 def test_routes_builders_are_callable():
     """Каждый builder в ROUTES должен быть callable."""
     from kb_console.pages import ROUTES
-    for path, label, builder in ROUTES:
+    for path, label, builder, _min_role in ROUTES:
         assert callable(builder), f"Builder for {path} ({label}) is not callable"
 
 

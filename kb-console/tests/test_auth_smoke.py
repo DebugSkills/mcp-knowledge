@@ -37,6 +37,10 @@ def _start_console(port: int) -> subprocess.Popen:
     env.pop("CONSOLE_USERS_FILE", None)
     env.pop("CONSOLE_ADMIN_USER", None)
     env.pop("CONSOLE_ADMIN_PASSWORD", None)
+    # kb-console-roles Ф3.1: per-role ключи (P1-4).
+    env.pop("MCP_API_KEY_ADMIN", None)
+    env.pop("MCP_API_KEY_EDITOR", None)
+    env.pop("MCP_API_KEY_CONTRIBUTOR", None)
     env["CONSOLE_PORT"] = str(port)
     env["CONSOLE_HOST"] = "127.0.0.1"
     env["MCP_SERVER_URL"] = "http://localhost:8000"

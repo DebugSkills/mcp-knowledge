@@ -31,6 +31,7 @@ LEVEL_META: dict[str, dict] = {
     "subscriber": {"label": "🟢 подписчик", "color": "green"},
     "read": {"label": "🔵 чтение", "color": "blue"},
     "import": {"label": "🟠 импорт", "color": "orange"},
+    "editor": {"label": "🟣 редактор", "color": "purple"},
     "write": {"label": "🔴 запись", "color": "red"},
 }
 ZONE_META: dict[str, dict] = {
@@ -38,7 +39,7 @@ ZONE_META: dict[str, dict] = {
     "private": {"label": "private", "color": "purple"},
     "both": {"label": "обе зоны", "color": "grey"},
 }
-LEVEL_CODE = {"subscriber": "s", "read": "r", "import": "i", "write": "w"}
+LEVEL_CODE = {"subscriber": "s", "read": "r", "import": "i", "editor": "e", "write": "w"}
 ZONE_CODE = {"public": "a", "private": "b", "both": "x"}
 
 
@@ -115,7 +116,15 @@ def _stale_banner_rows(tokens: list[dict]) -> list[dict]:
 
 
 def build_tokens() -> None:
-    """Построить страницу «Токены»."""
+    """Построить страницу «Токены» (admin-only — У-3/Ф3.2)."""
+    from ..core.identity import is_admin
+
+    if not is_admin():
+        ui.label("⛔ 403: управление токенами доступно только администраторам.").classes(
+            "text-h6 text-negative"
+        )
+        ui.label("Обратитесь к администратору консоли.").classes("text-body1 text-grey")
+        return
 
     # ── состояние ────────────────────────────────────────────
     _tokens: list[dict] = []

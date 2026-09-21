@@ -219,6 +219,12 @@ def build_import() -> None:
         value=None,
         with_input=True,
     ).classes("w-full q-mb-md")
+    # Ф3.2 (P1-1): contributor НЕ видит replace-селектор — серверный гейт Ф1
+    # (content.py error-dict) остаётся defense-in-depth, UI лишь не предлагает.
+    from ..core.identity import can_replace
+
+    if not can_replace():
+        replace_select.set_visibility(False)
 
     # cid → zone для префилла zone_select при выборе заменяемой книги
     _replace_zones: dict[str, str] = {}
