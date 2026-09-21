@@ -207,10 +207,33 @@ backup_ssot_tar() {
     echo "[$(date -Iseconds)] SSOT tar: $BACKUP_DIR/knowledge-${TIMESTAMP}.tar.gz"
 }
 
+# --- Console state backup (kb-console-roles Ф4.4, P2-5a) ---
+# users.jsonl (pbkdf2-хэши — секретов нет) + users_audit.jsonl + tokens.jsonl
+# (тот же класс данных; дыра в бэкап-контуре отмечена ещё в 001).
+# Восстановление = копия файлов + рестарт контейнеров.
+backup_console_state() {
+    echo "[$(date -Iseconds)] Backing up console state (users/tokens)..."
+    mkdir -p "$BACKUP_DIR"
+    local items=()
+    local dir
+    for dir in data/console data/tokens; do
+        if [ -d "$dir" ] && ls "$dir"/*.jsonl >/dev/null 2>&1; then
+            items+=("$dir")
+        fi
+    done
+    if [ ${#items[@]} -eq 0 ]; then
+        echo "[$(date -Iseconds)] Console state: нет users/tokens файлов — пропуск."
+        return 0
+    fi
+    tar -czf "$BACKUP_DIR/console-state-${TIMESTAMP}.tar.gz" "${items[@]}" 2>&1
+    echo "[$(date -Iseconds)] Console state tar: $BACKUP_DIR/console-state-${TIMESTAMP}.tar.gz"
+}
+
 # --- Ротация старых бэкапов ---
 rotate_backups() {
     echo "[$(date -Iseconds)] Rotating backups older than ${RETENTION_DAYS} days..."
     find "$BACKUP_DIR" -name "knowledge-*.tar.gz" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
+    find "$BACKUP_DIR" -name "console-state-*.tar.gz" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
     # 2026-08-09: ротация Qdrant-снапшотов (раньше копились бесконечно).
     # Файлы снапшотов теперь в bind-mount (data/qdrant/snapshots) — удаляем по mtime.
     find "$SNAPSHOT_DIR" -name "backup-*.snapshot" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
@@ -256,6 +279,7 @@ fi
 # Regular backup flow
 [ "$NO_QDRANT" = false ] && create_qdrant_snapshot
 [ "$NO_SSOT" = false ] && backup_ssot_git
+backup_console_state   # kb-console-roles Ф4.4: users.jsonl + users_audit + tokens
 rotate_backups
 
 echo "=== Backup completed: ${TIMESTAMP} ==="

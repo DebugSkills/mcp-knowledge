@@ -49,6 +49,37 @@ websocket-транспорт — обход через WS невозможен; 
   медленнее. В Chromium/Firefox — полный websocket-транспорт. Это известное
   поведение, не ошибка.
 
+## 👥 Роли и учётные записи (code-2026-09-21-001)
+
+Два режима авторизации: **legacy** (пустой users-стор — один пароль
+`CONSOLE_PASSWORD`, username игнорируется, поведение выше) и **per-user**
+(учётные записи в `users.jsonl`; при непустом сторе `CONSOLE_PASSWORD`
+игнорируется полностью — warning в логах).
+
+**Bootstrap-админ:** задайте `CONSOLE_ADMIN_USER` + `CONSOLE_ADMIN_PASSWORD`
+(.compose env) — при первом старте создастся админ (идемпотентно: только если
+нет активного админа). Дальше — управление через страницу `/users`.
+
+**Роли** (привилегии убывают; серверный enforcement — per-role MCP-ключи
+`MCP_API_KEY_ADMIN/EDITOR/CONTRIBUTOR`, пусто → общий `MCP_API_KEY`):
+
+| Роль | Страницы/действия | MCP-ключ |
+|---|---|---|
+| 🔴 admin | всё: /tokens, /users, bulk-кнопки «Качества», replace-импорт, reindex/set_zone | write |
+| 🟣 editor | контент + dedup-ревью (по одному), add/update/delete fragment, replace-импорт; БЕЗ /tokens, /users, bulk, reindex/set_zone | editor (🟣, mcp_e*) |
+| 🟠 contributor | добавление: импорт (без replace), add_fragment; без удаления | import |
+
+**`/users`** (admin-only): список учёток, создание (пароль генерируется и
+показывается ОДИН раз), reset пароля, смена роли, деактивация (сброшенные
+креды перестают работать немедленно). Защита от self-lockout: последнего
+активного админа нельзя деактивировать/понизить. Все действия пишутся в
+`users_audit.jsonl` (кто/что/когда), логины — тоже.
+
+**Ротация:** пользователи управляются в UI (`/users`), не через env;
+editor/import ключи минтятся админом на `/tokens`. `users.jsonl` живёт в
+volume `./data/console` (переживает пересоздание контейнера, только
+pbkdf2-хэши — секретов нет) и входит в `scripts/backup.sh`.
+
 ## 📑 Страницы
 
 ### 1. Статус

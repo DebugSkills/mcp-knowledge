@@ -154,20 +154,30 @@ services:
     environment:
       - MCP_SERVER_URL=http://localhost:8000
       - MCP_API_KEY=${MCP_API_KEY:-}
+      # kb-console-roles Ф3.1/Ф4: per-role ключи (fallback MCP_API_KEY — legacy)
+      - MCP_API_KEY_ADMIN=${MCP_API_KEY_ADMIN:-}
+      - MCP_API_KEY_EDITOR=${MCP_API_KEY_EDITOR:-}
+      - MCP_API_KEY_CONTRIBUTOR=${MCP_API_KEY_CONTRIBUTOR:-}
       - CONSOLE_PORT=8085
       - CONSOLE_HOST=127.0.0.1
       - CONSOLE_PASSWORD=${CONSOLE_PASSWORD:-}   # HTTP Basic auth: пусто = auth off (code-2026-09-20-002)
       - CONSOLE_AUTH=${CONSOLE_AUTH:-auto}       # interlock: auto | off | required
+      # kb-console-roles Ф2/Ф4: учётки (users.jsonl в volume — паттерн data/tokens;
+      # CONSOLE_PASSWORD при непустом сторе игнорируется)
+      - CONSOLE_USERS_FILE=/app/data/console/users.jsonl
+      - CONSOLE_ADMIN_USER=${CONSOLE_ADMIN_USER:-}
+      - CONSOLE_ADMIN_PASSWORD=${CONSOLE_ADMIN_PASSWORD:-}
+    volumes:
+      - ./data/console:/app/data/console   # users.jsonl + users_audit.jsonl (Ф3.3)
     depends_on:
       mcp-server:
         condition: service_healthy
     healthcheck:
       # curl в образе kb-console (python:3.11-slim) ОТСУТСТВУЕТ — старый curl-test
       # был латентным дефектом; унифицировано с dev- compose на python/urllib.
-      # Auth-aware (code-2026-09-20-002): при заданном CONSOLE_PASSWORD корень
-      # за Basic-auth — креды собираются из env контейнера; при пустом пароле
-      # auth off, заголовок безвреден.
-      test: ["CMD", "python", "-c", "import base64,os,urllib.request;req=urllib.request.Request('http://localhost:8085/',headers={'Authorization':'Basic '+base64.b64encode((':'+os.environ.get('CONSOLE_PASSWORD','')).encode()).decode()});urllib.request.urlopen(req,timeout=3)"]
+      # Auth-aware (code-2026-09-20-002 + roles Ф4): legacy — (':'+CONSOLE_PASSWORD);
+      # per-user — bootstrap-админ (CONSOLE_ADMIN_USER/PASSWORD).
+      test: ["CMD", "python", "-c", "import base64,os,urllib.request;u=os.environ.get('CONSOLE_ADMIN_USER','');p=os.environ.get('CONSOLE_ADMIN_PASSWORD','') or os.environ.get('CONSOLE_PASSWORD','');req=urllib.request.Request('http://localhost:8085/',headers={'Authorization':'Basic '+base64.b64encode((u+':'+p).encode()).decode()});urllib.request.urlopen(req,timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3

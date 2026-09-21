@@ -60,7 +60,9 @@ mcp-stdio/bridge.py │    │  диаг. :8085 → :8000
 └────────────────────────────────────────────────────┘
 ```
 
-**kb-console** — отдельный самодостаточный контейнер (образ `kb-console:prod`): страницы **Статус** (health-карточки, метрики, 31 инструмент), **Книги** (список коллекций + оглавление), **Импорт** (загрузка материалов через `import_content`), **Поиск** (по корпусу), **Качество** (запуск quality-скана с живым прогрессом, review-очередь устаревших книг, issues, dedup-ревью 🟢/🟡). Может жить на клиентских хостах (`MCP_SERVER_URL` из env). Руководство: `kb-console/USER_GUIDE.md`.
+**kb-console** — отдельный самодостаточный контейнер (образ `kb-console:prod`): страницы **Статус** (health-карточки, метрики, 31 инструмент), **Книги** (список коллекций + оглавление), **Импорт** (загрузка материалов через `import_content`), **Поиск** (по корпусу), **Качество** (запуск quality-скана с живым прогрессом, review-очередь устаревших книг, issues, dedup-ревью 🟢/🟡), **Токены** и **Пользователи** (admin-only). Может жить на клиентских хостах (`MCP_SERVER_URL` из env). Руководство: `kb-console/USER_GUIDE.md`.
+
+**Роли консоли** (code-2026-09-21-001): `admin` (всё, вкл. /tokens, /users, bulk-операции quality, replace-импорт) → `editor` (контент+dedup-ревью, 🟣 editor-ключ MCP, без reindex/set_zone/bulk) → `contributor` (только добавление: импорт без replace). Учётки — `users.jsonl` (pbkdf2, volume `./data/console`), bootstrap-админ из `CONSOLE_ADMIN_USER/PASSWORD`, управление через `/users`; per-role MCP-ключи `MCP_API_KEY_ADMIN/EDITOR/CONTRIBUTOR` (пусто → общий `MCP_API_KEY`). Пустой стор = legacy-режим одного пароля `CONSOLE_PASSWORD` (бит-ин-бит). Серверный enforcement: уровни ключей s/r/i/e/w (`EDITOR_TOOLS`, replace-гейт в `import_content`).
 
 ## 🚀 Быстрый старт
 
