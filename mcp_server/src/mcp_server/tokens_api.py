@@ -1,6 +1,6 @@
 """W5: admin API управления токенами (kb-console backend).
 
-Эндпоинты (write-only, X-API-Key с key_level ∈ {write, import}):
+Эндпоинты (write-only, X-API-Key с key_level == write):
 - GET    /tokens            — список записей (без key_hash, с маской)
 - POST   /tokens            — создать (возвращает plaintext ОДИН раз)
 - POST   /tokens/{id}/revoke — отозвать
@@ -13,6 +13,8 @@
 - Запись содержит key_hash — в ответы НЕ попадает.
 - Аутентификация: AuthMiddleware ставит request.state.auth (AuthInfo);
   уровень ниже write → 403.
+- kb-console-roles У-3: ADMIN_LEVELS = {"write"} — import-ключ больше
+  НЕ может минтить токены (закрыта эскалация import→write).
 """
 
 from __future__ import annotations
@@ -28,15 +30,15 @@ logger = logging.getLogger("mcp_knowledge.tokens_api")
 
 router = APIRouter(prefix="/tokens", tags=["tokens"])
 
-ADMIN_LEVELS = {"write", "import"}
+ADMIN_LEVELS = {"write"}
 
 
 def _require_admin(request: Request) -> None:
-    """Только write/import-уровень (kb-console ходит с write-ключом)."""
+    """Только write-уровень (kb-console ходит с admin-ключом; У-3: import → 403)."""
     auth = getattr(request.state, "auth", None)
     level = getattr(auth, "key_level", "") if auth is not None else ""
     if level not in ADMIN_LEVELS:
-        raise HTTPException(status_code=403, detail="tokens API requires write/import key")
+        raise HTTPException(status_code=403, detail="tokens API requires write key")
 
 
 def _get_store(request: Request):

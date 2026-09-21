@@ -14,7 +14,7 @@ revoke/scope меняют запись, файл переписывается ц
 
 Формат токена (единая точка генерации — TokenStore.create(), v1.6):
     mcp_<level_code><zone_code>_<secret32>
-    level_code: s=subscriber, r=read, i=import, w=write
+    level_code: s=subscriber, r=read, i=import, e=editor (kb-console-roles B2), w=write
     zone_code:  a=public, b=private, x=both (subscriber → принудительно a)
     secret: 32 символа base62 (secrets.choice, ≥190 бит энтропии)
 
@@ -52,7 +52,7 @@ logger = logging.getLogger("mcp_knowledge.auth.token_store")
 # ── Легенда (план §2.3): коды уровня и зоны в теле токена ─────
 
 LEVEL_CODES: dict[str, str] = {
-    "subscriber": "s", "read": "r", "import": "i", "write": "w",
+    "subscriber": "s", "read": "r", "import": "i", "editor": "e", "write": "w",
 }
 ZONE_CODES: dict[str, str] = {"public": "a", "private": "b", "both": "x"}
 
@@ -80,7 +80,7 @@ class TokenRecord(BaseModel):
 
     id: str = Field(..., description='"tok_" + token_hex(8)')
     key_hash: str = Field(..., description="sha256(plaintext).hexdigest()")
-    level: str = Field(..., description="subscriber | read | import | write")
+    level: str = Field(..., description="subscriber | read | import | editor | write")
     zone: str = Field(..., description="public | private | both (subscriber → public)")
     scope: list[str] | None = Field(
         default=None, description="knowledge_id/collection_id grants (W6)",

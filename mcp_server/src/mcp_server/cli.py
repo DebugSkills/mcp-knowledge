@@ -177,6 +177,7 @@ async def dlq_replay():
 
 # ── Токены: визуальные бейджи и вывод (W4.5, план §2.3) ──────
 # Легенда (v1.3): subscriber 🟢 · read 🔵 · import 🟠 · write 🔴;
+# v1.7 (kb-console-roles B2): editor 🟣 (write минус админ-операции);
 # зона public «A» 🟢 · private «B» 🔴 · both «A+B» ⚪;
 # статус active ✅ · revoked ⛔ · expired ⏳ · expiring soon ⚠️ (≤7 дней).
 
@@ -184,6 +185,7 @@ _LEVEL_BADGES = {
     "subscriber": ("🟢", "32"),
     "read": ("🔵", "34"),
     "import": ("🟠", "38;5;208"),
+    "editor": ("🟣", "35"),
     "write": ("🔴", "31"),
 }
 _ZONE_BADGES = {
@@ -201,6 +203,7 @@ _LEVEL_NAMES = {
     "subscriber": "подписчик",
     "read": "чтение",
     "import": "импорт",
+    "editor": "редактор",
     "write": "запись",
 }
 _ZONE_NAMES = {

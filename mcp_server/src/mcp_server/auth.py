@@ -69,6 +69,19 @@ IMPORT_TOOLS: set[str] = {
     "import_content",
     "cancel_import",
     "extract_pdf_text",  # PDF→текст для авто-классификации (оперирует загруженным PDF)
+    "add_fragment",  # kb-console-roles Q3 (P1-2): «добавляющий» добавляет секции в книги
+}
+
+# ── Editor tools (kb-console-roles B2: роль «редактор» без админ-операций) ──
+# WRITE минус: reindex/set_zone (Q1/Q2 — admin-only: инфраструктура/курирование
+# public-слоя) и bulk_* (P2-2 — массовые операции над десятками записей).
+# run_quality_scan остаётся editor (P2-3: чтение индекса + issues.jsonl,
+# контент не мутирует; асимметрия с reindex обоснована характером операции).
+EDITOR_TOOLS: set[str] = WRITE_TOOLS - {
+    "reindex",
+    "set_zone",
+    "bulk_resolve_issues",
+    "bulk_deprecate_duplicates",
 }
 
 # ── W3.3: белый список subscriber-токенов (план two-zone-access §2.3) ──
@@ -101,7 +114,7 @@ UNAUTHENTICATED_METHODS: set[str] = {
 class AuthInfo:
     """Результат аутентификации, сохраняется в request.state."""
     authenticated: bool = False
-    key_level: str = "none"  # "subscriber" | "read" | "import" | "write" | "none"
+    key_level: str = "none"  # "subscriber" | "read" | "import" | "editor" | "write" | "none"
     key_hash: str = ""  # sha256 первых 8 символов для аудита
     zone: str = "both"  # W3.4: "public" | "private" | "both"
     scope: set[str] = field(default_factory=set)  # W3.4: scope-grants (W6)
@@ -277,6 +290,22 @@ def check_tool_permission(auth_info: AuthInfo, tool_name: str) -> None:
     # Write-ключ → доступ ко всему
     if auth_info.key_level == "write":
         return
+
+    # kb-console-roles B2: Editor-ключ → read + editor-тулы (зеркало import-ветки).
+    # Админ-операции (reindex/set_zone/bulk_*) и /tokens — только write.
+    if auth_info.key_level == "editor":
+        if tool_name in READ_TOOLS or tool_name in EDITOR_TOOLS:
+            return
+        logger.warning(
+            "Auth FORBIDDEN: editor-key attempted non-editor tool '%s' (key_hash=%s)",
+            tool_name,
+            auth_info.key_hash,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"Editor key cannot access tool '{tool_name}'. "
+            f"Admin operations (reindex, set_zone, bulk actions) require a write key.",
+        )
 
     # W3.6: Subscriber-ключ → только SUBSCRIBER_TOOLS (белый список),
     # зона принудительно public. Внутренние quality-тулы и resources/prompts

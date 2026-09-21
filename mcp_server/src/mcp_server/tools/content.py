@@ -956,6 +956,27 @@ async def import_content(params: dict, app_state) -> dict:
     replace_collection_id = params.get("replace_collection_id", "")
     replace_on_partial = params.get("replace_on_partial", False)
 
+    # ── kb-console-roles Ф1.6: серверный replace-гейт (P1-1/Q4) ──
+    # Единая точка всех путей импорта (book: submit_import; pdf: _bg_import) —
+    # ДО pdf-ветки и early-validation. mcp_handler инжектит params["_auth"]
+    # для всех MCP-вызовов; отсутствует → internal (CLI/тесты) → allow.
+    # Замена = каскадное удаление старой книги → разрешена только editor/write.
+    _auth = params.get("_auth")
+    if _auth is not None and replace_collection_id:
+        _level = getattr(_auth, "key_level", "")
+        if _level not in {"editor", "write"}:
+            logger.warning(
+                "[IMPORT] replace_collection_id denied for key level '%s' "
+                "(masked key_hash=%s)",
+                _level,
+                getattr(_auth, "key_hash", ""),
+            )
+            return {
+                "error": f"replace_collection_id is not allowed for key level "
+                f"'{_level}': replacement deletes the old collection (cascade). "
+                f"Use editor or write key."
+            }
+
     # ── Progress tracker (Фаза 13.9) ────────────────────────
     tracker = getattr(app_state, "import_progress", None)
 

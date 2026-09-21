@@ -78,9 +78,10 @@ class TestCreateFormat:
             store.create("read", "galaxy")
 
     def test_legend_codes(self):
-        """Легенда §2.3: s/r/i/w и a/b/x."""
+        """Легенда §2.3: s/r/i/e/w и a/b/x (e=editor — kb-console-roles B2, Ф1.3)."""
         assert LEVEL_CODES == {
-            "subscriber": "s", "read": "r", "import": "i", "write": "w",
+            "subscriber": "s", "read": "r", "import": "i",
+            "editor": "e", "write": "w",
         }
         assert ZONE_CODES == {"public": "a", "private": "b", "both": "x"}
 
