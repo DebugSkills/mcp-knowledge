@@ -209,11 +209,49 @@ def extract_marker(rest: str):
     return None
 
 
-def parse_docker_log_events(container: str, lines, last_ts: str):
+# ── D1 (Ф5): класс «ожидаемый/рутинный» — capture-first НЕ меняется (всё пишем
+# в raw), меняется только маркировка события expected=True и приоритет агрегата.
+
+MCP_OK_MS_RE = re.compile(r"\[MCP\] tool=\S+ ok .*?\b(\d+(?:\.\d+)?) ms")
+
+
+def classify_routine(rest: str, level, marker, status, slow_ms: float):
+    """→ (expected, hint): routine-строки INFO-уровня без признаков ошибки.
+
+    routine: '[MCP] tool=… ok <ms>' при ms<slow_ms; '[MCP] tool=… start';
+    access '[REQ] …' 2xx/без явного 4xx-5xx.
+    НЕ routine (expected=False): ERROR/CRITICAL/traceback, любой 5xx, '[MCP]'
+    с error, WARNING. slow: '[MCP] … ok <ms≥slow_ms>' → hint='slow' (P1).
+    """
+    low = rest.lower()
+    if level in ("ERROR", "CRITICAL") or status is not None and status >= 500:
+        return False, None
+    if "traceback" in low or "exception" in low or ("error" in low and marker == "MCP"):
+        return False, None
+    if level == "WARNING":
+        return False, None  # WARNING не рутинен (кроме health-проб — свой источник)
+    if marker == "MCP":
+        m = MCP_OK_MS_RE.search(rest)
+        if m and level in (None, "INFO"):
+            ms = float(m.group(1))
+            if ms >= slow_ms:
+                return False, "slow"
+            return True, None
+        if re.search(r"\[MCP\] tool=\S+ start", rest) and level in (None, "INFO"):
+            return True, None
+        return False, None
+    if marker == "REQ" and (status is None or status < 400):
+        return True, None
+    return False, None
+
+
+def parse_docker_log_events(container: str, lines, last_ts: str, slow_ms: float = 60000):
     """Capture-first отбор: маркеры, WARN/ERROR/CRITICAL, traceback-блоки, access 4xx/5xx.
 
     Traceback-блок: строка 'Traceback (...)' + последующие строки С отступом;
     закрывается первой строкой без отступа (строка исключения) — она входит в блок.
+    D1 (Ф5): routine-строки ([MCP] ok fast / [MCP] start / [REQ] 2xx) помечаются
+    expected=True — сбор не меняется (всё пишем в raw), меняется приоритет агрегата.
     """
     events = []
     parsed = []
@@ -255,10 +293,14 @@ def parse_docker_log_events(container: str, lines, last_ts: str):
                 hint = "critical"
             elif status is not None and status >= 500:
                 hint = "5xx"
+            expected, routine_hint = classify_routine(rest, level, marker, status, slow_ms)
+            if routine_hint:
+                hint = routine_hint  # slow перекрывает routine (аномалия → P1)
             events.append(make_event(
                 ts, "docker_logs", rest, container=container, stream=None, level=level,
                 marker=marker, error_code=str(status) if status else None, status=status,
                 priority_hint=hint, actor_id=classify_actor(rest, "docker_logs"),
+                expected=expected,
             ))
         i += 1
     return events
@@ -327,7 +369,8 @@ def collect_docker_logs(sink: Path, state: dict, cfg: dict):
                   file=sys.stderr)
             continue
         lines = (proc.stdout or "") + (proc.stderr or "")
-        evs = parse_docker_log_events(container, lines.splitlines(), last_ts)
+        evs = parse_docker_log_events(container, lines.splitlines(), last_ts,
+                                      float(cfg.get("slow_ms", 60000)))
         events.extend(evs)
         newest = max((e["ts"] for e in evs), default=None)
         if newest and (not last_ts or newest > last_ts):
@@ -405,12 +448,15 @@ def collect_docker_events(sink: Path, state: dict, cfg: dict):
     last_ts = state.get("docker_events", "")
     since = last_ts or (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
     until = now_iso()
+    # D2 (Ф5): события ТОЛЬКО контейнеров нашего стека (cfg["containers"]);
+    # чужие (donation_bot и пр.) игнорируются — фильтр в команде + защитный пост-фильтр
+    scope = [c for c in cfg.get("containers", []) if c]
+    cmd = ["docker", "events", "--since", since, "--until", until,
+           "--filter", "type=container", "--format", "{{json .}}"]
+    for name in scope:
+        cmd += ["--filter", f"container={name}"]
     try:
-        proc = subprocess.run(
-            ["docker", "events", "--since", since, "--until", until,
-             "--filter", "type=container", "--format", "{{json .}}"],
-            capture_output=True, text=True, timeout=60, check=False,
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"[errors_collect] WARN: docker events: {exc} — skip", file=sys.stderr)
         return []
@@ -426,12 +472,14 @@ def collect_docker_events(sink: Path, state: dict, cfg: dict):
         action = raw.get("Action", "")
         if action not in ("die", "oom", "restart", "health_status"):
             continue
+        attrs = (raw.get("Actor") or {}).get("Attributes") or {}
+        container = attrs.get("name", raw.get("id", "")[:12])
+        if scope and container not in scope:  # D2: пост-фильтр — чужие не проходят
+            continue
         ts_raw = raw.get("Time") or raw.get("time")
         ts = datetime.fromtimestamp(int(ts_raw), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ts_raw else until
         if last_ts and ts <= last_ts:
             continue
-        attrs = (raw.get("Actor") or {}).get("Attributes") or {}
-        container = attrs.get("name", raw.get("id", "")[:12])
         hint, level, exit_code = None, "WARNING", None
         if action == "oom":
             hint, level = "oom", "ERROR"
@@ -641,7 +689,14 @@ def update_aggregates(sink: Path, events, cfg: dict):
         }
         hints = [(e.get("priority_hint"), e.get("expected", False)) for e in evs]
         p0 = any(h in P0_HINTS and not exp for h, exp in hints)
+        slow = any(h == "slow" for h, _ in hints)
         actors = {e.get("actor_id") for e in evs if e.get("actor_id")}
+        # D1 (Ф5): routine-сигнатура = все события expected и ни одного не-routine
+        # за историю (инкрементальность: флаг залипает, если хоть раз была не-рутина)
+        if any(not e.get("expected", False) for e in evs):
+            a["has_non_routine"] = True
+        routine_all = (not a.get("has_non_routine")
+                       and all(e.get("expected", False) for e in evs))
         day = now.strftime("%Y-%m-%d")
         a["daily"][day] = a["daily"].get(day, 0) + len(evs)
         # окно роста неделя-к-неделе требует 14d; старше 21d — сворачиваем
@@ -668,6 +723,13 @@ def update_aggregates(sink: Path, events, cfg: dict):
         )
         if p0:
             a["priority"], a["class"] = "P0", "T"
+        elif slow:
+            # D1: '[MCP] … ok <ms ≥ slow_ms>' — реальная аномалия (не рутина и не P2)
+            a["priority"], a["class"], a["slow"] = "P1", "U", True
+        elif routine_all and not p0:
+            # D1: вся сигнатура — ожидаемая рутина ([MCP] ok fast / start,
+            # [REQ] 2xx) → P3-baseline; «≥2 акторов ⇒ P1» к routine НЕ применяется
+            a["priority"], a["class"] = "P3", "T"
         elif len(set(a["actors"])) >= 2 or (count_prev_7d > 0 and count_7d > count_prev_7d):
             a["priority"] = "P1"
             a["class"] = "U" if a["actors"] else "T"
@@ -717,6 +779,7 @@ DEFAULT_CONFIG = {
                     "http://localhost:11435/api/tags", "http://localhost:8085/"],
     "own_log": "/var/log/mcp-errors-collect.log",
     "hang_window_min": 30,
+    "slow_ms": 60000,  # D1 (Ф5): '[MCP] … ok <ms>' при ms ≥ slow_ms → P1 (slow=true)
 }
 
 

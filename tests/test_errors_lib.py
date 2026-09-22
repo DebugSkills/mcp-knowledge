@@ -295,5 +295,149 @@ class TestMakeEvent:
         assert ec.classify_actor("[MCP] tool=search start key=abcd1234", "docker_logs") == "abcd1234"
 
 
+# ── Ф5 (iter2): routine-класс D1, slow_ms, скоуп docker events D2 ──
+
+LOG_LINE = "2026-09-22T10:00:00Z {}"
+
+
+class TestRoutineClassification:
+    """D1: routine → expected=True → P3; slow/ошибки НЕ routine."""
+
+    def _events(self, rest, slow_ms=60000):
+        return ec.parse_docker_log_events(
+            "mcp-knowledge-server", [LOG_LINE.format(rest)], "", slow_ms)
+
+    def _prio(self, events):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sink = Path(td)
+            ec.update_aggregates(sink, events, {})
+            aggs = json.loads((sink / "aggregates" / "signatures.json").read_text())
+            return next(iter(aggs.values()))
+
+    def test_mcp_ok_fast_is_routine_p3(self):
+        evs = self._events("2026-09-22 10:00:00,123 [INFO] mcp_knowledge.mcp: "
+                           "[MCP] tool=search_knowledge ok 157.8 ms key=f7708f878c65e1be")
+        assert len(evs) == 1 and evs[0]["expected"] is True
+        a = self._prio(evs)
+        assert a["priority"] == "P3" and a["class"] == "T"
+
+    def test_mcp_ok_slow_is_p1_slow(self):
+        # реальный кейс дев-стенда: import_content ok 724667.9 ms (12 минут)
+        evs = self._events("2026-09-22 10:00:00,123 [INFO] mcp_knowledge.mcp: "
+                           "[MCP] tool=import_content ok 724667.9 ms key=f7708f878c65e1be")
+        assert len(evs) == 1 and evs[0]["expected"] is False
+        assert evs[0]["priority_hint"] == "slow"
+        a = self._prio(evs)
+        assert a["priority"] == "P1" and a.get("slow") is True
+
+    def test_mcp_start_is_routine_p3(self):
+        # hang-детектор не задет: start всё ещё пишется в raw (capture-first)
+        evs = self._events("2026-09-22 10:00:00,123 [INFO] mcp_knowledge.mcp: "
+                           "[MCP] tool=search_knowledge start args=['_auth', 'query'] key=f7708f878c65e1be")
+        assert len(evs) == 1 and evs[0]["expected"] is True
+        assert self._prio(evs)["priority"] == "P3"
+
+    def test_mcp_error_not_routine(self):
+        evs = self._events("2026-09-22 10:00:00,123 [ERROR] mcp_knowledge.mcp: "
+                           "[MCP] tool=search_knowledge error: qdrant timeout")
+        assert len(evs) == 1 and evs[0]["expected"] is False
+        assert self._prio(evs)["priority"] in ("P0", "P1", "P2")
+
+    def test_5xx_not_routine_p0(self):
+        evs = self._events('INFO:     127.0.0.1:36936 - "GET /health HTTP/1.1" 503 Service Unavailable')
+        assert len(evs) == 1 and evs[0]["expected"] is False
+        assert evs[0]["priority_hint"] == "5xx"
+        assert self._prio(evs)["priority"] == "P0"
+
+    def test_warning_not_routine(self):
+        evs = self._events("2026-09-22 10:00:00,123 [WARNING] mcp_knowledge.pipeline: "
+                           "Очередь переполнена — blocking put")
+        assert len(evs) == 1 and evs[0]["expected"] is False
+
+    def test_req_2xx_is_routine_p3(self):
+        # реальный кейс: '[REQ] GET /' без кода ответа → рутина (не P2-шум)
+        evs = self._events("[REQ] GET /")
+        assert len(evs) == 1 and evs[0]["expected"] is True
+        assert self._prio(evs)["priority"] == "P3"
+
+    def test_routine_actors_do_not_make_p1(self):
+        # «≥2 акторов ⇒ P1» к routine НЕ применяется — два актора ok-fast → P3
+        evs = self._events("2026-09-22 10:00:00,1 [INFO] mcp: [MCP] tool=t ok 10.0 ms key=aaaa1111")
+        evs2 = self._events("2026-09-22 10:00:00,2 [INFO] mcp: [MCP] tool=t ok 20.0 ms key=bbbb2222")
+        # сигнатуры совпадают (ключ нормализован) — агрегат в одном батче
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sink = Path(td)
+            ec.update_aggregates(sink, evs + evs2, {})
+            aggs = json.loads((sink / "aggregates" / "signatures.json").read_text())
+            a = next(iter(aggs.values()))
+            assert len(a["actors"]) >= 2 and a["priority"] == "P3"
+
+    def test_non_routine_sticks(self):
+        # инкрементальность: одна сигнатура, батч 1 — routine (expected),
+        # батч 2 — та же сигнатура, но не-routine → has_non_routine залипает,
+        # приоритет уже НЕ откатится в P3 (даже если батч 3 снова routine)
+        import tempfile
+        ev_kw = dict(ts="2026-09-22T10:00:00Z", source="docker_logs",
+                     message="[REQ] GET /", marker="REQ")
+        with tempfile.TemporaryDirectory() as td:
+            sink = Path(td)
+            ec.update_aggregates(sink, [_ev(expected=True, **ev_kw)], {})
+            aggs = json.loads((sink / "aggregates" / "signatures.json").read_text())
+            assert next(iter(aggs.values()))["priority"] == "P3"
+            ec.update_aggregates(sink, [_ev(expected=False, **ev_kw)], {})
+            aggs = json.loads((sink / "aggregates" / "signatures.json").read_text())
+            assert next(iter(aggs.values()))["priority"] != "P3"
+            ec.update_aggregates(sink, [_ev(expected=True, **ev_kw)], {})
+            aggs = json.loads((sink / "aggregates" / "signatures.json").read_text())
+            assert next(iter(aggs.values()))["priority"] != "P3"  # залипло
+
+
+class TestDockerEventsScope:
+    """D2: события чужих контейнеров (donation_bot*) полностью игнорируются."""
+
+    def test_foreign_container_filtered(self, monkeypatch):
+        payload = {
+            "status": "die", "Action": "die",
+            "Actor": {"Attributes": {"name": "donation_bot", "exitCode": "1"}},
+            "Time": 1758554400,
+        }
+
+        class FakeProc:
+            returncode = 0
+            stdout = json.dumps(payload) + "\n"
+
+        cmd_seen = {}
+
+        def fake_run(cmd, **kw):
+            cmd_seen["cmd"] = cmd
+            return FakeProc()
+
+        monkeypatch.setattr(ec.subprocess, "run", fake_run)
+        cfg = {"containers": ["mcp-knowledge-server", "kb-console"]}
+        out = ec.collect_docker_events(Path("/tmp/kilo/nonexistent-sink"), {}, cfg)
+        assert out == []  # чужой контейнер отброшен пост-фильтром
+        # и фильтры container= в команде присутствуют (двойная защита)
+        flat = " ".join(cmd_seen["cmd"])
+        assert "container=mcp-knowledge-server" in flat
+
+    def test_own_container_passes(self, monkeypatch):
+        payload = {
+            "status": "die", "Action": "die",
+            "Actor": {"Attributes": {"name": "mcp-knowledge-server", "exitCode": "1"}},
+            "Time": 1758554400,
+        }
+
+        class FakeProc:
+            returncode = 0
+            stdout = json.dumps(payload) + "\n"
+
+        monkeypatch.setattr(ec.subprocess, "run", lambda cmd, **kw: FakeProc())
+        out = ec.collect_docker_events(Path("/tmp/kilo/nonexistent-sink"), {},
+                                       {"containers": ["mcp-knowledge-server"]})
+        assert len(out) == 1 and "mcp-knowledge-server" in out[0]["message"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

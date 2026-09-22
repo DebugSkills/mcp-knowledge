@@ -165,6 +165,9 @@ def metrics(aggs, alert, raw):
     now = datetime.now(timezone.utc)
     p01_active, p01_30d, found_before_user = 0, 0, 0
     ttf, rules_candidates, recidives = [], 0, []
+    # D3 (Ф5): reported_by_user никем не выставляется → «н/д», а не псевдо-1.0;
+    # формула остаётся для случая, когда источник появится (жалобы оператора)
+    has_user_reports = any(st.get("reported_by_user") for st in alert.values())
     for sig, a in aggs.items():
         pri = a.get("priority")
         try:
@@ -188,9 +191,16 @@ def metrics(aggs, alert, raw):
                 recidives.append(sig)
     ttf.sort()
     med_ttf = round(ttf[len(ttf) // 2], 1) if ttf else None
+    if not has_user_reports:
+        found_ratio, found_str = None, "н/д (источник reported_by_user не подключён)"
+    elif p01_30d:
+        found_ratio = round(found_before_user / p01_30d, 2)
+        found_str = f"{found_before_user}/{p01_30d} = {found_ratio}"
+    else:
+        found_ratio, found_str = None, "0/0"
     return {
-        "found_before_user_ratio": round(found_before_user / p01_30d, 2) if p01_30d else None,
-        "found_before_user": f"{found_before_user}/{p01_30d}",
+        "found_before_user_ratio": found_ratio,
+        "found_before_user": found_str,
         "rules_candidates": rules_candidates,
         "median_ttf_h": med_ttf,
         "recidives_7d": recidives,
@@ -271,8 +281,9 @@ def cmd_weekly(sink, send_tg):
     L.append(f"- noise_ratio (P3-строк/всех за 7d): {raw['noise_ratio']}")
     L.append("")
     L.append("## 5. Метрики цикла (канон §8)")
+    ratio_part = f" = {met['found_before_user_ratio']}" if met["found_before_user_ratio"] is not None else ""
     L.append(f"- доля ошибок, найденных ДО жалобы (P0/P1 30d, "
-             f"reported_by_user=false): {met['found_before_user']} = {met['found_before_user_ratio']}")
+             f"reported_by_user=false): {met['found_before_user']}{ratio_part}")
     L.append(f"- кандидатов на правило (resolved P0/P1): {met['rules_candidates']}")
     L.append(f"- median time-to-fix P0/P1: {met['median_ttf_h']} ч")
     L.append(f"- рецидивы 7d (события после fixed_at): {len(met['recidives_7d'])} "

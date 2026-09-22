@@ -1,9 +1,5 @@
-{{ ansible_managed | comment }}
-# Конфиг цикла Error→Rule (Ф4, code-2026-09-22-003). Рендерится errors.yml (тег setup)
-# в {{ data_root }}/logs/errors/config.json — errors_collect/report/prune читают его
-# через load_config(sink); дефолты см. scripts/errors_collect.py DEFAULT_CONFIG.
-# СЕКРЕТОВ НЕТ (ключи/токены — только notify.json из vault, 0600).
 {
+  "_doc": "Error→Rule config (Ф4/Ф5, code-2026-09-22-003; ansible-managed). Рендер errors.yml → config.json; секретов НЕТ (токены — notify.json из vault). Дефолты: scripts/errors_collect.py DEFAULT_CONFIG",
   "containers": ["mcp-knowledge-server", "kb-console", "mcp-qdrant-dev", "mcp-knowledge-ollama"],
   "cron_logs": ["/var/log/mcp-backup.log", "/var/log/mcp-quality.log", "/var/log/mcp-errors-collect.log"],
   "health_urls": [
@@ -14,6 +10,7 @@
   ],
   "own_log": "/var/log/mcp-errors-collect.log",
   "hang_window_min": 30,
+  "slow_ms": {{ errors_slow_ms | default(60000) }},
   "retention_days": {{ errors_retention_days | default(90) }},
   "hold_days": {{ errors_hold_days | default(14) }},
   "e4_window_days": 7,

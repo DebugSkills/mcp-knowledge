@@ -1,9 +1,5 @@
-{{ ansible_managed | comment }}
-# TG-доставка weekly-отчёта Error→Rule (Ф4, P2-10): бот-токен из ansible-vault,
-# НИКОГДА не в git. Рендерится errors.yml (тег setup) в {{ data_root }}/logs/errors/notify.json,
-# режим 0600. errors_report.py --send-tg читает и НИКОГДА не печатает токен;
-# отсутствующий/пустой файл → «TG: skip», exit 0 (graceful).
 {
+  "_doc": "TG-доставка weekly-отчёта Error→Rule (Ф4, P2-10; ansible-managed): bot_token из ansible-vault, режим 0600, НИКОГДА не в git и не логируется. errors_report.py --send-tg читает; пустые значения → 'TG: skip', exit 0 (graceful).",
   "bot_token": "{{ vault_telegram_bot_token | default('') }}",
   "chat_id": "{{ vault_telegram_chat_id | default('') }}"
 }
