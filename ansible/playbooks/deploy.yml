@@ -17,23 +17,22 @@
     # ─── dirs: создание структуры каталогов deploy_root (бывшая роль mcp_kb_dirs) ───
     # Корень — {{ deploy_root }} из inventory/group_vars/all.yml (по умолчанию /opt/mcp-knowledge).
     #
-    # ⚠️ Секция НАМЕРЕННО не создаёт НИЧЕГО внутри {{ deploy_root }}/{{ repo_name }}/ (каталог клона):
-    # (а) деплой запускает dirs ДО repos, а git clone требует пустой или
-    #     несуществующий целевой каталог — иначе «fatal: ... уже существует и не является
-    #     пустым каталогом»;
-    # (б) data/qdrant и data/ollama/models создаёт сам Docker при первом `up` (bind-mount) —
-    #     лэйаут как на текущем dev-хосте (data/qdrant там root-owned, создан Docker'ом);
-    # (в) data/backups создаёт backup.sh — `mkdir -p "$BACKUP_DIR"` (scripts/backup.sh:204).
+    # DATA_ROOT-вынос (code-2026-09-22-002): данные живут в ОДНОМ дереве
+    # {{ data_root }} (={{ deploy_root }}/data) ВНЕ git-клона. Распределение создания:
+    # (а) эта секция создаёт ТО, что нужно до docker compose up с конкретным владельком:
+    #     - ../-маунты mcp-server → {{ deploy_root }}/data/{dlq,quality,logs,pdf_cache,tokens}
+    #       (owner 1000:1000 — как пишет mcp-server) + {{ deploy_root }}/models_cache;
+    #     - {{ data_root }}/console — kb-console (users.jsonl; Docker создал бы root-owned,
+    #       задаём 0755 заранее для едиобразия с остальными);
+    # (б) data/qdrant и data/ollama/models создаёт Docker при первом `up` (bind-mount,
+    #     root-owned — как на dev-хосте);
+    # (в) data/backups создаёт backup.sh — `mkdir -p "$BACKUP_DIR"` + chmod 700.
+    # Двух расходящихся data/-деревьев НЕТ: все потребители (compose ${DATA_ROOT}-маунты,
+    # ../-маунты mcp-server, backup.sh DATA_ROOT) сходятся в {{ deploy_root }}/data.
     #
-    # Создаются только каталоги ВНЕ клона, нужные до docker compose up (эти же пути создают
-    # и сам {{ deploy_root }} — он нужен до клонирования):
-    # - ../... в compose (mcp-server, host-net) → {{ deploy_root }}/data/{dlq,quality,logs,pdf_cache,tokens},
-    #   {{ deploy_root }}/models_cache
-    # Двух расходящихся data/-деревьев быть не должно: qdrant-снапшоты и backups живут
-    # ТОЛЬКО в data/ клона (оттуда их забирает backup.sh), но создают их Docker/backup.sh,
-    # а не эта секция.
-    # {{ deploy_root }}/scripts больше НЕ создаётся: cron-скрипты берутся из клона
-    # ({{ deploy_root }}/{{ repo_name }}/scripts/), отдельная копия не нужна (секция cron).
+    # ⚠️ Внутри {{ deploy_root }}/{{ repo_name }}/ (каталог клона) секция НАМЕРЕННО
+    # ничего не создаёт: деплой запускает dirs ДО repos, а git clone требует пустой
+    # или несуществующий целевой каталог.
     - name: Создать структуру каталогов deploy_root вне git-клона
       tags: [dirs]
       block:
@@ -51,6 +50,12 @@
             - "{{ deploy_root }}/data/pdf_cache"  # compose: ../data/pdf_cache
             - "{{ deploy_root }}/data/tokens"     # compose: ../data/tokens (TokenStore)
             - "{{ deploy_root }}/models_cache"    # compose: ../models_cache (HF-токенизатор)
+
+        - name: Создать каталог данных kb-console (DATA_ROOT/console, code-2026-09-22-002)
+          ansible.builtin.file:
+            path: "{{ data_root }}/console"       # compose: ${DATA_ROOT}/console
+            state: directory
+            mode: '0755'
 
         # noqa обоснование: ansible.builtin.git не умеет создавать пустой bare-репозиторий
         # (только clone), поэтому git init --bare через command с creates=-гардом идемпотентности
@@ -183,6 +188,16 @@
             name: MCP_WRITE_KEY
             env: true
             value: "{{ vault_cron_write_key | default('') }}"
+            user: root
+
+        # DATA_ROOT (code-2026-09-22-002): backup.sh берёт корень данных из env —
+        # nightly-бэкап console-state/tokens/snapshots/backups идёт в {{ data_root }},
+        # а не в data/ git-клона (паттерн MCP_WRITE_KEY выше).
+        - name: Добавить DATA_ROOT в crontab (env для backup.sh)
+          ansible.builtin.cron:
+            name: DATA_ROOT
+            env: true
+            value: "{{ data_root }}"
             user: root
 
         - name: Настроить cron для ежедневного бэкапа

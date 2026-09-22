@@ -3,6 +3,9 @@
 deploy_root: /opt/mcp-knowledge        # родительский каталог (basename 'mcp-knowledge' сохраняется!)
 repo_name: mcp-knowledge               # compose project name = basename
 compose_file: docker-compose.yml       # переносим работающий dev-стек
+# DATA_ROOT (code-2026-09-22-002): корень данных ВНЕ git-клона (qdrant/ollama/console);
+# рендерится в .env (→ compose ${DATA_ROOT}) + cron-env backup.sh + dirs секция deploy.yml
+data_root: "{{ deploy_root }}/data"
 old_root: /kvm/mcp-knowledge           # текущий хост (источник)
 staging: /opt/mcp-kb-transfer          # промежуточный каталог переноса на новом хосте
 min_free_gb: 30

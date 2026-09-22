@@ -1,5 +1,12 @@
 version: "3.8"
 
+# DATA_ROOT (code-2026-09-22-002): корень данных ВНЕ git-клона кода —
+# qdrant/ollama/console монтируются из ${DATA_ROOT} (дефолт ./data = прежний
+# dev-layout бит-в-бит; прод рендерит DATA_ROOT={{ deploy_root }}/data в .env).
+# DATA_ROOT — непустой абсолютный путь; пустая строка = конфигурационная ошибка.
+# Маунты mcp-server ../data/* здесь НЕ интерполируются (уже корректны на обоих
+# контурах: dev = sibling-каталог, прод = {{ deploy_root }}/data).
+
 services:
   qdrant:
     image: qdrant/qdrant:v1.13.4
@@ -14,7 +21,7 @@ services:
       # Loopback (audit P1 У-2, code-2026-09-20-001): как в docker-compose.prod.yml
       - "127.0.0.1:6333:6333"   # REST (gRPC 6334 наружу не пробрасываем — как в текущем dev)
     volumes:
-      - ./data/qdrant:/qdrant/storage
+      - ${DATA_ROOT:-./data}/qdrant:/qdrant/storage
     environment:
       # 2026-08-09: снапшоты должны писаться В bind-mount (./data/qdrant/snapshots),
       # иначе Qdrant кладёт их в /qdrant/snapshots (слой контейнера) — они теряются
@@ -53,7 +60,7 @@ services:
       # ОТДЕЛЬНЫЙ от host-ollama каталог (/usr/share/ollama/.ollama НЕ трогаем):
       # блобы 2 моделей ~6.64GB (mxbai 0.67 + qwen2.5vl 5.97); контейнер работает от root → root-owned файлы, ок
       # (каталог пишет ТОЛЬКО контейнер, host-ollama его не видит)
-      - ./data/ollama/models:/root/.ollama/models
+      - ${DATA_ROOT:-./data}/ollama/models:/root/.ollama/models
     # В образе НЕТ curl → TCP-probe как у qdrant (внутри контейнера канонический 11434)
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/11434'"]
@@ -169,7 +176,7 @@ services:
       - CONSOLE_ADMIN_USER=${CONSOLE_ADMIN_USER:-}
       - CONSOLE_ADMIN_PASSWORD=${CONSOLE_ADMIN_PASSWORD:-}
     volumes:
-      - ./data/console:/app/data/console   # users.jsonl + users_audit.jsonl (Ф3.3)
+      - ${DATA_ROOT:-./data}/console:/app/data/console   # users.jsonl + users_audit.jsonl (Ф3.3)
     # NiceGUI-клиент лёгкий — 512 МБ достаточно.
     mem_limit: 512m
     cpus: 1

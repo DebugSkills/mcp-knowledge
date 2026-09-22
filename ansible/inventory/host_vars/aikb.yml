@@ -33,6 +33,8 @@ deploy_root: /opt/mcp-knowledge
 repo_name: mcp-knowledge
 compose_file: docker-compose.yml
 min_free_gb: 30
+# data_root — дубль group_vars/all.yml (файл самодостаточен, см. шапку)
+data_root: /opt/mcp-knowledge/data
 
 # ─── ollama / embedding ───
 ollama_url: http://localhost:11435

@@ -8,9 +8,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-DATA_DIR="$PROJECT_DIR/data"
-BACKUP_DIR="$DATA_DIR/backups"
-SNAPSHOT_DIR="$DATA_DIR/qdrant/snapshots"
+# DATA_ROOT (code-2026-09-22-002): корень данных ВНЕ git-клона. Env-override:
+# прод передаёт DATA_ROOT через crontab-env (deploy.yml, cron-секция), cron-скрипты
+# не умеют .env; дефолт = прежнее dev-поведение (data внутри клона).
+DATA_ROOT="${DATA_ROOT:-$PROJECT_DIR/data}"
+BACKUP_DIR="$DATA_ROOT/backups"
+SNAPSHOT_DIR="$DATA_ROOT/qdrant/snapshots"
 KNOWLEDGE_DIR="$PROJECT_DIR/../knowledge"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 RETENTION_DAYS=7
@@ -184,11 +187,12 @@ test_restore() {
 }
 
 # --- SSOT backup (git push to bare remote) ---
+# P0-1 (code-2026-09-22-002): git -C вместо cd — cd без возврата ломал
+# последующие функции с относительными путями (backup_console_state тихо скипала).
 backup_ssot_git() {
     echo "[$(date -Iseconds)] Backing up SSOT (git push to bare)..."
     if [ -d "$KNOWLEDGE_DIR/.git" ]; then
-        cd "$KNOWLEDGE_DIR"
-        git push backup main 2>&1 || {
+        git -C "$KNOWLEDGE_DIR" push backup main 2>&1 || {
             echo "WARN: git push backup failed. Falling back to tar."
             backup_ssot_tar
         }
@@ -211,12 +215,15 @@ backup_ssot_tar() {
 # users.jsonl (pbkdf2-хэши — секретов нет) + users_audit.jsonl + tokens.jsonl
 # (тот же класс данных; дыра в бэкап-контуре отмечена ещё в 001).
 # Восстановление = копия файлов + рестарт контейнеров.
+# P0-1 (code-2026-09-22-002): АБСОЛЮТНЫЕ пути от $DATA_ROOT — прежние относительные
+# data/console ломались после cd "$KNOWLEDGE_DIR" в backup_ssot_git → тихий скип.
 backup_console_state() {
     echo "[$(date -Iseconds)] Backing up console state (users/tokens)..."
     mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
     local items=()
     local dir
-    for dir in data/console data/tokens; do
+    for dir in "$DATA_ROOT/console" "$DATA_ROOT/tokens"; do
         if [ -d "$dir" ] && ls "$dir"/*.jsonl >/dev/null 2>&1; then
             items+=("$dir")
         fi
@@ -225,8 +232,29 @@ backup_console_state() {
         echo "[$(date -Iseconds)] Console state: нет users/tokens файлов — пропуск."
         return 0
     fi
-    tar -czf "$BACKUP_DIR/console-state-${TIMESTAMP}.tar.gz" "${items[@]}" 2>&1
+    # -C "$DATA_ROOT": в таре относительные имена (console/, tokens/) —
+    # распаковка restore-скриптом в любой каталог без разворока абсолютных путей
+    tar -czf "$BACKUP_DIR/console-state-${TIMESTAMP}.tar.gz" -C "$DATA_ROOT" \
+        $(for dir in "${items[@]}"; do basename "$dir"; done) 2>&1
     echo "[$(date -Iseconds)] Console state tar: $BACKUP_DIR/console-state-${TIMESTAMP}.tar.gz"
+}
+
+# --- Secrets backup (.env; P1-4/P2-9, code-2026-09-22-002) ---
+# .env = ключи всех уровней + пароль консоли — единственный незеркалируемый
+# конфиг. vault.yml в тар НЕ включаем (сам зашифрован ansible-vault, едет на
+# offsite отдельно). Guard P2-9: dev .env может отсутствовать (gitignored,
+# необязателен) — skip с сообщением, НЕ ошибка (set -euo pipefail не роняет nightly).
+backup_secrets() {
+    echo "[$(date -Iseconds)] Backing up secrets (.env)..."
+    if [ -f "$PROJECT_DIR/.env" ]; then
+        mkdir -p "$BACKUP_DIR"
+        chmod 700 "$BACKUP_DIR"
+        tar -czf "$BACKUP_DIR/secrets-${TIMESTAMP}.tar.gz" -C "$PROJECT_DIR" .env 2>&1
+        chmod 600 "$BACKUP_DIR/secrets-${TIMESTAMP}.tar.gz"
+        echo "[$(date -Iseconds)] Secrets tar: $BACKUP_DIR/secrets-${TIMESTAMP}.tar.gz (mode 600)"
+    else
+        echo "[$(date -Iseconds)] secrets: .env отсутствует — пропуск (не ошибка)."
+    fi
 }
 
 # --- Ротация старых бэкапов ---
@@ -234,6 +262,7 @@ rotate_backups() {
     echo "[$(date -Iseconds)] Rotating backups older than ${RETENTION_DAYS} days..."
     find "$BACKUP_DIR" -name "knowledge-*.tar.gz" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
     find "$BACKUP_DIR" -name "console-state-*.tar.gz" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
+    find "$BACKUP_DIR" -name "secrets-*.tar.gz" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
     # 2026-08-09: ротация Qdrant-снапшотов (раньше копились бесконечно).
     # Файлы снапшотов теперь в bind-mount (data/qdrant/snapshots) — удаляем по mtime.
     find "$SNAPSHOT_DIR" -name "backup-*.snapshot" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
@@ -280,6 +309,7 @@ fi
 [ "$NO_QDRANT" = false ] && create_qdrant_snapshot
 [ "$NO_SSOT" = false ] && backup_ssot_git
 backup_console_state   # kb-console-roles Ф4.4: users.jsonl + users_audit + tokens
+backup_secrets         # code-2026-09-22-002 P1-4: .env (guard P2-9 — skip без файла)
 rotate_backups
 
 echo "=== Backup completed: ${TIMESTAMP} ==="
