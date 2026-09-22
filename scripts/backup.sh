@@ -257,12 +257,43 @@ backup_secrets() {
     fi
 }
 
+# --- Errors state backup (Error→Rule Ф4, code-2026-09-22-003) ---
+# Sink-состояние цикла Error→Rule: config.json + alert_state.json +
+# aggregates/signatures.json. Без raw-событий (восстанавливаемы ретро-сканом
+# логов) и БЕЗ notify.json — TG-токен в тары НЕ попадает (P2-10; notify.json
+# рендерится заново ansible errors.yml setup из vault).
+backup_errors_state() {
+    echo "[$(date -Iseconds)] Backing up errors state (config/aggregates/alert_state)..."
+    local sink="$DATA_ROOT/logs/errors"
+    if [ ! -d "$sink" ]; then
+        echo "[$(date -Iseconds)] errors state: sink отсутствует — пропуск (не ошибка)."
+        return 0
+    fi
+    local items=()
+    local f
+    for f in config.json alert_state.json; do
+        [ -f "$sink/$f" ] && items+=("$f")
+    done
+    [ -f "$sink/aggregates/signatures.json" ] && items+=("aggregates/signatures.json")
+    if [ ${#items[@]} -eq 0 ]; then
+        echo "[$(date -Iseconds)] errors state: нет файлов состояния — пропуск."
+        return 0
+    fi
+    mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
+    # -C "$sink": относительные имена (config.json, aggregates/) — как console-state
+    tar -czf "$BACKUP_DIR/errors-state-${TIMESTAMP}.tar.gz" -C "$sink" "${items[@]}" 2>&1
+    echo "[$(date -Iseconds)] errors state tar: $BACKUP_DIR/errors-state-${TIMESTAMP}.tar.gz"
+}
+
 # --- Ротация старых бэкапов ---
 rotate_backups() {
     echo "[$(date -Iseconds)] Rotating backups older than ${RETENTION_DAYS} days..."
     find "$BACKUP_DIR" -name "knowledge-*.tar.gz" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
     find "$BACKUP_DIR" -name "console-state-*.tar.gz" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
     find "$BACKUP_DIR" -name "secrets-*.tar.gz" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
+    # Error→Rule state (Ф4): тот же retention, что остальные тары
+    find "$BACKUP_DIR" -name "errors-state-*.tar.gz" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
     # 2026-08-09: ротация Qdrant-снапшотов (раньше копились бесконечно).
     # Файлы снапшотов теперь в bind-mount (data/qdrant/snapshots) — удаляем по mtime.
     find "$SNAPSHOT_DIR" -name "backup-*.snapshot" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
@@ -458,6 +489,7 @@ fi
 [ "$NO_SSOT" = false ] && backup_ssot_git
 backup_console_state   # kb-console-roles Ф4.4: users.jsonl + users_audit + tokens
 backup_secrets         # code-2026-09-22-002 P1-4: .env (guard P2-9 — skip без файла)
+backup_errors_state    # Error→Rule Ф4: config/aggregates/alert_state (без notify.json)
 rotate_backups
 
 echo "=== Backup completed: ${TIMESTAMP} ==="

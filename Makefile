@@ -134,7 +134,8 @@ install-cpu:  ## Альтернатива: CPU-only torch (air-gap / dev, без
 #   make prod-logs S=mcp-server N=500
 
 .PHONY: prod-update prod-update-check prod-logs prod-events prod-health prod-metrics prod-stats \
-        prod-backup prod-backup-verify prod-restore
+        prod-backup prod-backup-verify prod-restore \
+        prod-errors prod-errors-report prod-errors-prune prod-errors-sources test-errors
 
 prod-update:  ## Прод: идемпотентный апдейт кода (гейты preflight + migrations pause)
 	$(MAKE) -C ansible update
@@ -165,3 +166,22 @@ prod-backup-verify:  ## Прод: проверка восстановимост�
 
 prod-restore:  ## Прод: ВОССТАНОВЛЕНИЕ (деструктивно; SCOPE=… RESTORE_CONFIRM=yes)
 	$(MAKE) -C ansible restore $(if $(SCOPE),SCOPE=$(SCOPE)) $(if $(RESTORE_SNAPSHOT),RESTORE_SNAPSHOT=$(RESTORE_SNAPSHOT)) RESTORE_CONFIRM=$(RESTORE_CONFIRM)
+
+# ─── Error→Rule (code-2026-09-22-003 Ф4): наблюдаемость ошибок ───
+# Sink: {{ data_root }}/logs/errors (вне клона/контейнеров). P2-1: требуется
+# vault_password_file в ansible/ansible.cfg (vault.yml шифрован даже для RO-тегов).
+
+prod-errors:  ## Прод: топ-сигнатур sink, P0 первыми (read-only)
+	$(MAKE) -C ansible errors
+
+prod-errors-report:  ## Прод: weekly-отчёт 6 секций (+TG при TG=1)
+	$(MAKE) -C ansible errors-report $(if $(TG),TG=$(TG))
+
+prod-errors-prune:  ## Прод: ретенция sink (dry-run; реальное удаление CONFIRM=--confirm)
+	$(MAKE) -C ansible errors-prune $(if $(CONFIRM),CONFIRM=$(CONFIRM))
+
+prod-errors-sources:  ## Прод: E5-проверка реестра охвата источников ошибок
+	$(MAKE) -C ansible errors-sources
+
+test-errors:  ## Error→Rule: юнит-тесты коллектора + E5-реестр (P2-9)
+	.venv/bin/python -m pytest tests/test_error_sources.py tests/test_errors_lib.py -v

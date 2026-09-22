@@ -10,3 +10,10 @@ vault_mcp_editor_key: ""
 vault_mcp_contributor_key: ""
 # Пароль kb-console (HTTP Basic). Сгенерировать: openssl rand -hex 16
 vault_console_password: "<сгенерируйте: openssl rand -hex 16>"
+# Error→Rule TG-доставка (003 Ф4, P2-10): токен ТОЛЬКО здесь (ansible-vault),
+# рендерится в {{ data_root }}/logs/errors/notify.json (0600, вне git).
+# Бот создать через @BotFather. chat_id ЛИЧНОГО чата положительный, ГРУППЫ — отрицательный
+# (вида -100xxxxxxxxxx); узнать: добавить бота в чат → https://api.telegram.org/bot<TOKEN>/getUpdates
+# Пустые значения → errors_report.py --send-tg молча skip («TG: skip», exit 0).
+vault_telegram_bot_token: ""
+vault_telegram_chat_id: ""

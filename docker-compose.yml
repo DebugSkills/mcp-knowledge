@@ -35,6 +35,14 @@ services:
       retries: 3
       start_period: 15s
     restart: unless-stopped
+    # P2-7 (code-2026-09-22-003 Ф4): ротация json-логов qdrant 10m×3 — как у
+    # остальных сервисов; без неё logs-слой копится бесконечно. prod-имена
+    # контейнеров (mcp-qdrant-prod) — см. docs/operations/error-sources.md (gap).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ollama — LLM-движок проекта (эмбеддинги mxbai + chat qwen2.5vl) на GPU хоста.
   ollama:

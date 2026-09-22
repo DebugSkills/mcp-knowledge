@@ -57,6 +57,22 @@
             state: directory
             mode: '0755'
 
+        # Error→Rule sink (code-2026-09-22-003 Ф4): {{ data_root }}/logs/errors —
+        # ВНЕ git-клона и ВНЕ контейнеров (M1). 0750 root: cron-коллектор работает
+        # от root; контейнерам sink не маунтится. Поддерево создаём отдельной
+        # задачей (не в loop 1000:1000 выше — владельцы расходятся).
+        - name: Создать дерево sink Error→Rule (logs/errors, Ф4)
+          tags: [dirs]
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: '0750'
+          loop:
+            - "{{ data_root }}/logs/errors"
+            - "{{ data_root }}/logs/errors/events/raw"
+            - "{{ data_root }}/logs/errors/aggregates"
+            - "{{ data_root }}/logs/errors/reports"
+
         # noqa обоснование: ansible.builtin.git не умеет создавать пустой bare-репозиторий
         # (только clone), поэтому git init --bare через command с creates=-гардом идемпотентности
         - name: Создать bare-репозиторий для бэкапа SSOT  # noqa: command-instead-of-module
@@ -177,6 +193,21 @@
             remote_src: true
             mode: '0755'
 
+        # Error→Rule (code-2026-09-22-003 Ф4): скрипты цикла из клона — тот же
+        # паттерн exec-битов (git хранит 100644). cron_wrap.sh оборачивает
+        # backup/quality/errors-collect → [CRON]-строки для errors_collect.py.
+        - name: Установить права 0755 на errors-скрипты из клона (Ф4)
+          ansible.builtin.copy:
+            src: "{{ deploy_root }}/{{ repo_name }}/scripts/{{ item }}"
+            dest: "{{ deploy_root }}/{{ repo_name }}/scripts/{{ item }}"
+            remote_src: true
+            mode: '0755'
+          loop:
+            - cron_wrap.sh
+            - errors_collect.py
+            - errors_report.py
+            - errors_prune.py
+
         # quality_scan.sh берёт ключ из env: MCP_WRITE_KEY (по умолчанию dev-write-key-001 →
         # на проде с vault-ключами 401). Ключ передаём через crontab-env (см. README → M2):
         # vault_cron_write_key — ОДИНОЧНЫЙ ключ (один из элементов JSON-списка
@@ -200,10 +231,25 @@
             value: "{{ data_root }}"
             user: root
 
+        # CLONE_DIR (code-2026-09-22-003 Ф4): канонический путь клона для
+        # errors-скриптов (test_error_sources.py сканирует код клона).
+        - name: Добавить CLONE_DIR в crontab (env для Error→Rule)
+          ansible.builtin.cron:
+            name: CLONE_DIR
+            env: true
+            value: "{{ deploy_root }}/{{ repo_name }}"
+            user: root
+
+        # Error→Rule (Ф4): существующие cron-задачи ОБЁРНУТЫ в cron_wrap.sh —
+        # в лог дописывается [CRON] job=… exit=N (E3-признак cron_nonzero).
+        # Расписания 3:00 / Пн-4:00 НЕ меняются (инвариант трассы 003).
         - name: Настроить cron для ежедневного бэкапа
           ansible.builtin.cron:
             name: "MCP Knowledge — daily backup"
-            job: "{{ deploy_root }}/{{ repo_name }}/scripts/backup.sh >> /var/log/mcp-backup.log 2>&1"
+            # >- (folded): YAML склеивает строки в одну cron-команду с пробелами
+            job: >-
+              {{ deploy_root }}/{{ repo_name }}/scripts/cron_wrap.sh backup /var/log/mcp-backup.log --
+              {{ deploy_root }}/{{ repo_name }}/scripts/backup.sh >> /var/log/mcp-backup.log 2>&1
             hour: "3"
             minute: "0"
             user: root
@@ -211,8 +257,22 @@
         - name: Настроить cron для weekly quality scan
           ansible.builtin.cron:
             name: "MCP Knowledge — weekly quality scan"
-            job: "{{ deploy_root }}/{{ repo_name }}/scripts/quality_scan.sh >> /var/log/mcp-quality.log 2>&1"
+            job: >-
+              {{ deploy_root }}/{{ repo_name }}/scripts/cron_wrap.sh quality /var/log/mcp-quality.log --
+              {{ deploy_root }}/{{ repo_name }}/scripts/quality_scan.sh >> /var/log/mcp-quality.log 2>&1
             weekday: "1"
             hour: "4"
             minute: "0"
+            user: root
+
+        # Error→Rule коллектор (Ф4): каждые 5 минут собирает ошибки в sink
+        # ({{ data_root }}/logs/errors — вне клона/контейнеров). Graceful:
+        # любой сбой коллектора не роняет cron (exit 0 + запись в own_log).
+        - name: Настроить cron для errors collector (5 минут)
+          ansible.builtin.cron:
+            name: "MCP Knowledge — errors collector"
+            job: >-
+              {{ deploy_root }}/{{ repo_name }}/scripts/cron_wrap.sh errors-collect /var/log/mcp-errors-collect.log --
+              python3 {{ deploy_root }}/{{ repo_name }}/scripts/errors_collect.py >> /var/log/mcp-errors-collect.log 2>&1
+            minute: "*/5"
             user: root

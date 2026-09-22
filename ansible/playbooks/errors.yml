@@ -1,0 +1,107 @@
+---
+# errors.yml — цикл Error→Rule на проде (Ф4, code-2026-09-22-003).
+# Теги (ровно один): setup | view | report | prune | sources
+#   make -C ansible errors                    # view: топ-сигнатуры sink (read-only)
+#   make -C ansible errors-report [TG=1]      # weekly-отчёт 6 секций (+TG если TG=1)
+#   make -C ansible errors-prune [CONFIRM=--confirm]   # ретенция (dry-run по умолчанию!)
+#   make -C ansible errors-sources            # E5: проверка реестра охвата
+#
+# setup рендерит config.json (без секретов) + notify.json (bot_token из vault,
+# 0600, no_log). Теги view|report|prune|sources vault-переменных НЕ используют.
+# ⚠️ P2-1: inventory/group_vars/all/vault.yml зашифрован ⇒ пароль нужен при
+# загрузке инвентаря ВСЕГДА (и для read-only тегов) — раскомментируй
+# vault_password_file в ansible/ansible.cfg (см. RUNBOOK → Error-наблюдаемость).
+
+- name: Error→Rule — view/report/prune/sources + setup
+  hosts: mcp_kb_new
+  gather_facts: false
+  become: true
+
+  vars:
+    errors_sink: "{{ data_root }}/logs/errors"
+    clone_dir: "{{ deploy_root }}/{{ repo_name }}"
+    scripts: "{{ clone_dir }}/scripts"
+
+  tasks:
+    # ════════════════════ setup (vault) ════════════════════
+    - name: "Setup: каталог sink существует (создаёт deploy.yml dirs)"
+      tags: [setup]
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0750'
+      loop:
+        - "{{ errors_sink }}"
+        - "{{ errors_sink }}/events/raw"
+        - "{{ errors_sink }}/aggregates"
+        - "{{ errors_sink }}/reports"
+
+    - name: "Setup: рендер config.json (контейнеры/health/ретенция/kill-switch)"
+      tags: [setup]
+      ansible.builtin.template:
+        src: "{{ playbook_dir | dirname }}/templates/errors-config.json.j2"
+        dest: "{{ errors_sink }}/config.json"
+        mode: '0640'
+
+    - name: "Setup: рендер notify.json (TG-токен из vault; P2-10)"
+      tags: [setup]
+      ansible.builtin.template:
+        src: "{{ playbook_dir | dirname }}/templates/errors-notify.json.j2"
+        dest: "{{ errors_sink }}/notify.json"
+        mode: '0600'
+      no_log: true  # шаблон содержит vault_telegram_bot_token
+
+    # ════════════════════ view (read-only, без vault) ════════════════════
+    - name: "View: топ-сигнатур sink (P0 первыми; E7 read-only)"
+      tags: [view]
+      ansible.builtin.command:
+        cmd: python3 {{ scripts }}/errors_report.py --view --top 50 --sink {{ errors_sink }}
+      register: view_out
+      changed_when: false
+
+    - name: "View: вывод"
+      tags: [view]
+      ansible.builtin.debug:
+        var: view_out.stdout_lines
+
+    # ════════════════════ report ════════════════════
+    - name: "Report: weekly-отчёт (6 секций) + alert_state; TG при tg_send=1"
+      tags: [report]
+      ansible.builtin.command:
+        cmd: python3 {{ scripts }}/errors_report.py --weekly {{ '--send-tg' if tg_send | default(false) | bool else '' }} --sink {{ errors_sink }}
+      register: report_out
+      changed_when: false  # отчёт идемпотентен по неделе (report-<ISO-week>.md)
+
+    - name: "Report: вывод"
+      tags: [report]
+      ansible.builtin.debug:
+        var: report_out.stdout_lines
+
+    # ════════════════════ prune (деструктивный гейт) ════════════════════
+    - name: "Prune: ретенция sink (dry-run БЕЗ CONFIRM=--confirm)"
+      tags: [prune]
+      ansible.builtin.command:
+        cmd: python3 {{ scripts }}/errors_prune.py {{ prune_confirm | default('') }} --sink {{ errors_sink }}
+      register: prune_out
+      changed_when: "'PRUNED' in prune_out.stdout"
+      failed_when: prune_out.rc not in [0, 1]  # rc=1 = kill-switch/--confirm-конфликт: показать, не ронять
+
+    - name: "Prune: вывод"
+      tags: [prune]
+      ansible.builtin.debug:
+        var: prune_out.stdout_lines
+
+    # ════════════════════ sources (E5, read-only) ════════════════════
+    - name: "Sources: E5-проверка реестра охвата (скан кода клона; exit 1 = новый источник без строки)"
+      tags: [sources]
+      ansible.builtin.command:
+        cmd: python3 tests/test_error_sources.py
+        chdir: "{{ clone_dir }}"
+      register: sources_out
+      changed_when: false
+      failed_when: sources_out.rc != 0  # COVERAGE FAIL = код ушёл дальше реестра
+
+    - name: "Sources: вывод"
+      tags: [sources]
+      ansible.builtin.debug:
+        var: sources_out.stdout_lines
