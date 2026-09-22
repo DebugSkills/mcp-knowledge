@@ -252,6 +252,9 @@ async def test_delete_entry_cascade_deletes_children(app_state):
 
     app_state.qdrant.scroll = MagicMock(return_value=(children, None))
     app_state.store.delete = AsyncMock(return_value=True)
+    # Фаза 13.22 P1: каскад удаляет секции через store.delete_many (batch, один
+    # git-коммит) — мокаем его, иначе auto-attr MagicMock не awaitable → cascade_deleted=0
+    app_state.store.delete_many = AsyncMock(return_value=2)
 
     result = await delete_entry(
         {"knowledge_id": "ru-test-entry", "cascade": True},

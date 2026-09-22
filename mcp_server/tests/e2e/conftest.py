@@ -110,7 +110,12 @@ def _e2e_services_available():
         pytest.skip(f"E2E requires Ollama at {OLLAMA_BASE_URL}")
 
 
-@pytest.fixture(scope="session")
+# П-1 (code-2026-09-22-001): scope="package", НЕ session. Session-scope протекал:
+# pytest собирает пакеты по алфавиту (e2e < integration < unit), патч глобалов
+# жил до конца ВСЕЙ сессии → 21 order-dependent падение в zone/blue-green тестах
+# (collection_for_zone читает модульные глобалы в рантайме). Package-scope:
+# teardown восстанавливает глобалы сразу после последнего e2e-теста.
+@pytest.fixture(scope="package")
 def _patched_collection():
     """Monkeypatch зональных коллекций на e2e-имена на всю сессию.
 
@@ -152,7 +157,9 @@ def _patched_collection():
     qc_mod.COLLECTION_NAME = orig["qc_COLLECTION_NAME"]
 
 
-@pytest.fixture(scope="session")
+# П-1: package-scope — зависит от package-фикстуры _patched_collection
+# (session был бы ScopeMismatch) и наследует её гарантию восстановления глобалов.
+@pytest.fixture(scope="package")
 def real_qdrant(_patched_collection):
     """Session-scoped QdrantClient в REST-mode.
 
@@ -213,7 +220,9 @@ def real_embedder():
     return adapter
 
 
-@pytest.fixture(scope="session")
+# П-1: package-scope — мутация settings.MCP_*_KEYS не должна переживать e2e-пакет
+# (та же причина, что у _patched_collection: session-патч заражал последующие тесты).
+@pytest.fixture(scope="package")
 def e2e_keys():
     """Тестовые ключи для auth-сценариев."""
     from mcp_server.config import settings

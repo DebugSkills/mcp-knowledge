@@ -6,9 +6,20 @@ dry-run does not call set_payload, idempotent re-run.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+# П-1 (code-2026-09-22-001): scripts/ лежит в корне репо, вне пакета mcp_server —
+# импорт `from scripts.backfill_sequence_payload import ...` работал только при
+# cwd=корень (pytest инжектит cwd в sys.path), из mcp_server/ — ModuleNotFoundError.
+# Привязка к __file__ делает импорт cwd-независимым:
+# tests/unit/test_backfill.py → parents[3] = корень репо (там лежит scripts/).
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 pytestmark = pytest.mark.asyncio
 
