@@ -137,6 +137,10 @@ services:
       retries: 3
       start_period: 60s
     restart: unless-stopped
+    # Ресурсы зеркально dev (П-2 аудита code-2026-09-22-001): Python-сервер лёгкий,
+    # embeddings/chat выполняет ollama-контейнер; потолок 2g/2cpu (инцидент 2026-08-06)
+    mem_limit: 2g
+    cpus: 2
 
   # kb-console — NiceGUI-клиент (диагностика + импорт + поиск).
   # Отдельный самодостаточный образ: может жить и на клиентских хостах —
@@ -183,3 +187,6 @@ services:
       retries: 3
       start_period: 30s
     restart: unless-stopped
+    # Ресурсы зеркально dev (П-2 аудита code-2026-09-22-001): NiceGUI-клиент лёгкий
+    mem_limit: 512m
+    cpus: 1
