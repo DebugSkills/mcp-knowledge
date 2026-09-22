@@ -124,3 +124,34 @@ install-gpu:  ## Установить CUDA-12 torch (cu121) для GPU-инфе�
 install-cpu:  ## Альтернатива: CPU-only torch (air-gap / dev, без CUDA-deps)
 	.venv/bin/pip install --upgrade --force-reinstall torch \
 	    --index-url https://download.pytorch.org/whl/cpu
+
+# ═══════════════════════════════════════════════════════════════
+# PROD-обвязка (code-2026-09-22-002 Ф2) — passthrough в ansible/
+# ═══════════════════════════════════════════════════════════════
+# Апдейт кода прода (preflight→pull→build→up→health→migrations) и read-only
+# диагностика. Перед prod-update ВСЕГДА смотреть prod-update-check.
+# Переменные пробрасываются: S=<сервис> N=<строк логов> M=<строк событий>;
+#   make prod-logs S=mcp-server N=500
+
+.PHONY: prod-update prod-update-check prod-logs prod-events prod-health prod-metrics prod-stats
+
+prod-update:  ## Прод: идемпотентный апдейт кода (гейты preflight + migrations pause)
+	$(MAKE) -C ansible update
+
+prod-update-check:  ## Прод: dry-run апдейта (--check --diff) — смотреть ПЕРЕД prod-update
+	$(MAKE) -C ansible update-check
+
+prod-logs:  ## Прод: логи сервисов (S=<сервис> N=<строк>; дефолт: все/200)
+	$(MAKE) -C ansible logs $(if $(S),S=$(S)) $(if $(N),N=$(N))
+
+prod-events:  ## Прод: события [START|RECONCILE|...] за 24ч (M=<строк>, дефолт 2000)
+	$(MAKE) -C ansible events $(if $(M),M=$(M))
+
+prod-health:  ## Прод: health-пробы mcp-server/qdrant/ollama/kb-console
+	$(MAKE) -C ansible health
+
+prod-metrics:  ## Прод: Prometheus-метрики :8000/metrics
+	$(MAKE) -C ansible metrics
+
+prod-stats:  ## Прод: docker stats --no-stream
+	$(MAKE) -C ansible stats

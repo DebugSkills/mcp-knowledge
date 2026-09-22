@@ -1,0 +1,131 @@
+---
+# ops.yml — read-only операции прода mcp-knowledge (code-2026-09-22-002 Ф2).
+# Логи / события / health / метрики / docker stats. Ничего не мутирует,
+# vault-переменные НЕ использует ⇒ запускается БЕЗ --ask-vault-pass.
+#
+# Теги (ровно один): logs | events | health | metrics | stats
+#   make -C ansible logs  S=mcp-server N=500   # логи одного сервиса
+#   make -C ansible logs                        # все сервисы, 200 строк
+#   make -C ansible events M=5000               # события за 24ч
+#
+# Переменные:
+#   S — сервис (mcp-server|kb-console|qdrant|ollama|backup-cron|...); '' = все
+#   N — tail для logs (дефолт 200)
+#   M — tail для events (дефолт 2000)
+
+- name: Read-only операции прода (логи/события/health/метрики)
+  hosts: mcp_kb_new
+  gather_facts: false
+  become: true
+
+  vars:
+    # compose_file, deploy_root, repo_name — из inventory (group_vars/all.yml)
+    clone_dir: "{{ deploy_root }}/{{ repo_name }}"
+    # S/N/M (верхний регистр) передаются как extra vars (make logs S=mcp-server N=500);
+    # default()-фильтрами в местах использования (самоссылка в vars = recursion).
+    # Маркеры событий сервера (grep -E). [AUTH] НЕ включён: такого маркера в коде
+    # нет (решение оператора Q3); auth-муть в событиях не нужна.
+    event_markers: '\[(START|RECONCILE|REINDEX|EMBED|MCP|IMPORT|ANALYZE)\]'
+
+  tasks:
+    # ════════════════════ logs ════════════════════
+    - name: "Logs: docker compose logs (tail=N, сервис S или все)"
+      tags: [logs]
+      ansible.builtin.command:
+        cmd: docker compose -f {{ compose_file }} logs --timestamps --tail={{ N | default(200) }} {{ S | default('') }}
+        chdir: "{{ clone_dir }}"
+      register: logs_out
+      changed_when: false
+
+    - name: "Logs: вывод"
+      tags: [logs]
+      ansible.builtin.debug:
+        var: logs_out.stdout_lines
+
+    # ════════════════════ events ════════════════════
+    - name: "Events: маркеры за 24ч из логов всех сервисов"
+      tags: [events]
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail;
+          docker compose -f {{ compose_file }} logs --timestamps --since 24h --tail={{ M | default(2000) }}
+          | grep -E '{{ event_markers }}'
+          || echo '(событий с маркерами {{ event_markers }} за 24ч не найдено)'
+        chdir: "{{ clone_dir }}"
+        executable: /bin/bash
+      register: events_out
+      changed_when: false
+      # [AUTH] сознательно исключён — см. комментарий в vars.
+
+    - name: "Events: вывод"
+      tags: [events]
+      ansible.builtin.debug:
+        var: events_out.stdout_lines
+
+    # ════════════════════ health ════════════════════
+    - name: "Health: mcp-server /health"
+      tags: [health]
+      ansible.builtin.uri:
+        url: http://localhost:8000/health
+        return_content: true
+      register: hp_mcp
+      failed_when: hp_mcp.status != 200
+
+    - name: "Health: qdrant /healthz"
+      tags: [health]
+      ansible.builtin.uri:
+        url: http://localhost:6333/healthz
+      register: hp_qdrant
+      failed_when: hp_qdrant.status != 200
+
+    - name: "Health: ollama /api/tags"
+      tags: [health]
+      ansible.builtin.uri:
+        url: http://localhost:11435/api/tags
+      register: hp_ollama
+      failed_when: hp_ollama.status != 200
+
+    - name: "Health: kb-console :8085 (200/401 = жив)"
+      tags: [health]
+      ansible.builtin.uri:
+        url: http://localhost:8085/
+        status_code: [200, 401]
+      register: hp_console
+      failed_when: hp_console.status not in [200, 401]
+
+    - name: "Health: сводка"
+      tags: [health]
+      ansible.builtin.debug:
+        msg:
+          mcp-server: "{{ hp_mcp.status }} ✓"
+          qdrant: "{{ hp_qdrant.status }} ✓"
+          ollama: "{{ hp_ollama.status }} ✓"
+          kb-console: "{{ hp_console.status }} ✓ (200/401 — жив, auth-aware)"
+          детали_mcp_server: "{{ hp_mcp.content | default('') | truncate(500, true) }}"
+
+    # ════════════════════ metrics ════════════════════
+    - name: "Metrics: Prometheus-метрики :8000/metrics"
+      tags: [metrics]
+      ansible.builtin.uri:
+        url: http://localhost:8000/metrics
+        return_content: true
+      register: metrics_out
+      failed_when: metrics_out.status != 200
+
+    - name: "Metrics: вывод (текст Prometheus)"
+      tags: [metrics]
+      ansible.builtin.debug:
+        var: metrics_out.content_lines
+
+    # ════════════════════ stats ════════════════════
+    - name: "Stats: docker stats --no-stream"
+      tags: [stats]
+      ansible.builtin.command:
+        cmd: docker stats --no-stream
+      register: stats_out
+      changed_when: false
+
+    - name: "Stats: вывод"
+      tags: [stats]
+      ansible.builtin.debug:
+        var: stats_out.stdout_lines

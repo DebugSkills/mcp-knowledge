@@ -1,0 +1,283 @@
+---
+# update.yml — идемпотентный апдейт КОДА mcp-knowledge на проде (code-2026-09-22-002 Ф2).
+#
+# Обновляет ТОЛЬКО код в git-клоне {{ deploy_root }}/{{ repo_name }}/:
+#   preflight (диск/health-снапшот/mount-гейт/prev-HEAD/лёгкий бэкап)
+#   → pull --ff-only → build mcp-server+kb-console → up -d --wait
+#   → health (4 пробы) → migrations (backfill_/migrate_ из scripts/).
+#
+# ⚠️ ДАННЫЕ НЕ ТРОГАЕМ: Qdrant/Ollama/console-жизнь в {{ data_root }} ВНЕ клона
+#    (Ф1, DATA_ROOT). Поэтому здесь НИКАКИХ `git clean` / `git reset` /
+#    `git checkout -f` — деструктивные команды запрещены даже для «чистоты»:
+#    рядом с клоном могут лежать файлы оператора и артефакты, а локальные правки
+#    в клоне — сигнал STOP (dirty-гейт), а не повод затирать.
+#
+# Откат: rollback-hint в конце + сам плейбук идемпотентен (повтор prod-update
+# после git reset на prev HEAD в клоне восстанавливает предыдущую версию).
+#
+# Теги: preflight | pull | build | up | health | migrations
+#   make -C ansible update                       # полный прогон
+#   make -C ansible run-tag PLAYBOOK=playbooks/update.yml ROLE=health HOST=aikb
+
+- name: Идемпотентный апдейт кода mcp-knowledge (Ф2 update)
+  hosts: mcp_kb_new
+  gather_facts: true
+  become: true
+
+  vars:
+    # repo_name, compose_file, deploy_root, data_root, min_free_gb — из inventory
+    # (group_vars/all.yml + host_vars/aikb.yml). Здесь только run-параметры:
+    update_source: git          # git | bundle (bundle — заглушка, см. preflight)
+    update_branch: main
+    health_retries: 10          # попыток каждой health-пробы (delay 5с ⇒ до ~50с)
+    clone_dir: "{{ deploy_root }}/{{ repo_name }}"
+    # P1-3в: в scripts/ считаются миграциями только backfill_*.py / migrate_*.py
+    migration_pattern: '(backfill|migrate)_.*\.py$'
+
+  tasks:
+    # ════════════════════ preflight ════════════════════
+    - name: "Preflight: bundle-заглушка — оффлайн-режим не реализован"
+      tags: [preflight]
+      when: update_source == 'bundle'
+      ansible.builtin.fail:
+        msg: >-
+          update_source=bundle не реализован: положите bundle рядом с клоном и
+          используйте scripts/offline-deploy.sh (см. RUNBOOK §11, Ф3).
+          Для обычного апдейта не задавайте update_source.
+
+    - name: "Preflight: свободное место на разделе deploy_root"
+      tags: [preflight]
+      ansible.builtin.command:
+        cmd: df -BG --output=avail {{ deploy_root }}
+      register: df_avail
+      changed_when: false
+
+    - name: "Preflight: гейт свободного места (порог min_free_gb из inventory)"
+      tags: [preflight]
+      vars:
+        avail_gb: "{{ (df_avail.stdout_lines[-1] | regex_findall('\\d+')) | first | int }}"
+      ansible.builtin.assert:
+        that: avail_gb | int >= min_free_gb | int
+        fail_msg: >-
+          Свободно {{ avail_gb }} GB < {{ min_free_gb }} GB на разделе {{ deploy_root }}.
+          Модели/снапшоты не влезут — освободите место (старые бэкапы: см. RUNBOOK §10)
+          перед обновлением.
+
+    - name: Preflight — зафиксировать prev HEAD клона  # noqa: command-instead-of-module
+      tags: [preflight]
+      ansible.builtin.command:
+        cmd: git -C {{ clone_dir }} rev-parse HEAD
+      register: prev_head
+      changed_when: false
+
+    - name: Preflight — dirty-гейт, в клоне не должно быть локальных правок  # noqa: command-instead-of-module
+      tags: [preflight]
+      ansible.builtin.command:
+        cmd: git -C {{ clone_dir }} status --porcelain
+      register: git_status
+      changed_when: false
+      failed_when: git_status.stdout | length > 0
+      # STOP вместо затирания: reset/clean запрещены (см. шапку). Локальные правки —
+      # сигнал разобраться (git -C {{ clone_dir }} stash list / diff), а не повод чистить.
+
+    - name: "Preflight: mount-гейт — рендер compose против data_root/qdrant"
+      tags: [preflight]
+      ansible.builtin.command:
+        cmd: docker compose -f {{ compose_file }} config --format json
+        chdir: "{{ clone_dir }}"
+      register: compose_cfg
+      changed_when: false
+
+    - name: "Preflight: извлечь фактический qdrant-маунт из рендера"
+      tags: [preflight]
+      vars:
+        mounts: "{{ (compose_cfg.stdout | from_json).services.qdrant.volumes | default([]) }}"
+      ansible.builtin.set_fact:
+        qdrant_source: "{{ mounts | selectattr('target', 'equalto', '/qdrant/storage')
+                           | map(attribute='source') | list | first | default('') }}"
+
+    - name: "Preflight: mount-гейт — qdrant-маунт должен совпадать с data_root (P2-12)"
+      tags: [preflight]
+      ansible.builtin.assert:
+        that: qdrant_source == data_root ~ '/qdrant'
+        fail_msg: >-
+          ВНИМАНИЕ: фактический qdrant-маунт '{{ qdrant_source }}' != ожидаемого
+          '{{ data_root }}/qdrant'. Сервер смотрит НЕ в прод-каталог данных —
+          запуск up создал бы ПУСТУЮ базу.
+          Проверьте: (1) DATA_ROOT в {{ clone_dir }}/.env — должен быть {{ data_root }}
+          (рендерится deploy.yml из inventory data_root); (2) data_root в
+          ansible/inventory/group_vars/all.yml и host_vars/aikb.yml;
+          (3) после правки .env — перезапустить через deploy.yml (up применит маунты).
+          Остановлено ДО pull/build/up — данные не тронуты.
+
+    - name: "Preflight: health-снапшот mcp-server ДО обновления"
+      tags: [preflight]
+      ansible.builtin.uri:
+        url: http://localhost:8000/health
+        return_content: true
+      register: pre_health
+      ignore_errors: true   # снапшот для сверки «до/после», не блокируем
+      failed_when: false
+
+    - name: "Preflight: лёгкий бэкап перед обновлением (без qdrant/SSOT)"
+      tags: [preflight]
+      ansible.builtin.command:
+        cmd: bash scripts/backup.sh --no-qdrant --no-ssot
+        chdir: "{{ clone_dir }}"
+      changed_when: false
+
+    # ════════════════════ pull ════════════════════
+    - name: Pull — git pull --ff-only из origin, ветка update_branch, только репо кода  # noqa: command-instead-of-module
+      tags: [pull]
+      ansible.builtin.command:
+        cmd: git -C {{ clone_dir }} pull --ff-only origin {{ update_branch }}
+      register: pull_result
+      changed_when: "'Already up to date' not in pull_result.stdout"
+      # ТОЛЬКО репо кода; knowledge-SSOT бэкапится отдельно (backup.sh --ssot).
+      # Никаких clean/reset/checkout -f — см. шапку плейбука.
+
+    - name: Pull — новый HEAD после обновления  # noqa: command-instead-of-module
+      tags: [pull]
+      ansible.builtin.command:
+        cmd: git -C {{ clone_dir }} rev-parse HEAD
+      register: new_head
+      changed_when: false
+
+    # ════════════════════ build ════════════════════
+    - name: "Build: пересобрать образы mcp-server + kb-console"
+      tags: [build]
+      ansible.builtin.command:
+        cmd: docker compose -f {{ compose_file }} build mcp-server kb-console
+        chdir: "{{ clone_dir }}"
+      changed_when: false   # docker build кешируется сам; changed-статус неинформативен
+
+    # ════════════════════ up ════════════════════
+    - name: "Up: перезапустить стек (up -d --wait)"
+      tags: [up]
+      ansible.builtin.command:
+        cmd: docker compose -f {{ compose_file }} up -d --wait
+        chdir: "{{ clone_dir }}"
+      register: up_result
+      changed_when: >-
+        up_result.stdout is search('Created|Recreated|Started|Built')
+        or up_result.stderr is search('Created|Recreated|Started|Built')
+
+    # ════════════════════ health ════════════════════
+    - name: "Health: mcp-server /health (retries: health_retries)"
+      tags: [health]
+      ansible.builtin.uri:
+        url: http://localhost:8000/health
+      register: h_mcp
+      retries: "{{ health_retries }}"
+      delay: 5
+      until: h_mcp.status == 200
+
+    - name: "Health: qdrant /healthz"
+      tags: [health]
+      ansible.builtin.uri:
+        url: http://localhost:6333/healthz
+      register: h_qdrant
+      retries: "{{ health_retries }}"
+      delay: 5
+      until: h_qdrant.status == 200
+
+    - name: "Health: ollama /api/tags"
+      tags: [health]
+      ansible.builtin.uri:
+        url: http://localhost:11435/api/tags
+      register: h_ollama
+      retries: "{{ health_retries }}"
+      delay: 5
+      until: h_ollama.status == 200
+
+    - name: "Health: kb-console :8085 (200 или 401 = жив, auth-aware)"
+      tags: [health]
+      ansible.builtin.uri:
+        url: http://localhost:8085/
+        status_code: [200, 401]
+      register: h_console
+      retries: "{{ health_retries }}"
+      delay: 5
+      until: h_console.status in [200, 401]
+
+    - name: "Health: сводка (до → после)"
+      tags: [health]
+      ansible.builtin.debug:
+        msg:
+          mcp-server: "{{ h_mcp.status }} (до: {{ pre_health.status | default('n/a') }})"
+          qdrant: "{{ h_qdrant.status }}"
+          ollama: "{{ h_ollama.status }}"
+          kb-console: "{{ h_console.status }} (200/401 — жив)"
+
+    # ════════════════════ migrations (P1-3 / P1-3в) ════════════════════
+    - name: Migrations — diff scripts/ между HEADами  # noqa: command-instead-of-module
+      tags: [migrations]
+      ansible.builtin.command:
+        cmd: git -C {{ clone_dir }} diff --name-only {{ prev_head.stdout }}..HEAD -- scripts/
+      register: mig_diff
+      changed_when: false
+
+    - name: "Migrations: отфильтровать backfill_/migrate_ скрипты"
+      tags: [migrations]
+      ansible.builtin.set_fact:
+        pending_migrations: "{{ mig_diff.stdout_lines | select('search', migration_pattern) | list }}"
+
+    - name: "Migrations: новых миграций нет — пропуск"
+      tags: [migrations]
+      when: pending_migrations | length == 0
+      ansible.builtin.debug:
+        msg: "Миграций между {{ prev_head.stdout[:7] }} и HEAD нет (scripts/ без backfill_/migrate_) — пропуск."
+
+    - name: "Migrations: список к запуску + команды ручного повтора"
+      tags: [migrations]
+      when: pending_migrations | length > 0
+      ansible.builtin.debug:
+        msg: "{{ 'Обнаружены миграции: ' ~ (pending_migrations | map('basename') | join(', ')) }}"
+
+    - name: "Migrations: подтверждение оператора (User Gate)"
+      tags: [migrations]
+      when: pending_migrations | length > 0
+      ansible.builtin.pause:
+        prompt: >-
+          Будут запущены миграции (host-сеть, --env-file, образ mcp-knowledge-mcp-server:latest):
+          {{ pending_migrations | map('basename') | join(', ') }}. Запускать? (Enter — да / Ctrl+C — STOP)
+
+    - name: "Migrations: команда ручного повтора (для журнала)"
+      tags: [migrations]
+      when: pending_migrations | length > 0
+      ansible.builtin.debug:
+        msg: >-
+          docker run --rm --network host --env-file {{ clone_dir }}/.env
+          -v {{ clone_dir }}/scripts/СКРИПТ.py:/app/СКРИПТ.py:ro
+          mcp-knowledge-mcp-server:latest python /app/СКРИПТ.py
+          # P2-11: --env-file ОБЯЗАТЕЛЕН — без него QDRANT_URL=http://qdrant:6334
+          # (дефолт из docker-сети) не резолвится из host-сети и миграция падает.
+
+    - name: "Migrations: выполнить каждую (STOP при non-zero exit)"
+      tags: [migrations]
+      when: pending_migrations | length > 0
+      loop: "{{ pending_migrations }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      ansible.builtin.command:
+        cmd: >-
+          docker run --rm --network host
+          --env-file {{ clone_dir }}/.env
+          -v {{ clone_dir }}/{{ item }}:/app/{{ item | basename }}:ro
+          mcp-knowledge-mcp-server:latest python /app/{{ item | basename }}
+      register: mig_run
+      changed_when: true   # миграция реально мутирует данные — честный changed-статус
+      # rc != 0 у command = fail задачи = STOP плейбука: в выводе будут имя скрипта
+      # (label), exit code и stdout/stderr; команда ручного повтора — debug выше.
+
+    # ════════════════════ rollback-hint ════════════════════
+    - name: "Rollback-hint: как откатиться"
+      tags: [always]
+      when: prev_head is defined
+      ansible.builtin.debug:
+        msg:
+          - "Обновление завершено: {{ prev_head.stdout[:7] }} → {{ (new_head.stdout | default(''))[:7] or 'HEAD' }}"
+          - "Откат при проблемах:"
+          - "  ssh: git -C {{ clone_dir }} reset --hard {{ prev_head.stdout }}"
+          - "  затем повторить: make prod-update  (плейбук идемпотентен — пересоберёт образы и перезапустит стек)"
+          - "Крайняя мера — восстановление из бэкапа: RUNBOOK §10 (backup.sh restore)."
