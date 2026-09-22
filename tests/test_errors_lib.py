@@ -361,6 +361,43 @@ class TestRoutineClassification:
         assert len(evs) == 1 and evs[0]["expected"] is True
         assert self._prio(evs)["priority"] == "P3"
 
+    # ── 006 (P1-1б): audit-маркер [ERRORS_QUERY] → routine P3 ──
+
+    def test_errors_query_audit_is_routine_p3(self):
+        # формат тула: без query-текста, только q_len/q_hash (P1-1а)
+        evs = self._events("2026-09-22 10:00:00,123 [INFO] mcp_knowledge.tools.errors_query: "
+                           "[ERRORS_QUERY] view=aggregates prio=- src=- period=- "
+                           "q_len=0 q_hash=- sig=False results=3 dur=1.2ms key=f7708f87")
+        assert len(evs) == 1 and evs[0]["expected"] is True
+        assert evs[0]["marker"] == "ERRORS_QUERY"
+        a = self._prio(evs)
+        assert a["priority"] == "P3" and a["class"] == "T"
+
+    def test_errors_query_audit_two_actors_still_p3(self):
+        # «≥2 акторов ⇒ P1» к routine-аудиту НЕ применяется (главный риск P1-1)
+        import tempfile
+        evs = self._events("[INFO] eq: [ERRORS_QUERY] view=both results=1 dur=1ms key=aaaa1111")
+        evs2 = self._events("[INFO] eq: [ERRORS_QUERY] view=both results=2 dur=2ms key=bbbb2222")
+        with tempfile.TemporaryDirectory() as td:
+            sink = Path(td)
+            ec.update_aggregates(sink, evs + evs2, {})
+            aggs = json.loads((sink / "aggregates" / "signatures.json").read_text())
+        a = next(iter(aggs.values()))
+        assert a["priority"] == "P3"
+
+    def test_errors_query_with_error_word_not_routine(self):
+        # P2-new-3: сбойные audit-строки (error/fail/exception) НЕ глотаем
+        evs = self._events("2026-09-22 10:00:00,123 [INFO] mcp_knowledge.tools.errors_query: "
+                           "[ERRORS_QUERY] error: sink scan failed")
+        assert len(evs) == 1 and evs[0]["expected"] is False
+        assert self._prio(evs)["priority"] != "P3"
+
+    def test_mcp_slow_regression_untouched(self):
+        # регресс-защита: slow-путь D1 не задет веткой 006
+        evs = self._events("2026-09-22 10:00:00,123 [INFO] mcp_knowledge.mcp: "
+                           "[MCP] tool=import_content ok 724667.9 ms key=f7708f878c65e1be")
+        assert evs[0]["expected"] is False and evs[0]["priority_hint"] == "slow"
+
     def test_routine_actors_do_not_make_p1(self):
         # «≥2 акторов ⇒ P1» к routine НЕ применяется — два актора ok-fast → P3
         evs = self._events("2026-09-22 10:00:00,1 [INFO] mcp: [MCP] tool=t ok 10.0 ms key=aaaa1111")

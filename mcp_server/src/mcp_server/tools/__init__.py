@@ -17,6 +17,7 @@ from .browse import list_domains, list_projects, list_subjects
 from .collections import list_collections
 from .content import cancel_import, extract_pdf_text, import_content
 from .crud import delete_entry, update_entry, write_knowledge
+from .errors_query import errors_query
 from .fragments import add_fragment, delete_fragment, find_fragment, update_fragment
 from .quality import (
     bulk_deprecate_duplicates,
@@ -397,6 +398,44 @@ _EXTRACT_PDF_TEXT_SCHEMA: dict[str, Any] = {
     "required": ["pdf_path"],
 }
 
+# errors_query (006): read-only доступ admin к sink ошибок Error→Rule.
+# view default = aggregates (drill-down: примеры — вторым запросом по signature).
+_ERRORS_QUERY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "view": {"type": "string", "enum": ["aggregates", "examples", "both"],
+                 "default": "aggregates",
+                 "description": "Режим: агрегаты сигнатур / свежие примеры / оба"},
+        "priority": {"type": "array",
+                     "items": {"type": "string", "enum": ["P0", "P1", "P2", "P3"]},
+                     "description": "Фильтр по приоритету (по умолчанию все)"},
+        "source": {"type": "string",
+                   "description": "Фильтр по источнику (docker_logs, cron_log, ...)"},
+        "signature": {"type": "string",
+                      "description": "Точная сигнатура (ключ aggregates/signatures.json)"},
+        "query": {"type": "string", "maxLength": 200,
+                  "description": "Подстрока ТОЛЬКО по normalized_message (не по сырому "
+                                  "message), case-insensitive"},
+        "include_audit": {"type": "boolean", "default": False,
+                          "description": "Включать ли audit-события самого тула "
+                                         "(marker=ERRORS_QUERY). Фильтр ТОЛЬКО выдачи: "
+                                         "сбор capture-first не меняется"},
+        "status": {"type": "string", "enum": ["active", "resolved"],
+                   "description": "Фильтр статуса сигнатуры (агрегаты)"},
+        "since": {"type": "string", "format": "date-time",
+                  "description": "ISO-8601: события/агрегаты с last_seen ≥ since. "
+                                 "Взаимоисключимо с period"},
+        "period": {"type": "string", "enum": ["24h", "7d", "14d", "30d"],
+                   "description": "Относительное окно (raw-скан примеров ≤ 30d; "
+                                  "без period/since примеры — за последние 24h)"},
+        "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100,
+                  "description": "Макс. число сигнатур в ответе"},
+        "examples_limit": {"type": "integer", "default": 3, "minimum": 1, "maximum": 10,
+                           "description": "Макс. примеров на сигнатуру "
+                          "(view=examples|both)"},
+    },
+}
+
 # ── Tool definitions ───────────────────────────────────────
 
 TOOLS: list[dict[str, Any]] = [
@@ -560,6 +599,15 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Найти разделы внутри книги по семантическому запросу. Возвращает fragment_id, title, score, snippet.",
         "inputSchema": _FIND_FRAGMENT_SCHEMA,
     },
+    {
+        "name": "errors_query",
+        # P2-1: без путей sink/внутренней структуры — tools/list виден всем
+        # не-subscriber уровням (mcp_handler.py:144), вызов — только write.
+        "description": "Read-only запрос к sink ошибок Error→Rule: агрегаты "
+                       "сигнатур и примеры, фильтры priority/source/period "
+                       "(поиск по нормализованному сообщению). Admin-only.",
+        "inputSchema": _ERRORS_QUERY_SCHEMA,
+    },
 ]
 
 # ── Handler dispatch table (реальные реализации) ───────────
@@ -598,4 +646,6 @@ TOOL_HANDLERS = {
     "update_fragment": update_fragment,
     "delete_fragment": delete_fragment,
     "find_fragment": find_fragment,
+    # Error→Rule sink (006): admin-only read-only
+    "errors_query": errors_query,
 }

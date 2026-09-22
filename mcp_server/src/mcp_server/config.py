@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     # Лог сканирования (13.19) — файл в /app/data/logs (volume → хост)
     QUALITY_SCAN_LOG_DIR: str = "/app/data/logs"
 
+    # Sink «Error → Rule» (006) — read-only маунт :ro в обоих compose;
+    # env-override для тестов и dev-без-докера (паттерн QUALITY_DIR)
+    ERRORS_SINK_DIR: str = "/app/data/logs/errors"
+
     # ── Dedup auto-deprecate (Фаза 3) ──────────────────────
     # OFF по умолчанию (блокер 2): авто-скрытие включается только явно (env).
     AUTO_DEDUP_ENABLED: bool = False

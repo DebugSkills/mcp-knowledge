@@ -214,6 +214,11 @@ def extract_marker(rest: str):
 
 MCP_OK_MS_RE = re.compile(r"\[MCP\] tool=\S+ ok .*?\b(\d+(?:\.\d+)?) ms")
 
+# 006 (P2-new-3): слово-детект сбойных audit-строк. Word-boundary обязателен:
+# наивный "error" in low ловит сам маркер ERRORS_QUERY («errors_query» содержит
+# «error»), \berror\b — нет («s» — word-char). failed/failure — тоже отделяем.
+AUDIT_FAIL_RE = re.compile(r"\b(error|errors|failed|failure|fail|exception)\b")
+
 
 def classify_routine(rest: str, level, marker, status, slow_ms: float):
     """→ (expected, hint): routine-строки INFO-уровня без признаков ошибки.
@@ -241,6 +246,12 @@ def classify_routine(rest: str, level, marker, status, slow_ms: float):
             return True, None
         return False, None
     if marker == "REQ" and (status is None or status < 400):
+        return True, None
+    if (marker == "ERRORS_QUERY" and level in (None, "INFO")
+            and not AUDIT_FAIL_RE.search(low)):
+        # 006 (P1-1б): audit-маркер тула errors_query — routine → P3-baseline;
+        # иначе default P2, а при ≥2 admin-ключах/росте — P1 (портит noise_ratio).
+        # P2-new-3: сбойные строки (error/failed/exception как СЛОВА) НЕ глотаем.
         return True, None
     return False, None
 

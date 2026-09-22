@@ -111,6 +111,8 @@
 |---|---|---|---|
 | ollama:context_truncation | тихая обрезка контекста ollama | sink: — | gap: ловится только если ollama пишет распознаваемую строку в stdout; проверить на проде после 1 недели наблюдения |
 | manual:prod-update | make prod-update / ansible-фейлы / offsite-rsync (j) | sink: — | gap: ручные операции; запускать через cron_wrap.sh (документировано в RUNBOOK) |
+| marker:ERRORS_QUERY | mcp-server, 1 сайт (errors_query, audit обращений) | sink: docker logs mcp-knowledge-server → errors_collect.py (source=docker_logs) | covered |
+| class:errors_query_audit | [ERRORS_QUERY]-строки тула | sink: classify_routine → expected=True (P3-baseline) | covered |
 
 ---
 Обслуживание: новый источник → `make test-errors` КРАСНЫЙ → добавить строку

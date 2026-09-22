@@ -32,12 +32,17 @@ from mcp_server.token_store import LEVEL_CODES, TokenStore
 
 class TestEditorToolsetDefinition:
     def test_editor_tools_is_write_minus_admin(self):
-        """EDITOR_TOOLS = WRITE_TOOLS − {reindex, set_zone, bulk_×2} (P2-2/Q1/Q2)."""
+        """EDITOR_TOOLS = WRITE_TOOLS − {reindex, set_zone, bulk_×2, errors_query}.
+
+        P2-2/Q1/Q2 + 006: errors_query — admin-only (чувствительный sink),
+        WRITE-вычитание без явного исключения утекло бы в editor (факт №6 спеки 006).
+        """
         assert EDITOR_TOOLS == WRITE_TOOLS - {
             "reindex",
             "set_zone",
             "bulk_resolve_issues",
             "bulk_deprecate_duplicates",
+            "errors_query",
         }
 
     def test_editor_tools_exact_content(self):

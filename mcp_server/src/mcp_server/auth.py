@@ -62,6 +62,9 @@ WRITE_TOOLS: set[str] = {
     "update_fragment",  # Фаза 13.23: обновление секции книги
     "delete_fragment",  # Фаза 13.23: удаление секции книги
     "set_zone",  # W4: перекладка записи между зонами (курирование public-слоя)
+    # 006: read-only доступ к sink ошибок Error→Rule. Инфраструктурный тул
+    # (не контентный): sink содержит чувствительные данные → admin-only.
+    "errors_query",
 }
 
 # ── Import tools (MCP_IMPORT_KEYS: read + import_content, без delete/reindex) ──
@@ -77,11 +80,14 @@ IMPORT_TOOLS: set[str] = {
 # public-слоя) и bulk_* (P2-2 — массовые операции над десятками записей).
 # run_quality_scan остаётся editor (P2-3: чтение индекса + issues.jsonl,
 # контент не мутирует; асимметрия с reindex обоснована характером операции).
+# 006: errors_query — admin-only: WRITE_TOOLS вычитанием «утекает» в EDITOR,
+# поэтому ЯВНОЕ исключение (иначе editor получит чувствительный sink).
 EDITOR_TOOLS: set[str] = WRITE_TOOLS - {
     "reindex",
     "set_zone",
     "bulk_resolve_issues",
     "bulk_deprecate_duplicates",
+    "errors_query",  # 006: read-only sink, admin-only (отклонение E7, спека §0)
 }
 
 # ── W3.3: белый список subscriber-токенов (план two-zone-access §2.3) ──
