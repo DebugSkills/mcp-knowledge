@@ -133,7 +133,8 @@ install-cpu:  ## Альтернатива: CPU-only torch (air-gap / dev, без
 # Переменные пробрасываются: S=<сервис> N=<строк логов> M=<строк событий>;
 #   make prod-logs S=mcp-server N=500
 
-.PHONY: prod-update prod-update-check prod-logs prod-events prod-health prod-metrics prod-stats
+.PHONY: prod-update prod-update-check prod-logs prod-events prod-health prod-metrics prod-stats \
+        prod-backup prod-backup-verify prod-restore
 
 prod-update:  ## Прод: идемпотентный апдейт кода (гейты preflight + migrations pause)
 	$(MAKE) -C ansible update
@@ -155,3 +156,12 @@ prod-metrics:  ## Прод: Prometheus-метрики :8000/metrics
 
 prod-stats:  ## Прод: docker stats --no-stream
 	$(MAKE) -C ansible stats
+
+prod-backup:  ## Прод: полный бэкап (qdrant+weekly+ssot+console+secrets)
+	$(MAKE) -C ansible backup
+
+prod-backup-verify:  ## Прод: проверка восстановимости бэкапов (test-restore+sha256+drill)
+	$(MAKE) -C ansible backup-verify
+
+prod-restore:  ## Прод: ВОССТАНОВЛЕНИЕ (деструктивно; SCOPE=… RESTORE_CONFIRM=yes)
+	$(MAKE) -C ansible restore $(if $(SCOPE),SCOPE=$(SCOPE)) $(if $(RESTORE_SNAPSHOT),RESTORE_SNAPSHOT=$(RESTORE_SNAPSHOT)) RESTORE_CONFIRM=$(RESTORE_CONFIRM)

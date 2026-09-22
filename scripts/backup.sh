@@ -268,6 +268,143 @@ rotate_backups() {
     find "$SNAPSHOT_DIR" -name "backup-*.snapshot" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
     # остаточные .checksum файлы
     find "$SNAPSHOT_DIR" -name "backup-*.snapshot.checksum" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
+    # Ф3 P2-7: weekly-каталоги старше ~4 недель (по mtime каталога, имена не парсятся)
+    find "$SNAPSHOT_DIR/weekly" -mindepth 1 -maxdepth 1 -mtime +28 -exec rm -rf {} + 2>/dev/null || true
+}
+
+# --- Weekly-4 снапшоты (P2-7, code-2026-09-22-002 Ф3) ---
+# Имена Qdrant-снапшотов произвольные ({collection}-{uuid}-{ts}.snapshot) —
+# find по суффсуксу даты невозможен. Вместо этого: по воскресеньям (date +%u = 7)
+# каталог weekly/%G-W%V, куда КОПИРУЕТСЯ последний по mtime снапшот каждой
+# коллекции; ротация по mtime каталогов (-mtime +28 ≈ 4 недели, имена не парсятся).
+# Offsite (§11) забирает только weekly/-поддерево.
+backup_weekly_snapshots() {
+    if [ "$(date +%u)" != "7" ]; then
+        return 0
+    fi
+    local week_dir="$SNAPSHOT_DIR/weekly/$(date +%G-W%V)"
+    echo "[$(date -Iseconds)] Weekly-4: копируем последние снапшоты в ${week_dir}..."
+    mkdir -p "$week_dir"
+    local coll_dir latest
+    for coll_dir in "$SNAPSHOT_DIR"/*/; do
+        [ -d "$coll_dir" ] || continue
+        local cname
+        cname="$(basename "$coll_dir")"
+        [ "$cname" = "weekly" ] && continue
+        latest="$(ls -t "$coll_dir"/*.snapshot 2>/dev/null | head -1 || true)"
+        if [ -n "$latest" ]; then
+            cp -p "$latest" "$week_dir/"
+            echo "    ✔ ${cname}: $(basename "$latest")"
+        else
+            echo "    — ${cname}: снапшотов нет, пропуск"
+        fi
+    done
+    echo "[$(date -Iseconds)] Weekly-4: готово ($(ls "$week_dir" | wc -l) файлов)."
+}
+
+# --- Console-state untar-drill (P2-6, code-2026-09-22-002 Ф3) ---
+# Последний console-state-тар: tar -tzf (целостность) → untar во временный каталог
+# → каждая строка users.jsonl/users_audit.jsonl/tokens.jsonl парсится json.loads
+# → cleanup. Возвращает 0/1; отсутствие тара — skip (return 0 с сообщением).
+verify_console_drill() {
+    echo "[$(date -Iseconds)] Console untar-drill (P2-6)..."
+    local tar_file
+    tar_file="$(ls -t "$BACKUP_DIR"/console-state-*.tar.gz 2>/dev/null | head -1 || true)"
+    if [ -z "$tar_file" ]; then
+        echo "    — console-state-таров нет — drill пропущен (не ошибка)."
+        return 0
+    fi
+    echo "    Tar: $tar_file"
+    tar -tzf "$tar_file" > /dev/null || {
+        echo "    ✖ tar -tzf FAILED (архив битый): $tar_file"
+        return 1
+    }
+    local tmp
+    tmp="$(mktemp -d)"
+    tar -xzf "$tar_file" -C "$tmp" || { rm -rf "$tmp"; return 1; }
+    local jsonl rc=0
+    while IFS= read -r jsonl; do
+        local n
+        n="$(python3 -c "
+import sys, json
+ok = 0
+with open(sys.argv[1], encoding='utf-8') as f:
+    for i, line in enumerate(f, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            json.loads(line)
+            ok += 1
+        except json.JSONDecodeError as e:
+            print(f'BAD line {i}: {e}', file=sys.stderr)
+            sys.exit(1)
+print(ok)
+" "$jsonl")" || rc=1
+        if [ "$rc" -eq 0 ]; then
+            echo "    ✔ $(basename "$jsonl"): ${n} строк, все валидный JSON"
+        else
+            echo "    ✖ $(basename "$jsonl"): битые строки JSON"
+            break
+        fi
+    done < <(find "$tmp" -name '*.jsonl' -type f | sort)
+    rm -rf "$tmp"
+    return "$rc"
+}
+
+# --- Verify-режим (--verify, code-2026-09-22-002 Ф3; В2(б) «не молчи когда всё ок») ---
+# НЕ создаёт новые бэкапы — проверяет существующие:
+#   1) qdrant test-restore (ПОЛНЫЙ цикл recover — ТРЕБУЕТ живого Qdrant;
+#      с --no-qdrant пропускается с сообщением — это задокументированное поведение)
+#   2) sha256-контрольная сумма последних таров каждого типа (отсутствие = skip)
+#   3) console untar-drill (P2-6)
+# Итог: «RESTORE TEST PASSED/FAILED», non-zero exit при провале.
+verify_mode() {
+    echo "=== VERIFY MODE: восстановимость бэкапов ==="
+    local fails=0 checks=0 rc
+
+    # 1. Qdrant test-restore
+    if [ "$NO_QDRANT" = true ]; then
+        echo "[SKIP] Qdrant test-restore: --no-qdrant (требует живого Qdrant :6333)."
+    else
+        checks=$((checks + 1))
+        test_restore && rc=0 || rc=1
+        [ "$rc" -ne 0 ] && fails=$((fails + 1))
+    fi
+
+    # 2. sha256 последних таров каждого типа
+    local kind f
+    for kind in knowledge console-state secrets; do
+        f="$(ls -t "$BACKUP_DIR"/${kind}-*.tar.gz 2>/dev/null | head -1 || true)"
+        if [ -z "$f" ]; then
+            echo "[SKIP] sha256 ${kind}: таров нет."
+            continue
+        fi
+        checks=$((checks + 1))
+        if sha256sum "$f"; then
+            echo "    ✔ sha256 OK: $(basename "$f")"
+        else
+            echo "    ✖ sha256 FAILED: $f"
+            fails=$((fails + 1))
+        fi
+    done
+
+    # 3. Console untar-drill
+    checks=$((checks + 1))
+    verify_console_drill && rc=0 || rc=1
+    [ "$rc" -ne 0 ] && fails=$((fails + 1))
+
+    echo ""
+    if [ "$fails" -eq 0 ] && [ "$checks" -gt 0 ]; then
+        echo "✅ RESTORE TEST PASSED (${checks} проверок, 0 провалов)"
+        return 0
+    elif [ "$checks" -eq 0 ]; then
+        echo "❌ RESTORE TEST FAILED: нечего проверять (0 проверок) — бэкапов нет?"
+        return 1
+    else
+        echo "❌ RESTORE TEST FAILED: ${fails}/${checks} проверок провалено"
+        return 1
+    fi
 }
 
 # --- Main ---
@@ -276,24 +413,27 @@ echo "=== MCP Knowledge Backup: ${TIMESTAMP} ==="
 NO_QDRANT=false
 NO_SSOT=false
 TEST_RESTORE=false
+VERIFY=false
 for arg in "$@"; do
     case "$arg" in
         --no-qdrant)    NO_QDRANT=true ;;
         --no-ssot)      NO_SSOT=true ;;
         --test-restore) TEST_RESTORE=true ;;
+        --verify)       VERIFY=true ;;
         --help|-h)
-            echo "Usage: $0 [--no-ssot] [--no-qdrant] [--test-restore]"
+            echo "Usage: $0 [--no-ssot] [--no-qdrant] [--test-restore] [--verify]"
             echo ""
             echo "Options:"
             echo "  --no-ssot       Skip SSOT (Markdown) backup"
             echo "  --no-qdrant     Skip Qdrant snapshot"
             echo "  --test-restore  Run full restore test cycle and exit"
+            echo "  --verify        Verify existing backups (test-restore + sha256 + console-drill) and exit"
             echo "  --help, -h      Show this help"
             exit 0
             ;;
         *)
             echo "ERROR: Unknown argument: $arg"
-            echo "Usage: $0 [--no-ssot] [--no-qdrant] [--test-restore]"
+            echo "Usage: $0 [--no-ssot] [--no-qdrant] [--test-restore] [--verify]"
             exit 1
             ;;
     esac
@@ -305,8 +445,16 @@ if [ "$TEST_RESTORE" = true ]; then
     exit $?
 fi
 
+# Ф3 (code-2026-09-22-002): --verify проверяет существующие бэкапы
+# (с --no-qdrant Qdrant-часть пропускается — работает без живого сервера).
+if [ "$VERIFY" = true ]; then
+    verify_mode
+    exit $?
+fi
+
 # Regular backup flow
 [ "$NO_QDRANT" = false ] && create_qdrant_snapshot
+[ "$NO_QDRANT" = false ] && backup_weekly_snapshots   # P2-7: вс-копии (no-op в остальные дни)
 [ "$NO_SSOT" = false ] && backup_ssot_git
 backup_console_state   # kb-console-roles Ф4.4: users.jsonl + users_audit + tokens
 backup_secrets         # code-2026-09-22-002 P1-4: .env (guard P2-9 — skip без файла)

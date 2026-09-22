@@ -9,7 +9,8 @@ VAULT_ARGS := --vault-password-file $(VAULT_PASS_FILE)
 endif
 APB := ansible-playbook -i $(INVENTORY)
 .PHONY: deps test lint check run run-tag vault-create vault-edit \
-        update update-check logs events health metrics stats
+        update update-check logs events health metrics stats \
+        backup backup-verify restore
 deps:
 	# --break-system-packages: Debian 12 PEP 668 (externally-managed); пакеты идут в ~/.local
 	python3 -m pip install --user --break-system-packages -r requirements.txt
@@ -59,3 +60,21 @@ metrics:
 	$(APB) $(OPS) --tags metrics
 stats:
 	$(APB) $(OPS) --tags stats
+
+# ─── Ф3 (code-2026-09-22-002): бэкап/верификация/восстановление ───
+
+# Полный бэкап (backup.sh: qdrant-snapshots + weekly-4 + SSOT + console + secrets).
+backup:
+	$(APB) playbooks/backup.yml --tags backup $(VAULT_ARGS)
+
+# Верификация восстановимости существующих бэкапов
+# (backup.sh --verify: test-restore + sha256 + console untar-drill).
+backup-verify:
+	$(APB) playbooks/backup.yml --tags verify $(VAULT_ARGS)
+
+# RESTORE — деструктивный, интерактивный. Всегда сначала backup + backup-verify!
+#   make restore SCOPE=console RESTORE_CONFIRM=yes
+#   make restore SCOPE=all RESTORE_CONFIRM=yes              # всё последовательно
+#   make restore SCOPE=qdrant RESTORE_CONFIRM=yes RESTORE_SNAPSHOT=<name>.snapshot
+restore:
+	$(APB) playbooks/backup.yml --tags restore $(VAULT_ARGS) $(if $(SCOPE),-e restore_scope=$(SCOPE)) -e restore_confirm=$(RESTORE_CONFIRM) $(if $(RESTORE_SNAPSHOT),-e restore_snapshot=$(RESTORE_SNAPSHOT))

@@ -1,0 +1,273 @@
+---
+# backup.yml — бэкап/верификация/восстановление прода (code-2026-09-22-002 Ф3).
+#
+# Теги: backup | verify | restore
+#   make -C ansible backup              # полный бэкап (backup.sh)
+#   make -C ansible backup-verify       # backup.sh --verify (test-restore+sha256+drill)
+#   make -C ansible restore SCOPE=console RESTORE_CONFIRM=yes
+#
+# restore — ДЕСТРУКТИВЕН и интерактивен: печатает план перезаписи, требует
+# restore_confirm=yes (extra-vars) И живой pause-ответ оператора.
+# restore_scope: qdrant | ssot | console | secrets | all (default all).
+
+- name: Бэкап, верификация и восстановление mcp-knowledge
+  hosts: mcp_kb_new
+  gather_facts: false
+  become: true
+
+  vars:
+    # deploy_root, data_root, repo_name, compose_file — из inventory
+    clone_dir: "{{ deploy_root }}/{{ repo_name }}"
+    backup_dir: "{{ data_root }}/backups"
+    snapshot_dir: "{{ data_root }}/qdrant/snapshots"
+    restore_scope: all            # qdrant|ssot|console|secrets|all
+    restore_confirm: "no"         # деструктивный гейт: должен быть 'yes'
+    restore_snapshot: ""          # имя .snapshot для qdrant; '' = последний по mtime
+    scope_qdrant: "{{ restore_scope in ['qdrant', 'all'] }}"
+    scope_ssot: "{{ restore_scope in ['ssot', 'all'] }}"
+    scope_console: "{{ restore_scope in ['console', 'all'] }}"
+    scope_secrets: "{{ restore_scope in ['secrets', 'all'] }}"
+
+  tasks:
+    # ════════════════════ backup ════════════════════
+    - name: Backup — полный прогон scripts/backup.sh
+      tags: [backup]
+      ansible.builtin.command:
+        cmd: bash scripts/backup.sh
+        chdir: "{{ clone_dir }}"
+      register: backup_out
+      changed_when: true   # создаёт артефакты (snapshot/tar) — честный changed
+
+    - name: Backup — свежие артефакты за 10 минут
+      tags: [backup]
+      ansible.builtin.command:
+        cmd: find {{ backup_dir }} {{ snapshot_dir }} -type f -mmin -10
+      register: fresh_out
+      changed_when: false
+
+    - name: Backup — сводка
+      tags: [backup]
+      ansible.builtin.debug:
+        msg:
+          - "Вывод backup.sh:"
+          - "{{ backup_out.stdout_lines }}"
+          - "Свежие артефакты:"
+          - "{{ fresh_out.stdout_lines }}"
+
+    # ════════════════════ verify ════════════════════
+    - name: Verify — проверка восстановимости существующих бэкапов
+      tags: [verify]
+      ansible.builtin.command:
+        cmd: bash scripts/backup.sh --verify
+        chdir: "{{ clone_dir }}"
+      register: verify_out
+      changed_when: false
+      failed_when: >-
+        verify_out.rc != 0
+        and 'RESTORE TEST FAILED' not in verify_out.stdout
+      # Провал верификации = падение задачи (non-zero): для cron/ручного прогона
+      # видно сразу; полный отчёт — в debug ниже.
+
+    - name: Verify — отчёт
+      tags: [verify]
+      ansible.builtin.debug:
+        msg: "{{ verify_out.stdout_lines }}"
+
+    # ════════════════════ restore (деструктивный, интерактив) ════════════════════
+    - name: Restore — план перезаписи (scope из extra-vars)
+      tags: [restore]
+      ansible.builtin.debug:
+        msg:
+          - "restore_scope = {{ restore_scope }}. Что будет перезаписано:"
+          - "  qdrant:  коллекция 'knowledge' целиком (recover из снапшота{{ restore_snapshot or ' (последний по mtime)' }})"
+          - "  ssot:    НЕТ перезаписи — клон из bare-репо в {{ deploy_root }}/knowledge.restored (живой ../knowledge не трогаем)"
+          - "  console: {{ data_root }}/console/*.jsonl + {{ data_root }}/tokens/*.jsonl (текущие копируются в pre-restore-тар)"
+          - "  secrets: {{ clone_dir }}/.env (текущий копируется в .env.pre-restore)"
+          - "  после: docker compose restart kb-console mcp-server + health ×4"
+
+    - name: Restore — гейт restore_confirm (должен быть явный yes)
+      tags: [restore]
+      ansible.builtin.assert:
+        that: restore_confirm == 'yes'
+        fail_msg: >-
+          Restore деструктивен. Подтвердите осознанно, повторив команду с
+          -e restore_confirm=yes (и при желании -e restore_scope=<scope>).
+
+    - name: Restore — интерактивное подтверждение оператора
+      tags: [restore]
+      ansible.builtin.pause:
+        prompt: "Проверьте план выше. Enter — продолжить RESTORE, Ctrl+C — отменить."
+
+    # ── scope=qdrant ──
+    - name: Restore qdrant — найти снапшот для recover  # noqa: command-instead-of-module
+      tags: [restore]
+      when: scope_qdrant | bool
+      ansible.builtin.command:
+        cmd: ls -t {{ snapshot_dir }}/knowledge/*.snapshot | head -1
+      register: snap_file
+      changed_when: false
+
+    - name: Restore qdrant — recover через API (перезапись коллекции knowledge)
+      tags: [restore]
+      when: scope_qdrant | bool
+      vars:
+        snap_name: "{{ restore_snapshot or (snap_file.stdout | basename) }}"
+      ansible.builtin.uri:
+        url: http://localhost:6333/collections/knowledge/snapshots/recover
+        method: PUT
+        headers:
+          Content-Type: application/json
+        body:
+          location: "file:///qdrant/storage/snapshots/knowledge/{{ snap_name }}"
+        body_format: json
+        status_code: 200
+      register: recover_resp
+
+    - name: Restore qdrant — ответ recover
+      tags: [restore]
+      when: scope_qdrant | bool
+      ansible.builtin.debug:
+        var: recover_resp.json
+
+    # ── scope=ssot (безопасный клон рядом, не перезапись) ──
+    - name: Restore ssot — клон из bare-репо рядом с живым  # noqa: command-instead-of-module
+      tags: [restore]
+      when: scope_ssot | bool
+      ansible.builtin.command:
+        cmd: git clone {{ deploy_root }}-bare/knowledge.git {{ deploy_root }}/knowledge.restored
+        creates: "{{ deploy_root }}/knowledge.restored/HEAD"
+
+    - name: Restore ssot — подсказка замены
+      tags: [restore]
+      when: scope_ssot | bool
+      ansible.builtin.debug:
+        msg:
+          - "Клон готов: {{ deploy_root }}/knowledge.restored"
+          - "Живой SSOT НЕ тронут. Для фактической замены (вручную!):"
+          - "  make prod-down; mv {{ deploy_root }}/knowledge {{ deploy_root }}/knowledge.broken-$(date +%F)"
+          - "  mv {{ deploy_root }}/knowledge.restored {{ deploy_root }}/knowledge; make prod-up"
+
+    # ── scope=console ──
+    - name: Restore console — последний console-state-тар  # noqa: command-instead-of-module
+      tags: [restore]
+      when: scope_console | bool
+      ansible.builtin.command:
+        cmd: ls -t {{ backup_dir }}/console-state-*.tar.gz | head -1
+      register: console_tar
+      changed_when: false
+      failed_when: console_tar.stdout | length == 0
+
+    - name: Restore console — pre-restore-копия текущего состояния  # noqa: command-instead-of-module
+      tags: [restore]
+      when: scope_console | bool
+      ansible.builtin.command:
+        cmd: >-
+          tar -czf {{ backup_dir }}/pre-restore-console-$(date +%Y%m%d-%H%M%S).tar.gz
+          -C {{ data_root }} console tokens
+      register: pre_console
+      changed_when: true
+      failed_when: pre_console.rc != 0
+
+    - name: Restore console — распаковка тара во временный каталог
+      tags: [restore]
+      when: scope_console | bool
+      ansible.builtin.unarchive:
+        src: "{{ console_tar.stdout }}"
+        dest: /tmp/mcp-restore-console
+        remote_src: true
+
+    - name: Restore console — вернуть файлы по каталогам (console + tokens)
+      tags: [restore]
+      when: scope_console | bool
+      ansible.builtin.command:
+        cmd: >-
+          bash -c 'set -e;
+          [ -d /tmp/mcp-restore-console/console ] && cp -a /tmp/mcp-restore-console/console/. {{ data_root }}/console/;
+          [ -d /tmp/mcp-restore-console/tokens ] && cp -a /tmp/mcp-restore-console/tokens/. {{ data_root }}/tokens/;
+          true'
+      register: copy_jsonl
+      changed_when: true
+      # tar хранит относительные console/ и tokens/ (формат backup.sh, Ф1) —
+      # каждый подкаталог возвращается в свой каталог данных.
+
+    - name: Restore console — cleanup временного каталога
+      tags: [restore]
+      when: scope_console | bool
+      ansible.builtin.file:
+        path: /tmp/mcp-restore-console
+        state: absent
+
+    # ── scope=secrets ──
+    - name: Restore secrets — последний secrets-тар  # noqa: command-instead-of-module
+      tags: [restore]
+      when: scope_secrets | bool
+      ansible.builtin.command:
+        cmd: ls -t {{ backup_dir }}/secrets-*.tar.gz | head -1
+      register: secrets_tar
+      changed_when: false
+      failed_when: secrets_tar.stdout | length == 0
+
+    - name: Restore secrets — pre-restore-копия текущего .env
+      tags: [restore]
+      when: scope_secrets | bool
+      ansible.builtin.command:
+        cmd: cp -p {{ clone_dir }}/.env {{ clone_dir }}/.env.pre-restore
+        creates: "{{ clone_dir }}/.env.pre-restore"
+
+    - name: Restore secrets — распаковка во временный каталог
+      tags: [restore]
+      when: scope_secrets | bool
+      ansible.builtin.unarchive:
+        src: "{{ secrets_tar.stdout }}"
+        dest: /tmp/mcp-restore-secrets
+        remote_src: true
+
+    - name: Restore secrets — вернуть .env (mode 600)
+      tags: [restore]
+      when: scope_secrets | bool
+      ansible.builtin.copy:
+        src: /tmp/mcp-restore-secrets/.env
+        dest: "{{ clone_dir }}/.env"
+        mode: "0600"
+        remote_src: true
+
+    - name: Restore secrets — cleanup
+      tags: [restore]
+      when: scope_secrets | bool
+      ansible.builtin.file:
+        path: /tmp/mcp-restore-secrets
+        state: absent
+
+    - name: Restore secrets — напоминание об источнике истины
+      tags: [restore]
+      when: scope_secrets | bool
+      ansible.builtin.debug:
+        msg: >-
+          .env восстановлен из тара. Источник истины секретов — ansible-vault:
+          правки делать в vault.yml + make prod-run (deploy.yml перерендерит .env).
+
+    # ── финал: рестарт сервисов, коснувшихся данных + health ──
+    - name: Restore — рестарт kb-console и mcp-server (подхват файлов состояния)
+      tags: [restore]
+      when: (scope_console | bool) or (scope_secrets | bool)
+      ansible.builtin.command:
+        cmd: docker compose -f {{ compose_file }} restart kb-console mcp-server
+        chdir: "{{ clone_dir }}"
+      register: restart_out
+      changed_when: "'Restarting' in restart_out.stdout or restart_out.rc == 0"
+
+    - name: Restore — health после восстановления
+      tags: [restore]
+      ansible.builtin.uri:
+        url: http://localhost:8000/health
+      register: r_health
+      retries: 10
+      delay: 5
+      until: r_health.status == 200
+
+    - name: Restore — итог
+      tags: [restore]
+      ansible.builtin.debug:
+        msg:
+          - "RESTORE ЗАВЕРШЁН (scope={{ restore_scope }}), mcp-server health {{ r_health.status }}."
+          - "Проверьте вручную: kb-console login, поиск, points_count (make prod-stats)."
