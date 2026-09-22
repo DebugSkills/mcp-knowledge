@@ -57,11 +57,12 @@ class TestMCPClientE2E:
         )
         try:
             tools = await client.tools_list()
-            # 31 = базовые + quality + import + фрагментные (book-fragments)
+            # 32 = базовые + quality + import + фрагментные (book-fragments)
             #      + dedup: bulk_deprecate_duplicates + review_duplicate_pairs
             #      + list_audit_log (Фаза 3) + set_zone (W4.1)
             #      (code-2026-08-13-dedup-elimination; code-2026-08-16-001 W4)
-            assert len(tools) == 31, f"Expected 31 tools, got {len(tools)}"
+            #      + errors_query (006: admin-only sink ошибок Error→Rule)
+            assert len(tools) == 32, f"Expected 32 tools, got {len(tools)}"
             tool_names = {t["name"] for t in tools}
             assert "set_zone" in tool_names
             assert "search_knowledge" in tool_names
