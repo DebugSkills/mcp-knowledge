@@ -110,6 +110,11 @@ services:
       - ./data/dlq:/app/data/dlq
       - ./data/quality:/app/data/quality
       - ./data/tokens:/app/data/tokens       # токен-стор (TokenStore): переживает пересоздание контейнера
+      # 006: sink «Error → Rule», read-only для контейнера (errors_query).
+      # Единственный интерполированный маунт в prod-файле — осознанно: sink живёт
+      # в DATA_ROOT-дереве (контракт errors_collect.py:50, ansible рендерит DATA_ROOT
+      # в .env); литерал разошёлся бы с коллектором молча при смене data_root.
+      - ${DATA_ROOT:-./data}/logs/errors:/app/data/logs/errors:ro
     env_file:
       - .env
     environment:

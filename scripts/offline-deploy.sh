@@ -191,6 +191,9 @@ deploy() {
 
     echo "[5/6] Preparing data dirs..."
     mkdir -p "$PROJECT_DIR/knowledge" "$PROJECT_DIR/data/qdrant" "$PROJECT_DIR/data/quality" "$PROJECT_DIR/data/dlq"
+    # 006: sink «Error → Rule» (errors_collect/errors_query); явность лучше
+    # авто-create Docker при bind-маунте (air-gap layout)
+    mkdir -p "$PROJECT_DIR/data/logs/errors/events/raw" "$PROJECT_DIR/data/logs/errors/aggregates"
 
     echo "[6/6] Starting services (qdrant + mcp-server)..."
     docker compose -f "$PROJECT_DIR/$COMPOSE_PROD" up -d

@@ -263,6 +263,9 @@ backup_secrets() {
 # логов) и БЕЗ notify.json — TG-токен в тары НЕ попадает (P2-10; notify.json
 # рендерится заново ansible errors.yml setup из vault).
 backup_errors_state() {
+    # 006: audit обращений errors_query ([ERRORS_QUERY]-маркеры) в tar НЕ входит
+    # BY DESIGN: аудит живёт в docker logs (json-file 10m×3) и raw sink (TTL 90d,
+    # collector routine-P3) — см. спеку 006 §5/P2-8, prune не трогает audit/.
     echo "[$(date -Iseconds)] Backing up errors state (config/aggregates/alert_state)..."
     local sink="$DATA_ROOT/logs/errors"
     if [ ! -d "$sink" ]; then

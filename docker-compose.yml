@@ -106,6 +106,10 @@ services:
       - ../data/dlq:/app/data/dlq
       - ../data/quality:/app/data/quality
       - ../data/logs:/app/data/logs           # 13.19: логи сканирования (проброс на хост)
+      # 006: sink «Error → Rule» — вложенный bind :ro поверх ../data/logs.
+      # Единственный mcp-server-маунт через DATA_ROOT: sink живёт в DATA_ROOT-дереве
+      # (контракт errors_collect.py:50); sibling-паттерн ../data/logs для sink неверен.
+      - ${DATA_ROOT:-./data}/logs/errors:/app/data/logs/errors:ro
       - ../data/pdf_cache:/app/data/pdf_cache # PDF checkpoint-кэш: переживает передеплой
       - ../data/tokens:/app/data/tokens       # токен-стор (TokenStore): переживает пересоздание контейнера
       - ../models_cache:/app/models_cache

@@ -398,6 +398,34 @@ curl -s -X POST http://localhost:8000/mcp \
 
 ---
 
+## 7.3 `errors_query` — read-only диагностика sink «Error → Rule» (006)
+
+**Admin-only** (`write`-ключ; editor/read/import/subscriber → 403, subscriber не видит тул в `tools/list`). Семантически read-only: sink смонтирован в контейнер `:ro`, write-вызовов в коде нет. Продюсер sink — host-cron `*/5` (`scripts/errors_collect.py`), см. операционный цикл в RUNBOOK §12.
+
+**Отклонение от канона self-improvement-loop E7** (scoped token вместо admin) — решение оператора 2026-09-22: sink содержит маскированные, но чувствительные данные (пути, хэши акторов, фрагменты сообщений). Митигации: FS-`:ro`, аудит каждого обращения, маскирование на записи + оборонительное на отдаче, лимиты/капы, структурная проверка доступности sink, routine-P3-класс аудита (не шумит в noise_ratio).
+
+```json
+// Триаж: агрегаты сигнатур за неделю (дефолт view=aggregates — без raw-скана)
+{"tool": "errors_query", "arguments": {"period": "7d", "priority": ["P0", "P1"]}}
+
+// Drill-down: примеры по конкретной сигнатуре (second call by signature)
+{"tool": "errors_query", "arguments": {"view": "examples",
+  "signature": "docker_logs|MCP|…", "examples_limit": 5}}
+
+// Поиск по нормализованному сообщению (НЕ по сырому message — PII-поверхность)
+{"tool": "errors_query", "arguments": {"query": "timeout after", "period": "30d"}}
+```
+
+Ключевые аргументы: `view` (aggregates|examples|both, дефолт aggregates), `priority`/`source`/`signature`/`status`/`since`/`period` (взаимоисключимы с since), `query` (≤200 симв., только по `normalized_message`), `limit` ≤100, `examples_limit` ≤10, `include_audit=false`.
+
+**`include_audit` — фильтр ВЫДАЧИ, не сбора** (P2-new-4): `errors_collect.py` пишет всё capture-first (включая аудит-события `marker=ERRORS_QUERY`, routine-P3); параметр лишь скрывает собственный аудит из диагностического ответа, чтобы самонаблюдение не смешивалось с диагнозом.
+
+Ответ: `sink_available` (СТРУКТУРНАЯ проверка `events/raw/` + `aggregates/signatures.json` — авто-созданный Docker'ом пустой каталог ≠ «ошибок нет»), `aggregates[]` (без `last_example`/`actors[]` — только счётчики, `trend` up/down/flat/null, `actors_count`), `examples[]` (message ≤500 симв., маскирован), `meta` (`sink_dir`, `raw_scan_truncated` при капе 64 МБ, `warnings`). Graceful: пустой sink → `hint`; нет структуры/PermissionError → `sink_available:false` + причина (агент сообщает оператору, не гадает).
+
+Аудит обращений: stdout-маркер `[ERRORS_QUERY] view=… q_len=… q_hash=sha256[:8] … key=<hash>` — **без текста запроса** (длина+хэш для корреляции повторов). Grep: `docker logs mcp-knowledge-server 2>&1 | grep ERRORS_QUERY`; после цикла коллектора (≤5 мин) события в sink как P3-baseline.
+
+---
+
 ### 8.1 В Kilo Code
 
 1. Откройте сессию Kilo
