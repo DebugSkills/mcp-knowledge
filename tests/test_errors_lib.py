@@ -379,8 +379,8 @@ class TestRoutineClassification:
         # батч 2 — та же сигнатура, но не-routine → has_non_routine залипает,
         # приоритет уже НЕ откатится в P3 (даже если батч 3 снова routine)
         import tempfile
-        ev_kw = dict(ts="2026-09-22T10:00:00Z", source="docker_logs",
-                     message="[REQ] GET /", marker="REQ")
+        ev_kw = {"ts": "2026-09-22T10:00:00Z", "source": "docker_logs",
+                 "message": "[REQ] GET /", "marker": "REQ"}
         with tempfile.TemporaryDirectory() as td:
             sink = Path(td)
             ec.update_aggregates(sink, [_ev(expected=True, **ev_kw)], {})

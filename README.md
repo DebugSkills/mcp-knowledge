@@ -277,6 +277,39 @@ tar -xzf mcp-kb-airgap-bundle.tar.gz && cd staging
 | mcp-stdio bridge tests | 19/19 (unit 18 + smoke 1) |
 | Ruff | 0 ошибок |
 
+## 🧪 Проверки перед пушем (preflight)
+
+В проекте **нет CI/CD** — все проверки гоняются вручную. `scripts/preflight.sh` — единый pre-push гейт: запускается host-side через `.venv` (не требует поднятого стека; compose/e2e-проверки при отсутствии Docker помечаются `SKIP`, а не `FAIL`).
+
+| Гейт | Что проверяет |
+|------|---------------|
+| G1 | ruff: src+tests mcp_server/kb-console + tests/ + errors-скрипты |
+| G2 | pytest mcp_server/tests (~1023 passed; e2e-маркеры фильтруются addopts) |
+| G3 | pytest kb-console/tests (~258 passed) |
+| G4 | pytest tests/ (~50 passed — errors_lib + E5-скан охвата) |
+| G5 | E5-отчёт `COVERAGE OK` (новый источник ошибок без строки реестра → FAIL) |
+| G6 | `docker compose config -q` dev+prod (нет Docker → SKIP) |
+| G7 | `ansible-lint playbooks/` 0/0 + `--syntax-check` всех плейбуков |
+| G8 | `bash -n scripts/*.sh` (+ shellcheck, если установлен) |
+| G9 | smoke Error→Rule на свежем temp-sink: collect → view → prune(dry-run) |
+| G10 | `make -n prod-errors*` — проброс make-таргетов не сломан |
+
+```bash
+make preflight          # полный набор G1–G10 (~4 мин: G2 доминирует)
+make preflight-quick    # ≤60 с: G1+G4+G5+G10
+bash scripts/preflight.sh --full   # + e2e и контейнерные test/lint (нужен поднятый стек)
+```
+
+Git-хук на push:
+
+```bash
+make hooks-install      # .git/hooks/pre-push → preflight
+git push --no-verify    # escape-hatch, если нужно протолкнуть без гейта
+make hooks-uninstall    # снять хук
+```
+
+Итог: `N passed / M failed / K skipped`, exit-код = число упавших гейтов (0 = зелёно). Флаги: `--quick` · `--full` · `--no-smoke` · `--fail-fast`.
+
 ## ⚠️ Known Limitations
 
 - **Factual correctness:** не проверяется (требует LLM)

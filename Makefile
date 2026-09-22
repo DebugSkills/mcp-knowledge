@@ -185,3 +185,29 @@ prod-errors-sources:  ## Прод: E5-проверка реестра охват
 
 test-errors:  ## Error→Rule: юнит-тесты коллектора + E5-реестр (P2-9)
 	.venv/bin/python -m pytest tests/test_error_sources.py tests/test_errors_lib.py -v
+
+# ═══════════════════════════════════════════════════════════════
+# Preflight (code-2026-09-22-004) — pre-push гейт вместо CI/CD
+# ═══════════════════════════════════════════════════════════════
+
+.PHONY: preflight preflight-quick preflight-full hooks-install hooks-uninstall
+
+preflight:  ## Pre-push гейт: G1-G10 (lint/unit×2/E5/compose/ansible/shell/smoke/make)
+	bash scripts/preflight.sh
+
+preflight-quick:  ## Быстрый гейт ≤60с: G1 lint + G4 root + G5 E5 + G10 make
+	bash scripts/preflight.sh --quick
+
+preflight-full:  ## Полный: default + e2e и контейнерные test/lint (нужен стек)
+	bash scripts/preflight.sh --full
+
+hooks-install:  ## Установить .git/hooks/pre-push → preflight (escape: --no-verify)
+	@printf '#!/usr/bin/env bash\nexec "$$(git rev-parse --show-toplevel)/scripts/preflight.sh" "$$@"\n' \
+		> .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+	@echo "✔ pre-push hook установлен (preflight). Обход при необходимости: git push --no-verify"
+
+hooks-uninstall:  ## Удалить pre-push hook (в .trash/, обратимо)
+	@mkdir -p .trash
+	@mv .git/hooks/pre-push ".trash/pre-push-hook-$$(date +%Y%m%d-%H%M%S)" 2>/dev/null \
+		&& echo "✔ pre-push hook удалён (копия в .trash/)" \
+		|| echo "— hook не был установлен"
