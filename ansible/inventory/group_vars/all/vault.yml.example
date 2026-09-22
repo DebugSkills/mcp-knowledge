@@ -4,5 +4,9 @@ vault_mcp_read_keys: '["read-key"]'
 vault_mcp_write_keys: '["write-key"]'
 vault_mcp_import_keys: '["import-key"]'
 vault_mcp_console_key: "console-key"
+# kb-console roles (003): per-role MCP-ключи (минтить через /tokens под админом;
+# editor → уровень editor `mcp_e*`; пусто → fallback на MCP_API_KEY)
+vault_mcp_editor_key: ""
+vault_mcp_contributor_key: ""
 # Пароль kb-console (HTTP Basic). Сгенерировать: openssl rand -hex 16
 vault_console_password: "<сгенерируйте: openssl rand -hex 16>"

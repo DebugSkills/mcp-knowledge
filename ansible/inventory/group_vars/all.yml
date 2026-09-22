@@ -21,6 +21,9 @@ qdrant_url: http://localhost:6333
 # для прода рекомендуется "required" (fail-fast, если пароль не задан).
 console_auth_mode: "auto"
 
+# kb-console roles (003): bootstrap-username админа (пароль — vault_console_password)
+console_admin_user: "admin"
+
 # Docker-прокси (пусто = прямая сеть)
 docker_proxy: ""
 docker_no_proxy: "localhost,127.0.0.1,::1"
