@@ -158,3 +158,35 @@ class TestOneShotBranches:
                 state=state,
             )
         assert outcome.skipped and outcome.transport_error is not None
+
+
+class TestSourceInvariants:
+    """Канарейки против возврата к молчаливому глушению (RED-инъекция №1)."""
+
+    def test_queue_console_poll_has_no_silent_catch(self):
+        """queue_console._poll не содержит 'except Exception' — стоп-условие
+        обеспечивается poll_step; глушение = возврат 401-шторма (007 §7.6)."""
+        import inspect
+
+        from kb_console.components import queue_console
+
+        src = inspect.getsource(queue_console)
+        start = src.index("async def _poll")
+        end = src.index("async def _fetch_live_queue")
+        poll_region = src[start:end]
+        assert "except Exception" not in poll_region, (
+            "queue_console._poll глушит исключения — 401-шторм вернулся"
+        )
+
+    def test_progress_panel_poll_uses_poll_step(self):
+        """progress_panel._poll обязан идти через poll_step (P7)."""
+        import inspect
+
+        from kb_console.components import progress_panel
+
+        src = inspect.getsource(progress_panel)
+        start = src.index("async def _poll")
+        end = src.index("async def _cancel_scan")
+        poll_region = src[start:end]
+        assert "poll_step(" in poll_region
+        assert "except Exception" not in poll_region
