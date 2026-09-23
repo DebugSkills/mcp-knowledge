@@ -71,6 +71,7 @@ P0_HINTS = frozenset(
 # baseline P3: 4xx без актора (словарь 4xx заморожен каноном §4)
 BASELINE_4XX = frozenset({401, 403, 404, 429})
 DAILY_KEEP_DAYS = 21  # окно расчёта роста неделя-к-неделе + запас
+ENDPOINTS_KEEP = 20  # 009: cap ключей endpoints в агрегате (хвост → __others__)
 
 
 def now_iso() -> str:
@@ -124,6 +125,31 @@ def make_signature(source: str, marker, error_code, message: str) -> str:
     return f"{source}|{key}|{deep_normalize(message)}"
 
 
+def extract_endpoint(message: str):
+    """endpoint (009 §7.1): route-шаблон request-target access-строки.
+
+    Вычисляется ТОЛЬКО при матче ACCESS_RE (кавычечный uvicorn-формат
+    `"METHOD target HTTP/x.x" NNN` — access-логи mcp-server); [REQ]-строки
+    kb-console (без статуса/кавычек) не матчатся → None всегда (зона
+    покрытия P1-2, расширение ACCESS_RE — вне трассы 009). Вход — УЖЕ
+    замаскированная строка (порядок mask→trunc→extract, §7.3-1): секреты
+    конструктивно не могут попасть в поле. Query отброшен (до ?);
+    абсолютный URL → отброс scheme/host/port, только path; id-сегменты
+    (pure-digits / UUID / hex≥16) → <id>; корень / → /; обрезка 200."""
+    m = ACCESS_RE.search(message)
+    if not m:
+        return None
+    target = m.group(2).split("?", 1)[0]  # query отброшен (до ?)
+    i = target.find("://")  # абсолютный URL → только path
+    if i != -1:
+        rest = target[i + 3:]
+        target = rest[rest.find("/"):] if "/" in rest else "/"
+    segs = [s for s in target.split("/") if s]
+    norm = ["<id>" if s.isdigit() or UUID_RE.fullmatch(s) or HEX16_RE.fullmatch(s)
+            else s for s in segs]
+    return ("/" + "/".join(norm))[:200] if segs else "/"
+
+
 def classify_actor(message: str, source: str) -> str:
     """actor_id v1 (OQ-3): key_hash из [MCP]-строк; cron:<job>; host; console:<user>."""
     m = KEY_HASH_RE.search(message)
@@ -161,7 +187,7 @@ def load_json(path: Path, default):
 def make_event(ts, source, message, *, container=None, stream=None, level=None,
                marker=None, error_code=None, status=None, priority_hint=None,
                actor_id=None, exit_code=None, expected=False,
-               suppressed_count=0, sampled=False):
+               suppressed_count=0, sampled=False, endpoint=None):
     message = mask_secrets(str(message))[:2000]
     return {
         "ts": ts, "source": source, "container": container, "stream": stream,
@@ -173,6 +199,9 @@ def make_event(ts, source, message, *, container=None, stream=None, level=None,
         "trace_id": None, "exit_code": exit_code, "expected": expected,
         # 008: аддитивные поля гварда — перенос подавленных в разрешённое
         "suppressed_count": suppressed_count, "sampled": sampled,
+        # 009 §7.3-1: диагностический endpoint — только из ИТОГОВОЙ строки
+        # (замаскированной и усечённой); kw-only для явного управления
+        "endpoint": endpoint if endpoint is not None else extract_endpoint(message),
     }
 
 
