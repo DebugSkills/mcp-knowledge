@@ -104,6 +104,7 @@
 | script:errors_collect.py | сам коллектор (cron */5) | sink: — | gap: self — анти-рекурсия (P2-2); stderr → mcp-errors-collect.log с ротацией |
 | script:errors_report.py | weekly-отчёт (ручной/make) | sink: — | gap: self — свои ошибки в reports/tg-errors.log + stderr, не в sink |
 | script:errors_prune.py | prune (ручной/make, dry-run-first) | sink: — | gap: self — вывод только в stdout/stderr |
+| script:errors_guard.py | write-side гвард (cap/burst) + suppression-CLI | sink: — | gap: self — сам не источник; решения оператора → sink/suppression.json + audit.jsonl |
 
 ## Известные дыры (честный бэклог, канон §9)
 

@@ -160,7 +160,8 @@ def load_json(path: Path, default):
 
 def make_event(ts, source, message, *, container=None, stream=None, level=None,
                marker=None, error_code=None, status=None, priority_hint=None,
-               actor_id=None, exit_code=None, expected=False):
+               actor_id=None, exit_code=None, expected=False,
+               suppressed_count=0, sampled=False):
     message = mask_secrets(str(message))[:2000]
     return {
         "ts": ts, "source": source, "container": container, "stream": stream,
@@ -170,6 +171,8 @@ def make_event(ts, source, message, *, container=None, stream=None, level=None,
         "signature": make_signature(source, marker, error_code, message),
         "priority_hint": priority_hint, "actor_id": actor_id,
         "trace_id": None, "exit_code": exit_code, "expected": expected,
+        # 008: аддитивные поля гварда — перенос подавленных в разрешённое
+        "suppressed_count": suppressed_count, "sampled": sampled,
     }
 
 
@@ -680,75 +683,111 @@ def mark_expected_restarts(events, window_min: int = 15):
 
 # ── Агрегат E3 (приоритет сигнатуры — агрегатный, замороженный словарь) ──
 
-def update_aggregates(sink: Path, events, cfg: dict):
-    """Инкремент aggregates/signatures.json; resolved = last_seen старше окна E4 (7d)."""
-    if not events:
+def update_aggregates(sink: Path, events, cfg: dict,
+                      suppressed_delta=None, burst_delta=None):
+    """Инкремент aggregates/signatures.json; resolved = last_seen старше окна E4 (7d).
+
+    008 (P1-2): suppressed_delta/burst_delta — отдельные параметры; сигнатура
+    с 0 разрешённых за цикл (операторская suppression / cap-шторм) продолжает
+    накапливать suppressed_total/suppressed_daily/count_total через stub-агрегат
+    (§13.3:188 «подавленное не терять»). count_total/daily = ПОЛНАЯ правда о
+    частоте: len(evs) + Δ (P2-new-1 — иначе count_7d полностью-подавленной
+    сигнатуры = 0). last_seen подавленной НЕ обновляется (тишина в raw = E4).
+    Burst-пост-шаг — КАЖДЫЙ цикл после лестницы (лестница P0/P1 не понижает).
+    """
+    suppressed_delta = suppressed_delta or {}
+    burst_delta = burst_delta or {}
+    if not events and not suppressed_delta and not burst_delta:
         return
     agg_path = sink / "aggregates" / "signatures.json"
     aggregates = load_json(agg_path, {})
     e4_days = int(cfg.get("e4_window_days", 7))
     now = datetime.now(timezone.utc)
+    day = now.strftime("%Y-%m-%d")
+    # окно роста неделя-к-неделе требует 14d; старше 21d — сворачиваем
+    # (события уже учтены в count_total при записи — только удаляем ключи)
+    cutoff = (now - timedelta(days=DAILY_KEEP_DAYS)).strftime("%Y-%m-%d")
+    week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+    two_weeks_ago = (now - timedelta(days=14)).strftime("%Y-%m-%d")
     by_sig = {}
     for ev in events:
         by_sig.setdefault(ev["signature"], []).append(ev)
-    for sig, evs in by_sig.items():
+    for sig in list(by_sig) + [s for s in suppressed_delta if s not in by_sig]:
+        evs = by_sig.get(sig, [])
+        delta = int(suppressed_delta.get(sig, 0))
         a = aggregates.get(sig) or {
-            "priority": "P2", "class": "T", "first_seen": evs[0]["ts"],
-            "last_seen": evs[0]["ts"], "count_total": 0, "daily": {},
+            "priority": "P2", "class": "T",
+            "first_seen": (evs[0]["ts"] if evs else now_iso()),
+            "last_seen": (evs[0]["ts"] if evs else now_iso()),
+            "count_total": 0, "daily": {},
             "actors": [], "sources": [], "last_example": None,
             "status": "active", "fixed_at": None,
         }
-        hints = [(e.get("priority_hint"), e.get("expected", False)) for e in evs]
-        p0 = any(h in P0_HINTS and not exp for h, exp in hints)
-        slow = any(h == "slow" for h, _ in hints)
-        actors = {e.get("actor_id") for e in evs if e.get("actor_id")}
-        # D1 (Ф5): routine-сигнатура = все события expected и ни одного не-routine
-        # за историю (инкрементальность: флаг залипает, если хоть раз была не-рутина)
-        if any(not e.get("expected", False) for e in evs):
-            a["has_non_routine"] = True
-        routine_all = (not a.get("has_non_routine")
-                       and all(e.get("expected", False) for e in evs))
-        day = now.strftime("%Y-%m-%d")
-        a["daily"][day] = a["daily"].get(day, 0) + len(evs)
-        # окно роста неделя-к-неделе требует 14d; старше 21d — сворачиваем
-        # (события уже учтены в count_total при записи — только удаляем ключи)
-        cutoff = (now - timedelta(days=DAILY_KEEP_DAYS)).strftime("%Y-%m-%d")
+        if evs:
+            hints = [(e.get("priority_hint"), e.get("expected", False)) for e in evs]
+            p0 = any(h in P0_HINTS and not exp for h, exp in hints)
+            slow = any(h == "slow" for h, _ in hints)
+            actors = {e.get("actor_id") for e in evs if e.get("actor_id")}
+            # D1 (Ф5): routine-сигнатура = все события expected и ни одного не-routine
+            # за историю (инкрементальность: флаг залипает, если хоть раз была не-рутина)
+            if any(not e.get("expected", False) for e in evs):
+                a["has_non_routine"] = True
+            routine_all = (not a.get("has_non_routine")
+                           and all(e.get("expected", False) for e in evs))
+            a["last_seen"] = max(e["ts"] for e in evs)
+            a["actors"] = sorted(set(a.get("actors", [])) | actors)[:50]
+            a["sources"] = sorted(set(a.get("sources", [])) | {e["source"] for e in evs})
+            a["last_example"] = {"ts": evs[-1]["ts"], "message": evs[-1]["message"][:300]}
+        # инкременты: события + suppressed-дельта — ПОЛНАЯ правда о частоте (P2-new-1)
+        a["daily"][day] = a["daily"].get(day, 0) + len(evs) + delta
         for d in [d for d in a["daily"] if d < cutoff]:
             a["daily"].pop(d)
-        a["count_total"] += len(evs)
-        a["last_seen"] = max(e["ts"] for e in evs)
-        a["actors"] = sorted(set(a.get("actors", [])) | actors)[:50]
-        a["sources"] = sorted(set(a.get("sources", [])) | {e["source"] for e in evs})
-        a["last_example"] = {"ts": evs[-1]["ts"], "message": evs[-1]["message"][:300]}
-        # приоритет E3 (заморожено): P0-hint(не expected) → P1(≥2 акторов | рост) → P3-baseline → P2
-        count_7d = sum(n for d, n in a["daily"].items()
-                       if d >= (now - timedelta(days=7)).strftime("%Y-%m-%d"))
+        if delta:
+            sd = a.get("suppressed_daily") or {}
+            sd[day] = sd.get(day, 0) + delta
+            for d in [d for d in sd if d < cutoff]:  # P2-4: cutoff 21d единообразно
+                sd.pop(d)
+            a["suppressed_daily"] = sd
+            a["suppressed_total"] = a.get("suppressed_total", 0) + delta
+        a["count_total"] += len(evs) + delta
+        count_7d = sum(n for d, n in a["daily"].items() if d >= week_ago)
         count_prev_7d = sum(n for d, n in a["daily"].items()
-                            if (now - timedelta(days=14)).strftime("%Y-%m-%d") <= d
-                            < (now - timedelta(days=7)).strftime("%Y-%m-%d"))
+                            if two_weeks_ago <= d < week_ago)
         a["count_7d"], a["count_prev_7d"] = count_7d, count_prev_7d
-        baseline = all(
-            (e.get("status") in BASELINE_4XX and not e.get("actor_id"))
-            or (e.get("marker") == "HEALTH") or ("[AUTH]" in e.get("message", ""))
-            for e in evs
-        )
-        if p0:
-            a["priority"], a["class"] = "P0", "T"
-        elif slow:
-            # D1: '[MCP] … ok <ms ≥ slow_ms>' — реальная аномалия (не рутина и не P2)
-            a["priority"], a["class"], a["slow"] = "P1", "U", True
-        elif routine_all and not p0:
-            # D1: вся сигнатура — ожидаемая рутина ([MCP] ok fast / start,
-            # [REQ] 2xx) → P3-baseline; «≥2 акторов ⇒ P1» к routine НЕ применяется
-            a["priority"], a["class"] = "P3", "T"
-        elif len(set(a["actors"])) >= 2 or (count_prev_7d > 0 and count_7d > count_prev_7d):
-            a["priority"] = "P1"
-            a["class"] = "U" if a["actors"] else "T"
-        elif baseline:
-            a["priority"], a["class"] = "P3", "T"
-        else:
-            a["priority"] = "P2"
-            a["class"] = "U" if a["actors"] else "T"
+        if evs:
+            # приоритет E3 (заморожено): P0-hint(не expected) → slow → burst(008)
+            # → routine → P1(≥2 акторов | рост) → P3-baseline → P2
+            baseline = all(
+                (e.get("status") in BASELINE_4XX and not e.get("actor_id"))
+                or (e.get("marker") == "HEALTH") or ("[AUTH]" in e.get("message", ""))
+                for e in evs
+            )
+            if p0:
+                a["priority"], a["class"] = "P0", "T"
+            elif slow:
+                # D1: '[MCP] … ok <ms ≥ slow_ms>' — реальная аномалия (не рутина и не P2)
+                a["priority"], a["class"], a["slow"] = "P1", "U", True
+            elif any(h == "burst" for h, _ in hints):
+                # 008: [GUARD]-маркер с ЯВНЫМ priority_hint="burst" → P1/T (P2-5)
+                a["priority"], a["class"] = "P1", "T"
+            elif routine_all and not p0:
+                # D1: вся сигнатура — ожидаемая рутина ([MCP] ok fast / start,
+                # [REQ] 2xx) → P3-baseline; «≥2 акторов ⇒ P1» к routine НЕ применяется
+                a["priority"], a["class"] = "P3", "T"
+            elif len(set(a["actors"])) >= 2 or (count_prev_7d > 0 and count_7d > count_prev_7d):
+                a["priority"] = "P1"
+                a["class"] = "U" if a["actors"] else "T"
+            elif baseline:
+                a["priority"], a["class"] = "P3", "T"
+            else:
+                a["priority"] = "P2"
+                a["class"] = "U" if a["actors"] else "T"
+        # 008 (P1-1): жертва burst-эскалации получает burst_ts + burst_count_5m
+        b = burst_delta.get(sig)
+        if b:
+            a["burst"] = True
+            a["burst_ts"] = b.get("burst_ts")
+            a["burst_count_5m"] = b.get("burst_count_5m")
         # E4: resolved = тишина ≥ окна; рецидив — last_seen обновится, report пометит regressed
         if a["status"] == "active" and (now - parse_ts(a["last_seen"])).days >= e4_days:
             a["status"], a["fixed_at"] = "resolved", a["last_seen"]
@@ -756,6 +795,17 @@ def update_aggregates(sink: Path, events, cfg: dict):
             a["status"] = "active"  # рецидив в окне наблюдения
             a["fixed_at"] = None
         aggregates[sig] = a
+    # 008 (P1-1): burst-пост-шаг КАЖДЫЙ цикл после замороженной лестницы —
+    # sticky-эскалация P2/P3→P1 в окне 7d от burst_ts (декей: старше 7d не влияет)
+    for a in aggregates.values():
+        if not (a.get("burst") and a.get("burst_ts")):
+            continue
+        try:
+            age_s = (now - parse_ts(a["burst_ts"])).total_seconds()
+        except ValueError:
+            continue
+        if age_s <= 7 * 86400 and a.get("priority") not in ("P0", "P1"):
+            a["priority"] = "P1"
     atomic_write_json(agg_path, aggregates)
 
 
@@ -791,6 +841,11 @@ DEFAULT_CONFIG = {
     "own_log": "/var/log/mcp-errors-collect.log",
     "hang_window_min": 30,
     "slow_ms": 60000,  # D1 (Ф5): '[MCP] … ok <ms>' при ms ≥ slow_ms → P1 (slow=true)
+    # 008 «Шторм-гард» (kill-switch — по прецеденту prune.enabled): cap 5/60 с
+    # на сигнатуру; burst ≥50/цикл или ×10 к среднему за 12 циклов (~1 ч);
+    # TTL guard/burst-состояния в collector_state.json.
+    "guard": {"enabled": True, "cap_per_minute": 5, "burst_abs": 50,
+              "burst_ratio": 10, "burst_window_cycles": 12, "state_ttl_days": 7},
 }
 
 
@@ -838,10 +893,17 @@ def main(argv=None) -> int:
 
     events = mark_expected_restarts(events)
     collected_at = now_iso()
-    append_events(sink, events, collected_at)
-    update_aggregates(sink, events, cfg)
+    # 008 «Шторм-гард»: write-side гвард между маркировкой и записью (§7.0-1 —
+    # единственная вставка). Lazy-импорт: errors_guard берёт make_event отсюда.
+    from errors_guard import apply_write_guard, load_suppression
+    events, guard_markers, sup_delta, burst_delta = apply_write_guard(
+        events, state, cfg, load_suppression(sink), collected_at)
+    append_events(sink, events + guard_markers, collected_at)
+    update_aggregates(sink, events + guard_markers, cfg,
+                      suppressed_delta=sup_delta, burst_delta=burst_delta)
     atomic_write_json(state_path, state)
-    print(f"[errors_collect] {collected_at}: captured={len(events)} → {sink}")
+    print(f"[errors_collect] {collected_at}: captured={len(events)}"
+          f"(+{len(guard_markers)} guard) suppressed={sum(sup_delta.values())} → {sink}")
     return 0  # graceful: сбор даже без стека не роняет cron (P2-5)
 
 

@@ -150,6 +150,7 @@ def _suppress(ev, sig, guard_state, suppressed_delta):
     guard_state[sig] = st
     st["suppressed_pending"] = st.get("suppressed_pending", 0) + 1
     st["last_seen"] = max(st.get("last_seen", ""), ev["ts"])
+    suppressed_delta[sig] = suppressed_delta.get(sig, 0) + 1
 
 
 def _ttl_cleanup(guard_state, ttl_days, now):
