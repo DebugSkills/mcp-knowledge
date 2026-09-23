@@ -119,3 +119,14 @@ mcp_kb_transfer__excludes:
   - .playwright-mcp
   - node_modules
   - "*.pyc"
+
+# — Error→Rule: config.json (playbooks/errors.yml → templates/errors-config.json.j2) —
+# Ручки «Шторм-гарда» (008) должны совпадать с DEFAULT_CONFIG.guard в
+# scripts/errors_collect.py. Kill-switch: errors_guard_enabled: false — полностью
+# выключает write-side гард. Остальные ключи guard (burst_ratio/burst_window_cycles/
+# state_ttl_days) берутся из DEFAULT_CONFIG (поключевой merge в load_config).
+# Прочие ручки errors_* (slow_ms=60000 / retention_days=90 / hold_days=14 /
+# prune.enabled=false) задаются дефолтами шаблона.
+errors_guard_enabled: true        # kill-switch гварда: false = отключить
+errors_guard_cap_per_minute: 5    # cap событий на сигнатуру в минуту
+errors_guard_burst_abs: 50        # burst-порог: абсолютных событий за цикл

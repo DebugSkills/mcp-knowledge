@@ -14,5 +14,6 @@
   "retention_days": {{ errors_retention_days | default(90) }},
   "hold_days": {{ errors_hold_days | default(14) }},
   "e4_window_days": 7,
-  "prune": {"enabled": {{ errors_prune_enabled | default('false') | bool | to_json }}}
+  "prune": {"enabled": {{ errors_prune_enabled | default('false') | bool | to_json }}},
+  "guard": {"enabled": {{ errors_guard_enabled | default('true') | bool | to_json }}, "cap_per_minute": {{ errors_guard_cap_per_minute | default(5) }}, "burst_abs": {{ errors_guard_burst_abs | default(50) }}}
 }
