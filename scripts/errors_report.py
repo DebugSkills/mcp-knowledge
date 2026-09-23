@@ -74,7 +74,8 @@ def cmd_view(sink, top):
         actors = ",".join(a.get("actors", [])[:3]) or "-"
         ex = (a.get("last_example") or {}).get("message", "")[:100].replace("\n", " ")
         print(f"[{a.get('priority')}] {a.get('class')} 7d={a.get('count_7d', 0):<5} "
-              f"total={a.get('count_total', 0):<6} actors={actors:<20} "
+              f"total={a.get('count_total', 0):<6} sup={a.get('suppressed_total', 0):<5} "
+              f"actors={actors:<20} "
               f"last={a.get('last_seen', '?')[:16]}  {ex}")
         print(f"        sig: {sig[:150]}")
     return 0
@@ -218,6 +219,8 @@ RULE_BY_HINT = {  # M5: тип правила по природе причины
     "health_degraded": "ansible-preflight-гард (health-гейт)",
     "hang": "pytest-регресс (timeout-контракт tool-вызова)",
     "disk_critical": "ansible-гард (host-пороги df)",
+    # 008 storm-guard (§7.5): burst-маркер [GUARD]
+    "burst": "разбор источника шторма (§11.2-чеклист) + проверка стоп-условий",
 }
 
 
@@ -227,6 +230,15 @@ def rule_hint(sig, a):
         if hint in sig or hint.replace("_", " ") in ex.lower():
             return rule
     return "L2-инсайт (причина вне словаря M5) — разбор вручную"
+
+
+def suppressed_7d_map(aggs):
+    """sig → suppressed за 7d — вычисляемое из suppressed_daily (008 P2-7,
+    единообразно с count_7d; не хранится — одна правда при обрезке 21d)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+    return {sig: sum(n for d, n in (a.get("suppressed_daily") or {}).items()
+                     if str(d) >= cutoff)
+            for sig, a in aggs.items()}
 
 
 # ── --weekly: 6 секций ──
@@ -252,11 +264,12 @@ def cmd_weekly(sink, send_tg):
                          and a.get("priority") in ("P0", "P1")],
                         key=lambda kv: kv[1]["fixed_at"], reverse=True)
 
-    def fmt_list(items, limit=10):
+    def fmt_list(items, limit=10, sup=False):
         lines = []
         for sig, a in items[:limit]:
             ex = (a.get("last_example") or {}).get("message", "")[:90].replace("\n", " ")
-            lines.append(f"- [{a.get('priority')}] 7d={a.get('count_7d', 0)} "
+            sup_part = f" sup={a.get('suppressed_total', 0)}" if sup else ""
+            lines.append(f"- [{a.get('priority')}] 7d={a.get('count_7d', 0)}{sup_part} "
                          f"actors={','.join(a.get('actors', [])[:2]) or '-'} — {ex}")
         return lines or ["- (пусто)"]
 
@@ -269,6 +282,20 @@ def cmd_weekly(sink, send_tg):
              f"resolved: {len(classes['resolved'])}")
     L.append(f"- raw-строк за 7d: {raw['lines_7d']} · объём raw: {raw['raw_mb']} МБ "
              f"(~{raw['mb_per_month']} МБ/мес)")
+    # 008 (§7.5): suppressed-строка — честность «мы скрыли N» + контракт
+    # верификации E4-при-гварде: глушилась (suppressed_total>0) и замолчала
+    # (count_7d==0 и suppressed_7d==0) = источник устранён при активном гварде.
+    sup7 = suppressed_7d_map(aggs)
+    sup_total_7d = sum(sup7.values())
+    sup_top = sorted(((s, n) for s, n in sup7.items() if n > 0),
+                     key=lambda kv: -kv[1])[:3]
+    guard_fixed = sum(1 for s, a in aggs.items()
+                      if a.get("suppressed_total", 0) > 0 and a.get("count_7d", 0) == 0
+                      and sup7.get(s, 0) == 0)
+    L.append(f"- suppressed за 7d (гвард): {sup_total_7d}"
+             + (f" по {len(sup_top)} сигнатурам; топ: "
+                + "; ".join(f"{s[:60]}={n}" for s, n in sup_top) if sup_top else "")
+             + (f" · источник устранён при гварде: {guard_fixed}" if guard_fixed else ""))
     L.append("")
     L.append("## 2. P0 (поломка — независимо от числа)")
     L.extend(fmt_list(p0))
@@ -277,8 +304,22 @@ def cmd_weekly(sink, send_tg):
     L.extend(fmt_list(p12))
     L.append("")
     L.append("## 4. P3-baseline (шум)")
-    L.extend(fmt_list(p3, 5))
+    L.extend(fmt_list(p3, 5, sup=True))
     L.append(f"- noise_ratio (P3-строк/всех за 7d): {raw['noise_ratio']}")
+    # 008 (§7.5/P1-1): burst-подсекция — фильтр по burst_ts в окне 7d (не по
+    # sticky-флагу — декей 7d исключает неограниченный рост), свежие первыми
+    burst_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    bursts = sorted(((s, a) for s, a in aggs.items()
+                     if a.get("burst_ts") and a["burst_ts"] >= burst_cutoff),
+                    key=lambda kv: kv[1]["burst_ts"], reverse=True)
+    L.append("")
+    L.append("### Burst-инциденты за 7d ([GUARD]-гвард)")
+    if bursts:
+        for s, a in bursts[:10]:
+            L.append(f"- burst_ts={str(a['burst_ts'])[:16]} count_5m={a.get('burst_count_5m')} "
+                     f"7d={a.get('count_7d', 0)} [{a.get('priority')}] — {s[:120]}")
+    else:
+        L.append("- (пусто)")
     L.append("")
     L.append("## 5. Метрики цикла (канон §8)")
     ratio_part = f" = {met['found_before_user_ratio']}" if met["found_before_user_ratio"] is not None else ""

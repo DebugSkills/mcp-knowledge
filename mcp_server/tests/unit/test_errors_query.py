@@ -143,7 +143,9 @@ class TestViews:
         assert set(agg) == {
             "signature", "priority", "class", "status", "count_7d",
             "count_prev_7d", "count_total", "trend", "actors_count",
-            "sources", "first_seen", "last_seen", "fixed_at"}
+            "sources", "first_seen", "last_seen", "fixed_at",
+            # 008 storm-guard: аддитивные поля видимости suppressed/burst (§7.5)
+            "suppressed_total", "suppressed_7d", "burst", "burst_ts"}
 
     async def test_trend_semantics(self, sink):
         r = await _call(signature="docker_logs|MCP|timeout after <n>")

@@ -199,8 +199,20 @@ def _filter_aggregates(
     return out
 
 
+def _suppressed_7d(agg: dict[str, Any]) -> int:
+    """Вычисляемое на рендере из suppressed_daily (008 P2-7 — единообразно с
+    count_7d errors_collect.py:724-725; не хранится — одна правда при обрезке 21d)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+    return sum(n for d, n in (agg.get("suppressed_daily") or {}).items()
+               if str(d) >= cutoff)
+
+
 def _render_aggregate(sig: str, agg: dict[str, Any]) -> dict[str, Any]:
-    """Агрегат без last_example и actors[] (Critic ③, P2-2): только счётчики+meta."""
+    """Агрегат без last_example и actors[] (Critic ③, P2-2): только счётчики+meta.
+
+    008 (§7.5): +suppressed_total / suppressed_7d (вычисляемое) / burst /
+    burst_ts — аддитивно через .get: старые агрегаты без полей не ломают выдачу (R6).
+    """
     return {
         "signature": sig,
         "priority": agg.get("priority"),
@@ -215,6 +227,10 @@ def _render_aggregate(sig: str, agg: dict[str, Any]) -> dict[str, Any]:
         "first_seen": agg.get("first_seen"),
         "last_seen": agg.get("last_seen"),
         "fixed_at": agg.get("fixed_at"),
+        "suppressed_total": agg.get("suppressed_total", 0),
+        "suppressed_7d": _suppressed_7d(agg),
+        "burst": bool(agg.get("burst")),
+        "burst_ts": agg.get("burst_ts"),
     }
 
 
@@ -287,6 +303,8 @@ def _scan_raw_examples(
                     "marker": ev.get("marker"),
                     "actor_id": ev.get("actor_id"),  # namespace коллектора (P2-2)
                     "message": _truncate(mask_output(str(ev.get("message", "")))),
+                    "suppressed_count": ev.get("suppressed_count"),  # 008: гвард-перенос
+                    "sampled": ev.get("sampled"),
                 })
                 if all(len(buckets[s]) >= flt["examples_limit"] for s in buckets):
                     break  # ранний выход внутри файла
