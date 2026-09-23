@@ -14,9 +14,38 @@ from typing import Any, Self
 
 import httpx
 
+from .auth_state import AuthenticationError, ForbiddenError, TransportError
+
 _NOT_SET = object()  # W5: sentinel «не трогать поле» (patch_token)
 
 logger = logging.getLogger("kb_console.mcp_client")
+
+
+def _status_error(status_code: int, body: str = "") -> RuntimeError | None:
+    """Статус-матрица §7.2b (code-2026-09-22-007): 401/403 → Auth*,
+    429/5xx → TransportError, прочие 4xx → None (прежний дефолт хелпера).
+
+    Тексты 401/403/429/503 — бит-в-бит из _call (OQ-2: тесты клиента
+    проверяют тексты через RuntimeError-match; наследники — те же строки).
+    """
+    if status_code == 401:
+        return AuthenticationError("Ошибка аутентификации: неверный API-ключ (401)")
+    if status_code == 403:
+        return ForbiddenError("Доступ запрещён: недостаточно прав (403)")
+    if status_code == 429:
+        return TransportError("Слишком много запросов: превышен rate limit (429)")
+    if status_code == 503:
+        return TransportError("Сервер временно недоступен: degraded (503)")
+    if status_code >= 500:
+        return TransportError(f"Ошибка HTTP {status_code}: {body[:200]}")
+    return None
+
+
+def _transport_from_http_error(exc: httpx.HTTPError) -> TransportError:
+    """Сетевой/таймаут сбой → TransportError (текст бит-в-бит из _call)."""
+    if isinstance(exc, httpx.TimeoutException):
+        return TransportError(f"Таймаут запроса к серверу: {exc}")
+    return TransportError(f"Сервер недоступен: {exc}")
 
 
 class MCPClient:
@@ -89,7 +118,10 @@ class MCPClient:
             result из ответа.
 
         Raises:
-            RuntimeError: при ошибках соединения, HTTP, или JSON-RPC error.
+            AuthenticationError: HTTP 401 — неверный API-ключ (стоп поллеров).
+            ForbiddenError: HTTP 403 — недостаточно прав.
+            TransportError: соединение/таймаут/HTTP 429-5xx/decode/JSON-RPC.
+            (все — наследники RuntimeError, back-compat — 007 §7.2b/OQ-2)
         """
         payload = {
             "jsonrpc": "2.0",
@@ -108,24 +140,18 @@ class MCPClient:
         except httpx.ConnectError as e:
             msg = f"Сервер недоступен: {e}"
             logger.error(msg)
-            raise RuntimeError(msg) from e
+            raise TransportError(msg) from e
         except httpx.TimeoutException as e:
             msg = f"Таймаут запроса к серверу: {e}"
             logger.error(msg)
-            raise RuntimeError(msg) from e
+            raise TransportError(msg) from e
 
-        # HTTP-level errors
-        if response.status_code == 401:
-            raise RuntimeError("Ошибка аутентификации: неверный API-ключ (401)")
-        if response.status_code == 403:
-            raise RuntimeError("Доступ запрещён: недостаточно прав (403)")
-        if response.status_code == 429:
-            raise RuntimeError("Слишком много запросов: превышен rate limit (429)")
-        if response.status_code == 503:
-            raise RuntimeError("Сервер временно недоступен: degraded (503)")
-
+        # HTTP-level errors (статус-матрица §7.2b)
         if response.status_code != 200:
-            raise RuntimeError(
+            exc = _status_error(response.status_code, response.text)
+            if exc is not None:
+                raise exc
+            raise TransportError(
                 f"Ошибка HTTP {response.status_code}: {response.text[:200]}"
             )
 
@@ -134,14 +160,14 @@ class MCPClient:
             data = response.json()
         except json.JSONDecodeError as e:
             logger.error("Invalid JSON response: %s", response.text[:200])
-            raise RuntimeError(f"Некорректный JSON-ответ от сервера: {e}") from e
+            raise TransportError(f"Некорректный JSON-ответ от сервера: {e}") from e
 
         if "error" in data:
             err = data["error"]
             msg = err.get("message", str(err))
             code = err.get("code", -1)
             logger.error("JSON-RPC error code=%s: %s", code, msg)
-            raise RuntimeError(f"Ошибка JSON-RPC ({code}): {msg}")
+            raise TransportError(f"Ошибка JSON-RPC ({code}): {msg}")
 
         return data.get("result", {})
 
@@ -221,20 +247,25 @@ class MCPClient:
 
         Returns:
             Словарь прогресса (imported, total, failed, status, messages[], ...)
-            или None при любой ошибке (404 / endpoint отсутствует / сеть) —
-            никогда не бросает.
+            или None при 404/ожидаемых 4xx (прежний дефолт — §7.2b, инвариант).
+        Raises:
+            AuthenticationError / ForbiddenError: 401/403 (стоп поллеров).
+            TransportError: 429/5xx/сеть/таймаут/decode (бэкофф).
         """
         url = f"{self.base_url}/imports/{import_id}/progress"
         try:
             response = await self._client.get(url, headers=self._headers(), timeout=5.0)
-        except httpx.HTTPError:
-            return None
+        except httpx.HTTPError as e:
+            raise _transport_from_http_error(e) from e
         if response.status_code != 200:
-            return None
+            exc = _status_error(response.status_code, response.text)
+            if exc is not None:
+                raise exc
+            return None  # 404 / ожидаемые 4xx → прежний дефолт
         try:
             return response.json()
-        except (json.JSONDecodeError, ValueError):
-            return None
+        except (json.JSONDecodeError, ValueError) as e:
+            raise TransportError(f"Некорректный JSON-ответ от сервера: {e}") from e
 
     async def get_import_log(self, import_id: str) -> dict[str, Any] | None:
         """GET /imports/{import_id}/log — построчный лог импорта из ring-буфера.
@@ -244,20 +275,25 @@ class MCPClient:
 
         Returns:
             {"import_id": "...", "log": [{"ts": "...", "level": "...", "text": "..."}]}
-            или None при любой ошибке (404 / endpoint отсутствует / сеть) —
-            никогда не бросает.
+            или None при 404/ожидаемых 4xx (прежний дефолт — §7.2b).
+        Raises:
+            AuthenticationError / ForbiddenError: 401/403.
+            TransportError: 429/5xx/сеть/таймаут/decode.
         """
         url = f"{self.base_url}/imports/{import_id}/log"
         try:
             response = await self._client.get(url, headers=self._headers(), timeout=5.0)
-        except httpx.HTTPError:
-            return None
+        except httpx.HTTPError as e:
+            raise _transport_from_http_error(e) from e
         if response.status_code != 200:
-            return None
+            exc = _status_error(response.status_code, response.text)
+            if exc is not None:
+                raise exc
+            return None  # 404 / ожидаемые 4xx → прежний дефолт
         try:
             return response.json()
-        except (json.JSONDecodeError, ValueError):
-            return None
+        except (json.JSONDecodeError, ValueError) as e:
+            raise TransportError(f"Некорректный JSON-ответ от сервера: {e}") from e
 
     # ── Variant A (13.10): хелперы для «Книги» + информативный поиск ──
 
@@ -408,35 +444,56 @@ class MCPClient:
         Используется DataCache для гибридной инвалидации (TTL + version check).
 
         Returns:
-            Текущая версия данных (0 если ошибка).
+            Текущая версия данных.
+
+        Raises:
+            AuthenticationError / ForbiddenError: 401/403 (стоп поллеров).
+            TransportError: любой другой non-200 (у /data-version легитимного
+            404 нет — спец-строка §7.2b), сеть/таймаут/decode.
         """
         url = f"{self.base_url}/data-version"
         try:
             response = await self._client.get(url, headers=self._headers(), timeout=5.0)
-        except httpx.HTTPError:
-            return 0
+        except httpx.HTTPError as e:
+            raise _transport_from_http_error(e) from e
         if response.status_code != 200:
-            return 0
+            exc = _status_error(response.status_code, response.text)
+            if exc is not None:
+                raise exc
+            raise TransportError(
+                f"Ошибка HTTP {response.status_code}: {response.text[:200]}"
+            )
         try:
             return response.json().get("data_version", 0)
-        except (json.JSONDecodeError, ValueError):
-            return 0
+        except (json.JSONDecodeError, ValueError) as e:
+            raise TransportError(f"Некорректный JSON-ответ от сервера: {e}") from e
 
     # ── W5: token admin API (/tokens) ─────────────────────────
 
     async def list_tokens(self) -> list[dict[str, Any]]:
-        """GET /tokens — список токенов (без key_hash/plaintext)."""
+        """GET /tokens — список токенов (без key_hash/plaintext).
+
+        Raises:
+            AuthenticationError / ForbiddenError: 401/403.
+            TransportError: прочий non-200 (легитимных не-200 у /tokens нет),
+            сеть/таймаут/decode.
+        """
         url = f"{self.base_url}/tokens"
         try:
             response = await self._client.get(url, headers=self._headers(), timeout=5.0)
-        except httpx.HTTPError:
-            return []
+        except httpx.HTTPError as e:
+            raise _transport_from_http_error(e) from e
         if response.status_code != 200:
-            return []
+            exc = _status_error(response.status_code, response.text)
+            if exc is not None:
+                raise exc
+            raise TransportError(
+                f"Ошибка HTTP {response.status_code}: {response.text[:200]}"
+            )
         try:
             return response.json().get("tokens", [])
-        except (json.JSONDecodeError, ValueError):
-            return []
+        except (json.JSONDecodeError, ValueError) as e:
+            raise TransportError(f"Некорректный JSON-ответ от сервера: {e}") from e
 
     async def create_token(
         self,
@@ -445,7 +502,11 @@ class MCPClient:
         note: str = "",
         expires_at: str | None = None,
     ) -> dict[str, Any] | None:
-        """POST /tokens — создать токен; возвращает {id, plaintext, mask} (один раз)."""
+        """POST /tokens — создать токен; возвращает {id, plaintext, mask} (один раз).
+
+        Raises (P2-4, one-shot §7.2а): AuthenticationError/ForbiddenError (401/403),
+        TransportError (сеть/таймаут/429/5xx). Ожидаемые 4xx (400) → None.
+        """
         url = f"{self.base_url}/tokens"
         body: dict[str, Any] = {"level": level, "zone": zone, "note": note}
         if expires_at:
@@ -454,23 +515,34 @@ class MCPClient:
             response = await self._client.post(
                 url, json=body, headers=self._headers(), timeout=10.0,
             )
-        except httpx.HTTPError:
-            return None
+        except httpx.HTTPError as e:
+            raise _transport_from_http_error(e) from e
         if response.status_code != 200:
+            exc = _status_error(response.status_code, response.text)
+            if exc is not None:
+                raise exc
             return None
         try:
             return response.json()
-        except (json.JSONDecodeError, ValueError):
-            return None
+        except (json.JSONDecodeError, ValueError) as e:
+            raise TransportError(f"Некорректный JSON-ответ от сервера: {e}") from e
 
     async def revoke_token(self, token_id: str) -> bool:
-        """POST /tokens/{id}/revoke — отозвать токен."""
+        """POST /tokens/{id}/revoke — отозвать токен.
+
+        Raises (P2-4): Auth*/TransportError как create_token; ожидаемые 4xx → False.
+        """
         url = f"{self.base_url}/tokens/{token_id}/revoke"
         try:
             response = await self._client.post(url, headers=self._headers(), timeout=5.0)
-        except httpx.HTTPError:
+        except httpx.HTTPError as e:
+            raise _transport_from_http_error(e) from e
+        if response.status_code != 200:
+            exc = _status_error(response.status_code, response.text)
+            if exc is not None:
+                raise exc
             return False
-        return response.status_code == 200
+        return True
 
     async def patch_token(
         self,
@@ -479,7 +551,10 @@ class MCPClient:
         expires_at: str | None | object = _NOT_SET,
         active: bool | None = None,
     ) -> dict[str, Any] | None:
-        """PATCH /tokens/{id} — обновить note/expires_at/active."""
+        """PATCH /tokens/{id} — обновить note/expires_at/active.
+
+        Raises (P2-4): Auth*/TransportError как create_token; ожидаемые 4xx → None.
+        """
         url = f"{self.base_url}/tokens/{token_id}"
         body: dict[str, Any] = {}
         if note is not None:
@@ -494,28 +569,37 @@ class MCPClient:
             response = await self._client.patch(
                 url, json=body, headers=self._headers(), timeout=5.0,
             )
-        except httpx.HTTPError:
-            return None
+        except httpx.HTTPError as e:
+            raise _transport_from_http_error(e) from e
         if response.status_code != 200:
+            exc = _status_error(response.status_code, response.text)
+            if exc is not None:
+                raise exc
             return None
         try:
             return response.json()
-        except (json.JSONDecodeError, ValueError):
-            return None
+        except (json.JSONDecodeError, ValueError) as e:
+            raise TransportError(f"Некорректный JSON-ответ от сервера: {e}") from e
 
     async def rotate_token(self, token_id: str) -> dict[str, Any] | None:
-        """POST /tokens/{id}/rotate — rotate (revoke + create с теми же параметрами)."""
+        """POST /tokens/{id}/rotate — rotate (revoke + create с теми же параметрами).
+
+        Raises (P2-4): Auth*/TransportError как create_token; ожидаемые 4xx → None.
+        """
         url = f"{self.base_url}/tokens/{token_id}/rotate"
         try:
             response = await self._client.post(url, headers=self._headers(), timeout=10.0)
-        except httpx.HTTPError:
-            return None
+        except httpx.HTTPError as e:
+            raise _transport_from_http_error(e) from e
         if response.status_code != 200:
+            exc = _status_error(response.status_code, response.text)
+            if exc is not None:
+                raise exc
             return None
         try:
             return response.json()
-        except (json.JSONDecodeError, ValueError):
-            return None
+        except (json.JSONDecodeError, ValueError) as e:
+            raise TransportError(f"Некорректный JSON-ответ от сервера: {e}") from e
 
     async def get_scan_progress(self) -> dict[str, Any] | None:
         """GET /quality/scan/progress — снапшот живого прогресса quality scan.
@@ -523,20 +607,26 @@ class MCPClient:
         Returns:
             Словарь прогресса (scan_id, status, phase, imported, total,
             messages[], started_at, updated_at, summary{metrics?}) или None
-            при любой ошибке (404 / endpoint отсутствует / сеть) —
-            никогда не бросает.
+            при 404/ожидаемых 4xx (прежний дефолт — §7.2b, инвариант 404:
+            «no scan has been started» ≠ транспорт).
+        Raises:
+            AuthenticationError / ForbiddenError: 401/403.
+            TransportError: 429/5xx/сеть/таймаут/decode.
         """
         url = f"{self.base_url}/quality/scan/progress"
         try:
             response = await self._client.get(url, headers=self._headers(), timeout=5.0)
-        except httpx.HTTPError:
-            return None
+        except httpx.HTTPError as e:
+            raise _transport_from_http_error(e) from e
         if response.status_code != 200:
-            return None
+            exc = _status_error(response.status_code, response.text)
+            if exc is not None:
+                raise exc
+            return None  # 404 / ожидаемые 4xx → прежний дефолт
         try:
             return response.json()
-        except (json.JSONDecodeError, ValueError):
-            return None
+        except (json.JSONDecodeError, ValueError) as e:
+            raise TransportError(f"Некорректный JSON-ответ от сервера: {e}") from e
 
     # ── Quality tools (Фаза 13.14) ────────────────────────────
 
@@ -815,15 +905,28 @@ class MCPClient:
         return response.json()
 
     async def list_imports(self) -> list[dict[str, Any]]:
-        """GET /imports — список всех импортов в очереди."""
+        """GET /imports — список всех импортов в очереди.
+
+        Raises:
+            AuthenticationError / ForbiddenError: 401/403.
+            TransportError: прочий non-200, сеть/таймаут/decode (§7.2а).
+        """
         url = f"{self.base_url}/imports"
-        response = await self._client.get(url, headers=self._headers(), timeout=10.0)
+        try:
+            response = await self._client.get(url, headers=self._headers(), timeout=10.0)
+        except httpx.HTTPError as e:
+            raise _transport_from_http_error(e) from e
         if response.status_code != 200:
-            return []
+            exc = _status_error(response.status_code, response.text)
+            if exc is not None:
+                raise exc
+            raise TransportError(
+                f"Ошибка HTTP {response.status_code}: {response.text[:200]}"
+            )
         try:
             return response.json()
-        except (json.JSONDecodeError, ValueError):
-            return []
+        except (json.JSONDecodeError, ValueError) as e:
+            raise TransportError(f"Некорректный JSON-ответ от сервера: {e}") from e
 
     async def start_convert(self, pdf_path: str, base_id: str) -> dict[str, Any]:
         """POST /imports/convert — операция «Преобразовать» (PDF→текст).
@@ -870,15 +973,27 @@ class MCPClient:
         return response.json()
 
     async def get_imports_active(self) -> dict[str, Any]:
-        """GET /imports/active — текущий running-импорт (F5-recovery)."""
+        """GET /imports/active — текущий running-импорт (F5-recovery).
+
+        Вызовов в кодовой базе нет; контракт выровнен по §7.2b для
+        совместимости (OQ-4④): 401/403 → Auth*, транспорт → TransportError.
+        """
         url = f"{self.base_url}/imports/active"
-        response = await self._client.get(url, headers=self._headers(), timeout=10.0)
+        try:
+            response = await self._client.get(url, headers=self._headers(), timeout=10.0)
+        except httpx.HTTPError as e:
+            raise _transport_from_http_error(e) from e
         if response.status_code != 200:
-            return {"active": False}
+            exc = _status_error(response.status_code, response.text)
+            if exc is not None:
+                raise exc
+            raise TransportError(
+                f"Ошибка HTTP {response.status_code}: {response.text[:200]}"
+            )
         try:
             return response.json()
-        except (json.JSONDecodeError, ValueError):
-            return {"active": False}
+        except (json.JSONDecodeError, ValueError) as e:
+            raise TransportError(f"Некорректный JSON-ответ от сервера: {e}") from e
 
     async def cancel_import(self, import_id: str) -> dict[str, Any]:
         """POST /imports/{import_id}/cancel — отменить импорт."""

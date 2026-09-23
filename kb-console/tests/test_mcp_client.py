@@ -567,3 +567,242 @@ async def test_run_quality_scan_calls_tool(client):
     result = await client.run_quality_scan()
     assert result.get("ok") is True
     assert result.get("tool") == "run_quality_scan"
+
+
+# ── Tests: статус-матрица §7.2b (code-2026-09-22-007) ────────
+
+
+from kb_console.core.auth_state import (
+    AuthenticationError,
+    AuthError,
+    ForbiddenError,
+    TransportError,
+)
+
+
+def _status_transport(status: int, body: dict | None = None) -> httpx.MockTransport:
+    """Транспорт, отдающий заданный HTTP-статус на любой GET/POST."""
+    return httpx.MockTransport(lambda request: httpx.Response(status, json=body or {}))
+
+
+def _status_client(status: int, body: dict | None = None) -> MCPClient:
+    return MCPClient(
+        base_url="http://test", api_key="k", client=httpx.AsyncClient(transport=_status_transport(status, body))
+    )
+
+
+@pytest.mark.asyncio
+async def test_call_401_raises_authentication_error():
+    async with _status_client(401) as c:
+        with pytest.raises(AuthenticationError, match="неверный API-ключ"):
+            await c.initialize()
+
+
+@pytest.mark.asyncio
+async def test_call_403_raises_forbidden_error():
+    async with _status_client(403) as c:
+        with pytest.raises(ForbiddenError, match="недостаточно прав"):
+            await c.initialize()
+
+
+@pytest.mark.asyncio
+async def test_call_429_raises_transport_error():
+    async with _status_client(429) as c:
+        with pytest.raises(TransportError, match="rate limit"):
+            await c.initialize()
+
+
+@pytest.mark.asyncio
+async def test_call_503_text_bit_to_bit():
+    """Текст 503 бит-в-бит (OQ-2: тесты _call-текстов)."""
+    async with _status_client(503) as c:
+        with pytest.raises(RuntimeError, match="Сервер временно недоступен: degraded \\(503\\)"):
+            await c.initialize()
+
+
+@pytest.mark.asyncio
+async def test_call_500_raises_transport_error():
+    async with _status_client(500) as c:
+        with pytest.raises(TransportError, match="Ошибка HTTP 500"):
+            await c.initialize()
+
+
+@pytest.mark.asyncio
+async def test_typed_errors_are_runtime_errors():
+    """Back-compat OQ-2: иерархия — наследники RuntimeError."""
+    assert issubclass(AuthenticationError, RuntimeError)
+    assert issubclass(ForbiddenError, RuntimeError)
+    assert issubclass(TransportError, RuntimeError)
+    assert issubclass(AuthenticationError, AuthError)
+    assert not issubclass(TransportError, AuthError)
+
+
+# get_data_version — спец-строка §7.2b (легитимного 404 нет)
+
+
+@pytest.mark.asyncio
+async def test_get_data_version_401_raises_authentication():
+    async with _status_client(401) as c:
+        with pytest.raises(AuthenticationError):
+            await c.get_data_version()
+
+
+@pytest.mark.asyncio
+async def test_get_data_version_403_raises_forbidden():
+    async with _status_client(403) as c:
+        with pytest.raises(ForbiddenError):
+            await c.get_data_version()
+
+
+@pytest.mark.asyncio
+async def test_get_data_version_404_raises_transport():
+    """Спец-строка: non-200 кроме 401/403 → TransportError (не дефолт 0)."""
+    async with _status_client(404) as c:
+        with pytest.raises(TransportError, match="Ошибка HTTP 404"):
+            await c.get_data_version()
+
+
+@pytest.mark.asyncio
+async def test_get_data_version_503_raises_transport():
+    async with _status_client(503) as c:
+        with pytest.raises(TransportError):
+            await c.get_data_version()
+
+
+@pytest.mark.asyncio
+async def test_get_data_version_network_error_raises_transport():
+    transport = httpx.MockTransport(lambda request: (_ for _ in ()).throw(httpx.ConnectError("refused")))
+    async with MCPClient(base_url="http://test", api_key="k", client=httpx.AsyncClient(transport=transport)) as c:
+        with pytest.raises(TransportError, match="Сервер недоступен"):
+            await c.get_data_version()
+
+
+@pytest.mark.asyncio
+async def test_get_data_version_ok():
+    async with _status_client(200, {"data_version": 12}) as c:
+        assert await c.get_data_version() == 12
+
+
+# GET-хелперы прогресса: 401/403/транспорт → typed; 404 → прежний дефолт
+
+
+@pytest.mark.asyncio
+async def test_get_progress_401_raises_authentication():
+    async with _status_client(401) as c:
+        with pytest.raises(AuthenticationError):
+            await c.get_progress("id")
+
+
+@pytest.mark.asyncio
+async def test_get_progress_403_raises_forbidden():
+    async with _status_client(403) as c:
+        with pytest.raises(ForbiddenError):
+            await c.get_progress("id")
+
+
+@pytest.mark.asyncio
+async def test_get_progress_503_raises_transport():
+    async with _status_client(503) as c:
+        with pytest.raises(TransportError):
+            await c.get_progress("id")
+
+
+@pytest.mark.asyncio
+async def test_get_import_log_401_raises_authentication():
+    async with _status_client(401) as c:
+        with pytest.raises(AuthenticationError):
+            await c.get_import_log("id")
+
+
+@pytest.mark.asyncio
+async def test_get_scan_progress_401_raises_authentication():
+    async with _status_client(401) as c:
+        with pytest.raises(AuthenticationError):
+            await c.get_scan_progress()
+
+
+@pytest.mark.asyncio
+async def test_get_scan_progress_timeout_raises_transport():
+    transport = httpx.MockTransport(lambda request: (_ for _ in ()).throw(httpx.ReadTimeout("slow")))
+    async with MCPClient(base_url="http://test", api_key="k", client=httpx.AsyncClient(transport=transport)) as c:
+        with pytest.raises(TransportError, match="Таймаут"):
+            await c.get_scan_progress()
+
+
+# list_* хелперы: 401/403/транспорт → typed
+
+
+@pytest.mark.asyncio
+async def test_list_tokens_401_raises_authentication():
+    async with _status_client(401) as c:
+        with pytest.raises(AuthenticationError):
+            await c.list_tokens()
+
+
+@pytest.mark.asyncio
+async def test_list_tokens_503_raises_transport():
+    async with _status_client(503) as c:
+        with pytest.raises(TransportError):
+            await c.list_tokens()
+
+
+@pytest.mark.asyncio
+async def test_list_imports_401_raises_authentication():
+    async with _status_client(401) as c:
+        with pytest.raises(AuthenticationError):
+            await c.list_imports()
+
+
+@pytest.mark.asyncio
+async def test_list_imports_connect_error_raises_transport():
+    transport = httpx.MockTransport(lambda request: (_ for _ in ()).throw(httpx.ConnectError("no route")))
+    async with MCPClient(base_url="http://test", api_key="k", client=httpx.AsyncClient(transport=transport)) as c:
+        with pytest.raises(TransportError, match="Сервер недоступен"):
+            await c.list_imports()
+
+
+@pytest.mark.asyncio
+async def test_get_imports_active_401_raises_authentication():
+    """OQ-4④: вызовов нет, контракт выровнен (401 → Auth*)."""
+    async with _status_client(401) as c:
+        with pytest.raises(AuthenticationError):
+            await c.get_imports_active()
+
+
+# one-shot мутации токенов (P2-4): Auth* / TransportError / ожидаемые 4xx
+
+
+@pytest.mark.asyncio
+async def test_create_token_401_raises_authentication():
+    async with _status_client(401) as c:
+        with pytest.raises(AuthenticationError):
+            await c.create_token(level="read")
+
+
+@pytest.mark.asyncio
+async def test_create_token_timeout_raises_transport():
+    transport = httpx.MockTransport(lambda request: (_ for _ in ()).throw(httpx.ConnectError("refused")))
+    async with MCPClient(base_url="http://test", api_key="k", client=httpx.AsyncClient(transport=transport)) as c:
+        with pytest.raises(TransportError):
+            await c.create_token(level="read")
+
+
+@pytest.mark.asyncio
+async def test_revoke_token_403_raises_forbidden():
+    async with _status_client(403) as c:
+        with pytest.raises(ForbiddenError):
+            await c.revoke_token("tok-1")
+
+
+@pytest.mark.asyncio
+async def test_rotate_token_503_raises_transport():
+    async with _status_client(503) as c:
+        with pytest.raises(TransportError):
+            await c.rotate_token("tok-1")
+
+
+@pytest.mark.asyncio
+async def test_patch_token_400_returns_none_default():
+    """Ожидаемые 4xx (валидация) → прежний дефолт None (§7.2b)."""
+    async with _status_client(400) as c:
+        assert await c.patch_token("tok-1", note="x") is None

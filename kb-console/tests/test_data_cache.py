@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from kb_console.core.data_cache import DataCache, cache
 
 
@@ -118,3 +120,62 @@ class TestDataCache:
         """Module-level cache это синглтон DataCache."""
         assert isinstance(cache, DataCache)
         assert cache._max_size == 100
+
+
+# ── P1-2: контракт check_version (code-2026-09-22-007, §7.3) ──
+
+
+from kb_console.core.auth_state import AuthenticationError, TransportError
+
+
+class TestCheckVersionContract:
+    async def test_transport_error_swallowed_cache_preserved(self):
+        """TransportError → return; known_version/store НЕ меняются (P1-2)."""
+        cache = DataCache(max_size=10)
+        cache._store["k"] = ("v", 0.0)
+        cache._known_version = 5
+
+        class TransportClient:
+            async def get_data_version(self):
+                raise TransportError("Сервер недоступен")
+
+        await cache.check_version(TransportClient())
+        assert cache.known_version == 5
+        assert "k" in cache._store
+
+    async def test_transport_error_no_false_invalidation_on_recovery(self):
+        """Восстановление без ложной инвалидации: транспорт-шторм, затем тот же
+        known_version → кеш НЕ очищается (P1-2)."""
+        cache = DataCache(max_size=10)
+        cache._store["k"] = ("v", 0.0)
+        cache._known_version = 7
+
+        class FlakyClient:
+            def __init__(self):
+                self.calls = 0
+
+            async def get_data_version(self):
+                self.calls += 1
+                if self.calls <= 3:
+                    raise TransportError("503")
+                return 7  # версия не менялась
+
+        client = FlakyClient()
+        for _ in range(3):
+            await cache.check_version(client)
+        await cache.check_version(client)  # восстановление
+        assert cache.known_version == 7
+        assert "k" in cache._store  # ложной инвалидации нет
+
+    async def test_auth_error_propagates(self):
+        """AuthError → наружу (странице показать баннер, §7.3)."""
+        cache = DataCache(max_size=10)
+        cache._store["k"] = ("v", 0.0)
+
+        class DeadKeyClient:
+            async def get_data_version(self):
+                raise AuthenticationError("401")
+
+        with pytest.raises(AuthenticationError):
+            await cache.check_version(DeadKeyClient())
+        assert "k" in cache._store  # кеш не пострадал

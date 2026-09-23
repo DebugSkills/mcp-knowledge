@@ -15,6 +15,8 @@ from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
 
+from .auth_state import AuthError, TransportError
+
 
 class DataCache:
     """TTL + LRU in-memory cache with server-side version-based invalidation."""
@@ -62,11 +64,24 @@ class DataCache:
 
         Args:
             client: MCPClient с методом get_data_version().
+
+        Контракт P1-2 (code-2026-09-22-007, §7.3):
+            - TransportError → поглощается ВНУТРИ (return): кеш остаётся,
+              known_version/store НЕ меняются, восстановления без ложной
+              инвалидации (первый успешный version-check после сбоя сравнивает
+              с прежним known_version);
+            - AuthError (401/403) → наружу (raise): странице показать
+              auth-баннер и остановить автообновление;
+            - прочие исключения → прежнее поведение (return).
         """
         try:
             server_version = await client.get_data_version()
+        except TransportError:
+            return  # транспорт — кеш остаётся (P1-2)
+        except AuthError:
+            raise  # отказ ключа — наружу странице (§7.3)
         except Exception:  # noqa: BLE001
-            return  # сервер недоступен — кеш остаётся
+            return  # сервер недоступен — кеш остаётся (прежнее поведение)
 
         if self._known_version is None:
             self._known_version = server_version
