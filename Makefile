@@ -202,7 +202,7 @@ preflight-full:  ## Полный: default + e2e и контейнерные test
 	bash scripts/preflight.sh --full
 
 hooks-install:  ## Установить .git/hooks/pre-push → preflight (escape: --no-verify)
-	@printf '#!/usr/bin/env bash\nexec "$$(git rev-parse --show-toplevel)/scripts/preflight.sh" "$$@"\n' \
+	@printf '#!/usr/bin/env bash\nexec "$$(git rev-parse --show-toplevel)/scripts/preflight.sh"\n' \
 		> .git/hooks/pre-push && chmod +x .git/hooks/pre-push
 	@echo "✔ pre-push hook установлен (preflight). Обход при необходимости: git push --no-verify"
 
