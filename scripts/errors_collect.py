@@ -767,6 +767,22 @@ def update_aggregates(sink: Path, events, cfg: dict,
             a["actors"] = sorted(set(a.get("actors", [])) | actors)[:50]
             a["sources"] = sorted(set(a.get("sources", [])) | {e["source"] for e in evs})
             a["last_example"] = {"ts": evs[-1]["ts"], "message": evs[-1]["message"][:300]}
+            # 009 (§7.3-2): merge endpoints с None-фильтром — события без
+            # ACCESS_RE-матча ([MCP]/host/health/[GUARD]/[REQ] kb-console) не
+            # добавляют None-ключ; cap 20 + __others__ (прецедент actors[:50],
+            # дрейф top-20 при сжатии — осознанный компромисс §7.8-8)
+            eps = a.get("endpoints") or {}
+            for e in evs:
+                ep = e.get("endpoint")
+                if ep:
+                    eps[ep] = eps.get(ep, 0) + 1
+            if len(eps) > ENDPOINTS_KEEP:
+                ranked = sorted(eps.items(), key=lambda kv: (-kv[1], kv[0]))
+                eps = dict(ranked[:ENDPOINTS_KEEP])
+                eps["__others__"] = eps.get("__others__", 0) + sum(
+                    n for _, n in ranked[ENDPOINTS_KEEP:])
+            if eps:
+                a["endpoints"] = eps
         # инкременты: события + suppressed-дельта — ПОЛНАЯ правда о частоте (P2-new-1)
         a["daily"][day] = a["daily"].get(day, 0) + len(evs) + delta
         for d in [d for d in a["daily"] if d < cutoff]:
