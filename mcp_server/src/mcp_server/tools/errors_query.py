@@ -212,6 +212,9 @@ def _render_aggregate(sig: str, agg: dict[str, Any]) -> dict[str, Any]:
 
     008 (§7.5): +suppressed_total / suppressed_7d (вычисляемое) / burst /
     burst_ts — аддитивно через .get: старые агрегаты без полей не ломают выдачу (R6).
+
+    009 (§7.3-3): +endpoints — топ-эндпоинты сигнатуры (count desc, key asc),
+    аддитивно через .get: legacy-агрегат без поля → {} (R6).
     """
     return {
         "signature": sig,
@@ -231,6 +234,8 @@ def _render_aggregate(sig: str, agg: dict[str, Any]) -> dict[str, Any]:
         "suppressed_7d": _suppressed_7d(agg),
         "burst": bool(agg.get("burst")),
         "burst_ts": agg.get("burst_ts"),
+        "endpoints": dict(sorted((agg.get("endpoints") or {}).items(),
+                                 key=lambda kv: (-kv[1], kv[0]))[:20]),
     }
 
 

@@ -51,6 +51,12 @@ def load_aggregates(sink):
 
 # ── --view: read-only просмотр (E7) ──
 
+def _ep_top(a, top=3):
+    """009 (§7.3-4): топ-endpoints сигнатуры — [(ep, n)], count desc, key asc."""
+    return sorted((a.get("endpoints") or {}).items(),
+                  key=lambda kv: (-kv[1], kv[0]))[:top]
+
+
 def cmd_view(sink, top):
     aggs = load_aggregates(sink)
     if not aggs:
@@ -77,7 +83,15 @@ def cmd_view(sink, top):
               f"total={a.get('count_total', 0):<6} sup={a.get('suppressed_total', 0):<5} "
               f"actors={actors:<20} "
               f"last={a.get('last_seen', '?')[:16]}  {ex}")
-        print(f"        sig: {sig[:150]}")
+        # 009: суффикс топ-эндпоинтов; (+N) = сумма counts вне топ-3 (вкл. __others__)
+        eps = _ep_top(a)
+        ep_part = ""
+        if eps:
+            rest = sum((a.get("endpoints") or {}).values()) - sum(n for _, n in eps)
+            ep_part = " ep=" + ",".join(f"{k}×{n}" for k, n in eps)
+            if rest > 0:
+                ep_part += f"(+{rest})"
+        print(f"        sig: {sig[:150]}{ep_part}")
     return 0
 
 
@@ -264,13 +278,19 @@ def cmd_weekly(sink, send_tg):
                          and a.get("priority") in ("P0", "P1")],
                         key=lambda kv: kv[1]["fixed_at"], reverse=True)
 
-    def fmt_list(items, limit=10, sup=False):
+    def fmt_list(items, limit=10, sup=False, ep=False):
         lines = []
         for sig, a in items[:limit]:
             ex = (a.get("last_example") or {}).get("message", "")[:90].replace("\n", " ")
             sup_part = f" sup={a.get('suppressed_total', 0)}" if sup else ""
+            # 009 (§7.3-4): суффикс топ-3 эндпоинтов — только если endpoints непуст
+            ep_part = ""
+            if ep:
+                top_eps = _ep_top(a)
+                if top_eps:
+                    ep_part = " · ep: " + ", ".join(f"{k}×{v}" for k, v in top_eps)
             lines.append(f"- [{a.get('priority')}] 7d={a.get('count_7d', 0)}{sup_part} "
-                         f"actors={','.join(a.get('actors', [])[:2]) or '-'} — {ex}")
+                         f"actors={','.join(a.get('actors', [])[:2]) or '-'} — {ex}{ep_part}")
         return lines or ["- (пусто)"]
 
     L = []
@@ -304,7 +324,7 @@ def cmd_weekly(sink, send_tg):
     L.extend(fmt_list(p12))
     L.append("")
     L.append("## 4. P3-baseline (шум)")
-    L.extend(fmt_list(p3, 5, sup=True))
+    L.extend(fmt_list(p3, 5, sup=True, ep=True))
     L.append(f"- noise_ratio (P3-строк/всех за 7d): {raw['noise_ratio']}")
     # 008 (§7.5/P1-1): burst-подсекция — фильтр по burst_ts в окне 7d (не по
     # sticky-флагу — декей 7d исключает неограниченный рост), свежие первыми

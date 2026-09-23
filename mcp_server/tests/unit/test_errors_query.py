@@ -145,7 +145,9 @@ class TestViews:
             "count_prev_7d", "count_total", "trend", "actors_count",
             "sources", "first_seen", "last_seen", "fixed_at",
             # 008 storm-guard: аддитивные поля видимости suppressed/burst (§7.5)
-            "suppressed_total", "suppressed_7d", "burst", "burst_ts"}
+            "suppressed_total", "suppressed_7d", "burst", "burst_ts",
+            # 009 path-endpoint: топ-эндпоинты сигнатуры (§7.3-3, аддитивно)
+            "endpoints"}
 
     async def test_trend_semantics(self, sink):
         r = await _call(signature="docker_logs|MCP|timeout after <n>")
