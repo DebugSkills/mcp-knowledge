@@ -62,6 +62,9 @@ FAMILY_CASES = [
     ("token-colon", "token: abc123xyz"),
     ("api-key", "api_key=sk-12345"),
     ("secret-eq", "secret=s3cr3tvalue"),
+    # 009 (AC4): query-токен в path access-строки — обе стороны без секрета;
+    # endpoint-нормализация отбрасывает query ДО сохранения (extract_endpoint)
+    ("token-in-query", 'GET /imports?token=zecret99 HTTP/1.1" 401'),
 ]
 
 

@@ -476,5 +476,108 @@ class TestDockerEventsScope:
         assert len(out) == 1 and "mcp-knowledge-server" in out[0]["message"]
 
 
+# ── extract_endpoint (009 §7.1: route-шаблон из замаскированной access-строки) ──
+
+UV401 = 'INFO:     127.0.0.1:43002 - "GET {} HTTP/1.1" 401 Unauthorized'
+
+
+class TestExtractEndpoint:
+    def test_plain_path(self):
+        assert ec.extract_endpoint(UV401.format("/imports/active")) == "/imports/active"
+
+    def test_query_dropped(self):
+        msg = UV401.format("/imports?limit=10&offset=2")
+        assert ec.extract_endpoint(msg) == "/imports"
+
+    def test_uuid_and_digits_to_id(self):
+        msg = ('INFO:     127.0.0.1:43002 - "GET /api/v1/books/'
+               '550e8400-e29b-41d4-a716-446655440000/entries/42 HTTP/1.1" 404 Not Found')
+        assert ec.extract_endpoint(msg) == "/api/v1/books/<id>/entries/<id>"
+
+    def test_hex16_segment_to_id(self):
+        msg = ('INFO:     127.0.0.1:43002 - "GET /files/0123456789abcdef0123 '
+               'HTTP/1.1" 404 Not Found')
+        assert ec.extract_endpoint(msg) == "/files/<id>"
+
+    def test_abs_url_scheme_host_port_dropped(self):
+        msg = 'INFO:     127.0.0.1:43002 - "GET http://kb.local:8420/x?y=1 HTTP/1.1" 400 Bad Request'
+        assert ec.extract_endpoint(msg) == "/x"
+
+    def test_root(self):
+        assert ec.extract_endpoint('INFO:     127.0.0.1:1 - "GET / HTTP/1.1" 401 Unauthorized') == "/"
+
+    def test_non_access_line_none(self):
+        assert ec.extract_endpoint("[MCP] tool=list_books ok 120 ms") is None
+        assert ec.extract_endpoint("[CRON] job=backup exit=0 dur=1.2s") is None
+
+    def test_kb_console_req_none(self):
+        # зона покрытия §7.1 (P1-2): [REQ]-строки kb-console (app.py:33 —
+        # метод+путь БЕЗ статуса/HTTP-версии/кавычек) ACCESS_RE не матчатся
+        # ⇒ endpoint=None ВСЕГДА (расширение ACCESS_RE — вне трассы 009)
+        assert ec.extract_endpoint("[REQ] GET /") is None
+        assert ec.extract_endpoint("[REQ] POST /api/v1/kb/upload") is None
+
+    def test_extracted_from_masked_message_no_secret_no_query(self):
+        # AC4 (§7.4): порядок mask→trunc→extract — секрет/query не попадают
+        raw = ec.mask_secrets('"GET /a?token=supersecret1 HTTP/1.1" 401')
+        ep = ec.extract_endpoint(raw)
+        assert ep == "/a"
+        assert "?" not in ep and "<secret>" not in ep
+
+    def test_truncated_200(self):
+        msg = UV401.format("/" + "z" * 300)
+        assert len(ec.extract_endpoint(msg)) == 200
+
+    def test_explicit_kw_only_endpoint(self):
+        ev = ec.make_event("2026-09-23T10:00:00Z", "docker_logs", UV401.format("/x"),
+                           endpoint="/custom")
+        assert ev["endpoint"] == "/custom"
+
+
+# ── AC3 (009 §7.4): E2 байт-в-байт на uvicorn-корпусе — сигнатуры заморожены
+# ДО патча (литералы, не чтение живого dev-sink — §6 iter2 критика); корпус:
+# реальные форматы dev-sink + синтетика (uuid/hex/числа/query/абс-URL/корень) ──
+
+AC3_CORPUS = [
+    ('INFO:     127.0.0.1:43002 - "GET /imports HTTP/1.1" 401 Unauthorized',
+     'docker_logs|401|INFO: <n>.<n>.<n>.<n>:<n> - "GET <path> HTTP/<n>.<n>" <n> Unauthorized'),
+    ('INFO:     127.0.0.1:43002 - "GET /imports/active HTTP/1.1" 401 Unauthorized',
+     'docker_logs|401|INFO: <n>.<n>.<n>.<n>:<n> - "GET <path> HTTP/<n>.<n>" <n> Unauthorized'),
+    ('INFO:     127.0.0.1:43002 - "GET /quality/scan/progress HTTP/1.1" 401 Unauthorized',
+     'docker_logs|401|INFO: <n>.<n>.<n>.<n>:<n> - "GET <path> HTTP/<n>.<n>" <n> Unauthorized'),
+    ('INFO:     127.0.0.1:43002 - "GET /data-version HTTP/1.1" 401 Unauthorized',
+     'docker_logs|401|INFO: <n>.<n>.<n>.<n>:<n> - "GET <path> HTTP/<n>.<n>" <n> Unauthorized'),
+    ('INFO:     127.0.0.1:43002 - "GET /imports?limit=10&offset=2 HTTP/1.1" 401 Unauthorized',
+     'docker_logs|401|INFO: <n>.<n>.<n>.<n>:<n> - "GET <path>?limit=<n>&offset=<n> '
+     'HTTP/<n>.<n>" <n> Unauthorized'),
+    ('INFO:     172.17.0.5:33410 - "POST /api/v1/books/'
+     '550e8400-e29b-41d4-a716-446655440000/entries HTTP/1.1" 503 Service Unavailable',
+     'docker_logs|503|INFO: <n>.<n>.<n>.<n>:<n> - "POST <path>/<uuid><path> '
+     'HTTP/<n>.<n>" <n> Service Unavailable'),
+    ('INFO:     127.0.0.1:43002 - "GET /files/0123456789abcdef0123 HTTP/1.1" 404 Not Found',
+     'docker_logs|404|INFO: <n>.<n>.<n>.<n>:<n> - "GET <path>/<hex> HTTP/<n>.<n>" <n> Not Found'),
+    ('INFO:     127.0.0.1:43002 - "GET http://kb.local:8420/x?y=1 HTTP/1.1" 400 Bad Request',
+     'docker_logs|400|INFO: <n>.<n>.<n>.<n>:<n> - "GET http://kb.local:<n>/x?y=<n> '
+     'HTTP/<n>.<n>" <n> Bad Request'),
+    ('INFO:     127.0.0.1:1 - "GET / HTTP/1.1" 401 Unauthorized',
+     'docker_logs|401|INFO: <n>.<n>.<n>.<n>:<n> - "GET / HTTP/<n>.<n>" <n> Unauthorized'),
+    ('INFO:     127.0.0.1:43002 - "DELETE /api/v1/tokens/deadbeefdeadbeefdeadbeefdeadbeef '
+     'HTTP/1.1" 404 Not Found',
+     'docker_logs|404|INFO: <n>.<n>.<n>.<n>:<n> - "DELETE <path>/<secret> '
+     'HTTP/<n>.<n>" <n> Not Found'),
+]
+
+
+class TestE2FrozenOnAccessCorpus:
+    @pytest.mark.parametrize("line,expected", AC3_CORPUS)
+    def test_signature_frozen_byte_in_byte(self, line, expected):
+        m = ec.ACCESS_RE.search(line)
+        status = int(m.group(3)) if m else None
+        ev = ec.make_event("2026-09-23T10:00:00Z", "docker_logs", line,
+                           level="INFO", error_code=str(status) if status else None,
+                           status=status)
+        assert ev["signature"] == expected
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

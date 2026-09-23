@@ -149,6 +149,11 @@ class TestViews:
             # 009 path-endpoint: топ-эндпоинты сигнатуры (§7.3-3, аддитивно)
             "endpoints"}
 
+    async def test_endpoints_legacy_fixture_renders_empty(self, sink):
+        # 009: фикстура AGGS — legacy-агрегаты без «endpoints» → {} (R6 .get)
+        r = await _call()
+        assert all(a["endpoints"] == {} for a in r["aggregates"])
+
     async def test_trend_semantics(self, sink):
         r = await _call(signature="docker_logs|MCP|timeout after <n>")
         assert r["aggregates"][0]["trend"] == "up"       # 12 > 3
