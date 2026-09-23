@@ -130,13 +130,13 @@ AC6_CORPUS = [
     (UV401.format("/quality/scan/progress"), 401),
     (UV401.format("/data-version"), 401),
     (UV401.format("/imports?limit=10&offset=2"), 401),
-    ('INFO:     172.17.0.5:33410 - "POST /api/v1/books/'
-     '550e8400-e29b-41d4-a716-446655440000/entries HTTP/1.1" 503 Service Unavailable', 503),
+    (('INFO:     172.17.0.5:33410 - "POST /api/v1/books/'
+      '550e8400-e29b-41d4-a716-446655440000/entries HTTP/1.1" 503 Service Unavailable'), 503),
     ('INFO:     127.0.0.1:43002 - "GET /files/0123456789abcdef0123 HTTP/1.1" 404 Not Found', 404),
     ('INFO:     127.0.0.1:43002 - "GET http://kb.local:8420/x?y=1 HTTP/1.1" 400 Bad Request', 400),
     ('INFO:     127.0.0.1:1 - "GET / HTTP/1.1" 401 Unauthorized', 401),
-    ('INFO:     127.0.0.1:43002 - "DELETE /api/v1/tokens/'
-     'deadbeefdeadbeefdeadbeefdeadbeef HTTP/1.1" 404 Not Found', 404),
+    (('INFO:     127.0.0.1:43002 - "DELETE /api/v1/tokens/'
+      'deadbeefdeadbeefdeadbeefdeadbeef HTTP/1.1" 404 Not Found'), 404),
 ]
 
 # заморожено ДО патчи (прогон кода 008-состояния): приоритет/класс/счётчики
