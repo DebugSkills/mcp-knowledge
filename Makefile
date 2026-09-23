@@ -135,7 +135,8 @@ install-cpu:  ## Альтернатива: CPU-only torch (air-gap / dev, без
 
 .PHONY: prod-update prod-update-check prod-logs prod-events prod-health prod-metrics prod-stats \
         prod-backup prod-backup-verify prod-restore \
-        prod-errors prod-errors-report prod-errors-prune prod-errors-sources test-errors
+        prod-errors prod-errors-report prod-errors-prune prod-errors-sources test-errors \
+        errors-guard-add errors-guard-remove errors-guard-list
 
 prod-update:  ## Прод: идемпотентный апдейт кода (гейты preflight + migrations pause)
 	$(MAKE) -C ansible update
@@ -183,8 +184,23 @@ prod-errors-prune:  ## Прод: ретенция sink (dry-run; реально�
 prod-errors-sources:  ## Прод: E5-проверка реестра охвата источников ошибок
 	$(MAKE) -C ansible errors-sources
 
-test-errors:  ## Error→Rule: юнит-тесты коллектора + E5-реестр (P2-9)
-	.venv/bin/python -m pytest tests/test_error_sources.py tests/test_errors_lib.py -v
+test-errors:  ## Error→Rule: юнит-тесты коллектора + гварда + E5-реестр (P2-9, 008)
+	.venv/bin/python -m pytest tests/test_error_sources.py tests/test_errors_lib.py tests/test_errors_guard.py -v
+
+# ─── Storm-guard (code-2026-09-23-008): suppression-лист known-noise ───
+# Файл: $DATA_ROOT/logs/errors/suppression.json (в sink — вне клона, НЕ
+# рендерится ansible, переживает деплои). Ключ — ТОЛЬКО точная сигнатура
+# (диапазоны кодов/regex запрещены архитектурно). Прод: запуск на хосте aikb
+# с DATA_ROOT из prod .env. Каждый add/remove пишет audit.jsonl.
+
+errors-guard-add:  ## Гвард: заглушить ТОЧНУЮ сигнатуру (SIG=… REASON=… [UNTIL=YYYY-MM-DD])
+	.venv/bin/python scripts/errors_guard.py add "$(SIG)" --reason "$(REASON)" $(if $(UNTIL),--until $(UNTIL))
+
+errors-guard-remove:  ## Гвард: снять глушение (SIG=…)
+	.venv/bin/python scripts/errors_guard.py remove "$(SIG)"
+
+errors-guard-list:  ## Гвард: показать suppression-лист (+истёкшие)
+	.venv/bin/python scripts/errors_guard.py list
 
 # ═══════════════════════════════════════════════════════════════
 # Preflight (code-2026-09-22-004) — pre-push гейт вместо CI/CD

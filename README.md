@@ -310,6 +310,19 @@ make hooks-uninstall    # снять хук
 
 Итог: `N passed / M failed / K skipped`, exit-код = число упавших гейтов (0 = зелёно). Флаги: `--quick` · `--full` · `--no-smoke` · `--fail-fast`.
 
+### 🛰️ Error→Rule: шторм-гард (code-2026-09-23-008)
+
+Write-side защита sink от штормов ошибок: cap **5 событий/60 с на сигнатуру**
++ burst-детектор (≥50/цикл или ×10 к среднему за час → маркер `[GUARD]` P1,
+эскалация P2/P3→P1 на 7d, без немедленных алертов — M7) + suppression-лист
+known-noise. Подавленное НЕ теряется: `suppressed_count/sampled=true`
+переносится в следующее разрешённое событие, `suppressed_total` растёт в
+агрегате немедленно; `count_total` = полный поток. Иммунитет: 4xx-с-актором
+(user-impact) и traceback автоматикой не глушатся. Управление suppression-листом
+(точная сигнатура + reason + audit.jsonl): `make errors-guard-add SIG=…
+REASON=… [UNTIL=YYYY-MM-DD]` · `errors-guard-remove SIG=…` · `errors-guard-list`.
+Подробности: `docs/operations/error-sources.md` § «Шторм-гард write-side».
+
 ## ⚠️ Known Limitations
 
 - **Factual correctness:** не проверяется (требует LLM)

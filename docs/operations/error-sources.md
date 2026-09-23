@@ -115,6 +115,37 @@
 | marker:ERRORS_QUERY | mcp-server, 1 сайт (errors_query, audit обращений) | sink: docker logs mcp-knowledge-server → errors_collect.py (source=docker_logs) | covered |
 | class:errors_query_audit | [ERRORS_QUERY]-строки тула | sink: classify_routine → expected=True (P3-baseline) | covered |
 
+## Шторм-гард write-side (code-2026-09-23-008, спека §7 .boardData.md)
+
+Гвард между сбором и записью в raw (`errors_collect.py:main` → `errors_guard.apply_write_guard`).
+Порядок «сначала фикс источника, потом гвард» (§11.3 канона) — источник 401-класса
+устранён трассой 007; гвард закрывает оставшиеся пробелы §13.3 (а/б/в).
+
+**Лимиты (config `guard.*`, kill-switch `guard.enabled=false`):**
+
+| Механизм | Лимит | Что делает |
+|---|---|---|
+| cap/sampling | 5 событий/60 с на сигнатуру (минутные ведра ts-based) | сверх — НЕ пишется в raw: `suppressed_pending` переносится в следующее разрешённое событие (`suppressed_count`+`sampled=true`), `suppressed_total/suppressed_daily` — в агрегат немедленно; `count_total/daily` = полный поток |
+| burst-детектор | ≥50/цикл(5 мин) ИЛИ ×10 к среднему за 12 циклов (~1 ч) | маркер `[GUARD]` (P1, `priority_hint=burst`) + жертве `burst/burst_ts/burst_count_5m`; эскалация P2/P3→P1 sticky в окне 7d (декей), re-arm после спада с кулдауном 24 цикла; БЕЗ немедленных алертов (M7 weekly-only) |
+| suppression-лист | ключ = ТОЛЬКО точная сигнатура | файл `sink/suppression.json` (НЕ рендерится ansible); `until` опционален |
+
+**Иммунитет-матрица (никогда не глушится автоматикой):** 4xx-с-актором
+(user-impact), traceback (не глушится и листом — абсолютно), host/health/
+docker_events (свой дедуп), сам маркер `[GUARD]`. 4xx-с-актором глушится
+ТОЛЬКО явной записью оператора с reason+audit. Диапазоны кодов/regex/
+подстроки — запрещены архитектурно (ключ = exact match).
+
+**Процедура suppression (оператор):** `make errors-guard-add SIG='<точная
+сигнатура>' REASON='зачем' [UNTIL=YYYY-MM-DD]` → `suppression.json` + запись в
+`sink/audit.jsonl` (кто/когда/зачем). Снять: `errors-guard-remove SIG=…`;
+посмотреть: `errors-guard-list`. Верификация фикса при активном гварде
+(§7.5): «источник устранён» = `suppressed_total>0` И `count_7d==0` И
+`suppressed_7d==0` (глушилась и замолчала) — видно в weekly-строке suppressed.
+
+**Видимость:** `errors_query` — поля `suppressed_total/suppressed_7d/burst/
+burst_ts` + `suppressed_count/sampled` в примерах; weekly — suppressed-строка
+(топ-3) и подсекция «Burst-инциденты за 7d»; view — колонка `sup=`.
+
 ---
 Обслуживание: новый источник → `make test-errors` КРАСНЫЙ → добавить строку
 (механизм сбора или честный gap с причиной) → ЗЕЛЁНЫЙ. Live-проверка на проде:
