@@ -146,6 +146,28 @@ docker_events (свой дедуп), сам маркер `[GUARD]`. 4xx-с-ак�
 burst_ts` + `suppressed_count/sampled` в примерах; weekly — suppressed-строка
 (топ-3) и подсекция «Burst-инциденты за 7d»; view — колонка `sup=`.
 
+## Поле endpoint (code-2026-09-23-009, спека §7 .boardData.md)
+
+Диагностическое поле `endpoint` (route-шаблон request-target) в событии и
+`endpoints={ep: count}` (cap 20 + `__others__`) в агрегате сигнатуры — БЕЗ
+смены формулы сигнатуры E2: 401-сигнатуры разных эндпоинтов по-прежнему одна
+строка, но с разбивкой «сколько на какой маршрут». Вычисляется только из
+уже замаскированного сообщения (порядок mask→trunc→extract — секреты и query
+в поле не попадают); id-сегменты (digits/UUID/hex≥16) → `<id>`; абсолютный
+URL → только path (`http://host:8420/x?y=1` → `/x`). Пример: сигнатура
+`docker_logs|401|INFO: … "GET <path> HTTP/<n>.<n>" <n> Unauthorized` →
+`endpoints == {"/imports/active": 3, "/data-version": 2}`.
+
+**Зона действия:** разбивка покрывает uvicorn access-логи mcp-server
+(кавычечный формат `"METHOD target HTTP/x.x" NNN`); `[REQ]`-строки kb-console
+(`app.py:33` — формат без статуса/кавычек) endpoint не получают — всегда
+`endpoint=None`, их разбивка не требуется и не обещается (после фикса 007
+устранены в источнике).
+
+**Видимость:** `errors_query` — поле `endpoints` (top-20, count desc);
+view — суффикс сигнатуры `ep=/a×3(+2)` (топ-3, `(+N)` = сумма вне топ-3);
+weekly P3-baseline — суффикс ` · ep: /a×3, /b×2` (топ-3, только если непуст).
+
 ---
 Обслуживание: новый источник → `make test-errors` КРАСНЫЙ → добавить строку
 (механизм сбора или честный gap с причиной) → ЗЕЛЁНЫЙ. Live-проверка на проде:
