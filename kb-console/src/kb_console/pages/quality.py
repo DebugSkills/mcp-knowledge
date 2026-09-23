@@ -23,8 +23,11 @@ from typing import Any
 
 from nicegui import ui
 
+from ..components.auth_banner import AuthBanner
 from ..components.progress_panel import build_scan_progress
 from ..config import MCP_API_KEY, MCP_SERVER_URL, REFRESH_SECONDS
+from ..core.auth_polling import Backoff, poll_step
+from ..core.auth_state import AuthError, record_auth_error
 from ..core.data_cache import cache
 from ..core.identity import is_admin
 from ..core.mcp_client import MCPClient
@@ -84,58 +87,48 @@ def build_quality() -> None:
     # 13.15: _refreshing флаг — ≤1 in-flight refresh
     _refreshing = False
 
+    # 007: auth-aware refresh — баннер + бэкофф (key_ref="global", P2-D)
+    _refresh_backoff = Backoff(base=QUALITY_REFRESH_SECONDS)
+    _refresh_timer: ui.timer | None = None
+
+    def _restart_refresh_timer() -> None:
+        """Ручное возобновление (баннер): перезапустить таймер + обновить."""
+        nonlocal _refresh_timer
+        _refresh_backoff.reset()
+        if _refresh_timer is None:
+            _refresh_timer = ui.timer(QUALITY_REFRESH_SECONDS, refresh)
+        asyncio.ensure_future(refresh())
+
+    _auth_banner = AuthBanner(key_ref="global", on_resume=_restart_refresh_timer)
+
     async def refresh() -> None:
         nonlocal _refreshing
         if _refreshing:
             return
         _refreshing = True
         try:
-            client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
-            try:
-                # Task 1: check version before cache fetch
-                await cache.check_version(client)
-                filters = latest.get("filters", {})
-                domain = filters.get("domain", "")
-                subject = filters.get("subject", "")
-                # R4: filter-dependent cache key
-                cache_key = f"quality:{domain}:{subject}" if (domain or subject) else "quality"
-                # Параллельная загрузка очереди книг, issues, dup-ревью и аудита (Фаза 2+3)
-                data, issues, review_pairs, audit = await asyncio.gather(
-                    cache.get(
-                        cache_key,
-                        lambda c=client, f=filters: c.review_queue_books(
-                            domain=f.get("domain"),
-                            subject=f.get("subject"),
-                            limit=50,
-                        ),
-                        ttl=30,
-                    ),
-                    cache.get(
-                        "quality:issues",
-                        lambda c=client: c.list_quality_issues(status="open", limit=50),
-                        ttl=30,
-                    ),
-                    cache.get(
-                        "quality:review_pairs",
-                        lambda c=client: c.review_duplicate_pairs(limit=200),
-                        ttl=30,
-                    ),
-                    cache.get(
-                        "quality:audit",
-                        lambda c=client: c.list_audit_log(limit=50),
-                        ttl=30,
-                    ),
-                )
-                latest["data"] = data
-                latest["issues"] = issues
-                latest["review_pairs"] = review_pairs
-                latest["audit"] = audit
-            finally:
-                await client.close()
-            render_queue.refresh()
-            render_issues.refresh()
-            render_review_pairs.refresh()
-            render_audit.refresh()
+            outcome = await poll_step(
+                _refresh_fetch,
+                key_ref="global",
+                backoff=_refresh_backoff,
+                on_auth_blocked=_auth_banner.show,
+            )
+            if _refresh_timer is not None and _refresh_timer.interval != outcome.interval:
+                _refresh_timer.interval = outcome.interval
+            if not outcome.skipped:
+                render_queue.refresh()
+                render_issues.refresh()
+                render_review_pairs.refresh()
+                render_audit.refresh()
+        except AuthError as exc:
+            # 007 P5/R4: перехват СТРОГО выше RuntimeError-ветки; стоп таймера
+            # + баннер. TransportError страницей НЕ потребляется — его ест
+            # poll_step (§7.3: check_version наружу отдаёт только AuthError).
+            record_auth_error(exc)
+            if _refresh_timer is not None:
+                _refresh_timer.cancel()
+            _auth_banner.show(exc)
+            return
         except RuntimeError as exc:
             if "parent slot" in str(exc):
                 return
@@ -143,9 +136,57 @@ def build_quality() -> None:
         finally:
             _refreshing = False
 
+    async def _refresh_fetch() -> None:
+        """Полный цикл загрузки данных качества (без рендера)."""
+        client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+        try:
+            # Task 1: check version before cache fetch
+            await cache.check_version(client)
+            filters = latest.get("filters", {})
+            domain = filters.get("domain", "")
+            subject = filters.get("subject", "")
+            # R4: filter-dependent cache key
+            cache_key = f"quality:{domain}:{subject}" if (domain or subject) else "quality"
+            # Параллельная загрузка очереди книг, issues, dup-ревью и аудита (Фаза 2+3)
+            data, issues, review_pairs, audit = await asyncio.gather(
+                cache.get(
+                    cache_key,
+                    lambda c=client, f=filters: c.review_queue_books(
+                        domain=f.get("domain"),
+                        subject=f.get("subject"),
+                        limit=50,
+                    ),
+                    ttl=30,
+                ),
+                cache.get(
+                    "quality:issues",
+                    lambda c=client: c.list_quality_issues(status="open", limit=50),
+                    ttl=30,
+                ),
+                cache.get(
+                    "quality:review_pairs",
+                    lambda c=client: c.review_duplicate_pairs(limit=200),
+                    ttl=30,
+                ),
+                cache.get(
+                    "quality:audit",
+                    lambda c=client: c.list_audit_log(limit=50),
+                    ttl=30,
+                ),
+            )
+            latest["data"] = data
+            latest["issues"] = issues
+            latest["review_pairs"] = review_pairs
+            latest["audit"] = audit
+        finally:
+            await client.close()
+
     # ── Layout ─────────────────────────────────────────────
 
     ui.label("Качество базы знаний").classes("text-h4 q-mb-md")
+
+    # 007: auth-баннер (живёт всегда, до заголовков данных)
+    _auth_banner.mount()
 
     # Top bar: скан + фильтры
     with ui.row().classes("gap-4 items-center q-mb-md"):
@@ -201,6 +242,7 @@ def build_quality() -> None:
         client=_scan_client,
         on_done=lambda: _on_scan_done(scan_btn, scan_state, refresh),
         on_update=_sync_scan_ui,
+        key_ref="global",  # 007 P2-D: метка ключа обязательна
     )
 
     def _cleanup_scan_client() -> None:

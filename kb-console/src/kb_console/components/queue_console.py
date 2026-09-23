@@ -23,7 +23,9 @@ import asyncio
 from nicegui import ui
 
 from ..config import MCP_API_KEY, MCP_SERVER_URL
+from ..core.auth_polling import Backoff, poll_step
 from ..core.mcp_client import MCPClient
+from .auth_banner import AuthBanner
 
 # Интервал опроса: 1s когда есть running, 5s в idle
 POLL_FAST = 1.0
@@ -68,17 +70,16 @@ def build_import_queue() -> ui.element:
     container = ui.column().classes("w-full")
     _timers: list[ui.timer] = []
 
+    # P1: auth-aware поллинг (007) — баннер + key-scoped блок + бэкофф
+    _auth_banner = AuthBanner(key_ref="global", on_resume=lambda: _resume_polling())
+    _auth_banner.mount()
+    _poll_backoff = Backoff(base=POLL_FAST)
+    _log_backoff = Backoff(base=EXPANDED_POLL)
+
     # P3: состояние expand/collapse (DBD-паттерн из quality.py)
     _expanded_ids: set[str] = set()
     _log_cache: dict[str, list[dict]] = {}  # import_id → log lines
     _prev_status: dict[str, str] = {}  # import_id → last seen status (для cache invalidate)
-
-    async def _fetch_queue(client: MCPClient) -> list[dict]:
-        """GET /imports → список операций."""
-        try:
-            return await client.list_imports()
-        except Exception:
-            return []
 
     async def _fetch_log(import_id: str, client: MCPClient) -> list[dict] | None:
         """GET /imports/{id}/log → лог или None."""
@@ -325,21 +326,38 @@ def build_import_queue() -> ui.element:
     _last_records: list[dict] = []
 
     async def _poll() -> None:
-        """Периодический опрос очереди (1s)."""
+        """Периодический опрос очереди (1s) — auth-aware (007 §7.6).
+
+        401/403 → блок ключа + баннер (0 автоматических запросов);
+        транспорт → бэкофф ×2 до 60с; успех → reset. Ключ заблокирован —
+        fetch не вызывается вовсе (AC#1).
+        """
+        outcome = await poll_step(
+            _fetch_live_queue,
+            key_ref="global",
+            backoff=_poll_backoff,
+            on_auth_blocked=_auth_banner.show,
+        )
+        if _poll_timer is not None and _poll_timer.interval != outcome.interval:
+            _poll_timer.interval = outcome.interval  # бэкофф/восстановление
+        if outcome.skipped:
+            return
+        nonlocal _last_records
+        _last_records = outcome.value or []
+        _invalidate_stale_cache(outcome.value or [])
+        _render_cards(outcome.value or [])
+
+    async def _fetch_live_queue() -> list[dict]:
+        """GET /imports через собственный клиент (закрывается здесь же)."""
         client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
         try:
-            queue = await _fetch_queue(client)
-            _last_records = queue
-            _invalidate_stale_cache(queue)
-            _render_cards(queue)
-        except Exception:
-            pass
+            return await client.list_imports()
         finally:
             await client.close()
 
     # P3: Expanded poll — fetch logs for running+expanded cards
     async def _expanded_poll_impl() -> None:
-        """Обновить логи для running+expanded карточек (2s)."""
+        """Обновить логи для running+expanded карточек (2s) — auth-aware (007)."""
         running_expanded = [
             rid for rid in _expanded_ids
             for rec in _last_records
@@ -347,16 +365,41 @@ def build_import_queue() -> ui.element:
         ]
         if not running_expanded:
             return
+        outcome = await poll_step(
+            lambda: _fetch_live_logs(running_expanded),
+            key_ref="global",
+            backoff=_log_backoff,
+            on_auth_blocked=_auth_banner.show,
+        )
+        if _expanded_timer is not None and _expanded_timer.interval != outcome.interval:
+            _expanded_timer.interval = outcome.interval
+        if outcome.skipped:
+            return
+        for import_id, log in (outcome.value or {}).items():
+            if log is not None:
+                _log_cache[import_id] = log
+
+    async def _fetch_live_logs(import_ids: list[str]) -> dict[str, list[dict] | None]:
+        """GET /imports/{id}/log для каждого running+expanded id."""
         client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
         try:
-            for import_id in running_expanded:
-                log = await _fetch_log(import_id, client)
-                if log is not None:
-                    _log_cache[import_id] = log
-        except Exception:
-            pass
+            result: dict[str, list[dict] | None] = {}
+            for import_id in import_ids:
+                data = await client.get_import_log(import_id)
+                result[import_id] = data.get("log", []) if data else None
+            return result
         finally:
             await client.close()
+
+    def _resume_polling() -> None:
+        """Возобновление после ручного пинга баннера: вернуть интервалы."""
+        _poll_backoff.reset()
+        _log_backoff.reset()
+        if _poll_timer is not None:
+            _poll_timer.interval = POLL_FAST
+        if _expanded_timer is not None:
+            _expanded_timer.interval = EXPANDED_POLL
+        asyncio.ensure_future(_poll())
 
     def _start_poll() -> None:
         nonlocal _poll_timer, _expanded_timer

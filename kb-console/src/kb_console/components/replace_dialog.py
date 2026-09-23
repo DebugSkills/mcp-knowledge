@@ -18,8 +18,10 @@ from collections.abc import Awaitable, Callable
 from nicegui import ui
 
 from ..config import MCP_API_KEY, MCP_SERVER_URL
+from ..core.auth_polling import Backoff, poll_step
 from ..core.mcp_client import MCPClient
 from ..core.utils import MAX_FILE_SIZE, _read_uploaded_file, render_import_progress
+from .auth_banner import AuthBanner
 
 # Таймаут HTTP для import_content (30 минут — крупные учебники).
 IMPORT_TIMEOUT = 1800.0
@@ -121,18 +123,41 @@ async def show_replace_dialog(
         progress_container.visible = False
         result_container = ui.column().classes("w-full")
 
+        # 007 P9: auth-баннер для поллинга замены (в контексте диалога)
+        _auth_banner = AuthBanner(key_ref="global", on_resume=lambda: _resume_dialog_polling())
+        _auth_banner.mount()
+
+        def _resume_dialog_polling() -> None:
+            _progress_backoff.reset()
+            if _progress_timer is not None:
+                _progress_timer.interval = PROGRESS_POLL_INTERVAL
+
         # ── Единый таймер прогресс-поллинга (в контексте диалога, слот гарантирован) ──
+        _progress_backoff = Backoff(base=PROGRESS_POLL_INTERVAL)  # 007 P9
+
         async def _poll_once() -> None:
-            """Периодический опрос прогресса импорта (работает вхолостую до старта импорта)."""
+            """Периодический опрос прогресса импорта (auth-aware, 007 P9).
+
+            До старта импорта работает вхолостую; 401/403 → баннер (стоп),
+            транспорт → бэкофф; 404 → прежний дефолт None (не бэкоффит).
+            """
             nonlocal client, active_import_id
             if client is None or active_import_id is None:
                 return
-            try:
-                snapshot = await client.get_progress(active_import_id)
-                if snapshot is not None:
-                    render_import_progress(snapshot, progress_container)
-            except Exception:  # noqa: BLE001, S110 — graceful: transient poll error
-                pass
+            current_client = client
+            current_id = active_import_id
+            outcome = await poll_step(
+                lambda: current_client.get_progress(current_id),
+                key_ref="global",
+                backoff=_progress_backoff,
+                on_auth_blocked=_auth_banner.show,
+            )
+            if _progress_timer is not None and _progress_timer.interval != outcome.interval:
+                _progress_timer.interval = outcome.interval
+            if outcome.skipped:
+                return
+            if outcome.value is not None:
+                render_import_progress(outcome.value, progress_container)
 
         _progress_timer = ui.timer(PROGRESS_POLL_INTERVAL, _poll_once)
 

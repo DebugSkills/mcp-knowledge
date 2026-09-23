@@ -19,7 +19,9 @@ from typing import Any
 
 from nicegui import ui
 
+from ..core.auth_polling import Backoff, poll_step
 from ..core.mcp_client import MCPClient
+from .auth_banner import AuthBanner
 
 _log = logging.getLogger(__name__)
 
@@ -43,6 +45,7 @@ def build_scan_progress(
     on_done: Callable[[], Awaitable[None]] | None = None,
     on_update: Callable[[dict[str, Any] | None], None] | None = None,
     poll_interval: float = SCAN_POLL_INTERVAL,
+    key_ref: str,
 ) -> ui.column:
     """Создать панель прогресса quality scan с авто-поллингом.
 
@@ -52,7 +55,9 @@ def build_scan_progress(
 
     Использование:
         scan_client = MCPClient(...)
-        panel = build_scan_progress(client=scan_client, on_done=my_refresh)
+        panel = build_scan_progress(
+            client=scan_client, on_done=my_refresh, key_ref="global"
+        )
         # panel монтируется в текущий NiceGUI-контекст;
         # scan_client закрывается через ui.context.client.on_disconnect
 
@@ -66,12 +71,20 @@ def build_scan_progress(
                    активного скана нет). Удобно для синхронизации UI-состояния
                    (например, блокировки кнопки «Запустить скан»).
         poll_interval: Интервал опроса в секундах (default 1.0).
+        key_ref: Метка ключа для auth-aware поллинга (007 P2-D —
+                 ОБЯЗАТЕЛЬНЫЙ kwarg без дефолта; прокидывается страницей,
+                 например quality.py: "global").
 
     Returns:
         ui.column с прогресс-панелью (изначально скрыт, container.visible=False).
     """
-    container = ui.column().classes("w-full q-mb-md")
+    root = ui.column().classes("w-full q-mb-md")  # 007: root всегда видим — баннер живёт здесь
+    container = ui.column().classes("w-full")
     container.visible = False
+
+    # 007: auth-aware поллинг — баннер + бэкофф (страница отвечает за key_ref)
+    _auth_banner = AuthBanner(key_ref=key_ref, on_resume=lambda: _resume())
+    _backoff = Backoff(base=poll_interval)
 
     _poll_timer: ui.timer | None = None
     # 13.27: id скана, на который on_done УЖЕ отработал (гарантия однократности).
@@ -85,10 +98,34 @@ def build_scan_progress(
             _poll_timer.cancel()
             _poll_timer = None
 
-    async def _poll() -> None:
-        nonlocal _last_done_id, _poll_timer
+    def _resume() -> None:
+        """Ручное возобновление (баннер): вернуть штатный интервал и опросить."""
+        _backoff.reset()
+        if _poll_timer is not None:
+            _poll_timer.interval = poll_interval
+        ui.timer(0.0, _poll, once=True)
 
-        snapshot = await client.get_scan_progress()
+    def _set_interval(value: float) -> None:
+        if _poll_timer is not None and _poll_timer.interval != value:
+            _poll_timer.interval = value
+
+    async def _poll() -> None:
+        nonlocal _last_done_id
+
+        # 007 §7.6: 401/403 → стоп (баннер); транспорт → бэкофф ×2 до 60с.
+        outcome = await poll_step(
+            client.get_scan_progress,
+            key_ref=key_ref,
+            backoff=_backoff,
+            on_auth_blocked=_auth_banner.show,
+        )
+        if outcome.skipped:
+            # Арбитраж §7.5 (P7/N-3): при backoff.factor > 1 адаптивная ветка
+            # НЕ пишет интервал — бэкофф сильнее; idle-ветка на 404 сюда
+            # НЕ попадает (404 → прежний дефолт None, не транспорт).
+            _set_interval(outcome.interval)
+            return
+        snapshot = outcome.value
 
         # 13.27: синхронизация внешнего UI-состояния на каждый полл
         if on_update is not None:
@@ -101,9 +138,9 @@ def build_scan_progress(
             # должна появиться автоматически (13.16 UX).
             container.visible = False
             _last_done_id = None  # сброс — следующий скан снова вызовет on_done
-            # Адаптивный интервал: idle → 5с
-            if _poll_timer is not None and _poll_timer.interval != SCAN_IDLE_POLL_INTERVAL:
-                _poll_timer.interval = SCAN_IDLE_POLL_INTERVAL
+            # Адаптивный интервал: idle → 5с (только без бэкоффа — §7.5)
+            if _backoff.factor <= 1:
+                _set_interval(SCAN_IDLE_POLL_INTERVAL)
             return
 
         container.visible = True
@@ -185,9 +222,10 @@ def build_scan_progress(
                     await on_done()
 
             # Адаптивный интервал: running → 1с, done/idle → 5с
-            new_interval = SCAN_POLL_INTERVAL if (not is_done) else SCAN_IDLE_POLL_INTERVAL
-            if _poll_timer is not None and _poll_timer.interval != new_interval:
-                _poll_timer.interval = new_interval
+            # (007 §7.5: только при backoff.factor <= 1 — арбитраж P7)
+            if _backoff.factor <= 1:
+                new_interval = SCAN_POLL_INTERVAL if (not is_done) else SCAN_IDLE_POLL_INTERVAL
+                _set_interval(new_interval)
 
     async def _cancel_scan(btn: ui.button) -> None:
         """13.18: Отправить запрос на отмену скана."""
@@ -206,7 +244,12 @@ def build_scan_progress(
         _stop_poll()
     ui.context.client.on_disconnect(_cleanup)
 
+    # 007: монтируем баннер в root (видим всегда, даже когда панель скрыта)
+    with root:
+        _auth_banner.mount()
+        container.move(root)
+
     # Первый poll — немедленно (проверить, идёт ли скан прямо сейчас)
     ui.timer(0.0, _poll, once=True)
 
-    return container
+    return root

@@ -16,11 +16,15 @@ Backend: GET/POST /tokens, POST /tokens/{id}/revoke|rotate, PATCH /tokens/{id}
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 from nicegui import ui
 
+from ..components.auth_banner import AuthBanner
 from ..config import MCP_API_KEY, MCP_SERVER_URL, REFRESH_SECONDS
+from ..core.auth_polling import Backoff, poll_step
+from ..core.auth_state import AuthError, TransportError, record_auth_error
 from ..core.mcp_client import MCPClient
 
 # Q9 (v1.7): авто-деактивация subscriber через 90 дней, warning за 7 (83+)
@@ -131,19 +135,53 @@ def build_tokens() -> None:
     _error: str = ""
     _filters = {"level": "", "zone": "", "status": ""}
     _timer = None
+    _load_backoff = Backoff(base=REFRESH_SECONDS)  # 007: бэкофф транспорта
 
     async def load() -> None:
+        """Обновить таблицу токенов (10s). 007 P6: AuthError → auth-баннер
+        (стоп автообновления); TransportError → существующий _error-UX."""
         nonlocal _tokens, _error
-        client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
-        try:
-            _tokens = await client.list_tokens()
-            _error = ""
-        except Exception as exc:
-            _error = f"Не удалось загрузить токены: {exc}"
-        finally:
-            await client.close()
+        outcome = await poll_step(
+            _list_tokens_step,
+            key_ref="global",
+            backoff=_load_backoff,
+            on_auth_blocked=_on_auth_blocked,
+        )
+        if _timer is not None and _timer.interval != outcome.interval:
+            _timer.interval = outcome.interval
+        if outcome.skipped:
+            if outcome.transport_error is not None:
+                _error = f"Не удалось загрузить токены: {outcome.transport_error}"
+                render.refresh()
+            return
+        _tokens = outcome.value or []
+        _error = ""
         render.refresh()
         render_stale_banner.refresh()  # W5 gate P1: баннер Q9 живёт в своём refreshable
+
+    async def _list_tokens_step() -> list[dict]:
+        client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+        try:
+            return await client.list_tokens()
+        finally:
+            await client.close()
+
+    def _on_auth_blocked(exc: AuthError) -> None:
+        """401/403: показать auth-баннер и остановить автообновление (P6)."""
+        record_auth_error(exc)
+        if _timer is not None:
+            _timer.cancel()
+        _auth_banner.show(exc)
+
+    def _restart_timer() -> None:
+        """Ручное возобновление (баннер): вернуть таймер и обновить."""
+        nonlocal _timer
+        _load_backoff.reset()
+        if _timer is None:
+            _timer = ui.timer(REFRESH_SECONDS, load)
+        asyncio.ensure_future(load())
+
+    _auth_banner = AuthBanner(key_ref="global", on_resume=_restart_timer)
 
     # ── баннер Q9 ────────────────────────────────────────────
     @ui.refreshable
@@ -242,6 +280,12 @@ def build_tokens() -> None:
                 level=_create_state["level"], zone=_create_state["zone"],
                 note=note, expires_at=expires,
             )
+        except AuthError as exc:  # 007 P2-4: 401/403 → auth-баннер
+            _on_auth_blocked(exc)
+            return
+        except TransportError as exc:  # 007 P2-4: не тихий None
+            ui.notify(f"Сервер недоступен: {exc}", type="negative")
+            return
         finally:
             await client.close()
         if result is None:
@@ -294,6 +338,12 @@ def build_tokens() -> None:
         client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
         try:
             ok = await client.revoke_token(token_id)
+        except AuthError as exc:  # 007 P2-4
+            _on_auth_blocked(exc)
+            return
+        except TransportError as exc:  # 007 P2-4
+            ui.notify(f"Сервер недоступен: {exc}", type="negative")
+            return
         finally:
             await client.close()
         ui.notify(f"Токен {token_id} отозван" if ok else "Ошибка отзыва", type="positive" if ok else "negative")
@@ -313,6 +363,12 @@ def build_tokens() -> None:
         client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
         try:
             result = await client.rotate_token(rec["id"])
+        except AuthError as exc:  # 007 P2-4
+            _on_auth_blocked(exc)
+            return
+        except TransportError as exc:  # 007 P2-4
+            ui.notify(f"Сервер недоступен: {exc}", type="negative")
+            return
         finally:
             await client.close()
         if result is None:
@@ -340,6 +396,12 @@ def build_tokens() -> None:
             try:
                 await client.patch_token(rec["id"], note=note_input.value or None,
                                          expires_at=exp_input.value or None)
+            except AuthError as exc:  # 007 P2-4
+                _on_auth_blocked(exc)
+                return
+            except TransportError as exc:  # 007 P2-4
+                ui.notify(f"Сервер недоступен: {exc}", type="negative")
+                return
             finally:
                 await client.close()
             ui.notify(f"Токен {rec['id']} обновлён", type="positive")
@@ -365,6 +427,9 @@ def build_tokens() -> None:
                   label="Зона", on_change=lambda v: (_filters.update(zone=v.value), render.refresh()))
         ui.select(["", "active", "revoked"], value="",
                   label="Статус", on_change=lambda v: (_filters.update(status=v.value), render.refresh()))
+
+    # 007: auth-баннер (после admin-гейта — виден только админам)
+    _auth_banner.mount()
 
     render_stale_banner()
     render()

@@ -18,8 +18,10 @@ from pathlib import Path
 
 from nicegui import ui
 
+from ..components.auth_banner import AuthBanner
 from ..components.queue_console import build_import_queue
 from ..config import MCP_API_KEY, MCP_SERVER_URL
+from ..core.auth_polling import Backoff, poll_step
 from ..core.mcp_client import MCPClient
 from ..core.utils import (
     MAX_FILE_SIZE,
@@ -311,6 +313,16 @@ def build_import() -> None:
     _timer: ui.timer | None = None
     # 13.9: таймер опроса живого прогресса импорта
     _progress_timer: ui.timer | None = None
+    # 007 P8: auth-aware поллинг прогресса — баннер + бэкофф
+    _progress_backoff = Backoff(base=PROGRESS_POLL_INTERVAL)
+
+    def _resume_progress_polling() -> None:
+        _progress_backoff.reset()
+        if _progress_timer is not None:
+            _progress_timer.interval = PROGRESS_POLL_INTERVAL
+
+    _progress_auth_banner = AuthBanner(key_ref="global", on_resume=_resume_progress_polling)
+    _progress_auth_banner.mount()
 
     def _start_timer() -> None:
         """Живой секундомер: ⏱ N с, обновляется каждую секунду."""
@@ -555,12 +567,20 @@ def build_import() -> None:
 
         async def _poll_once() -> None:
             nonlocal _progress_timer
-            try:
-                snapshot = await client.get_progress(import_id)
-                if snapshot is not None:
-                    render_import_progress(snapshot, progress_container)
-            except Exception:
-                pass  # graceful: no crash on transient poll error
+            # 007 P8: auth-aware поллинг — стоп на 401/403 (баннер),
+            # бэкофф на транспорте; 404 → прежний дефолт None (не бэкоффит).
+            outcome = await poll_step(
+                lambda: client.get_progress(import_id),
+                key_ref="global",
+                backoff=_progress_backoff,
+                on_auth_blocked=_progress_auth_banner.show,
+            )
+            if _progress_timer is not None and _progress_timer.interval != outcome.interval:
+                _progress_timer.interval = outcome.interval
+            if outcome.skipped:
+                return
+            if outcome.value is not None:
+                render_import_progress(outcome.value, progress_container)
 
         _progress_timer = ui.timer(PROGRESS_POLL_INTERVAL, _poll_once)
 
