@@ -74,3 +74,5 @@ ansible/HARDWARE*.md
 ansible/**/HARDWARE*.md
 ansible/hardware/
 docs/hardware-*.md
+.cline
+kb-console-quality-after-deploy-011-2026-09-24.png
