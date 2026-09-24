@@ -47,7 +47,6 @@ from errors_collect import (  # sibling-импорт по прецеденту e
     atomic_write_json,
     load_config,
     load_json,
-    now_iso,
     parse_ts,
 )
 from errors_guard import load_suppression
@@ -60,6 +59,15 @@ DEFAULT_ALERTS = {"new_p0_window_min": 10, "cooldown_min": 120,
 
 def _now():
     return datetime.now(timezone.utc)
+
+
+def _iso(dt):
+    """Формат now_iso() для инъецируемого dt (фикс T, 016): идентично
+    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") в проде, но
+    детерминистично в тестах — штампы стейта берутся из now_dt, не из
+    реальных часов (time-bomb: тест зелёный, пока UTC < NOW+121мин).
+    """
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _safe_parse(raw):
@@ -143,7 +151,7 @@ def _mark_alerted(alert, cand, now_dt, cooldown_min):
     st = alert.setdefault(cand["sig"], {})
     if not isinstance(st, dict):
         st = alert[cand["sig"]] = {}
-    stamp = now_iso()
+    stamp = _iso(now_dt)  # фикс T: из инъецируемых часов, не now_iso()
     if cand["kind"] == "new_p0":
         st["p0_alerted_at"] = stamp
     else:
@@ -212,7 +220,7 @@ def run_alerts(sink, send_tg=False, chat=None, host=None, dry_run=False, now=Non
     if sends:
         alert["_alerts_meta"] = {"hour_bucket": bucket,
                                  "sent_this_hour": sent_hour + sends,
-                                 "last_run": now_iso()}
+                                 "last_run": _iso(now_dt)}  # фикс T: детерминизм
         atomic_write_json(alert_path, alert)  # запись ТОЛЬКО при попытке отправки
     print(f"TG-алерты: отправлено {sends} (прогон), час: {sent_hour + sends}/{acfg['max_per_hour']}")
     return 0

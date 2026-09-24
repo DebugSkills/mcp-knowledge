@@ -411,3 +411,34 @@ class TestAlertText:
         run(sink)
         body = sender.sent[0]
         assert "s" * 121 not in body  # сигнатура усечена до ≤120
+
+
+# ── регресс time-bomb (trace code-2026-09-24-016, фикс T): штампы alert_state
+#    обязаны выводиться из инъецируемых часов (now_dt), а не реальных now_iso().
+#    NOW в прошлом ⇒ на коде со сливом реального времени штамп ≠ NOW всегда. ──
+
+class TestInjectedClockStamps:
+    def test_marks_derive_from_injected_clock(self, tmp_path, sender, fakenow):
+        sink = mk_sink(tmp_path, {"x|tb1": agg("P0"), "x|tb2": agg("P1", burst_ts=ISO)})
+        assert run(sink) == 0
+        assert len(sender.sent) == 2
+        st = json.loads((sink / "alert_state.json").read_text())
+        assert st["x|tb1"]["p0_alerted_at"] == ISO      # из fakenow, не из реальных часов
+        assert st["x|tb2"]["burst_alerted_at"] == ISO
+        assert st["x|tb1"]["alert_kind"] == "new_p0"
+        assert st["x|tb2"]["alert_kind"] == "burst"
+
+    def test_marks_follow_clock_shift(self, tmp_path, sender, fakenow):
+        """Штамп следует за инъецированными часами (LATER_10), не за реальными."""
+        later = LATER_10.strftime("%Y-%m-%dT%H:%M:%SZ")
+        fakenow["set"](LATER_10)
+        sink = mk_sink(tmp_path, {"x|tb3": agg("P1", burst_ts=later)})
+        assert run(sink) == 0
+        st = json.loads((sink / "alert_state.json").read_text())
+        assert st["x|tb3"]["burst_alerted_at"] == later
+
+    def test_last_run_derives_from_injected_clock(self, tmp_path, sender, fakenow):
+        sink = mk_sink(tmp_path, {"x|tb4": agg("P0")})
+        assert run(sink) == 0
+        st = json.loads((sink / "alert_state.json").read_text())
+        assert st["_alerts_meta"]["last_run"] == ISO
