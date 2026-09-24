@@ -453,3 +453,202 @@ class TestSkipDeprecated:
         b = self._mk("kid-b")
         dup_count, _ = _scan_dup_pairs([a, b], deprecated_kids=set())
         assert dup_count == 1  # теговая эвристика (embedder None)
+
+
+# ═══════════════════════════════════════════════════════════════
+# code-2026-09-24-011 (В3): 5.5 snapshot + cancel + batched-лог
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestAutoClearSnapshot:
+    """5.5 — snapshot-эквивалентность, cancel-aware, batched-лог (трасса 011)."""
+
+    @pytest.fixture
+    def issues_tempdir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from mcp_server.quality.issues import set_store_dir
+            set_store_dir(tmp)
+            yield tmp
+
+    @staticmethod
+    def _reference_per_kid(scored):
+        """Эталонная per-kid реализация (старый код 5.5 до фикса)."""
+        from mcp_server.quality.issues import list_issue_ids
+        from mcp_server.quality.scoring import REVIEW_THRESHOLD
+
+        to_close = []
+        for _f, fm, score in scored:
+            if score < REVIEW_THRESHOLD:
+                to_close.extend(
+                    list_issue_ids(
+                        types=["missing_field"], status="open",
+                        knowledge_id=fm.knowledge_id,
+                    )
+                )
+        return to_close
+
+    def _mixed_fixture(self):
+        """Фикстура AC2: open/resolved/ignored × missing_field/sensitive/duplicate × kids."""
+        from mcp_server.quality.issues import create_issue, update_issue_status
+
+        # Непроблемные kids (score 0.1 < 0.45) с open missing_field → закрывать
+        for i in range(3):
+            create_issue("missing_field", f"kid-ok-{i}", "warn", f"score high {i}")
+        # Проблемный kid (score 0.5 >= 0.45) → НЕ закрывать
+        create_issue("missing_field", "kid-bad", "warn", "score high")
+        # Resolved missing_field у непроблемного → уже закрыт, не трогаем
+        r = create_issue("missing_field", "kid-ok-0", "warn", "already resolved branch")
+        update_issue_status(r.issue_id, "resolved")
+        # Чужие типы у непроблемного → НЕ закрывать
+        create_issue("sensitive", "kid-ok-1", "warn", "sensitive markers")
+        create_issue("duplicate", "kid-ok-2", "warn", "possible duplicate")
+        # Ignored missing_field у непроблемного → не open, не трогаем
+        ig = create_issue("missing_field", "kid-ok-2", "warn", "ignored branch")
+        update_issue_status(ig.issue_id, "ignored")
+        # Непроблемный kid без issues
+        fm_entries = [
+            (Path("/tmp/kid-ok-0.md"), _make_fm(knowledge_id="kid-ok-0"), 0.1),
+            (Path("/tmp/kid-ok-1.md"), _make_fm(knowledge_id="kid-ok-1"), 0.2),
+            (Path("/tmp/kid-ok-2.md"), _make_fm(knowledge_id="kid-ok-2"), 0.0),
+            (Path("/tmp/kid-bad.md"), _make_fm(knowledge_id="kid-bad"), 0.5),
+            (Path("/tmp/kid-clean.md"), _make_fm(knowledge_id="kid-clean"), 0.1),
+        ]
+        return fm_entries
+
+    def test_snapshot_equivalence_vs_per_kid_reference(self, issues_tempdir):
+        """AC2: множество закрываемых == эталонной per-kid реализации (mixed-фикстура)."""
+        from unittest.mock import patch
+
+        from mcp_server.quality.scanner import _auto_clear_stale_issues
+
+        scored = self._mixed_fixture()
+
+        # Эталон ДО вызова: spy вызывает реальный bulk_update → стор мутирует
+        expected = self._reference_per_kid(scored)
+
+        captured = {}
+        real_bulk = __import__(
+            "mcp_server.quality.issues", fromlist=["bulk_update_status"]
+        ).bulk_update_status
+
+        def spy_bulk(ids, status, resolution=None):
+            captured["ids"] = list(ids)
+            captured["status"] = status
+            return real_bulk(ids, status, resolution)
+
+        with patch("mcp_server.quality.scanner.bulk_update_status", side_effect=spy_bulk):
+            cleared = _auto_clear_stale_issues(scored)
+
+        assert sorted(captured["ids"]) == sorted(expected)
+        assert len(captured["ids"]) == 3  # ровно open missing_field у kid-ok-*
+        assert cleared == 3
+        assert captured["status"] == "resolved"
+
+    def test_cancel_event_set_no_bulk_update(self, issues_tempdir):
+        """AC3-unit: cancel_event set → bulk_update_status НЕ вызывается."""
+        import asyncio
+        from unittest.mock import patch
+
+        from mcp_server.quality.issues import create_issue
+        from mcp_server.quality.scanner import _auto_clear_stale_issues
+
+        create_issue("missing_field", "kid-ok-0", "warn", "score high")
+        scored = [(Path("/tmp/kid-ok-0.md"), _make_fm(knowledge_id="kid-ok-0"), 0.1)]
+        cancel = asyncio.Event()
+        cancel.set()
+
+        with patch("mcp_server.quality.scanner.bulk_update_status") as mock_bulk:
+            cleared = _auto_clear_stale_issues(scored, cancel_event=cancel)
+
+        assert cleared == 0
+        mock_bulk.assert_not_called()
+
+    def test_cancel_midway_chunk_no_bulk_update(self, issues_tempdir, monkeypatch):
+        """AC3: cancel в середине (между чанками) → bulk_update_status НЕ вызывается."""
+        import asyncio
+        from unittest.mock import patch
+
+        from mcp_server.quality import scanner as scanner_mod
+
+        monkeypatch.setattr(scanner_mod, "AUTO_CLEAR_CHUNK_SIZE", 2)
+
+        from mcp_server.quality.issues import create_issue
+
+        for i in range(5):
+            create_issue("missing_field", f"kid-ok-{i}", "warn", f"score high {i}")
+        scored = [
+            (Path(f"/tmp/kid-ok-{i}.md"), _make_fm(knowledge_id=f"kid-ok-{i}"), 0.1)
+            for i in range(5)
+        ]
+        cancel = asyncio.Event()
+
+        # Cancel срабатывает при первом чанк-чеке (после 2 kids)
+        orig_is_set = cancel.is_set
+        calls = {"n": 0}
+
+        def is_set():
+            calls["n"] += 1
+            if calls["n"] >= 1:
+                return True
+            return orig_is_set()
+
+        cancel.is_set = is_set
+
+        with patch("mcp_server.quality.scanner.bulk_update_status") as mock_bulk:
+            cleared = scanner_mod._auto_clear_stale_issues(
+                scored, cancel_event=cancel,
+            )
+
+        assert cleared == 0
+        mock_bulk.assert_not_called()
+
+    def test_progress_log_batches(self, issues_tempdir):
+        """AC5: batched-лог auto-clear по образцу issues:/sensitive:."""
+        from mcp_server.quality.issues import create_issue
+        from mcp_server.quality.scanner import _auto_clear_stale_issues
+
+        for i in range(5):
+            create_issue("missing_field", f"kid-ok-{i}", "warn", f"score high {i}")
+        scored = [
+            (Path(f"/tmp/kid-ok-{i}.md"), _make_fm(knowledge_id=f"kid-ok-{i}"), 0.1)
+            for i in range(5)
+        ]
+
+        class FakeTracker:
+            def __init__(self):
+                self.logs = []
+
+            def log(self, pid, level, text):
+                self.logs.append((pid, level, text))
+
+        tracker = FakeTracker()
+        _auto_clear_stale_issues(
+            scored, progress=tracker, progress_id="scan-test",
+        )
+        assert any(
+            pid == "scan-test" and "auto-clear:" in text
+            for pid, _lvl, text in tracker.logs
+        ), f"auto-clear лог отсутствует: {tracker.logs}"
+
+    def test_reads_store_once_for_grouped_snapshot(self, issues_tempdir):
+        """O(N+M): один проход стора на весь шаг (анти-O(N×M))."""
+        from unittest.mock import patch
+
+        from mcp_server.quality import issues as issues_mod
+        from mcp_server.quality.issues import create_issue
+        from mcp_server.quality.scanner import _auto_clear_stale_issues
+
+        for i in range(5):
+            create_issue("missing_field", f"kid-ok-{i}", "warn", f"score high {i}")
+        scored = [
+            (Path(f"/tmp/kid-ok-{i}.md"), _make_fm(knowledge_id=f"kid-ok-{i}"), 0.1)
+            for i in range(5)
+        ]
+
+        with patch.object(
+            issues_mod, "_read_all_issues", wraps=issues_mod._read_all_issues
+        ) as mock_read, patch("mcp_server.quality.scanner.bulk_update_status"):
+            _auto_clear_stale_issues(scored)
+
+        # grouped-снапшот читает стор 1 раз; bulk_update замокан (реальный тоже читает 1)
+        assert mock_read.call_count == 1

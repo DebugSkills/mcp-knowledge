@@ -32,7 +32,7 @@ from mcp_server.quality.edit_war import detect_edit_war
 from mcp_server.quality.issues import (
     bulk_update_status,
     create_issue,
-    list_issue_ids,
+    list_open_issue_ids_grouped,
 )
 from mcp_server.quality.scoring import (
     REVIEW_THRESHOLD,
@@ -54,6 +54,8 @@ MAX_PAIRS_PER_BUCKET: int = 500  # макс пар для проверки в о
 # Лимит dup-issues на одну запись (13.14): книга на 15K секций даёт тысячи пар
 # с одинаковым fm_i → 15K+ issues на один knowledge_id (засорение issues + CPU 120%).
 MAX_ISSUES_PER_KNOWLEDGE: int = 10
+# Чанк auto-clear (011): cancel-чек + batched-лог каждые N записей (отмена ≤10 с)
+AUTO_CLEAR_CHUNK_SIZE: int = 2000
 
 # ── W4.3: sensitive-эвристики (план §2.5) ──────────────────────
 # Путь-маркеры (флаг, НЕ блок, НЕ deprecate) — тот же набор, что в
@@ -272,7 +274,11 @@ async def run_scan(
     # Шаг 5.5 (P0): auto-clear — закрыть open missing_field issues записей,
     # чьё условие исчезло (score упал ниже REVIEW_THRESHOLD). Накопленные
     # issues никогда не чистились (Д3) — этот шаг разрывает цикл.
-    cleared = await loop.run_in_executor(None, _auto_clear_stale_issues, scored)
+    # code-2026-09-24-011: cancel_event прокинут в executor (P1-B) +
+    # batched-лог (P1-C) + снапшот за один проход стора (P1-A).
+    cleared = await loop.run_in_executor(
+        None, _auto_clear_stale_issues, scored, cancel_event, progress, pid,
+    )
     if cleared:
         logger.info("Auto-clear: %d stale missing_field issues resolved", cleared)
 
@@ -959,6 +965,9 @@ def _create_sensitive_issues(
 
 def _auto_clear_stale_issues(
     scored: list[tuple[Path, KnowledgeFrontmatter, float]],
+    cancel_event=None,  # code-2026-09-24-011: отмена ≤10 с на любом шаге
+    progress=None,
+    progress_id: str | None = None,
 ) -> int:
     """P0 (A3a): закрыть open missing_field issues записей, чьё условие исчезло.
 
@@ -967,25 +976,62 @@ def _auto_clear_stale_issues(
     если запись теперь имеет score < REVIEW_THRESHOLD — закрываем её
     open missing_field issues как resolved (self-healing стор).
 
+    code-2026-09-24-011 (В3, P1-A): снапшот-open-issues ОДНИМ проходом
+    стора (list_open_issue_ids_grouped) вместо list_issue_ids на каждую
+    запись — O(N+M) вместо O(N×M) (8406 записей × 0.28 с/проход стора
+    ≈ 40–60 мин CPU → <5 с). Отмена: чанки по AUTO_CLEAR_CHUNK_SIZE с
+    cancel-чеком; при отмене bulk_update_status НЕ вызывается (частичный
+    результат не теряется критично — шаг идемпотентен, дочистит следующий
+    скан). Прогресс: batched-лог по образцу issues:/sensitive: (P1-C —
+    шаг раньше молчал 15+ мин, маскируя дефект).
+
     Args:
         scored: список (filepath, frontmatter, score) после scoring.
+        cancel_event: asyncio.Event для отмены (проверяется по чанкам).
+        progress: опциональный ImportProgressTracker.
+        progress_id: id записи в трекере.
 
     Returns:
         int: число закрытых issues.
     """
+    # Снапшот ОДНИМ проходом стора: kid → open missing_field issue_ids.
+    # Под heavy_ops_lock скана параллельных missing_field-писателей нет ⇒
+    # снапшот эквивалентен последовательным per-kid вызовам (§7.3).
+    grouped = list_open_issue_ids_grouped(["missing_field"])
+    if not grouped:
+        return 0
+
     # Собираем запись → текущий score
     score_by_kid: dict[str, float] = {}
     for _f, fm, score in scored:
         score_by_kid[fm.knowledge_id] = score
 
-    # Закрываем open missing_field issues записей, больше не проблемных
+    # Чанки по kids: cancel-чек + batched-лог каждые AUTO_CLEAR_CHUNK_SIZE
     to_close: list[str] = []
-    for kid, score in score_by_kid.items():
+    total = len(score_by_kid)
+    kids = list(score_by_kid.items())
+    for idx, (kid, score) in enumerate(kids):
+        if idx % AUTO_CLEAR_CHUNK_SIZE == 0:
+            if cancel_event is not None and cancel_event.is_set():
+                logger.info("Auto-clear cancelled at %d/%d entries", idx, total)
+                return 0
+            if progress and progress_id and idx > 0:
+                progress.log(
+                    progress_id, "info",
+                    f"auto-clear: {idx}/{total} entries, {len(to_close)} collected",
+                )
         if score < REVIEW_THRESHOLD:
-            open_ids = list_issue_ids(
-                types=["missing_field"], status="open", knowledge_id=kid,
-            )
-            to_close.extend(open_ids)
+            to_close.extend(grouped.get(kid, []))
+
+    # Финальный cancel-чек перед bulk-операцией
+    if cancel_event is not None and cancel_event.is_set():
+        logger.info("Auto-clear cancelled before bulk update (%d entries)", total)
+        return 0
+    if progress and progress_id and total:
+        progress.log(
+            progress_id, "info",
+            f"auto-clear: {total}/{total} entries, {len(to_close)} collected",
+        )
 
     if not to_close:
         return 0
