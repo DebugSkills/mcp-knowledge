@@ -187,3 +187,108 @@ class TestSignatureRoundTrip:
         assert [s for s, _ in out_no] == [s_norm]
         out_yes = eq_tool._filter_aggregates(aggs, make_flt(include_audit=True))
         assert len(out_yes) == 2
+
+
+# ── Блок C — trend (двусторонний: матрица _trend ↔ рост-условие лестницы) ──
+
+TREND_CASES = [  # (count_7d, count_prev_7d, ожидание _trend)
+    (0, 0, None),
+    (5, 0, None),
+    (5, 3, "up"),
+    (3, 5, "down"),
+    (5, 5, "flat"),
+]
+
+
+class TestTrendParity:
+    @pytest.mark.parametrize("c7,prev,expected", TREND_CASES)
+    def test_c1_c5_tool_trend_matrix(self, c7, prev, expected):
+        assert eq_tool._trend({"count_7d": c7, "count_prev_7d": prev}) == expected
+
+    def test_trend_invariant_equals_growth_condition(self):
+        # up ⟺ prev>0 ∧ c7>prev — ровно рост-условие лестницы update_aggregates
+        for c7 in range(7):
+            for prev in range(7):
+                got = eq_tool._trend({"count_7d": c7, "count_prev_7d": prev})
+                if prev == 0:
+                    want = None
+                elif c7 > prev:
+                    want = "up"
+                elif c7 < prev:
+                    want = "down"
+                else:
+                    want = "flat"
+                assert got == want, (c7, prev)
+
+    def test_c6_collector_growth_live(self, tmp_path, monkeypatch):
+        """Живое рост-условие лестницы: 2 события 8d назад + 3 сегодня (одна
+        сигнатура) → count_7d=3 > count_prev_7d=2 → P1/T. Второй цикл несёт
+        события (ранний выход update_aggregates при пустых events/delta).
+        """
+        sink = tmp_path / "sink"
+        msg = "upstream timeout after 30s"
+        t8 = FAKE_NOW - timedelta(days=8)
+        old = [ec.make_event(iso(t8), "docker_logs", msg, container="c",
+                             level="ERROR") for _ in range(2)]
+        set_fake_now(monkeypatch, t8)
+        ec.update_aggregates(sink, old, cfg={})
+        fresh = [ec.make_event(iso(FAKE_NOW), "docker_logs", msg, container="c",
+                               level="ERROR") for _ in range(3)]
+        set_fake_now(monkeypatch, FAKE_NOW)
+        ec.update_aggregates(sink, fresh, cfg={})
+        (agg,) = ec.load_json(sink / "aggregates" / "signatures.json",
+                              {}).values()
+        assert agg["count_7d"] == 3
+        assert agg["count_prev_7d"] == 2
+        assert agg["priority"] == "P1"
+        assert agg["class"] == "T"
+
+
+# ── Блок D — 7d-окно (двусторонне: _suppressed_7d ↔ week_ago-фильтр) ──
+
+class TestWindow7dParity:
+    def test_d1_boundary_day_included_tool(self):
+        # день РОВНО 7d назад включён (граница >=, не >)
+        edge = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+        assert eq_tool._suppressed_7d({"suppressed_daily": {edge: 4}}) == 4
+
+    def test_d2_day_beyond_window_excluded_tool(self):
+        old = (datetime.now(timezone.utc) - timedelta(days=8)).strftime("%Y-%m-%d")
+        assert eq_tool._suppressed_7d({"suppressed_daily": {old: 4}}) == 0
+
+    def test_d3_three_day_synthetic_sum_tool(self):
+        now = datetime.now(timezone.utc)
+        daily = {(now - timedelta(days=8)).strftime("%Y-%m-%d"): 5,
+                 (now - timedelta(days=7)).strftime("%Y-%m-%d"): 2,
+                 now.strftime("%Y-%m-%d"): 3}
+        # в окне только 7d-граница (2) и сегодня (3); 8d (5) — вне
+        assert eq_tool._suppressed_7d({"suppressed_daily": daily}) == 5
+
+    def test_d4_collector_boundary_live(self, tmp_path, monkeypatch):
+        """Живая включительная граница коллектора: единственное событие РОВНО
+        7d назад → count_7d==1 (при дрейфе `>` было бы 0)."""
+        sink = tmp_path / "sink"
+        t7 = FAKE_NOW - timedelta(days=7)
+        ev = ec.make_event(iso(t7), "docker_logs", "flaky border case",
+                           container="c", level="ERROR")
+        set_fake_now(monkeypatch, FAKE_NOW)
+        ec.update_aggregates(sink, [ev], cfg={})
+        (agg,) = ec.load_json(sink / "aggregates" / "signatures.json",
+                              {}).values()
+        assert agg["count_7d"] == 1
+        assert agg["count_prev_7d"] == 0
+
+
+# ── Блок E — endpoints cap (ENDPOINTS_KEEP ↔ литерал среза рендера) ──
+
+class TestEndpointsCapParity:
+    def test_e1_render_caps_to_collector_keep(self):
+        endpoints = {f"GET /ep{i}": 30 - i for i in range(30)}
+        rendered = eq_tool._render_aggregate("s", mini_agg(endpoints=endpoints))
+        assert len(rendered["endpoints"]) == ec.ENDPOINTS_KEEP
+
+    def test_e2_cap_literal_scoped_to_render(self):
+        # срез-N ищется ТОЛЬКО в теле _render_aggregate: по файлу наивный
+        # регекс ловит чужие [:8] sha256-аудита
+        caps = re.findall(r"\[:(\d+)\]", tool_render_aggregate_body())
+        assert caps == [str(ec.ENDPOINTS_KEEP)]
