@@ -2,25 +2,21 @@
 # errors_notify_import.sh — notify.json 0600 из /etc/backup-status.env
 # (code-2026-09-24-016, В2-блок в; sudo-helper, дельта 2 спеки §7.2в).
 #
-# Запуск (sudo обязателен: env-файл root-only 0600; sudo -n недоступен на
-# хосте — это ОДНА ручная команда оператора, аналог check-backup.sh):
-#   sudo bash scripts/errors_notify_import.sh [--env /etc/backup-status.env]
-#        [--out "$DATA_ROOT/logs/errors/notify.json"] [--host <тег>]
+# ⚠️ Д1 (живая свивка): make errors-notify-import запускать БЕЗ внешнего sudo
+# (sudo уже внутри рецепта Makefile). Двойной sudo (sudo make …) даёт
+# SUDO_USER=root → root-владельца notify.json → cron-юзер не читает → TG
+# молча skip. Прямой запуск: sudo bash scripts/errors_notify_import.sh
+#   [--env /etc/backup-status.env] [--out …] [--host <тег>]
+#   (sudo обязателен: env-файл root-only 0600; аналог check-backup.sh).
 #
-# Что делает:
-#   1) парсит env-файл (grep, БЕЗ source/исполнения): TG_TOKEN, TG_CHAT,
-#      HTTPS_PROXY → proxy (fallback HTTP_PROXY — паттерн check-backup.sh:29),
-#      NO_PROXY (опц.);
-#   2) валидация: нет файла/переменной/proxy → ИМЯ в stderr (без значений!)
-#      + exit≠0; политика хоста = прокси обязателен (§7.8 — не молчать);
-#   3) пишет notify.json {"bot_token","chat_id","proxy","no_proxy"(опц.),"host"}
-#      АТОМАРНО (tmp+mv), mode 0600, владелец/группа = $SUDO_USER (chown) —
-#      иначе пользовательский cron не прочитает; SUDO_USER пуст (чистый root/
-#      su -) → владелец НЕ меняется + warning в stderr (файл валиден, но cron
-#      ladmin его не увидит — запускайте sudo от целевого юзера);
-#   4) печатает ТОЛЬКО fingerprint: chat=sha256(chat_id)[:12], proxy=set|unset,
-#      host, path — токен/прокси-креды НИКОГДА не в stdout/stderr/логах (R5);
-#   5) идемпотентен: повтор = тот же файл (детерминированные данные).
+# Что делает: (1) парсит env-файл (grep, БЕЗ source): TG_TOKEN, TG_CHAT,
+#   HTTPS_PROXY → proxy (fallback HTTP_PROXY), NO_PROXY (опц.);
+#   (2) валидация: нет файла/переменной/proxy → ИМЯ в stderr (без значений,
+#   R5) + exit≠0; политика хоста = прокси обязателен (§7.8);
+#   (3) пишет notify.json АТОМАРНО (tmp+mv), 0600, владелец = resolve_owner
+#   (SUDO_USER≠root → владелец каталога назначения → id -un+warning);
+#   (4) fingerprint: chat=sha256(chat_id)[:12], proxy=set, host, path (R5);
+#   (5) идемпотентен: повтор = тот же файл.
 #
 # Прод-интеграция: НЕ рендерится ansible (переживает деплои, как suppression
 # 008); формат совместим с errors-notify.json.j2. set -u: unbound = баг скрипта.
@@ -33,16 +29,44 @@ DATA_ROOT="${DATA_ROOT:-$BASE/data}"
 ENV_FILE="/etc/backup-status.env"
 OUT="$DATA_ROOT/logs/errors/notify.json"
 HOST_ARG=""
+PRINT_OWNER=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --env)   ENV_FILE="$2"; shift 2 ;;
     --out)   OUT="$2"; shift 2 ;;
     --host)  HOST_ARG="$2"; shift 2 ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    --print-owner) PRINT_OWNER=1; shift ;;  # (скрытый, тесты Д1): только разрешить владельца
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1 (см. --help)" >&2; exit 2 ;;
   esac
 done
+
+# ── Д1: разрешение владельца (устойчиво к двойному sudo) ──
+# Порядок: SUDO_USER (непуст И не root) → владелец каталога назначения
+# (stat -c %U dirname OUT — реальный cron-юзер владеет каталогом данных) →
+# id -un + WARNING (последний резерв).
+resolve_owner() {  # stdout: имя владельца; stderr: NOTE/WARNING при fallback
+  local su="${SUDO_USER:-}"
+  if [ -n "$su" ] && [ "$su" != "root" ]; then
+    printf '%s\n' "$su"
+    return 0
+  fi
+  local dir_owner
+  dir_owner="$(stat -c %U "$(dirname "$OUT")" 2>/dev/null || true)"
+  if [ -n "$dir_owner" ] && [ "$dir_owner" != "root" ]; then
+    echo "NOTE: SUDO_USER='${su:-пуст}' (двойной sudo или чистый root) → владелец из каталога назначения: ${dir_owner}" >&2
+    printf '%s\n' "$dir_owner"
+    return 0
+  fi
+  echo "WARNING: SUDO_USER='${su:-пуст}', владелец каталога '${dir_owner:-?}' не определены — резерв: $(id -un); запускайте make errors-notify-import БЕЗ внешнего sudo" >&2
+  id -un
+}
+
+if [ -n "$PRINT_OWNER" ]; then  # тест-хук Д1: без чтения env и без записи
+  resolve_owner
+  exit 0
+fi
 
 fail_var() {  # $1 = имя переменной — ТОЛЬКО имя, без значения (R5)
   echo "errors_notify_import: missing variable: $1 (in $ENV_FILE)" >&2
@@ -97,11 +121,10 @@ trap 'rm -f "$TMP"' EXIT
 } > "$TMP"
 chmod 600 "$TMP"
 
-# владелец = $SUDO_USER (cron-пользователь должен читать файл); пуст → не менять
-if [ -n "${SUDO_USER:-}" ]; then
-  chown "${SUDO_USER}:" "$TMP" 2>/dev/null || chown "$SUDO_USER" "$TMP"
-else
-  echo "WARNING: SUDO_USER пуст — владелец $(id -un); cron-пользователь должен совпадать (запустите sudo от целевого юзера)" >&2
+# ── владелец (Д1): SUDO_USER (не root) → каталог назначения → id -un ──
+OWNER="$(resolve_owner)"
+if ! chown "${OWNER}:" "$TMP" 2>/dev/null && ! chown "$OWNER" "$TMP"; then
+  echo "WARNING: chown '$OWNER' не удался — владелец $(id -un); cron-пользователь должен совпадать (make БЕЗ внешнего sudo)" >&2
 fi
 
 mv -f "$TMP" "$OUT"

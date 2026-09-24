@@ -4,7 +4,7 @@
 #
 # Использование:
 #   scripts/errors_cron.sh --install | --remove | --status
-#       [--file PATH]     файл-модель crontab (тесты/preview; БЕЗ --file = реальный crontab юзера)
+#       [--file PATH]     файл-модель crontab (preview/тесты; существующий непустой: сначала crontab -l > PATH; БЕЗ --file = реальный crontab)
 #       [--data-root DIR] корень данных (по умолчанию $BASE/data; логи → DIR/logs/cron/)
 #   scripts/errors_cron.sh --validate FILE   (скрытый) R8-валидатор: exit≠0 на относительных путях
 #
@@ -17,8 +17,8 @@
 #   4) R8-валидация блока ДО записи: cd-префикс абсолютный, путь-токены
 #      абсолютные → иначе exit≠0 и crontab НЕ тронут;
 #   5) config-оверлей: cron_logs += 3 наших лог-файла в
-#      $DATA_ROOT/logs/errors/config.json (python3-merge union, чужие пути
-#      сохраняются, старый config бэкапится — R9).
+#      $DATA_ROOT/logs/errors/config.json — ТОЛЬКО в реальном режиме (в
+#      --file preview пропущен; python3-merge union, чужие пути R9).
 # --remove: вынимает ТОЛЬКО маркер-блок + строки с нашими 3 скриптами
 #      (вне блока), config-оверлей НЕ трогает (логи могут ещё собираться).
 #
@@ -146,6 +146,17 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$ACTION" ] || { echo "укажите --install | --remove | --status (см. --help)" >&2; exit 2; }
+
+# Д2 (живая свивка 016): --file-модель ОБЯЗАНА существовать и быть непустой.
+# Отсутствующий файл молча читался как ПУСТОЙ crontab → preview выглядел как
+# «удаление всех пользовательских джоб». Отказ ДО любых правок/бэкапов.
+if [ -n "$MODEL_FILE" ] && { [ ! -f "$MODEL_FILE" ] || [ ! -s "$MODEL_FILE" ]; }; then
+  echo "[errors_cron] ОТКАЗ: файл-модель '$MODEL_FILE' отсутствует или пуст." >&2
+  echo "  Модель должна содержать текущий crontab. Сначала снимите его:" >&2
+  echo "    crontab -l > $MODEL_FILE" >&2
+  exit 2
+fi
+
 mkdir -p "$TRASH" "$DATA_ROOT/logs/cron"
 
 case "$ACTION" in
@@ -174,9 +185,17 @@ case "$ACTION" in
     if ! validate_file "$OUT_TMP" >/dev/null; then exit 1; fi  # (недостижимо; паранойя)
     write_crontab "$OUT_TMP"
     rm -f "$OUT_TMP"
-    overlay_config "$TS"
+    # Д3 (живая свивка 016): preview (--file) НЕ мутирует реальный config.json —
+    # оверлей cron_logs только в реальном режиме.
+    if [ -n "$MODEL_FILE" ]; then
+      echo "[errors_cron] config overlay: пропущен (режим --file)"
+    else
+      overlay_config "$TS"
+    fi
     echo "[errors_cron] install OK: 3 джобы (collector */5, alerts */5, weekly Пн 10:02); бэкап: $BACKUP"
-    [ -n "$MODEL_FILE" ] && echo "[errors_cron] режим --file: реальный crontab НЕ тронут (модель: $MODEL_FILE)"
+    if [ -n "$MODEL_FILE" ]; then
+      echo "[errors_cron] режим --file: реальный crontab НЕ тронут (модель: $MODEL_FILE)"
+    fi
     ;;
   remove)
     CURRENT="$(read_crontab)"

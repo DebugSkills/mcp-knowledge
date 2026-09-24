@@ -190,8 +190,10 @@ test-errors:  ## Error→Rule: юнит-тесты коллектора + гва
 # ─── TG-оповещения Error→Rule (code-2026-09-24-016) ───
 # Каналы: weekly-отчёт (Пн 10:02) + немедленные алерты new-P0/burst (*/5).
 # notify.json: прод рендерит ansible (errors-notify.json.j2); локально —
-# sudo-хелпер из /etc/backup-status.env (0600, $SUDO_USER). Живая отправка
-# после: 1) sudo make errors-notify-import; 2) make errors-cron-install.
+# sudo-хелпер из /etc/backup-status.env (0600). Д1: запуск БЕЗ внешнего
+# sudo — sudo уже в рецепте (двойной sudo → SUDO_USER=root → root-владелец,
+# cron-юзер не читает). Живая отправка после: 1) make errors-notify-import;
+# 2) make errors-cron-install.
 
 errors-view:  ## 016: сводка sink (агрегаты/флаги) — что уйдёт в TG
 	.venv/bin/python scripts/errors_report.py
@@ -202,7 +204,7 @@ errors-report:  ## 016: weekly-отчёт (TG=1 → отправка в чат; 
 errors-alert:  ## 016: немедленные алерты new-P0/burst (TG=1 → отправка; dry-run по умолчанию)
 	.venv/bin/python scripts/errors_alert.py $(if $(TG),--send-tg)
 
-errors-notify-import:  ## 016: sudo-хелпер notify.json 0600 из /etc/backup-status.env (ENV=… OUT=… HOST=…)
+errors-notify-import:  ## 016: sudo-хелпер notify.json 0600 из /etc/backup-status.env (БЕЗ внешнего sudo!; ENV=… OUT=… HOST=…)
 	sudo bash scripts/errors_notify_import.sh $(if $(ENV),--env $(ENV)) $(if $(OUT),--out $(OUT)) $(if $(HOST),--host $(HOST))
 
 errors-cron-install:  ## 016: установить 3 cron-джобы (collector/alerts */5, weekly Пн 10:02); FILE=… модель

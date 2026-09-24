@@ -164,10 +164,88 @@ class TestNotifyImport:
         assert out.stat().st_uid == os.getuid()  # chown на себя прошёл
 
 
+# ── Д1 (живая свивка 016): устойчивое разрешение владельца notify.json ──
+
+def _dir_owner(path):
+    import pwd
+    return pwd.getpwuid(os.stat(path).st_uid).pw_name
+
+
+class TestResolveOwner:
+    """Д1: SUDO_USER=root (двойной sudo: `sudo make errors-notify-import`)
+    НЕ должен давать root-владельца — иначе cron-юзер не читает файл (TG
+    молча skip). Разрешение: SUDO_USER(≠root) → владелец каталога → id -un."""
+
+    def _owner(self, tmp_path, env_over=None):
+        out = tmp_path / "notify.json"
+        r = sh(IMPORT_SH, "--out", str(out), "--print-owner", env_over=env_over)
+        assert r.returncode == 0, r.stderr
+        return r.stdout.strip()
+
+    def test_sudo_user_named(self, tmp_path):
+        """SUDO_USER=ladmin (непуст, не root) → владелец = SUDO_USER."""
+        me = os.environ.get("USER") or "ladmin"
+        assert self._owner(tmp_path, {"SUDO_USER": me}) == me
+
+    def test_sudo_user_root_falls_to_dir_owner(self, tmp_path):
+        """Д1-мутация: SUDO_USER=root → владелец = владелец каталога назначения."""
+        assert self._owner(tmp_path, {"SUDO_USER": "root"}) == _dir_owner(tmp_path)
+
+    def test_sudo_user_empty_falls_to_dir_owner(self, tmp_path):
+        """Д1-мутация: SUDO_USER пуст → владелец = владелец каталога назначения."""
+        assert self._owner(tmp_path) == _dir_owner(tmp_path)
+
+    def test_double_sudo_file_owner_not_root(self, tmp_path):
+        """Д1 (живой кейс, интеграционно): SUDO_USER=root → файл принадлежит
+        владельцу каталога назначения (в тесте — self-chown), НЕ root."""
+        envf = fake_env(tmp_path)
+        out = tmp_path / "notify.json"
+        r = sh(IMPORT_SH, "--env", str(envf), "--out", str(out),
+               env_over={"SUDO_USER": "root"})
+        assert r.returncode == 0, r.stderr
+        assert out.stat().st_uid == os.getuid()
+        assert oct(os.stat(out).st_mode & 0o777)[2:] == "600"
+
+    def test_help_warns_no_outer_sudo(self):
+        """Д1: --help явно говорит запускать make БЕЗ внешнего sudo."""
+        r = sh(IMPORT_SH, "--help")
+        assert r.returncode == 0, r.stderr
+        assert "БЕЗ внешнего sudo" in r.stdout
+        assert "двойной sudo" in r.stdout.lower()
+
+
 # ── errors_cron.sh (AC-cron-1 / R8 / R9; только --file модель, БЕЗ crontab) ──
 
 MARK_BEGIN = "# mcp-knowledge errors-notify (code-2026-09-24-016)"
 MARK_END = "# mcp-knowledge errors-notify (end)"
+
+# минимальная валидная модель (Д2: пустые/отсутствующие модели запрещены)
+MODEL_SEED = "# модель текущего crontab (crontab -l > FILE)\n"
+
+
+def fake_crontab_env(tmp_path):
+    """Д3: герметичная эмуляция crontab(1) через PATH-инъекцию.
+
+    Оверлей cron_logs теперь пишется ТОЛЬКО в реальном режиме (не --file),
+    поэтому real-mode тесты идут через fake-бинарь: состояние в файле,
+    реальный crontab пользователя не трогается.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    state = tmp_path / "crontab.state"
+    (bin_dir / "crontab").write_text(
+        "#!/usr/bin/env bash\n"
+        'state="${FAKE_CRONTAB_STATE:?}"\n'
+        'if [ "${1:-}" = "-l" ]; then\n'
+        '  if [ -f "$state" ]; then cat "$state"; exit 0; '
+        'else echo "no crontab for user" >&2; exit 1; fi\n'
+        "fi\n"
+        'cat "${1:?}" > "$state"\n',
+        encoding="utf-8")
+    (bin_dir / "crontab").chmod(0o755)
+    env = {"PATH": f"{bin_dir}:{os.environ['PATH']}",
+           "FAKE_CRONTAB_STATE": str(state)}
+    return env, state
 
 
 class TestCronInstall:
@@ -193,7 +271,7 @@ class TestCronInstall:
     def test_absolute_paths_and_cd(self, tmp_path):
         """R8: команды через cd <абсолютный BASE>, все пути абсолютные."""
         cf = tmp_path / "crontab.txt"
-        cf.write_text("", encoding="utf-8")
+        cf.write_text(MODEL_SEED, encoding="utf-8")
         r = sh(CRON_SH, "--install", "--file", str(cf), "--data-root", str(tmp_path / "data"))
         assert r.returncode == 0, r.stderr
         for ln in cf.read_text().splitlines():
@@ -223,7 +301,7 @@ class TestCronInstall:
     def test_install_idempotent_no_dupes(self, tmp_path):
         """Повторный --install = 0 дублей (блок один, строк блока — по одному)."""
         cf = tmp_path / "crontab.txt"
-        cf.write_text("", encoding="utf-8")
+        cf.write_text(MODEL_SEED, encoding="utf-8")
         args = ("--install", "--file", str(cf), "--data-root", str(tmp_path / "data"))
         sh(CRON_SH, *args)
         r2 = sh(CRON_SH, *args)
@@ -236,33 +314,34 @@ class TestCronInstall:
         assert content.count("errors_report.py") == 1
 
     def test_config_overlay_cron_logs(self, tmp_path):
-        """R9: config-оверлей cron_logs — union с существующими (чужие не терять)."""
-        cf = tmp_path / "crontab.txt"
-        cf.write_text("", encoding="utf-8")
+        """R9 (Д3): config-оверлей cron_logs — ТОЛЬКО в реальном режиме
+        (fake crontab через PATH); union с существующими (чужие не терять)."""
+        env, state = fake_crontab_env(tmp_path)
         dr = tmp_path / "data"
         cfgp = dr / "logs" / "errors" / "config.json"
         cfgp.parent.mkdir(parents=True)
         cfgp.write_text(json.dumps(
             {"cron_logs": ["/var/log/mcp-backup.log", "/var/log/mcp-quality.log"]}), encoding="utf-8")
-        r = sh(CRON_SH, "--install", "--file", str(cf), "--data-root", str(dr))
+        r = sh(CRON_SH, "--install", "--data-root", str(dr), env_over=env)
         assert r.returncode == 0, r.stderr
+        assert "пропущен" not in r.stdout  # реальный режим → оверлей выполнен
         merged = json.loads(cfgp.read_text())
         cl = merged["cron_logs"]
         assert "/var/log/mcp-backup.log" in cl  # чужое сохранено
         for name in ("collector", "alerts", "weekly"):
             assert any(name in p for p in cl), f"нет {name}.log в cron_logs"
         assert len([p for p in cl if "collector" in p]) == 1  # без дублей
+        assert "errors_collect.py" in state.read_text()  # crontab записан
 
     def test_config_overlay_backup(self, tmp_path):
-        """R9: старый config.json бэкапится до мерджа."""
-        cf = tmp_path / "crontab.txt"
-        cf.write_text("", encoding="utf-8")
+        """R9 (Д3): старый config.json бэкапится до мерджа (реальный режим)."""
+        env, _state = fake_crontab_env(tmp_path)
         dr = tmp_path / "data"
         cfgp = dr / "logs" / "errors" / "config.json"
         cfgp.parent.mkdir(parents=True)
         original = {"cron_logs": ["/var/log/mcp-backup.log"]}
         cfgp.write_text(json.dumps(original), encoding="utf-8")
-        r = sh(CRON_SH, "--install", "--file", str(cf), "--data-root", str(dr))
+        r = sh(CRON_SH, "--install", "--data-root", str(dr), env_over=env)
         assert r.returncode == 0, r.stderr
         backups = list((ROOT / ".trash").glob("errors-config-backup-*.json"))
         assert backups
@@ -290,7 +369,7 @@ class TestCronInstall:
 
     def test_status(self, tmp_path):
         cf = tmp_path / "crontab.txt"
-        cf.write_text("", encoding="utf-8")
+        cf.write_text(MODEL_SEED, encoding="utf-8")
         args = ("--file", str(cf), "--data-root", str(tmp_path / "data"))
         r0 = sh(CRON_SH, "--status", *args)
         assert r0.returncode == 0
@@ -311,7 +390,7 @@ class TestCronInstall:
 
     def test_validator_accepts_ours(self, tmp_path):
         cf = tmp_path / "crontab.txt"
-        cf.write_text("", encoding="utf-8")
+        cf.write_text(MODEL_SEED, encoding="utf-8")
         sh(CRON_SH, "--install", "--file", str(cf), "--data-root", str(tmp_path / "data"))
         r = sh(CRON_SH, "--validate", str(cf))
         assert r.returncode == 0, r.stdout + r.stderr
@@ -325,6 +404,78 @@ class TestCronInstall:
                env_over={"ERRORS_CRON_FORCE_REL": "1"})
         assert r.returncode != 0
         assert cf.read_text() == "original\n"  # файл НЕ тронут
+
+
+# ── Д2 (живая свивка 016): --file-модель обязана существовать и быть непустой ──
+
+class TestCronFileModelGuard:
+    """Д2: отсутствующая модель молча читалась как ПУСТОЙ crontab → preview
+    «выглядел как удаление всех пользовательских джоб». Отказ до правок."""
+
+    def _real_crontab_snapshot(self):
+        return subprocess.run(["crontab", "-l"], capture_output=True, text=True, check=False)
+
+    def test_install_missing_model_refused(self, tmp_path):
+        """R-мутация: отсутствующая модель → exit≠0, подсказка crontab -l,
+        реальный crontab не тронут, модель не создана на пустом месте."""
+        cf = tmp_path / "absent-model"
+        before = self._real_crontab_snapshot()
+        r = sh(CRON_SH, "--install", "--file", str(cf), "--data-root", str(tmp_path / "data"))
+        assert r.returncode != 0
+        combined = r.stdout + r.stderr
+        assert "crontab -l" in combined  # понятная подсказка
+        assert not cf.exists()  # «пустой crontab» не материализован
+        after = self._real_crontab_snapshot()
+        assert (before.returncode, before.stdout) == (after.returncode, after.stdout)
+
+    def test_install_empty_model_refused(self, tmp_path):
+        """R-мутация: пустая (0 байт) модель → exit≠0 (модель = снимок реальности)."""
+        cf = tmp_path / "empty-model"
+        cf.write_text("", encoding="utf-8")
+        r = sh(CRON_SH, "--install", "--file", str(cf), "--data-root", str(tmp_path / "data"))
+        assert r.returncode != 0
+        assert "crontab -l" in (r.stdout + r.stderr)
+
+    def test_remove_missing_model_refused(self, tmp_path):
+        """--remove на отсутствующей модели тоже отказ (единый контракт --file)."""
+        r = sh(CRON_SH, "--remove", "--file", str(tmp_path / "absent"),
+               "--data-root", str(tmp_path / "data"))
+        assert r.returncode != 0
+
+    def test_status_missing_model_refused(self, tmp_path):
+        """--status на отсутствующей модели тоже отказ (не «not installed»)."""
+        r = sh(CRON_SH, "--status", "--file", str(tmp_path / "absent"),
+               "--data-root", str(tmp_path / "data"))
+        assert r.returncode != 0
+
+
+# ── Д3 (живая свивка 016): preview (--file) не мутирует реальный config.json ──
+
+class TestCronPreviewNoSideEffects:
+    """Д3: режим --file = preview → реальный config-оверлей cron_logs
+    НЕ пишется (реальные данные не мутируются в preview)."""
+
+    def test_preview_config_json_untouched(self, tmp_path):
+        cf = tmp_path / "crontab.txt"
+        cf.write_text("17 3 * * * /usr/bin/existing-job\n", encoding="utf-8")
+        dr = tmp_path / "data"
+        cfgp = dr / "logs" / "errors" / "config.json"
+        cfgp.parent.mkdir(parents=True)
+        original = json.dumps({"cron_logs": ["/var/log/mcp-backup.log"]},
+                              indent=2, ensure_ascii=False) + "\n"
+        cfgp.write_text(original, encoding="utf-8")
+        before = cfgp.read_bytes()
+        r = sh(CRON_SH, "--install", "--file", str(cf), "--data-root", str(dr))
+        assert r.returncode == 0, r.stderr
+        assert cfgp.read_bytes() == before  # побайтово не изменён
+        assert "пропущен" in r.stdout  # явное сообщение о пропуске overlay
+
+    def test_preview_message_names_file_mode(self, tmp_path):
+        cf = tmp_path / "crontab.txt"
+        cf.write_text(MODEL_SEED, encoding="utf-8")
+        r = sh(CRON_SH, "--install", "--file", str(cf), "--data-root", str(tmp_path / "data"))
+        assert r.returncode == 0, r.stderr
+        assert "config overlay: пропущен (режим --file)" in r.stdout
 
 
 # ── AC-collect-1(а): юнит collect_cron_logs на [CRON] exit=1 ──
