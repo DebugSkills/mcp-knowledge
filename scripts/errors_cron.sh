@@ -11,8 +11,9 @@
 # Что делает (--install):
 #   1) бэкап текущего crontab в .trash/crontab-backup-<ts>.txt ДО правки (R6);
 #   2) вынимает старый блок/сироты-строки (идемпотентность: 0 дублей);
-#   3) добавляет маркер-блок из 3 джоб (collector */5 ПЕРВЫМ — P3-c, alerts */5,
-#      weekly Пн 10:02) — все пути абсолютные + cd BASE, обёртки cron_wrap.sh
+#   3) добавляет маркер-блок из 3 джоб (collector */5 ПЕРВЫМ — P3-c, alerts */5
+#      с --send-tg — Д4: без флага errors_alert.py dry-run и алерты не уходят,
+#      weekly Пн 10:02 --send-tg) — все пути абсолютные + cd BASE, обёртки cron_wrap.sh
 #      пишут [CRON]-строки (exit≠0 → P0-признак cron_nonzero, AC-collect-1);
 #   4) R8-валидация блока ДО записи: cd-префикс абсолютный, путь-токены
 #      абсолютные → иначе exit≠0 и crontab НЕ тронут;
@@ -62,7 +63,7 @@ cron_lines() {
   cat <<EOF
 $MARK_BEGIN
 */5 * * * * cd $BASE && bash $BASE/scripts/cron_wrap.sh collector $CRON_DIR/collector.log -- $BASE/.venv/bin/python $BASE/scripts/errors_collect.py >> $CRON_DIR/collector.log 2>&1
-*/5 * * * * cd $BASE && bash $BASE/scripts/cron_wrap.sh alerts $CRON_DIR/alerts.log -- $BASE/.venv/bin/python $BASE/scripts/errors_alert.py >> $CRON_DIR/alerts.log 2>&1
+*/5 * * * * cd $BASE && bash $BASE/scripts/cron_wrap.sh alerts $CRON_DIR/alerts.log -- $BASE/.venv/bin/python $BASE/scripts/errors_alert.py --send-tg >> $CRON_DIR/alerts.log 2>&1
 2 10 * * 1 cd $BASE && bash $BASE/scripts/cron_wrap.sh weekly $CRON_DIR/weekly.log -- $BASE/.venv/bin/python $BASE/scripts/errors_report.py --send-tg >> $CRON_DIR/weekly.log 2>&1
 $MARK_END
 EOF

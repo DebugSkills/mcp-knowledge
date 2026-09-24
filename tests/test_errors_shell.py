@@ -263,8 +263,14 @@ class TestCronInstall:
         assert lines[b + 1].startswith("*/5")  # collector */5 ПЕРВЫМ
         assert "errors_collect.py" in lines[b + 1]
         assert "errors_alert.py" in lines[b + 2]
+        # Д4 (живая свивка 016): alerts-джоба ОБЯЗАНА иметь --send-tg — без
+        # флага errors_alert.py работает в dry-run (печать плана, exit 0) и
+        # немедленные P0/burst-алерты не уходят НИКОГДА.
+        assert "--send-tg" in lines[b + 2], \
+            f"Д4: alerts-джоба без --send-tg (алерты не отправляются): {lines[b + 2]}"
         assert lines[b + 3].startswith("2 10 * * 1")  # weekly Пн 10:02
         assert "errors_report.py" in lines[b + 3]
+        assert "--send-tg" in lines[b + 3]  # weekly с отправкой (фиксируем)
         assert lines[b + 4] == MARK_END
         assert "17 3 * * * /usr/bin/existing-job" in lines  # чужое не тронуто
 
@@ -312,6 +318,9 @@ class TestCronInstall:
         assert content.count("errors_collect.py") == 1
         assert content.count("errors_alert.py") == 1
         assert content.count("errors_report.py") == 1
+        # Д4: --send-tg ровно 2 (alerts + weekly) — идемпотентность не даёт
+        # дублей флага, а отсутствие обоих = dry-run-дефект класса Д4.
+        assert content.count("--send-tg") == 2
 
     def test_config_overlay_cron_logs(self, tmp_path):
         """R9 (Д3): config-оверлей cron_logs — ТОЛЬКО в реальном режиме
