@@ -351,8 +351,11 @@ class TestRoutineClassification:
         assert self._prio(evs)["priority"] == "P0"
 
     def test_warning_not_routine(self):
-        evs = self._events("2026-09-22 10:00:00,123 [WARNING] mcp_knowledge.pipeline: "
-                           "Очередь переполнена — blocking put")
+        # 015: строка «Очередь переполнена» перенесена в
+        # TestDurableRuleQueueOverflow (ожидаемый backpressure → routine);
+        # здесь — посторонний WARNING без признаков сбоя
+        evs = self._events("2026-09-22 10:00:00,123 [WARNING] mcp_knowledge.reconcile: "
+                           "пропускаю неиндексируемую запись")
         assert len(evs) == 1 and evs[0]["expected"] is False
 
     def test_req_2xx_is_routine_p3(self):
@@ -429,6 +432,96 @@ class TestRoutineClassification:
             ec.update_aggregates(sink, [_ev(expected=True, **ev_kw)], {})
             aggs = json.loads((sink / "aggregates" / "signatures.json").read_text())
             assert next(iter(aggs.values()))["priority"] != "P3"  # залипло
+
+
+# ── 015: durable-правило №1 — queue-overflow = ожидаемый backpressure ──
+
+QUEUE_OVERFLOW_LIVE_SIG = (
+    "docker_logs|-|<n>-<n>-<n> <n>:<n>:<n>,<n> [WARNING] "
+    "mcp_knowledge.pipeline: Очередь переполнена — blocking put")
+
+# Сид побайтово по форме ЖИВОГО агрегата (dev-sink 21.09: P2/T/754,
+# БЕЗ ключа has_non_routine — первое future-событие expected=True даёт
+# routine_all → P3/T на живой подписи)
+QUEUE_OVERFLOW_LIVE_SEED = {
+    "priority": "P2", "class": "T",
+    "first_seen": "2026-09-21T18:16:12.833938786Z",
+    "last_seen": "2026-09-21T18:27:37.865422712Z",
+    "count_total": 754, "daily": {"2026-09-22": 754},
+    "actors": [], "sources": ["docker_logs"], "last_example": None,
+    "status": "active", "fixed_at": None,
+}
+
+
+class TestDurableRuleQueueOverflow:
+    """015 (спека §7 .boardData.md): WARNING backpressure индексации →
+    expected=True → P3/T (прецедент: ERRORS_QUERY 006). Детектор — по rest
+    (литерал с заглавной «О» U+041E байт-идентичен pipeline.py:122),
+    fail-word-гард AUDIT_FAIL_RE — по low (как :283).
+    """
+
+    def _events(self, rest):
+        # docker logs --timestamps: RFC3339-префикс обязателен — без него
+        # parse_log_line отбрасывает строку (ts=None → 0 событий; Critic N2)
+        return ec.parse_docker_log_events(
+            "mcp-knowledge-server", [LOG_LINE.format(rest)], "", 60000)
+
+    def _prio(self, events):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sink = Path(td)
+            ec.update_aggregates(sink, events, {})
+            aggs = json.loads((sink / "aggregates" / "signatures.json").read_text())
+            return next(iter(aggs.values()))
+
+    def test_t1_live_literal_expected_p3_on_live_seed(self):
+        # t1: байт-идентичный литерал pipeline.py:122 (формат сырого лога)
+        evs = self._events("2026-09-22 10:00:00,123 [WARNING] mcp_knowledge.pipeline: "
+                           "Очередь переполнена — blocking put")
+        assert len(evs) == 1
+        assert evs[0]["expected"] is True
+        # сигнатура байт-равна живому ключу sink (сид-мердж адекватен)
+        assert evs[0]["signature"] == QUEUE_OVERFLOW_LIVE_SIG
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sink = Path(td)
+            ec.atomic_write_json(
+                sink / "aggregates" / "signatures.json",
+                {QUEUE_OVERFLOW_LIVE_SIG: dict(QUEUE_OVERFLOW_LIVE_SEED)})
+            ec.update_aggregates(sink, evs, {})
+            a = json.loads((sink / "aggregates" / "signatures.json").read_text())[
+                QUEUE_OVERFLOW_LIVE_SIG]
+        assert a["priority"] == "P3" and a["class"] == "T"  # было P2/T
+        assert a["count_total"] == 755  # 754 живых + 1 новое
+        assert "has_non_routine" not in a  # флаг не залипает
+
+    def test_t2_retry_warning_same_logger_not_routine(self):
+        # t2: Retry-warning того же логгера (pipeline.py:553) — нет якорной
+        # подстроки → False/P2 (R2: расширение на любой pipeline-WARNING ловится)
+        evs = self._events("2026-09-22 10:00:00,123 [WARNING] mcp_knowledge.pipeline: "
+                           "Retry 1/3 for kb-2026-0123 (delay=2.0s)")
+        assert len(evs) == 1 and evs[0]["expected"] is False
+        a = self._prio(evs)
+        assert a["priority"] == "P2" and a["class"] == "T"
+
+    def test_t2_foreign_logger_same_substring_not_routine(self):
+        # t2: чужой логгер с той же подстрокой → False/P2 — двойное сужение
+        # (R3: матч без проверки логгера ловится)
+        evs = self._events("2026-09-22 10:00:00,123 [WARNING] mcp_knowledge.other: "
+                           "Очередь переполнена — blocking put")
+        assert len(evs) == 1 and evs[0]["expected"] is False
+        a = self._prio(evs)
+        assert a["priority"] == "P2" and a["class"] == "T"
+
+    def test_t3_mutant_with_anchor_and_fail_words_not_routine(self):
+        # t3: мутант с СОХРАНЁННЫМ якорем + слова (failed, error) → False:
+        # ветку блокирует гард AUDIT_FAIL_RE, а НЕ отсутствие подстроки
+        # (R4: без гарда стало бы True — глотание сбойной семантики)
+        evs = self._events("2026-09-22 10:00:00,123 [WARNING] mcp_knowledge.pipeline: "
+                           "Очередь переполнена — blocking put (failed, error)")
+        assert len(evs) == 1 and evs[0]["expected"] is False
+        a = self._prio(evs)
+        assert a["priority"] == "P2" and a["class"] == "T"
 
 
 class TestDockerEventsScope:
