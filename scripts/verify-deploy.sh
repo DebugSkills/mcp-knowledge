@@ -9,7 +9,8 @@
 #   V1  health      GET :8000/health → status=healthy + reconcile без error
 #                   (печатает: status, reconcile.state, orphans, embedding.ok)
 #   V2  logs        docker logs mcp-knowledge-server (tail N): 0 строк
-#                   error|traceback|critical (нет docker/контейнера → SKIP)
+#                   [ERROR]/[CRITICAL]/CRITICAL/Traceback/[FATAL] — УРОВЕНЬ
+#                   лога, не подстрока (INFO errors=1 — НЕ FAIL; нет docker → SKIP)
 #   V3  MCP tools   POST /mcp tools/list с read-ключом из .env → ≥30
 #                   (нет ключа → SKIP с сообщением; ключ НЕ печатается)
 #   V4  console     :8085, auth-aware: CONSOLE_AUTH=required+пароль →
@@ -17,7 +18,9 @@
 #                   auth off/пусто без пароля → 200. Пароль НЕ печатается.
 #
 # Env: VERIFY_WAIT (сек ожидания health, дефолт 120) · VERIFY_LOG_TAIL
-#      (строк логов, дефолт 300) · VERIFY_MIN_TOOLS (дефолт 30) · --help
+#      (строк логов, дефолт 300) · VERIFY_MIN_TOOLS (дефолт 30) ·
+#      VERIFY_LOG_FILE / VERIFY_LOG_CMD (источник лога V2 вместо docker;
+#      для тестов) · --help
 # Выход: exit = число упавших проверок (0 = зелёно). Секреты не печатаются.
 
 set -euo pipefail
@@ -31,6 +34,8 @@ CONTAINER="${VERIFY_CONTAINER:-mcp-knowledge-server}"
 WAIT="${VERIFY_WAIT:-120}"
 LOG_TAIL="${VERIFY_LOG_TAIL:-300}"
 MIN_TOOLS="${VERIFY_MIN_TOOLS:-30}"
+LOG_FILE="${VERIFY_LOG_FILE:-}"   # тест-хук: V2 читает файл вместо docker logs
+LOG_CMD="${VERIFY_LOG_CMD:-}"     # тест-хук: V2 читает вывод команды (bash -c)
 PASSED=0; FAILED=0; SKIPPED=0; FAILED_IDS=()
 
 # Цвет — только при TTY (в пайпе вывод чистый)
@@ -123,28 +128,50 @@ print(d.get("status", "?"), rec.get("state", "?"),
     return 0
 }
 
-# ── V2 logs: 0 строк error|traceback|critical в последних N строках ──
+# ── V2 logs: 0 строк [ERROR]/[CRITICAL]/CRITICAL/Traceback/[FATAL] ──
+# Матчим УРОВЕНЬ лога (формат: `YYYY-MM-DD HH:MM:SS,mmm [LEVEL] name: msg`),
+# а не подстроку: INFO/WARNING-строки с `errors=1`/`error_count=`/NotFound
+# не являются сбоем. Источник лога: docker logs (дефолт) либо VERIFY_LOG_FILE
+# (файл) / VERIFY_LOG_CMD (команда) — переопределяется для тестов.
+V2_BAD_RE='\[(ERROR|FATAL)\]|CRITICAL|Traceback \(most recent call last\)'
+
+v2_fetch_logs() {
+    if [ -n "$LOG_FILE" ]; then
+        tail -n "$LOG_TAIL" "$LOG_FILE" 2>/dev/null || true
+    elif [ -n "$LOG_CMD" ]; then
+        bash -c "$LOG_CMD" 2>&1 | tail -n "$LOG_TAIL" || true
+    else
+        docker logs --tail "$LOG_TAIL" "$CONTAINER" 2>&1 || true
+    fi
+}
+
 v2_logs() {
-    if ! command -v docker >/dev/null 2>&1; then
-        SKIPPED=$((SKIPPED + 1)); say_skip 2 "server logs" "docker недоступен"
+    if [ -n "$LOG_FILE" ] && [ ! -r "$LOG_FILE" ]; then
+        FAILED=$((FAILED + 1)); FAILED_IDS+=("V2")
+        say_fail 2 "server logs" "VERIFY_LOG_FILE не читается: $LOG_FILE"
         return 0
     fi
-    if [ -z "$(docker ps --filter "name=$CONTAINER" -q 2>/dev/null || true)" ]; then
-        SKIPPED=$((SKIPPED + 1))
-        say_skip 2 "server logs" "контейнер $CONTAINER не запущен"
-        return 0
+    if [ -z "$LOG_FILE" ] && [ -z "$LOG_CMD" ]; then
+        if ! command -v docker >/dev/null 2>&1; then
+            SKIPPED=$((SKIPPED + 1)); say_skip 2 "server logs" "docker недоступен"
+            return 0
+        fi
+        if [ -z "$(docker ps --filter "name=$CONTAINER" -q 2>/dev/null || true)" ]; then
+            SKIPPED=$((SKIPPED + 1))
+            say_skip 2 "server logs" "контейнер $CONTAINER не запущен"
+            return 0
+        fi
     fi
     local hits
-    hits="$(docker logs --tail "$LOG_TAIL" "$CONTAINER" 2>&1 \
-        | grep -icE 'error|traceback|critical' || true)"
+    hits="$(v2_fetch_logs | grep -cE "$V2_BAD_RE" || true)"
     if [ "$hits" -eq 0 ]; then
         PASSED=$((PASSED + 1))
-        say_pass 2 "server logs (tail=$LOG_TAIL)" "0 строк error/traceback/critical"
+        say_pass 2 "server logs (tail=$LOG_TAIL)" "0 строк [ERROR]/CRITICAL/Traceback"
     else
         FAILED=$((FAILED + 1)); FAILED_IDS+=("V2")
-        say_fail 2 "server logs (tail=$LOG_TAIL)" "$hits строк error/traceback/critical:"
-        docker logs --tail "$LOG_TAIL" "$CONTAINER" 2>&1 \
-            | grep -iE 'error|traceback|critical' | head -5 | sed 's/^/    | /' || true
+        say_fail 2 "server logs (tail=$LOG_TAIL)" \
+            "$hits строк [ERROR]/CRITICAL/Traceback/[FATAL]:"
+        v2_fetch_logs | grep -E "$V2_BAD_RE" | head -5 | sed 's/^/    | /' || true
     fi
     return 0
 }
