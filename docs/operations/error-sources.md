@@ -168,6 +168,34 @@ URL → только path (`http://host:8420/x?y=1` → `/x`). Пример: с�
 view — суффикс сигнатуры `ep=/a×3(+2)` (топ-3, `(+N)` = сумма вне топ-3);
 weekly P3-baseline — суффикс ` · ep: /a×3, /b×2` (топ-3, только если непуст).
 
+## Parity замороженных артефактов (code-2026-09-23-010, спека §7 .boardData.md)
+
+Часть конвенций Error→Rule физически живёт в ДВУХ копиях: collector
+(`scripts/errors_collect.py`, сбор) ↔ tool (`tools/errors_query.py`, агентский
+API). Дубликат обязателен (scripts/ не копируется в Docker-образ), поэтому
+расхождение копий ловится parity-тестами на хосте (G4 preflight):
+`tests/test_masking_parity.py` (маскирование, 006) и
+`tests/test_frozen_parity.py` (010; блоки A–F, 22 теста, RED×7-мутации).
+Дрейф любой из сторон = красный тест — «тихая деградация» диагностики
+(агент и сбор трактуют P0–P3/окна по-разному) невозможна.
+
+**Шесть двухкопийных артефактов (предмет parity):**
+
+| Артефакт | Collector | Tool | Механизм проверки |
+|---|---|---|---|
+| Словарь P0–P3 | литералы лестницы `update_aggregates` (неявные) | `PRIO_RANK` | AST-литералы == ключам (A) |
+| Формат сигнатуры `source\|key\|normalized` | `make_signature` | разбор в `_filter_aggregates` | round-trip через обе функции (B) |
+| Trend up/down/flat | рост-условие лестницы | `_trend` | матрица + live-прогон (C) |
+| 7d-окно (включительная граница) | week_ago-фильтр `update_aggregates` | `_suppressed_7d` | синтетика + live-прогон (D) |
+| endpoints cap 20 | `ENDPOINTS_KEEP` | срез в `_render_aggregate` | рендер + scoped-регекс (E) |
+| Маркер `ERRORS_QUERY` | classify_routine → expected (P3-baseline) | аудит-фильтры (`include_audit=false`) | parse + фильтр (B5) |
+
+**Граница скоупа:** JSON-контракты полей агрегатов/событий
+(`sampled`, `suppressed_count`, `burst_ts`, `endpoints`) — двухкопийные имена,
+НО вне parity-трассы: покрыты mcp_server-юнитами и shape-тестами 009.
+`P0_HINTS`, `BASELINE_4XX`, `deep_normalize` — одиночные копии (живут только
+в collector, заморожены `test_errors_lib.py`), в parity не входят.
+
 ---
 Обслуживание: новый источник → `make test-errors` КРАСНЫЙ → добавить строку
 (механизм сбора или честный gap с причиной) → ЗЕЛЁНЫЙ. Live-проверка на проде:
