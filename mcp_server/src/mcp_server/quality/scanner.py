@@ -31,7 +31,7 @@ from mcp_server.quality.dup_ranking import (
 from mcp_server.quality.edit_war import detect_edit_war
 from mcp_server.quality.issues import (
     bulk_update_status,
-    create_issue,
+    create_issues_batch,
     list_open_issue_ids_grouped,
 )
 from mcp_server.quality.scoring import (
@@ -56,6 +56,10 @@ MAX_PAIRS_PER_BUCKET: int = 500  # макс пар для проверки в о
 MAX_ISSUES_PER_KNOWLEDGE: int = 10
 # Чанк auto-clear (011): cancel-чек + batched-лог каждые N записей (отмена ≤10 с)
 AUTO_CLEAR_CHUNK_SIZE: int = 2000
+# Батч issue-записи шагов 5/5.4 (011): один create_issues_batch на N записей
+ISSUES_BATCH_SIZE: int = 500
+# Intra-bucket cancel-чек dup_scan (011): каждые N итераций пар (отмена ≤10 с)
+DUP_CANCEL_CHECK_EVERY: int = 500
 
 # ── W4.3: sensitive-эвристики (план §2.5) ──────────────────────
 # Путь-маркеры (флаг, НЕ блок, НЕ deprecate) — тот же набор, что в
@@ -699,10 +703,19 @@ def _scan_dup_pairs(
     dup_map: dict[str, int] = {}  # R2: knowledge_id → dup_count
     total_domains = len(by_domain)
     domain_idx = 0
+    # code-2026-09-24-011 (В3): пары буферизуются и фллашатся ОДНИМ
+    # create_issues_batch в конце каждого domain-бакета — вместо inline
+    # create_issue на каждую пару (618 пар ≈ 3 мин + ~12 ГБ IO rewrite за скан).
+    dup_buffer: list[dict] = []
     for entries in by_domain.values():
         domain_idx += 1
-        # 13.18: проверка отмены между domain-бакетами
+        # 13.18: проверка отмены между domain-бакетами.
+        # code-2026-09-24-011 (P2-4): перед выходом фллашим накопленный буфер —
+        # частичный результат сохраняется (бакет до ~9 мин, отмена была незаметна).
         if cancel_event is not None and cancel_event.is_set():
+            if dup_buffer:
+                create_issues_batch(dup_buffer)
+                dup_buffer = []
             break
         if len(entries) < 2:
             continue
@@ -733,8 +746,23 @@ def _scan_dup_pairs(
         # Лимит dup-issues на одну запись: книга на 15K секций даёт тысячи пар
         # с одинаковым fm_i → тысячи issues на один knowledge_id (засорение + CPU).
         issue_counts: dict[str, int] = {}
+        bucket_cancelled = False
+        pair_iterations = 0
         for i in range(n):
+            if bucket_cancelled:
+                break
             for j in range(i + 1, n):
+                # code-2026-09-24-011: intra-bucket cancel-чек (каждые
+                # DUP_CANCEL_CHECK_EVERY итераций пар) — гранулярность отмены
+                # была «один domain-бакет» (до ~9 мин), теперь ≤10 с (AC3).
+                pair_iterations += 1
+                if (
+                    pair_iterations % DUP_CANCEL_CHECK_EVERY == 0
+                    and cancel_event is not None
+                    and cancel_event.is_set()
+                ):
+                    bucket_cancelled = True
+                    break
                 _, fm_i, _ = entries[i]
                 _, fm_j, _ = entries[j]
                 # Фаза 1 (1c): deprecated-записи пропускаем — иначе re-detection loop
@@ -764,7 +792,8 @@ def _scan_dup_pairs(
                 # R2: dup_map для пост-обработки scoring
                 dup_map[fm_i.knowledge_id] = dup_map.get(fm_i.knowledge_id, 0) + 1
                 dup_map[fm_j.knowledge_id] = dup_map.get(fm_j.knowledge_id, 0) + 1
-                # Создаём issue для дубликата (cosine в detail — сигнал уверенности, P0)
+                # Буферизуем спек issue (011: флаш одним батчем в конце бакета;
+                # detail/metadata-семантика дословно как в inline create_issue)
                 detail = (
                     f"Possible duplicate of {fm_j.knowledge_id} "
                     f"(same subject={fm_i.subject}, cosine={similarity:.3f})"
@@ -776,12 +805,12 @@ def _scan_dup_pairs(
                 # metadata НЕ входит в issue_id — идемпотентность сохранена.
                 meta_i = (content_meta or {}).get(fm_i.knowledge_id, {})
                 meta_j = (content_meta or {}).get(fm_j.knowledge_id, {})
-                create_issue(
-                    issue_type="duplicate",
-                    knowledge_id=fm_i.knowledge_id,
-                    severity="warn",
-                    detail=detail,
-                    metadata={
+                dup_buffer.append({
+                    "issue_type": "duplicate",
+                    "knowledge_id": fm_i.knowledge_id,
+                    "severity": "warn",
+                    "detail": detail,
+                    "metadata": {
                         "cosine": round(similarity, 4) if similarity is not None else None,
                         "content_hash": meta_i.get("content_hash"),
                         "content_length": meta_i.get("content_length"),
@@ -797,7 +826,13 @@ def _scan_dup_pairs(
                         "target_subject": fm_j.subject,
                         "target_kid": fm_j.knowledge_id,
                     },
-                )
+                })
+        # Флаш буфера в конце domain-бакета (точка уже является cancel-границей)
+        if dup_buffer:
+            create_issues_batch(dup_buffer)
+            dup_buffer = []
+        if bucket_cancelled:
+            break
     return dup_count, dup_map
 
 
@@ -849,8 +884,11 @@ def _create_issues_for_problems(
 
     Task 2: логирует прогресс по батчам ~500 записей.
     13.18: проверка cancel_event между батчами.
+    code-2026-09-24-011 (В3): спеки собираются по батчу → ОДИН
+    create_issues_batch на батч (тайм-бомба: при росте review queue
+    K=1000 per-record create_issue давал ≈5 мин + 1000×20 МБ rewrite).
     """
-    BATCH_SIZE = 500
+    BATCH_SIZE = ISSUES_BATCH_SIZE
     count = 0
     total = len(scored)
     for batch_start in range(0, total, BATCH_SIZE):
@@ -858,16 +896,19 @@ def _create_issues_for_problems(
         if cancel_event is not None and cancel_event.is_set():
             break
         batch = scored[batch_start:batch_start + BATCH_SIZE]
+        specs: list[dict] = []
         for _, frontmatter, score in batch:
             if score >= REVIEW_THRESHOLD:
-                # Проверяем — не создан ли уже issue для этой записи
-                create_issue(
-                    issue_type="missing_field",
-                    knowledge_id=frontmatter.knowledge_id,
-                    severity="warn",
-                    detail=f"Staleness score {score} >= {REVIEW_THRESHOLD} — needs review",
-                )
-                count += 1
+                specs.append({
+                    "issue_type": "missing_field",
+                    "knowledge_id": frontmatter.knowledge_id,
+                    "severity": "warn",
+                    "detail": f"Staleness score {score} >= {REVIEW_THRESHOLD} — needs review",
+                })
+        if specs:
+            create_issues_batch(specs)
+        # Метрика = число спеков (констрейнт §7.8-7: как раньше число вызовов)
+        count += len(specs)
         # Batch progress log
         if progress and progress_id:
             batch_end = min(batch_start + BATCH_SIZE, total)
@@ -922,13 +963,16 @@ def _create_sensitive_issues(
     → детерминированный issue_id (одна open issue на запись); детали
     живут в metadata (create_issue делает metadata-refresh при перескане).
 
+    code-2026-09-24-011 (В3): спеки (вкл. metadata) → ОДИН
+    create_issues_batch на батч (72 flagged ≈ 1.4 ГБ IO → 1 rewrite).
+
     Args:
         entries: результат _scan_filesystem — (Path, frontmatter, meta).
 
     Returns:
         int: число записей с созданным/подтверждённым sensitive-флагом.
     """
-    BATCH_SIZE = 500
+    BATCH_SIZE = ISSUES_BATCH_SIZE
     count = 0
     total = len(entries)
     for batch_start in range(0, total, BATCH_SIZE):
@@ -936,6 +980,7 @@ def _create_sensitive_issues(
         if cancel_event is not None and cancel_event.is_set():
             break
         batch = entries[batch_start:batch_start + BATCH_SIZE]
+        specs: list[dict] = []
         for filepath, frontmatter, _meta in batch:
             try:
                 content = filepath.read_text(encoding="utf-8")
@@ -945,14 +990,16 @@ def _create_sensitive_issues(
             payload = _check_sensitive(str(filepath), content)
             if payload is None:
                 continue
-            create_issue(
-                issue_type="sensitive",
-                knowledge_id=frontmatter.knowledge_id,
-                severity="warn",
-                detail="Sensitive markers detected (path or content heuristics)",
-                metadata=payload["metadata"],
-            )
-            count += 1
+            specs.append({
+                "issue_type": "sensitive",
+                "knowledge_id": frontmatter.knowledge_id,
+                "severity": "warn",
+                "detail": "Sensitive markers detected (path or content heuristics)",
+                "metadata": payload["metadata"],
+            })
+        if specs:
+            create_issues_batch(specs)
+        count += len(specs)
         # Batch progress log
         if progress and progress_id:
             batch_end = min(batch_start + BATCH_SIZE, total)

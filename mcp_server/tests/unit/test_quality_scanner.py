@@ -652,3 +652,263 @@ class TestAutoClearSnapshot:
 
         # grouped-снапшот читает стор 1 раз; bulk_update замокан (реальный тоже читает 1)
         assert mock_read.call_count == 1
+
+
+# ═══════════════════════════════════════════════════════════════
+# code-2026-09-24-011 (В3): батч-запись шагов 5 / 5.4 / dup_scan
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestCreateIssuesForProblemsBatched:
+    """Шаг 5: спеки собираются в батч → один create_issues_batch на батч 500."""
+
+    @pytest.fixture
+    def issues_tempdir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from mcp_server.quality.issues import set_store_dir
+            set_store_dir(tmp)
+            yield tmp
+
+    def test_single_batch_call_no_per_record_create(self, issues_tempdir):
+        """create_issue per-record НЕ вызывается; create_issues_batch — 1 раз на батч."""
+        from unittest.mock import patch
+
+        from mcp_server.quality import scanner as scanner_mod
+
+        scored = [
+            (Path(f"/tmp/kid-bad-{i}.md"), _make_fm(knowledge_id=f"kid-bad-{i}"), 0.9)
+            for i in range(3)
+        ]
+        with patch("mcp_server.quality.issues.create_issue") as mock_create, \
+             patch("mcp_server.quality.scanner.create_issues_batch") as mock_batch:
+            count = scanner_mod._create_issues_for_problems(scored)
+
+        mock_create.assert_not_called()
+        assert mock_batch.call_count == 1
+        specs = mock_batch.call_args[0][0]
+        assert len(specs) == 3
+        assert count == 3  # метрика = число спеков (как было число вызовов)
+
+    def test_equivalent_to_sequential_create(self, issues_tempdir):
+        """Эквивалентность: issue_id-множество батча == последовательному созданию."""
+        from mcp_server.quality.issues import list_issues
+        from mcp_server.quality.scanner import _create_issues_for_problems
+
+        scored = [
+            (Path(f"/tmp/kid-bad-{i}.md"), _make_fm(knowledge_id=f"kid-bad-{i}"), 0.7 + i / 100)
+            for i in range(4)
+        ]
+        _create_issues_for_problems(scored)
+        batch_ids = {i.issue_id for i in list_issues(status="open", limit=1000)}
+
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as tmp_b:
+            from mcp_server.quality.issues import create_issue, set_store_dir
+            set_store_dir(tmp_b)
+            for _f, fm, score in scored:
+                create_issue(
+                    "missing_field", fm.knowledge_id, "warn",
+                    f"Staleness score {score} >= 0.45 — needs review",
+                )
+            seq_ids = {i.issue_id for i in list_issues(status="open", limit=1000)}
+        assert batch_ids == seq_ids
+
+    def test_cancel_between_batches_no_call(self, issues_tempdir, monkeypatch):
+        """Cancel между батчами → последующие батчи не создаются (AC3)."""
+        import asyncio
+        from unittest.mock import patch
+
+        from mcp_server.quality import scanner as scanner_mod
+
+        monkeypatch.setattr(scanner_mod, "ISSUES_BATCH_SIZE", 2)
+        scored = [
+            (Path(f"/tmp/kid-bad-{i}.md"), _make_fm(knowledge_id=f"kid-bad-{i}"), 0.9)
+            for i in range(6)
+        ]
+        cancel = asyncio.Event()
+
+        orig = cancel.is_set
+        calls = {"n": 0}
+
+        def is_set():
+            calls["n"] += 1
+            if calls["n"] > 1:
+                return True
+            return orig()
+
+        cancel.is_set = is_set
+        with patch("mcp_server.quality.scanner.create_issues_batch") as mock_batch:
+            scanner_mod._create_issues_for_problems(scored, cancel_event=cancel)
+
+        assert mock_batch.call_count == 1  # второй батч отменён
+
+
+class TestCreateSensitiveIssuesBatched:
+    """Шаг 5.4: sensitive-спеки → один create_issues_batch на батч."""
+
+    @pytest.fixture
+    def issues_tempdir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from mcp_server.quality.issues import set_store_dir
+            set_store_dir(tmp)
+            yield tmp
+
+    @staticmethod
+    def _sensitive_entry(kid: str, path: str):
+        fm = _make_fm(knowledge_id=kid)
+        return (Path(path), fm, {})
+
+    def test_batched_flush_with_metadata(self, issues_tempdir, tmp_path):
+        """Sensitive: create_issue НЕ вызывается; батч несёт metadata (refresh-семантика)."""
+        from unittest.mock import patch
+
+        from mcp_server.quality import scanner as scanner_mod
+
+        p1 = tmp_path / "partners_entry.md"
+        p1.write_text("руб. руб. маржа")  # ≥2 контент-совпадений
+        p2 = tmp_path / "clean.md"
+        p2.write_text("чистый контент")
+
+        entries = [
+            self._sensitive_entry("kid-sens", str(p1)),
+            self._sensitive_entry("kid-clean", str(p2)),
+        ]
+        with patch("mcp_server.quality.issues.create_issue") as mock_create, \
+             patch("mcp_server.quality.scanner.create_issues_batch") as mock_batch:
+            count = scanner_mod._create_sensitive_issues(entries)
+
+        mock_create.assert_not_called()
+        assert mock_batch.call_count == 1
+        specs = mock_batch.call_args[0][0]
+        assert len(specs) == 1
+        assert specs[0]["metadata"]["path_flag"] is True or len(specs[0]["metadata"]["matched"]) >= 2
+        assert count == 1
+
+
+class TestScanDupPairsBuffered:
+    """Шаг 4 dup_scan: буфер пар → create_issues_batch per domain-бакет; флаш при cancel (P2-4)."""
+
+    @pytest.fixture
+    def issues_tempdir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from mcp_server.quality.issues import set_store_dir
+            set_store_dir(tmp)
+            yield tmp
+
+    def _mk_entry(self, kid: str, subject: str, tags: list[str], domain: str = "eng"):
+        fm = _make_fm(knowledge_id=kid, subject=subject, tags=tags, domain=domain)
+        return (Path(f"/tmp/{kid}.md"), fm, 0.1)
+
+    def test_no_inline_create_issue(self, issues_tempdir):
+        """Inline create_issue в dup_scan заменён на батч-флаш."""
+        from unittest.mock import patch
+
+        from mcp_server.quality.scanner import _scan_dup_pairs
+
+        a = self._mk_entry("kid-a", "devops", ["ai", "automation", "teaching"])
+        b = self._mk_entry("kid-b", "devops", ["ai", "automation", "teaching", "extra"])
+        with patch("mcp_server.quality.issues.create_issue") as mock_create, \
+             patch("mcp_server.quality.scanner.create_issues_batch") as mock_batch:
+            dup_count, dup_map = _scan_dup_pairs([a, b])
+
+        mock_create.assert_not_called()
+        assert mock_batch.call_count == 1  # один флаш на domain-бакет
+        specs = mock_batch.call_args[0][0]
+        assert len(specs) == 1
+        assert specs[0]["issue_type"] == "duplicate"
+        assert specs[0]["metadata"]["target_kid"] == "kid-b"
+        assert dup_count == 1
+
+    def test_flush_per_domain_bucket(self, issues_tempdir):
+        """Два domain-бакета → два отдельных флаша (по одному на бакет)."""
+        from unittest.mock import patch
+
+        from mcp_server.quality.scanner import _scan_dup_pairs
+
+        a1 = self._mk_entry("kid-a1", "subj", ["t1", "t2"], domain="eng")
+        b1 = self._mk_entry("kid-b1", "subj", ["t1", "t2"], domain="eng")
+        a2 = self._mk_entry("kid-a2", "subj", ["t1", "t2"], domain="math")
+        b2 = self._mk_entry("kid-b2", "subj", ["t1", "t2"], domain="math")
+
+        with patch("mcp_server.quality.scanner.create_issues_batch") as mock_batch:
+            dup_count, _ = _scan_dup_pairs([a1, b1, a2, b2])
+
+        assert dup_count == 2
+        assert mock_batch.call_count == 2
+        for call in mock_batch.call_args_list:
+            assert len(call[0][0]) == 1  # по одной паре на бакет
+
+    def test_intra_bucket_cancel_flushes_buffer(self, issues_tempdir, monkeypatch):
+        """P2-4: cancel ВНУТРИ бакета → накопленный буфер фллашится перед выходом."""
+        import asyncio
+        from unittest.mock import patch
+
+        from mcp_server.quality import scanner as scanner_mod
+
+        monkeypatch.setattr(scanner_mod, "DUP_CANCEL_CHECK_EVERY", 1)
+
+        # 3 записи → 3 пары; cancel после первой итерации → буфер с 1 парой флашится
+        a = self._mk_entry("kid-a", "subj", ["t1", "t2"])
+        b = self._mk_entry("kid-b", "subj", ["t1", "t2"])
+        c = self._mk_entry("kid-c", "subj", ["t1", "t2"])
+
+        cancel = asyncio.Event()
+        orig = cancel.is_set
+        calls = {"n": 0}
+
+        def is_set():
+            calls["n"] += 1
+            # n=1 — межбакетный чек (не cancel); n=2,3 — пары (0,1),(0,2)
+            # буферизуются; n=4 — cancel → флаш 2 пар перед выходом
+            if calls["n"] >= 4:
+                return True
+            return orig()
+
+        cancel.is_set = is_set
+
+        with patch("mcp_server.quality.scanner.create_issues_batch") as mock_batch:
+            dup_count, dup_map = scanner_mod._scan_dup_pairs([a, b, c], cancel_event=cancel)
+
+        # Частичный результат сохранён (флаш перед выходом)
+        assert mock_batch.call_count == 1
+        flushed = mock_batch.call_args[0][0]
+        assert len(flushed) >= 1
+        # dup_count/dup_map считаются до флаша — частичные метрики валидны
+        assert dup_count == len(flushed)
+
+    def test_dup_flush_equivalent_to_sequential(self, issues_tempdir):
+        """Эквивалентность: buffered-dup == последовательному create_issue (issue_id+metadata)."""
+        import tempfile as _tf
+
+        from mcp_server.quality.issues import list_issues
+        from mcp_server.quality.scanner import _scan_dup_pairs
+
+        a = self._mk_entry("kid-a", "devops", ["ai", "automation", "teaching"])
+        b = self._mk_entry("kid-b", "devops", ["ai", "automation", "teaching", "extra"])
+        _scan_dup_pairs([a, b])
+        batch = {
+            (i.issue_id): (i.metadata, i.status)
+            for i in list_issues(types=["duplicate"], status="open", limit=1000)
+        }
+
+        with _tf.TemporaryDirectory() as tmp_b:
+            from mcp_server.quality.issues import create_issue, set_store_dir
+            set_store_dir(tmp_b)
+            create_issue(
+                "duplicate", "kid-a", "warn",
+                "Possible duplicate of kid-b (same subject=devops, tag overlap)",
+                metadata={
+                    "cosine": None, "content_hash": None, "content_length": None,
+                    "target_content_hash": None, "target_content_length": None,
+                    "slug_negation": False, "standalone": True,
+                    "target_standalone": True, "subject": "devops",
+                    "target_subject": "devops", "target_kid": "kid-b",
+                },
+            )
+            seq = {
+                (i.issue_id): (i.metadata, i.status)
+                for i in list_issues(types=["duplicate"], status="open", limit=1000)
+            }
+
+        assert set(batch) == set(seq)
+        assert batch == seq
