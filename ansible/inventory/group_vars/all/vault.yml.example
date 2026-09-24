@@ -17,3 +17,7 @@ vault_console_password: "<сгенерируйте: openssl rand -hex 16>"
 # Пустые значения → errors_report.py --send-tg молча skip («TG: skip», exit 0).
 vault_telegram_bot_token: ""
 vault_telegram_chat_id: ""
+# 016 §7.8: прокси обязателен на проде (отправка TG через корп. прокси,
+# ProxyHandler; пусто → прямой fallback — только для локальной отладки).
+# Формат: http://host:port (без кредов в URL; socks не поддерживается urllib).
+vault_telegram_proxy: ""

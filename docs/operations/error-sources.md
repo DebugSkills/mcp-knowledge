@@ -228,6 +228,59 @@ dup-пары) и возвращает частичные метрики — он
 `progress.get()` / kb-console «Качество» → бейдж Cancelled; AC-замеры —
 `TestAcceptanceMeasures` (AC1 <5 с на 8406×32930: 0.95 с; AC3 ≤10 с).
 
+## TG-оповещения Error→Rule (code-2026-09-24-016, спека §7 .boardData.md)
+
+**Каналы доставки** (два, один ops-чат из проекта бекапов — те же креды,
+что у check-backup.sh): weekly-отчёт (агрегаты за 7 дней, Пн 10:02) +
+немедленные алерты (каждые 5 мин). Общая точка входа — shared TG-sender
+`scripts/errors_notify.py`: чанки ≤4096 без разрыва строк, continue-on-fail
+(ошибки доставки → `reports/tg-errors.log`, не роняют отчёт), маскировка
+`<token>`/`<proxy>` в логах (R5). Каждое сообщение/чанк начинается host-тегом
+`🤖[mcp-errors@<host>]` — источник: env `MCP_ERRORS_HOST` → `notify["host"]` →
+`socket.gethostname()` (короткое имя; прод рендерит `inventory_hostname`).
+
+**Прокси (§7.8):** отправка через корп. прокси обязательна на проде —
+`urllib` `ProxyHandler` при непустом `notify["proxy"]`; пустое значение →
+прямой fallback (только локальная отладка). Креды в URL запрещены.
+
+**Алерты (`scripts/errors_alert.py`, cron `*/5`):** new-P0 (первое попадание
+сигнатуры с priority P0, окно 10 мин по `first_seen`) и burst (новый инцидент
+`burst_ts` у P0/P1). Не алертятся: suppressed (активная suppression; истёкшая
+или битая `until` не фильтрует — parse-guard) и investigating. **Анти-шторм:**
+cooldown 120 мин/сигнатуру · ≤2 основных + 1 хвост-сводка («…и ещё N») за
+прогон · ≤3 отправок/час включая хвост (перебор → storm-limit-лог
+`suppressed M alerts`). Идемпотентность: `p0_alerted_at`/`burst_alerted_at`
+(поле-аддитивно к `cooldown_until` weekly-семантики).
+
+**Degraded-режим:** нет `notify.json`/токена → «TG: skip» + лог, exit 0,
+стейт алертов НЕ мутируется (алерты «дозреют» после починки доставки).
+
+**Cron (3 строки, `scripts/errors_cron.sh --install`):** collector `*/5`
+(ПЕРВЫМ — данные важнее алертов), alerts `*/5`, weekly `2 10 * * 1`. Все
+обёрнуты `cron_wrap.sh` → `[CRON] job=… exit=…` строки (exit≠0 → P0-признак
+`cron_nonzero`, см. class:cron_exit выше). R8: пути абсолютные + `cd BASE`,
+валидация ДО записи (кривой блок → crontab не тронут). Config-оверлей:
+`cron_logs` += 3 наших лога в `$DATA_ROOT/logs/errors/config.json`
+(union, чужие сохраняются, бэкап старого в `.trash/`). Повторный `--install`
+идемпотентен; `--remove` вынимает только блок 016. Бэкап crontab перед любой
+правкой: `.trash/crontab-backup-<ts>.txt`.
+
+**Персистентность notify.json (не рендерится ansible — переживает деплои,
+как suppression 008):** прод — `errors-notify.json.j2` (bot_token/chat_id/
+proxy из vault + host из inventory_hostname, 0600); локально — sudo-хелпер
+`scripts/errors_notify_import.sh` из `/etc/backup-status.env`.
+
+**Первичная настройка (порядок):**
+1. `sudo make errors-notify-import` — notify.json 0600, владелец `$SUDO_USER`
+   (пуст → warning, владелец не меняется); stdout = только fingerprint
+   `chat=sha256[:12]`, `proxy=set` — секреты не печатаются;
+2. `make errors-cron-install` — 3 джобы + config-оверлей (реальный crontab:
+   оператором по HITL-гейту; для preview `FILE=model.txt`).
+
+Дежурные команды: `make errors-view` (сводка sink), `make errors-report`
+(stdout) / `TG=1` (отправка), `make errors-alert` (dry-run) / `TG=1`,
+`make errors-cron-status`.
+
 ---
 Обслуживание: новый источник → `make test-errors` КРАСНЫЙ → добавить строку
 (механизм сбора или честный gap с причиной) → ЗЕЛЁНЫЙ. Live-проверка на проде:

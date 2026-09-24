@@ -15,7 +15,6 @@ import hashlib
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -371,3 +370,49 @@ class TestCollectCronLogsUnit:
         ev = events[0]
         assert ev["level"] == "INFO"  # exit=0 → INFO
         assert ev.get("priority_hint") is None  # БЕЗ P0-признака — алерты не триггерит
+
+
+# ── AC-host-3: jinja2-рендер errors-notify.json.j2 (без деплоя) ──
+
+class TestJ2Render:
+    def _render(self, inventory_hostname, proxy="http://10.9.9.9:3128"):
+        import jinja2
+        env = jinja2.Environment(
+            loader=jinja2.FileSystemLoader(str(J2.parent)),
+            keep_trailing_newline=True,
+            autoescape=False,
+        )
+        tpl = env.get_template(J2.name)
+        return tpl.render(
+            vault_telegram_bot_token="123:FAKE",
+            vault_telegram_chat_id="-100fake",
+            vault_telegram_proxy=proxy,
+            inventory_hostname=inventory_hostname,
+        )
+
+    @pytest.mark.parametrize("host", ["lup", "aikb"])
+    def test_host_rendered_and_valid_json(self, host):
+        """AC-host-3: host из inventory_hostname; вывод — валидный JSON."""
+        rendered = self._render(host)
+        data = json.loads(rendered)
+        assert data["host"] == host
+        assert data["proxy"] == "http://10.9.9.9:3128"
+        assert data["bot_token"] == "123:FAKE"
+        assert data["chat_id"] == "-100fake"
+
+    def test_proxy_default_empty(self):
+        """vault_telegram_proxy без default → пустая строка (graceful skip)."""
+        rendered = self._render("lup", proxy="")
+        data = json.loads(rendered)
+        assert data["proxy"] == ""  # пусто → sender идёт напрямую (fallback)
+
+    def test_inventory_hostname_fallback_empty(self):
+        """inventory_hostname не задан → host='' → sender возьмёт gethostname()."""
+        import jinja2
+        env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(J2.parent)),
+                                 keep_trailing_newline=True, autoescape=False)
+        rendered = env.get_template(J2.name).render(
+            vault_telegram_bot_token="t", vault_telegram_chat_id="c",
+            vault_telegram_proxy="p",
+        )  # inventory_hostname НЕ передан
+        assert json.loads(rendered)["host"] == ""

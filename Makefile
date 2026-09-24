@@ -3,7 +3,7 @@ DATA_DIR := ../data
 KNOWLEDGE_DIR := ../knowledge
 MODELS_DIR := ../models_cache
 
-.PHONY: dev deploy down logs test lint clean dlq-replay reindex backup prereq-dirs
+.PHONY: dev deploy down logs test lint clean dlq-replay reindex backup prereq-dirs errors-view errors-report errors-alert errors-notify-import errors-cron-install errors-cron-remove errors-cron-status
 
 # Проверка и создание необходимых директорий перед запуском
 prereq-dirs:
@@ -184,8 +184,35 @@ prod-errors-prune:  ## Прод: ретенция sink (dry-run; реально�
 prod-errors-sources:  ## Прод: E5-проверка реестра охвата источников ошибок
 	$(MAKE) -C ansible errors-sources
 
-test-errors:  ## Error→Rule: юнит-тесты коллектора + гварда + E5-реестр (P2-9, 008)
-	.venv/bin/python -m pytest tests/test_error_sources.py tests/test_errors_lib.py tests/test_errors_guard.py -v
+test-errors:  ## Error→Rule: юнит-тесты коллектора + гварда + sender/алертов + shell + E5-реестр (P2-9 008; P3-e 016)
+	.venv/bin/python -m pytest tests/test_error_sources.py tests/test_errors_lib.py tests/test_errors_guard.py tests/test_errors_notify.py tests/test_errors_alert.py tests/test_errors_shell.py -v
+
+# ─── TG-оповещения Error→Rule (code-2026-09-24-016) ───
+# Каналы: weekly-отчёт (Пн 10:02) + немедленные алерты new-P0/burst (*/5).
+# notify.json: прод рендерит ansible (errors-notify.json.j2); локально —
+# sudo-хелпер из /etc/backup-status.env (0600, $SUDO_USER). Живая отправка
+# после: 1) sudo make errors-notify-import; 2) make errors-cron-install.
+
+errors-view:  ## 016: сводка sink (агрегаты/флаги) — что уйдёт в TG
+	.venv/bin/python scripts/errors_report.py
+
+errors-report:  ## 016: weekly-отчёт (TG=1 → отправка в чат; по умолчанию stdout)
+	.venv/bin/python scripts/errors_report.py $(if $(TG),--send-tg)
+
+errors-alert:  ## 016: немедленные алерты new-P0/burst (TG=1 → отправка; dry-run по умолчанию)
+	.venv/bin/python scripts/errors_alert.py $(if $(TG),--send-tg)
+
+errors-notify-import:  ## 016: sudo-хелпер notify.json 0600 из /etc/backup-status.env (ENV=… OUT=… HOST=…)
+	sudo bash scripts/errors_notify_import.sh $(if $(ENV),--env $(ENV)) $(if $(OUT),--out $(OUT)) $(if $(HOST),--host $(HOST))
+
+errors-cron-install:  ## 016: установить 3 cron-джобы (collector/alerts */5, weekly Пн 10:02); FILE=… модель
+	bash scripts/errors_cron.sh --install $(if $(FILE),--file $(FILE))
+
+errors-cron-remove:  ## 016: снять cron-джобы 016 (обратимо; FILE=… модель)
+	bash scripts/errors_cron.sh --remove $(if $(FILE),--file $(FILE))
+
+errors-cron-status:  ## 016: статус cron-джоб 016 + config-оверлея (FILE=… модель)
+	bash scripts/errors_cron.sh --status $(if $(FILE),--file $(FILE))
 
 # ─── Storm-guard (code-2026-09-23-008): suppression-лист known-noise ───
 # Файл: $DATA_ROOT/logs/errors/suppression.json (в sink — вне клона, НЕ
