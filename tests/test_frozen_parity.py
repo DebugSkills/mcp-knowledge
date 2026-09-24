@@ -165,9 +165,9 @@ class TestSignatureRoundTrip:
                                           make_flt(include_audit=False))
         assert out2 == []
 
-    def test_b5_errors_query_marker_both_sides(self):
+    def test_b5_errors_query_marker_both_sides(self, tmp_path, monkeypatch):
         # (а) коллектор: audit-строка тула → routine (classify_routine-ветка
-        # маркера ERRORS_QUERY): expected=True, без актора
+        # маркера ERRORS_QUERY): expected=True, без актора; агрегат → P3/T
         line = (iso(FAKE_NOW) + " [ERRORS_QUERY] view=list prio=- src=-"
                 " period=7d q_len=0 q_hash=- sig=False results=3 dur=0.5ms"
                 " key=none")
@@ -176,6 +176,11 @@ class TestSignatureRoundTrip:
         assert len(evs) == 1
         assert evs[0]["marker"] == "ERRORS_QUERY"
         assert evs[0]["expected"] is True
+        set_fake_now(monkeypatch, FAKE_NOW)
+        ec.update_aggregates(tmp_path / "sink", evs, cfg={})
+        (agg,) = ec.load_json(tmp_path / "sink" / "aggregates"
+                              / "signatures.json", {}).values()
+        assert (agg["priority"], agg["class"]) == ("P3", "T")
         # (б) тул: аудит-фильтр согласован с (а) — ERRORS_QUERY исключается
         # при include_audit=False, чужие маркеры переживают
         s_audit = ec.make_signature("docker_logs", "ERRORS_QUERY", None,
