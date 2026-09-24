@@ -196,6 +196,33 @@ API). Дубликат обязателен (scripts/ не копируется 
 `P0_HINTS`, `BASELINE_4XX`, `deep_normalize` — одиночные копии (живут только
 в collector, заморожены `test_errors_lib.py`), в parity не входят.
 
+## Quality-scan: статусы, отмена и auto-clear (code-2026-09-24-011, спека §7 .boardData.md)
+
+Статус `cancelled` — самостоятельное терминальное состояние скана качества,
+НЕ ошибка: `cancelled ≠ error` в `scan_state.json`, progress-трекере
+(`progress.cancel()` — force-persist, log-level warning) и kb-console
+(терминальное множество `{done, error, cancelled}`). Отмена скана
+пользователем (`cancel_quality_scan`) срабатывает ≤10 с (замер 0.88 с:
+cancel-чек между батчами scoring / внутри чанков 5.5 / каждые 500 итераций
+dup-пары) и возвращает частичные метрики — они валидны для отчёта.
+
+Зависший после рестарта сервера `running`-скан при старте помечается
+`cancelled` («scan interrupted by server restart») с сохранением
+авто-ресюма 13.27: refresh-сканы < 2 ч подхватываются автоматически.
+
+Шаг 5.5 (auto-clear OK-записей) — снапшот O(N+M): один read стора
+(`list_open_issue_ids_grouped`), сверка в памяти, один bulk-RMW
+(`bulk_update_status`, чанки `AUTO_CLEAR_CHUNK_SIZE=2000`). Инцидент стенда
+(40–60 мин CPU: per-kid проходы стора 0.28 с × 8406) невозможен по
+конструкции: пер-запись RMW больше нет нигде — шаги 5/5.4 пишут issues
+батчем `ISSUES_BATCH_SIZE=500`, dup-пары флашатся per-domain-бакетом одним
+`create_issues_batch` (+ флаш перед выходом при отмене). Лог 5.5 агрегирован:
+`auto-clear: n/m entries, k collected` — одна строка на шаг вместо 8406.
+
+**Видимость:** `scan_state.json` → `status: cancelled` + `reason`;
+`progress.get()` / kb-console «Качество» → бейдж Cancelled; AC-замеры —
+`TestAcceptanceMeasures` (AC1 <5 с на 8406×32930: 0.95 с; AC3 ≤10 с).
+
 ---
 Обслуживание: новый источник → `make test-errors` КРАСНЫЙ → добавить строку
 (механизм сбора или честный gap с причиной) → ЗЕЛЁНЫЙ. Live-проверка на проде:
