@@ -310,7 +310,7 @@ make hooks-uninstall    # снять хук
 
 Итог: `N passed / M failed / K skipped`, exit-код = число упавших гейтов (0 = зелёно). Флаги: `--quick` · `--full` · `--no-smoke` · `--fail-fast`.
 
-> **🔁 Пуш ⇒ деплой:** локальный dev-стек = прод для сообщества — после `git push` обязательно обновить работающий стек (`make deploy` + проверки health/лог/консоль/инструменты). Пуш без деплоя = незавершённый пуш. См. `AGENTS.md` и skill `mcp-knowledge-prod-ops`.
+> **🔁 Пуш ⇒ деплой:** локальный dev-стек = прод для сообщества — после `git push` обязательно обновить работающий стек. Штатная команда: **`make push`** (= preflight → `git push --no-verify` → `make deploy` → `make verify-deploy`: /health + логи контейнера + MCP-инструменты + консоль auth-aware). Пуш без деплоя = незавершённый пуш. Ручная альтернатива: `make deploy` + `make verify-deploy`. См. `AGENTS.md` и skill `mcp-knowledge-prod-ops`.
 
 ### 🛰️ Error→Rule: шторм-гард (code-2026-09-23-008)
 

@@ -97,6 +97,7 @@
 | script:quality_scan.sh | cron weekly Пн 4:00 (deploy.yml) | sink: cron_log /var/log/mcp-quality.log + [CRON] wrapper | covered |
 | script:cron_wrap.sh | обёртка ручных/cron запусков | sink: [CRON]-строки → collect_cron_logs | covered |
 | script:preflight.sh | pre-push гейт (004); запускать через cron_wrap.sh при желании | sink: — | gap: self — сам гейт НЕ собирает ошибки (P2-2); unit-гейты G4/G5 покрывают E5 |
+| script:verify-deploy.sh | post-deploy гейт (make push / make verify-deploy, 2026-09-24) | sink: — | gap: ручной; FAIL → exit≠0 и явное сообщение оператору из make push; при автоматизации через cron_wrap.sh |
 | script:reindex.sh | ручной запуск | sink: — | gap: ручной; запускать через cron_wrap.sh (RUNBOOK §Error-наблюдаемость) |
 | script:offline-deploy.sh | air-gap-утилита, ручной запуск | sink: — | gap: ручной (bundle-контур вне прода) |
 | script:seed_knowledge.py | разовый сид, ручной | sink: — | gap: разовый; через cron_wrap.sh при использовании |

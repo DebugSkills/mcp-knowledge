@@ -14,10 +14,18 @@
 
 **Локальный dev-стек mcp-knowledge = прод для сообщества** — им пользуются люди. Поэтому **пуш без обновления работающего стека = незавершённый пуш**: пользователи видят работающий контейнер, а не git-ветку, так что незадеплоенный фикс остаётся живым дефектом.
 
-После `git push` (или сразу после коммитов, если push отложен) обязательно:
+Штатная команда — весь цикл одной строкой:
+
+```bash
+make push    # preflight → git push --no-verify → deploy → verify-deploy
+```
+
+`--no-verify` здесь безопасен: preflight уже прогнан первым шагом цели `push`, а повторный запуск в pre-push хуке — это лишние ~4–5 мин. `verify-deploy` (`scripts/verify-deploy.sh`, выход = число упавших) проверяет: `/health` :8000 (status=healthy + reconcile без error) · логи `mcp-knowledge-server` (0 строк error/traceback/critical) · MCP `tools/list` (≥30, read-ключ из `.env`, не печатается) · консоль :8085 auth-aware (`CONSOLE_AUTH=required` → 401+WWW-Authenticate без кредов и 200 с паролем; auth off → 200). Если verify-deploy падает, `make push` явно сообщает: **код уже запушен, стек требует внимания**.
+
+Ручной путь (альтернатива, когда нужен пошаговый контроль):
 
 1. **`make deploy`** (= `docker compose up -d --build --force-recreate`; bind-mount'ы qdrant/ollama/console/данных сохраняются).
-2. **Проверить:** `/health` (:8000 — reconcile + эмбеддер) · старт-лог (`make logs` / `prod-logs` — есть `[START]`, без ошибок) · kb-console в браузере (:8085 — 0 ошибок консоли) · доступность MCP-инструментов.
+2. **Проверить:** `make verify-deploy` — или вручную: `/health` (:8000 — reconcile + эмбеддер) · старт-лог (`make logs` / `prod-logs` — есть `[START]`, без ошибок) · kb-console в браузере (:8085 — 0 ошибок консоли) · доступность MCP-инструментов.
 
 Полный протокол: `skill('mcp-knowledge-prod-ops')`; канон — `docs/observability/self-improvement-loop.md` §13.9.
 

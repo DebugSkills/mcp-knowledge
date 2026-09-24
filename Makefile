@@ -227,3 +227,37 @@ hooks-uninstall:  ## Удалить pre-push hook (в .trash/, обратимо)
 	@mv .git/hooks/pre-push ".trash/pre-push-hook-$$(date +%Y%m%d-%H%M%S)" 2>/dev/null \
 		&& echo "✔ pre-push hook удалён (копия в .trash/)" \
 		|| echo "— hook не был установлен"
+
+# ═══════════════════════════════════════════════════════════════
+# Push ⇒ Deploy ⇒ Verify (2026-09-24) — «пуш без деплоя = незавершённый
+# пуш» одной командой. Канон: AGENTS.md «🚀 Пуш ⇒ деплой», skill
+# mcp-knowledge-prod-ops, docs/observability/self-improvement-loop.md §13.9
+# ═══════════════════════════════════════════════════════════════
+
+.PHONY: verify-deploy push
+
+verify-deploy:  ## Post-deploy проверки стека: /health + логи + MCP tools + консоль (auth-aware)
+	bash scripts/verify-deploy.sh
+
+# push: preflight уже прогнан зависимостью (шаг 1), поэтому git push идёт с
+# --no-verify — иначе pre-push hook (.git/hooks/pre-push → preflight.sh)
+# погнал бы гейт ВТОРОЙ раз (~4-5 мин). Штатный escape задокументирован
+# в README («git push --no-verify — escape-hatch»).
+push: preflight  ## Пуш+деплой стека: preflight → git push --no-verify → deploy → verify-deploy
+	@echo ""
+	@echo "1/4 ✔ preflight пройден → git push --no-verify (гейт уже прогнан выше)"
+	@git push --no-verify
+	@echo ""
+	@echo "2/4 ✔ код отправлен → 3/4 деплой работающего стека…"
+	@$(MAKE) deploy
+	@echo ""
+	@echo "4/4 деплой завершён → post-deploy проверки…"
+	@if $(MAKE) verify-deploy; then \
+		echo ""; \
+		echo "✅ push complete: код запушен, стек задеплоен и проверен."; \
+	else \
+		echo ""; \
+		echo "⚠️  ВНИМАНИЕ: код УЖЕ запушен, но стек требует разбора — verify-deploy нашёл проблемы."; \
+		echo "    Диагностика: make logs / make dev-latest-log / skill mcp-knowledge-prod-ops."; \
+		exit 1; \
+	fi

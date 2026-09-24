@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     # Ключ kb-console (лежит в .env рядом с ключами сервера; сам сервер его НЕ использует —
     # консоль шлёт его как X-API-Key. Поле нужно, чтобы pydantic не падал на extra_forbidden).
     MCP_API_KEY: str = ""
+    # CONSOLE_*: переменные kb-console в общем .env (auth с 2026-09-24). Сервер их
+    # НЕ использует; поля нужны, чтобы pydantic не валил host-side pytest на
+    # extra_forbidden при чтении env_file=".env" (паттерн MCP_API_KEY выше).
+    CONSOLE_AUTH: str = ""
+    CONSOLE_PASSWORD: str = ""
 
     # Git audit (#21) + SSOT
     GIT_AUDIT: bool = True

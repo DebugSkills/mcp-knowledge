@@ -55,6 +55,35 @@ class TestOllamaTopologyDefaults:
         assert settings.OLLAMA_URL == "http://localhost:11434"
 
 
+class TestConsoleEnvTolerance:
+    """CONSOLE_AUTH/CONSOLE_PASSWORD в общем .env (включён 2026-09-24) не
+    должны ломать Settings сервера extra_forbidden'ом — иначе host-side
+    pytest падает на collection ВСЕХ юнит-тестов (env_file=".env").
+    Паттерн MCP_API_KEY: поле-заглушка, сервер значение не использует.
+    """
+
+    def test_console_vars_in_env_file(self, tmp_path, monkeypatch):
+        """Общий .env с CONSOLE_* → Settings строится, значения проброшены."""
+        monkeypatch.delenv("CONSOLE_AUTH", raising=False)
+        monkeypatch.delenv("CONSOLE_PASSWORD", raising=False)
+        env_file = tmp_path / "env"
+        env_file.write_text(
+            "CONSOLE_AUTH=required\nCONSOLE_PASSWORD=secret-value\n",
+            encoding="utf-8",
+        )
+        settings = Settings(_env_file=str(env_file))
+        assert settings.CONSOLE_AUTH == "required"
+        assert settings.CONSOLE_PASSWORD == "secret-value"
+
+    def test_console_defaults(self, monkeypatch):
+        """Без env: пустые строки (сервер переменные не использует)."""
+        monkeypatch.delenv("CONSOLE_AUTH", raising=False)
+        monkeypatch.delenv("CONSOLE_PASSWORD", raising=False)
+        settings = Settings(_env_file=None)
+        assert settings.CONSOLE_AUTH == ""
+        assert settings.CONSOLE_PASSWORD == ""
+
+
 class TestAutoDedupSettings:
     """Фаза 3 (2a): флаги авто-deprecate."""
 
