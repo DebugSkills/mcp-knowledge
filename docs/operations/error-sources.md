@@ -119,6 +119,8 @@
 | manual:prod-update | make prod-update / ansible-фейлы / offsite-rsync (j) | sink: — | gap: ручные операции; запускать через cron_wrap.sh (документировано в RUNBOOK) |
 | marker:ERRORS_QUERY | mcp-server, 1 сайт (errors_query, audit обращений) | sink: docker logs mcp-knowledge-server → errors_collect.py (source=docker_logs) | covered |
 | class:errors_query_audit | [ERRORS_QUERY]-строки тула | sink: classify_routine → expected=True (P3-baseline) | covered |
+| class:queue_overflow_backpressure | WARNING «Очередь переполнена — blocking put» (pipeline.py:122) | sink: classify_routine → expected=True (P3-baseline, durable-правило 015) | covered |
+| backlog:queue_capacity | вариант В (ёмкость): max_queue/batch_size из settings, producer-батчинг импорта (015, отклонён — нет данных о повторяемости) | sink: — | gap: бэклог; триггер запуска: ≥2 массовых импортов/мес ИЛИ 503-readiness > 15 мин |
 
 ## Шторм-гард write-side (code-2026-09-23-008, спека §7 .boardData.md)
 
@@ -281,7 +283,33 @@ proxy из vault + host из inventory_hostname, 0600); локально — sud
 (stdout) / `TG=1` (отправка), `make errors-alert` (dry-run) / `TG=1`,
 `make errors-cron-status`.
 
+## Durable-правило №1: queue-overflow = ожидаемый backpressure (code-2026-09-24-015, спека §7 .boardData.md)
+
+WARNING `Очередь переполнена — blocking put` (`pipeline.py:122`: `put_nowait` →
+`QueueFull` → blocking `await put`) закреплён как **ожидаемый класс**: точная
+ветка в `classify_routine` (логгер `mcp_knowledge.pipeline` + якорная подстрока
+строго по `rest` — литерал с заглавной «О» U+041E байт-идентичен источнику +
+fail-word-гард `AUDIT_FAIL_RE` по `low`, прецедент ERRORS_QUERY 006) →
+`expected=True` → **P3/T-baseline**; capture-first не меняется (raw пишет всё).
+
+Инцидент-основа (21.09): массовый импорт 7032 секций (книга FPF, 9035.6 KB) →
+**754 события за ~11 мин** устойчивого «очередь полна» (52–84/мин; очередь
+`maxsize=1000`, один consumer, узкое место — Ollama-embed ~0.74–1.75 с/батч) +
+4×503 readiness. Это backpressure by design, не дефект конфигурации.
+**503-readiness и «Health: pipeline queue» НЕ глушатся** — честный user-impact
+сигнал (readiness-семантика E1 v1.1).
+
+**Эскалация устойчивого backpressure — ТОЛЬКО** через burst-гвард 008
+(`[GUARD]` → P1/T sticky 7d) или 503-readiness; routine-класс сам не
+эскалирует (рост неделя-к-неделе для routine приоритет не поднимает — класс
+ожидаем). Наблюдаемость: counter `mcp_pipeline_backpressure_total` в `/metrics`
+(Б-минимум, решение оператора OQ-2; текст WARNING не меняется — часть
+сигнатуры) + `/health` queue_size/max/utilization. Дрейф текста источника
+поймает t1-литерал (`tests/test_errors_lib.py`,
+TestDurableRuleQueueOverflow).
+
 ---
+
 Обслуживание: новый источник → `make test-errors` КРАСНЫЙ → добавить строку
 (механизм сбора или честный gap с причиной) → ЗЕЛЁНЫЙ. Live-проверка на проде:
 `make prod-errors-sources` (gap>0 → non-zero exit).
