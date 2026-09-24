@@ -310,6 +310,8 @@ make hooks-uninstall    # снять хук
 
 Итог: `N passed / M failed / K skipped`, exit-код = число упавших гейтов (0 = зелёно). Флаги: `--quick` · `--full` · `--no-smoke` · `--fail-fast`.
 
+> **🔁 Пуш ⇒ деплой:** локальный dev-стек = прод для сообщества — после `git push` обязательно обновить работающий стек (`make deploy` + проверки health/лог/консоль/инструменты). Пуш без деплоя = незавершённый пуш. См. `AGENTS.md` и skill `mcp-knowledge-prod-ops`.
+
 ### 🛰️ Error→Rule: шторм-гард (code-2026-09-23-008)
 
 Write-side защита sink от штормов ошибок: cap **5 событий/60 с на сигнатуру**
