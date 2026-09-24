@@ -969,3 +969,111 @@ class TestRunScanCancelStatus:
         assert tracker.calls == [("cancel", "cancelled by user")], (
             f"ожидался progress.cancel без error, получено: {tracker.calls}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════
+# AC-замеры трассы 011 (AC1 перф, AC3 отмена; AC2-эквивалентность выше)
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestAcceptanceMeasures:
+    """AC1/AC3 — фактические замеры на синтетике объёма прода (8406 записей)."""
+
+    def test_ac1_auto_clear_under_5s_production_scale(self):
+        """AC1: шаг 5.5 на 8406 записей × стор 32 930 строк < 5 с.
+
+        Инцидент стенда: per-kid проходы стора ≈ 40–60 мин CPU (0.28 с × 8406).
+        После В3 (снапшот одним read + один bulk RMW): замер 0.95 с.
+        Порог с 5-кратным запасом от спеки (AC1 < 5 с).
+        """
+        import tempfile
+        import time
+
+        from mcp_server.models import KnowledgeFrontmatter
+        from mcp_server.quality.issues import create_issues_batch, set_store_dir
+        from mcp_server.quality.scanner import _auto_clear_stale_issues
+
+        n_records, store_lines = 8406, 32_930
+        with tempfile.TemporaryDirectory() as tmp:
+            set_store_dir(tmp)
+            specs = [
+                {"issue_type": "missing_field", "knowledge_id": f"kid-ac1-{i}",
+                 "severity": "warn", "detail": f"Staleness score 0.5 >= 0.45 — needs review {i}"}
+                for i in range(n_records)
+            ] + [
+                {"issue_type": "duplicate", "knowledge_id": f"kid-old-{i % 500}",
+                 "severity": "warn", "detail": f"old dup {i}"}
+                for i in range(store_lines - n_records)
+            ]
+            assert create_issues_batch(specs)["created"] >= n_records
+
+            scored = [
+                (Path(f"/tmp/kid-ac1-{i}.md"),
+                 KnowledgeFrontmatter(
+                     knowledge_id=f"kid-ac1-{i}", domain="eng", subject="perf", tags=["t"],
+                     created_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                     updated_at=datetime(2026, 8, 3, tzinfo=timezone.utc),
+                 ), 0.1)
+                for i in range(n_records)
+            ]
+
+            t0 = time.perf_counter()
+            cleared = _auto_clear_stale_issues(scored)
+            dt = time.perf_counter() - t0
+
+        assert cleared == n_records
+        assert dt < 5.0, f"AC1 FAIL: auto-clear занял {dt:.2f}с (порог 5с)"
+
+    @pytest.mark.asyncio
+    async def test_ac3_cancel_latency_under_10s_real_cancel_tool(self, tmp_path, monkeypatch):
+        """AC3: отмена реальным cancel_quality_scan ≤ 10 с (wall-clock).
+
+        Замедленный scoring (~3 мс/запись → cancel-чек каждые ~1.5 с батчем),
+        cancel посреди фазы. Замер: от cancel_quality_scan до возврата run_scan.
+        Фикс: 0.88 с (гранулярность = один батч); до фикса 5.5 не видел event вовсе.
+        """
+        import asyncio
+        import time
+
+        from mcp_server.quality import scanner as scanner_mod
+        from mcp_server.quality.scanner import run_scan
+        from mcp_server.tools.quality import cancel_quality_scan
+
+        kd = tmp_path / "knowledge"
+        kd.mkdir()
+        n_files = 1200
+        for i in range(n_files):
+            (kd / f"entry_{i}.md").write_text(
+                f"---\nknowledge_id: kid-ac3-{i}\ndomain: eng\nsubject: s\n"
+                "created_at: 2026-08-01T10:00:00+03:00\nupdated_at: 2026-08-03T10:00:00+03:00\n"
+                f"---\n# e{i}\n"
+            )
+
+        orig = scanner_mod._compute_score
+
+        def slow_score(fm, now_dt, filepath):
+            time.sleep(0.003)
+            return orig(fm, now_dt, filepath)
+
+        class _AppState:
+            pass
+
+        app_state = _AppState()
+        app_state.scan_lock = asyncio.Lock()
+        app_state.scan_id = "scan-ac3"
+        ev = asyncio.Event()
+        app_state.scan_cancel_event = ev
+
+        async with app_state.scan_lock:
+            monkeypatch.setattr(scanner_mod, "_compute_score", slow_score)
+            task = asyncio.create_task(run_scan(knowledge_dir=kd, cancel_event=ev))
+            await asyncio.sleep(2.0)  # середина scoring
+
+            t0 = time.perf_counter()
+            resp = await cancel_quality_scan({}, app_state)
+            assert resp.get("cancelled") is True, resp
+            metrics = await asyncio.wait_for(task, timeout=30)
+            dt = time.perf_counter() - t0
+
+        assert metrics["files_scanned"] == n_files  # частичные метрики валидны
+        assert dt <= 10.0, f"AC3 FAIL: отмена заняла {dt:.2f}с (порог 10с)"
