@@ -258,13 +258,23 @@ def classify_routine(rest: str, level, marker, status, slow_ms: float):
     routine: '[MCP] tool=… ok <ms>' при ms<slow_ms; '[MCP] tool=… start';
     access '[REQ] …' 2xx/без явного 4xx-5xx.
     НЕ routine (expected=False): ERROR/CRITICAL/traceback, любой 5xx, '[MCP]'
-    с error, WARNING. slow: '[MCP] … ok <ms≥slow_ms>' → hint='slow' (P1).
+    с error, WARNING — КРОМЕ ожидаемого backpressure-паттерна индексации
+    (015: «Очередь переполнена — blocking put», логгер mcp_knowledge.pipeline).
+    slow: '[MCP] … ok <ms≥slow_ms>' → hint='slow' (P1).
     """
     low = rest.lower()
     if level in ("ERROR", "CRITICAL") or status is not None and status >= 500:
         return False, None
     if "traceback" in low or "exception" in low or ("error" in low and marker == "MCP"):
         return False, None
+    # 015: ожидаемый backpressure индексации (прецедент ERRORS_QUERY 006).
+    # Детектор — строго по rest: литерал с заглавной «О» (U+041E) байт-идентичен
+    # pipeline.py:122, low=rest.lower() его НЕ содержит. Fail-word-гард —
+    # по low, как в ветке ERRORS_QUERY ниже (сбойную семантику не глотаем).
+    if (level == "WARNING" and "mcp_knowledge.pipeline" in rest
+            and "Очередь переполнена — blocking put" in rest
+            and not AUDIT_FAIL_RE.search(low)):
+        return True, None
     if level == "WARNING":
         return False, None  # WARNING не рутинен (кроме health-проб — свой источник)
     if marker == "MCP":
