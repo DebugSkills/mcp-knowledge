@@ -21,6 +21,9 @@ ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("errors_notify", ROOT / "scripts" / "errors_notify.py")
 en = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(en)
+_spec_r = importlib.util.spec_from_file_location("errors_report", ROOT / "scripts" / "errors_report.py")
+er = importlib.util.module_from_spec(_spec_r)
+_spec_r.loader.exec_module(er)
 
 TOKEN = "1234567890:AAtest_TOKEN_value-xYz"
 CHAT = "-1009999999"
@@ -299,3 +302,81 @@ class TestSendHostTag:
         monkeypatch.setattr(en.urllib.request, "urlopen", fake_urlopen)
         en.send_telegram(sink, "x", chat_override="-100override")
         assert chats == ["-100override"]
+
+
+# ── weekly-интеграция через shared-модуль (AC-weekly-1) ──
+
+def _mk_agg(priority="P1", count=3, first="2026-09-20T10:00:00Z", last="2026-09-23T12:00:00Z"):
+    return {"priority": priority, "class": "T", "count_total": count, "count_7d": count,
+            "count_prev_7d": 0, "daily": {}, "first_seen": first, "last_seen": last,
+            "status": "active", "fixed_at": None, "actors": [], "sources": ["docker_logs"],
+            "last_example": {"message": "boom"}}
+
+
+class TestWeeklyIntegration:
+    def _run_weekly(self, sink, monkeypatch):
+        sent = []
+
+        def fake_urlopen(req, timeout=None):
+            sent.append(json.loads(req.data.decode())["text"])
+            return FakeResponse()
+
+        monkeypatch.setattr(en.urllib.request, "urlopen", fake_urlopen)
+        rc = er.main(["--weekly", "--send-tg", "--sink", str(sink)])
+        assert rc == 0
+        return sent
+
+    def test_weekly_six_sections_and_tag(self, tmp_path, monkeypatch):
+        """AC-weekly-1: 6 секций в report-*.md; TG-сообщение с тегом ровно 1 раз."""
+        write_notify(tmp_path, host="lup")
+        (tmp_path / "aggregates").mkdir()
+        (tmp_path / "aggregates" / "signatures.json").write_text(
+            json.dumps({"docker_logs|500|api": _mk_agg("P0"),
+                        "docker_logs|warn|x": _mk_agg("P2")}), encoding="utf-8")
+        sent = self._run_weekly(tmp_path, monkeypatch)
+        reports = list((tmp_path / "reports").glob("report-*.md"))
+        assert len(reports) == 1
+        body = reports[0].read_text()
+        for i in range(1, 7):
+            assert f"## {i}." in body  # 6 секций
+        assert len(sent) >= 1
+        for text in sent:
+            assert text.startswith("🤖[mcp-errors@lup]\n")
+            assert text.count("🤖[mcp-errors@lup]") == 1
+            assert len(text) <= en.TG_CHUNK
+
+    def test_weekly_two_chunks_tag_in_both(self, tmp_path, monkeypatch):
+        """AC-host-2: раздутый weekly → 2 чанка, тег в ОБЕИХ частях."""
+        write_notify(tmp_path, host="lup")
+        long_sig = "docker_logs|" + "k" * 60
+        aggs = {}
+        for i in range(12):  # секция P0 (все активные P0)
+            aggs[f"{long_sig}-p0-{i:02d}|tail"] = _mk_agg("P0")
+        for i in range(12):  # секция топ-P1/P2 (actors)
+            a = _mk_agg("P1")
+            a["actors"] = [f"actor{i}", "b"]
+            aggs[f"{long_sig}-p1-{i:02d}|tail"] = a
+        for i in range(8):  # burst-подсекция (burst_ts свежий)
+            a = _mk_agg("P1")
+            a["burst_ts"] = "2026-09-23T12:00:00Z"
+            a["burst_count_5m"] = 54
+            aggs[f"{long_sig}-burst-{i:02d}|tail"] = a
+        for i in range(10):  # секция 6 кандидаты (resolved + fixed_at)
+            a = _mk_agg("P0")
+            a["status"], a["fixed_at"] = "resolved", "2026-09-22T00:00:00Z"
+            aggs[f"{long_sig}-res-{i:02d}|tail"] = a
+        (tmp_path / "aggregates").mkdir()
+        (tmp_path / "aggregates" / "signatures.json").write_text(json.dumps(aggs), encoding="utf-8")
+        sent = self._run_weekly(tmp_path, monkeypatch)
+        assert len(sent) >= 2
+        for part in sent:
+            assert part.startswith("🤖[mcp-errors@lup]\n")
+
+    def test_weekly_degradation_no_notify(self, tmp_path, monkeypatch, capsys):
+        """AC-weekly-1/AC-deg-1: без notify.json weekly всё равно exit 0 + skip-лог."""
+        (tmp_path / "aggregates").mkdir()
+        (tmp_path / "aggregates" / "signatures.json").write_text(
+            json.dumps({"a|b|c": _mk_agg()}), encoding="utf-8")
+        sent = self._run_weekly(tmp_path, monkeypatch)
+        assert sent == []
+        assert "TG: skip" in (tmp_path / "reports" / "tg-errors.log").read_text()

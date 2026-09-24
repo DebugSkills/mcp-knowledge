@@ -10,21 +10,21 @@
                      Пишет reports/report-<ISO-week>.md; обновляет alert_state.json
                      (known-list: new/known/regressed/resolved; кулдаун-поля —
                      задел под будущий P0-алерт, при weekly НЕ активны — M7).
-  --send-tg          best-effort Telegram: notify.json (0600, из vault) →
-                     api.telegram.org sendMessage, чанки ≤4096; фейл →
-                     reports/tg-errors.log, exit 0; токен НИКОГДА не печатается.
+  --send-tg          best-effort Telegram через общий sender errors_notify.py
+                     (016, В2-блок б): notify.json (0600) → api.telegram.org
+                     sendMessage, чанки ≤4096 с тегом 🤖[mcp-errors@<host>] первой
+                     строкой каждой части, прокси-слой ProxyHandler при непустом
+                     notify.proxy; фейл → reports/tg-errors.log, exit 0; токен
+                     и прокси-креды НИКОГДА не печатаются.
 
-Запуск: make prod-errors / prod-errors-report [TG=1] (errors.yml теги view|report).
-Python ≥3.9, stdlib-only. Выход 0 всегда (best-effort, M7).
+Запуск: make prod-errors / prod-errors-report [TG=1] (errors.yml теги view|report);
+dev: make errors-report [TG=1]. Python ≥3.9, stdlib-only. Выход 0 всегда (M7).
 """
 
 import argparse
 import json
 import os
-import re
 import sys
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -35,8 +35,10 @@ from errors_collect import (
     load_json,
     parse_ts,
 )
+from errors_notify import (
+    send_telegram,  # 016: shared TG-sender (бит-в-бит + прокси/host-тег)
+)
 
-TG_CHUNK = 4096
 PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 
 
@@ -373,48 +375,8 @@ def cmd_weekly(sink, send_tg):
           f"resolved={len(classes['resolved'])})")
 
     if send_tg:
-        send_telegram(sink, report)
+        send_telegram(sink, report)  # 016: shared errors_notify (тег/прокси/маскировка)
     return 0
-
-
-# ── Telegram (M7: best-effort, weekly-only; токен не печатается) ──
-
-def send_telegram(sink, text):
-    notify = load_json(sink / "notify.json", None)
-    log_path = sink / "reports" / "tg-errors.log"
-    if not isinstance(notify, dict) or not notify.get("bot_token") or not notify.get("chat_id"):
-        msg = "TG: skip (notify.json отсутствует/пуст — рендер ansible errors.yml setup)"
-        print(msg)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
-        return
-    token, chat_id = notify["bot_token"], notify["chat_id"]
-    lines, chunks, cur = text.splitlines(), [], ""
-    for line in lines:  # чанки ≤4096, не рвём строки
-        if len(cur) + len(line) + 1 > TG_CHUNK - 20:
-            chunks.append(cur)
-            cur = line
-        else:
-            cur = f"{cur}\n{line}" if cur else line
-    if cur:
-        chunks.append(cur)
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    sent = 0
-    for i, chunk in enumerate(chunks, 1):
-        try:
-            data = json.dumps({"chat_id": chat_id, "text": chunk}).encode()
-            req = urllib.request.Request(url, data=data,
-                                         headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                if resp.status == 200:
-                    sent += 1
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            reason = re.sub(token, "<token>", str(exc)) if token else str(exc)
-            print(f"TG: ошибка доставки чанка {i}: {reason}")
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"{datetime.now(timezone.utc).isoformat()} chunk {i}/{len(chunks)}: {reason}\n")
-    print(f"TG: отправлено ({sent}/{len(chunks)} чанков)" if sent else "TG: не отправлено (см. tg-errors.log)")
 
 
 def main(argv=None):
