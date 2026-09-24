@@ -265,17 +265,28 @@ class TestWindow7dParity:
         assert eq_tool._suppressed_7d({"suppressed_daily": daily}) == 5
 
     def test_d4_collector_boundary_live(self, tmp_path, monkeypatch):
-        """Живая включительная граница коллектора: единственное событие РОВНО
-        7d назад → count_7d==1 (при дрейфе `>` было бы 0)."""
+        """Живая включительная граница коллектора. Механика (P2-калибр
+        критика iter2): daily-бакет атрибутируется дню ЦИКЛА (day=now), а не
+        дню события; ранний выход при пустых events ⇒ пересчёт count_7d
+        происходит только в цикле, несущем событие этой сигнатуры. Поэтому
+        ДВА цикла ОДНОЙ сигнатуры: цикл-1 при fake-now=T−7d (бакет на границе
+        окна), цикл-2 при fake-now=T (пересчёт: week_ago == T−7d ровно) →
+        count_7d == 2 (граница + сегодня); при дрейфе `>` день границы
+        выпадает → 1 → красный."""
         sink = tmp_path / "sink"
+        sig_msg = "flaky border case"
         t7 = FAKE_NOW - timedelta(days=7)
-        ev = ec.make_event(iso(t7), "docker_logs", "flaky border case",
-                           container="c", level="ERROR")
+        border = [ec.make_event(iso(t7), "docker_logs", sig_msg,
+                                container="c", level="ERROR")]
+        set_fake_now(monkeypatch, t7)
+        ec.update_aggregates(sink, border, cfg={})
+        today = [ec.make_event(iso(FAKE_NOW), "docker_logs", sig_msg,
+                               container="c", level="ERROR")]
         set_fake_now(monkeypatch, FAKE_NOW)
-        ec.update_aggregates(sink, [ev], cfg={})
+        ec.update_aggregates(sink, today, cfg={})
         (agg,) = ec.load_json(sink / "aggregates" / "signatures.json",
                               {}).values()
-        assert agg["count_7d"] == 1
+        assert agg["count_7d"] == 2  # сегодня (1) + день ровно на границе (1)
         assert agg["count_prev_7d"] == 0
 
 
@@ -298,9 +309,13 @@ class TestEndpointsCapParity:
 
 class TestRedInjection:
     def test_reduced_prio_dict_breaks_parity(self):
-        """Симуляция дрейфа: коллектор «потерял» P3 → проверки блока A обязаны
-        расходиться с каноном (иначе тест зелёный всегда и бесполезен)."""
-        real = collector_prio_literals()
-        drifted = real - {"P3"}
-        assert drifted != set(eq_tool.PRIO_RANK)  # A1 краснел бы
-        assert set(eq_tool.PRIO_RANK) - drifted   # зубы: потеря наблюдаема
+        """Симуляция дрейфа: усечённый ИЛИ расширенный словарь обязан
+        расходиться с каноном — иначе тест зелёный всегда и бесполезен.
+        (Оба направления — как в AC2: «добавить P4 / убрать P3».)"""
+        canon = set(eq_tool.PRIO_RANK)
+        drifted_add = canon | {"P4"}              # «коллектор добавил P4»
+        drifted_cut = canon - {max(canon)}         # «потерял старший ключ»
+        assert drifted_add != canon               # A1 краснел бы
+        assert drifted_cut != canon
+        assert canon - drifted_cut                # зубы: потеря наблюдаема
+        assert drifted_add - canon == {"P4"}
