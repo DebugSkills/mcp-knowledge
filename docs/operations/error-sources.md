@@ -107,6 +107,7 @@
 | script:errors_notify.py | общий TG-sender (016: weekly+алерты) | sink: — | gap: self — ошибки доставки → reports/tg-errors.log (маскировка <token>/<proxy>), не в sink |
 | script:errors_alert.py | немедленные алерты new-P0/burst (016, cron */5) | sink: — | gap: self — анти-шторм/skip-решения → reports/tg-errors.log + stdout, не в sink |
 | script:errors_notify_import.sh | sudo-helper notify.json 0600 из /etc/backup-status.env (016, руками оператора) | sink: — | gap: self — имя отсутствующей переменной в stderr (без значений, R5), не в sink |
+| script:errors_cron.sh | cron-инсталлятор 3 джоб 016 (--install/--remove/--status, R8-валидация до записи) | sink: — | gap: self — валидационные отказы в stderr, не в sink; сам НЕ в crontab |
 | script:errors_prune.py | prune (ручной/make, dry-run-first) | sink: — | gap: self — вывод только в stdout/stderr |
 | script:errors_guard.py | write-side гвард (cap/burst) + suppression-CLI | sink: — | gap: self — сам не источник; решения оператора → sink/suppression.json + audit.jsonl |
 
