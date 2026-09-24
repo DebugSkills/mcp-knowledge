@@ -292,3 +292,15 @@ class TestEndpointsCapParity:
         # регекс ловит чужие [:8] sha256-аудита
         caps = re.findall(r"\[:(\d+)\]", tool_render_aggregate_body())
         assert caps == [str(ec.ENDPOINTS_KEEP)]
+
+
+# ── Блок F — RED-механика (self-test: паритет умеет краснеть) ──
+
+class TestRedInjection:
+    def test_reduced_prio_dict_breaks_parity(self):
+        """Симуляция дрейфа: коллектор «потерял» P3 → проверки блока A обязаны
+        расходиться с каноном (иначе тест зелёный всегда и бесполезен)."""
+        real = collector_prio_literals()
+        drifted = real - {"P3"}
+        assert drifted != set(eq_tool.PRIO_RANK)  # A1 краснел бы
+        assert set(eq_tool.PRIO_RANK) - drifted   # зубы: потеря наблюдаема
