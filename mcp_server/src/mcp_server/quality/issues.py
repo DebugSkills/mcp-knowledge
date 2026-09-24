@@ -164,6 +164,56 @@ def _issue_from_dict(data: dict) -> Issue:
 # ── Public API ──────────────────────────────────────────────
 
 
+def _upsert_issue_into(
+    existing: list[dict],
+    *,
+    issue_type: IssueType,
+    knowledge_id: str,
+    severity: IssueSeverity,
+    detail: str,
+    metadata: dict | None,
+    now: datetime,
+) -> tuple[dict, bool, bool]:
+    """Идемпотентный upsert одного issue в УЖЕ прочитанный стор (без записи).
+
+    Общая логика create_issue и create_issues_batch (code-2026-09-24-011, DRY):
+    мутирует existing (append нового entry), вызывается ТОЛЬКО под _store_lock.
+
+    Семантика (дословно от create_issue):
+    - issue_id = SHA256(type, knowledge_id, detail); metadata НЕ в ID;
+    - существующий ID → metadata-refresh (Фаза 3 (0b): без refresh старые
+      open dup-issues застревают в 🟡 навсегда — ловушка Н1);
+    - нового нет → append нового entry со status="open".
+
+    Returns:
+        (entry, created, refreshed): словарь записи + флаги изменений
+        (запись на диск — ответственность вызывающего).
+    """
+    issue_id = _make_issue_id(issue_type, knowledge_id, detail)
+
+    for entry in existing:
+        if entry.get("issue_id") == issue_id:
+            refreshed = False
+            if metadata is not None and entry.get("metadata") != metadata:
+                entry["metadata"] = metadata
+                refreshed = True
+            return entry, False, refreshed
+
+    new_issue = Issue(
+        issue_id=issue_id,
+        type=issue_type,
+        knowledge_id=knowledge_id,
+        severity=severity,
+        detail=detail,
+        detected_at=now,
+        status="open",
+        metadata=metadata,
+    )
+    entry = new_issue.model_dump(mode="json")
+    existing.append(entry)
+    return entry, True, False
+
+
 def create_issue(
     issue_type: IssueType,
     knowledge_id: str,
@@ -190,47 +240,95 @@ def create_issue(
     Returns:
         Issue: Созданная (или существующая) запись
     """
-    issue_id = _make_issue_id(issue_type, knowledge_id, detail)
     now = datetime.now(timezone.utc)
 
     with _store_lock:
         store_path = _get_store_path()
         existing = _read_all_issues(store_path)
 
-        # Проверка на дубликат
-        for entry in existing:
-            if entry.get("issue_id") == issue_id:
-                # Фаза 3 (0b): metadata-refresh. metadata НЕ в issue_id — обновление
-                # сигналов при пересканe не ломает идемпотентность ID (Фаза 1).
-                # Без refresh старые open dup-issues никогда не получают
-                # target_subject → застревают в 🟡 навсегда (ловушка Н1).
-                if metadata is not None and entry.get("metadata") != metadata:
-                    entry["metadata"] = metadata
-                    _write_all_issues(store_path, existing)
-                    logger.debug("Idempotent skip + metadata refresh: issue %s", issue_id)
-                else:
-                    logger.debug("Idempotent skip: issue %s already exists", issue_id)
-                return _issue_from_dict(entry)
-
-        # Новый issue
-        new_issue = Issue(
-            issue_id=issue_id,
-            type=issue_type,
+        entry, created, refreshed = _upsert_issue_into(
+            existing,
+            issue_type=issue_type,
             knowledge_id=knowledge_id,
             severity=severity,
             detail=detail,
-            detected_at=now,
-            status="open",
             metadata=metadata,
+            now=now,
         )
-        existing.append(new_issue.model_dump(mode="json"))
-        _write_all_issues(store_path, existing)
+        if created or refreshed:
+            _write_all_issues(store_path, existing)
 
+    issue_id = entry["issue_id"]
+    if created:
         logger.info(
             "Created issue %s: type=%s knowledge_id=%s severity=%s",
             issue_id, issue_type, knowledge_id, severity,
         )
-        return new_issue
+    elif refreshed:
+        logger.debug("Idempotent skip + metadata refresh: issue %s", issue_id)
+    else:
+        logger.debug("Idempotent skip: issue %s already exists", issue_id)
+    return _issue_from_dict(entry)
+
+
+def create_issues_batch(specs: list[dict]) -> dict:
+    """Создать пакет issues ОДНИМ read-modify-write стора (code-2026-09-24-011, В3).
+
+    Та же семантика, что последовательные create_issue (общий хелпер
+    _upsert_issue_into): детерминированный issue_id, идемпотентный skip,
+    metadata-refresh. Отличие — один _read_all_issues + один
+    _write_all_issues на весь батч вместо K×(read+rewrite):
+    скан писал K×20 МБ IO за шаг (write-amplification), теперь 1×.
+
+    Вызывается под тем же _store_lock — lock-границы не меняются
+    (констрейнт трассы 011-§7.8-3). Формат JSONL не меняется.
+
+    Args:
+        specs: список словарей-аргументов create_issue:
+            {"issue_type", "knowledge_id", "severity", "detail", "metadata"?}
+
+    Returns:
+        {"created": int, "refreshed": int, "skipped": int}
+    """
+    if not specs:
+        return {"created": 0, "refreshed": 0, "skipped": 0}
+
+    created = refreshed = skipped = 0
+    now = datetime.now(timezone.utc)
+
+    with _store_lock:
+        store_path = _get_store_path()
+        existing = _read_all_issues(store_path)
+
+        changed = False
+        for spec in specs:
+            entry, item_created, item_refreshed = _upsert_issue_into(
+                existing,
+                issue_type=spec["issue_type"],
+                knowledge_id=spec["knowledge_id"],
+                severity=spec["severity"],
+                detail=spec["detail"],
+                metadata=spec.get("metadata"),
+                now=now,
+            )
+            if item_created:
+                created += 1
+                changed = True
+            elif item_refreshed:
+                refreshed += 1
+                changed = True
+            else:
+                skipped += 1
+
+        if changed:
+            _write_all_issues(store_path, existing)
+
+    if created or refreshed:
+        logger.info(
+            "Batch-upserted issues: %d created, %d refreshed, %d skipped",
+            created, refreshed, skipped,
+        )
+    return {"created": created, "refreshed": refreshed, "skipped": skipped}
 
 
 def list_issues(
@@ -433,6 +531,45 @@ def list_issue_ids(
             continue
         result.append(entry.get("issue_id", ""))
     return result
+
+
+def list_open_issue_ids_grouped(
+    types: list[IssueType] | None = None,
+) -> dict[str, list[str]]:
+    """Вернуть {knowledge_id: [issue_id]} по open-issues за ОДИН проход стора.
+
+    Snapshot-хелпер скана (code-2026-09-24-011, В3): шаг auto-clear вызывает
+    list_issue_ids на КАЖДУЮ запись, а каждый вызов читает весь стор
+    (32 930 строк ≈ 0.28 с) ⇒ O(N×M) ≈ 40–60 мин CPU. Этот хелпер читает
+    стор один раз и отдаёт сгруппированный снапшот — O(N+M).
+
+    Под heavy_ops_lock скана параллельных писателей нет ⇒ снапшотная
+    семантика эквивалентна последовательным per-kid вызовам (§7.3).
+
+    Args:
+        types: Фильтр по типам (None = все типы).
+
+    Returns:
+        dict: knowledge_id → список issue_id (status="open", в порядке стора).
+    """
+    store_path = _get_store_path()
+    if not store_path.exists():
+        return {}
+
+    with _store_lock:
+        all_issues = _read_all_issues(store_path)
+
+    grouped: dict[str, list[str]] = {}
+    for entry in all_issues:
+        if types is not None and entry.get("type") not in types:
+            continue
+        if entry.get("status") != "open":
+            continue
+        kid = entry.get("knowledge_id")
+        if not kid:
+            continue
+        grouped.setdefault(kid, []).append(entry.get("issue_id", ""))
+    return grouped
 
 
 def close_all_dup_issues(knowledge_id: str, resolution: str | None = None) -> int:

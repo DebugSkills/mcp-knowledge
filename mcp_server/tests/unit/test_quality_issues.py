@@ -246,3 +246,185 @@ class TestIssueModel:
         # JSON сериализация
         data = issue.model_dump(mode="json")
         assert data["type"] == "duplicate"
+
+
+# ═══════════════════════════════════════════════════════════════
+# code-2026-09-24-011 (В3): snapshot-хелперы для O(N+M) quality-scan
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestListOpenIssueIdsGrouped:
+    """list_open_issue_ids_grouped — один read стора → dict kid → [issue_id]."""
+
+    def test_groups_open_by_kid_with_type_filter(self):
+        """Группировка: только open + только заданные типы; resolved/чужие типы исключены."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_store_dir(tmpdir)
+            from mcp_server.quality.issues import list_open_issue_ids_grouped
+
+            i1 = create_issue("missing_field", "kid-a", "warn", "d1")
+            i2 = create_issue("missing_field", "kid-a", "warn", "d2")
+            i3 = create_issue("missing_field", "kid-b", "warn", "d3")
+            create_issue("duplicate", "kid-a", "warn", "d4")  # чужой тип
+            resolved = create_issue("missing_field", "kid-c", "warn", "d5")
+            update_issue_status(resolved.issue_id, "resolved")
+
+            grouped = list_open_issue_ids_grouped(["missing_field"])
+
+            assert set(grouped) == {"kid-a", "kid-b"}
+            assert sorted(grouped["kid-a"]) == sorted([i1.issue_id, i2.issue_id])
+            assert grouped["kid-b"] == [i3.issue_id]
+
+    def test_empty_store_returns_empty_dict(self):
+        """Пустой/несуществующий стор → {} (не падает)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_store_dir(tmpdir)
+            from mcp_server.quality.issues import list_open_issue_ids_grouped
+
+            assert list_open_issue_ids_grouped(["missing_field"]) == {}
+
+    def test_reads_store_once(self):
+        """ОДИН проход по стору на вызов (снапшот-семантика, анти-O(N×M))."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_store_dir(tmpdir)
+            from unittest.mock import patch
+
+            from mcp_server.quality.issues import list_open_issue_ids_grouped
+
+            for i in range(5):
+                create_issue("missing_field", f"kid-{i}", "warn", f"d{i}")
+
+            with patch(
+                "mcp_server.quality.issues._read_all_issues", wraps=None
+            ) as mock_read:
+                list_open_issue_ids_grouped(["missing_field"])
+                assert mock_read.call_count == 1
+
+
+class TestCreateIssuesBatch:
+    """create_issues_batch — один read-modify-write на батч, семантика create_issue."""
+
+    def _spec(self, kid: str, detail: str, metadata: dict | None = None) -> dict:
+        return {
+            "issue_type": "missing_field",
+            "knowledge_id": kid,
+            "severity": "warn",
+            "detail": detail,
+            "metadata": metadata,
+        }
+
+    def test_creates_new_and_counts(self):
+        """Новые спеки создаются, счётчики корректны."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_store_dir(tmpdir)
+            from mcp_server.quality.issues import create_issues_batch, list_issues
+
+            result = create_issues_batch([self._spec("kid-1", "d1"), self._spec("kid-2", "d2")])
+
+            assert result == {"created": 2, "refreshed": 0, "skipped": 0}
+            open_issues = list_issues(types=["missing_field"], status="open", limit=100)
+            assert {i.knowledge_id for i in open_issues} == {"kid-1", "kid-2"}
+
+    def test_idempotent_skip_existing(self):
+        """Дубликаты спеков (существующие issue_id) → skipped, без rewrite."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_store_dir(tmpdir)
+            from mcp_server.quality.issues import create_issues_batch
+
+            create_issues_batch([self._spec("kid-1", "d1")])
+            result = create_issues_batch([self._spec("kid-1", "d1")])
+            assert result == {"created": 0, "refreshed": 0, "skipped": 1}
+
+    def test_metadata_refresh_semantics_preserved(self):
+        """metadata-refresh как в create_issue: существующий issue получает новый metadata."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_store_dir(tmpdir)
+            from mcp_server.quality.issues import create_issues_batch, list_issues
+
+            create_issues_batch([self._spec("kid-1", "d1", metadata={"cosine": 0.9})])
+            result = create_issues_batch([self._spec("kid-1", "d1", metadata={"cosine": 0.95})])
+
+            assert result == {"created": 0, "refreshed": 1, "skipped": 0}
+            issues = list_issues(types=["missing_field"], status="open", limit=10)
+            assert len(issues) == 1
+            assert issues[0].metadata == {"cosine": 0.95}
+
+    def test_exactly_one_write_per_batch(self):
+        """РОВНО один _write_all_issues на батч (write-amplification K×→1)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_store_dir(tmpdir)
+            from unittest.mock import patch
+
+            from mcp_server.quality.issues import create_issues_batch
+
+            specs = [self._spec(f"kid-{i}", f"d{i}") for i in range(10)]
+            with patch(
+                "mcp_server.quality.issues._write_all_issues", wraps=None
+            ) as mock_write:
+                result = create_issues_batch(specs)
+                assert mock_write.call_count == 1
+            assert result["created"] == 10
+
+    def test_no_write_when_all_skipped(self):
+        """Все спеки — дубликаты без refresh → 0 write (лишний rewrite не нужен)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_store_dir(tmpdir)
+            from unittest.mock import patch
+
+            from mcp_server.quality.issues import create_issues_batch
+
+            create_issues_batch([self._spec("kid-1", "d1", metadata={"m": 1})])
+            with patch(
+                "mcp_server.quality.issues._write_all_issues", wraps=None
+            ) as mock_write:
+                result = create_issues_batch([self._spec("kid-1", "d1", metadata={"m": 1})])
+                assert mock_write.call_count == 0
+            assert result["skipped"] == 1
+
+    def test_equivalent_to_sequential_create_issue(self):
+        """Эквивалентность: батч == последовательные create_issue (issue_id + metadata)."""
+        with tempfile.TemporaryDirectory() as tmpdir_a, tempfile.TemporaryDirectory() as tmpdir_b:
+            from mcp_server.quality.issues import list_issues
+
+            specs = [
+                self._spec("kid-1", "d1", {"cosine": 0.9}),
+                self._spec("kid-2", "d2", None),
+                self._spec("kid-1", "d3", {"cosine": 0.8}),
+            ]
+            # Стор A: батч
+            set_store_dir(tmpdir_a)
+            from mcp_server.quality.issues import create_issues_batch
+            create_issues_batch(specs)
+            batch_issues = {
+                i.issue_id: (i.metadata, i.status) for i in list_issues(status="open", limit=1000)
+            }
+            # Стор B: последовательные create_issue
+            set_store_dir(tmpdir_b)
+            for spec in specs:
+                create_issue(**spec)
+            seq_issues = {
+                i.issue_id: (i.metadata, i.status) for i in list_issues(status="open", limit=1000)
+            }
+
+            assert batch_issues == seq_issues
+
+    def test_empty_specs_noop(self):
+        """Пустой батч → нулевые счётчики, стор не создаётся."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_store_dir(tmpdir)
+            from mcp_server.quality.issues import create_issues_batch, get_issues_store_path
+
+            result = create_issues_batch([])
+            assert result == {"created": 0, "refreshed": 0, "skipped": 0}
+            assert not get_issues_store_path().exists()
+
+    def test_no_tmp_leftover(self):
+        """Атомарность: после батча нет .tmp-остатка."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            set_store_dir(tmpdir)
+            from mcp_server.quality.issues import create_issues_batch, get_issues_store_path
+
+            create_issues_batch([self._spec("kid-1", "d1")])
+            store = get_issues_store_path()
+            assert store.exists()
+            assert not store.with_suffix(".jsonl.tmp").exists()
