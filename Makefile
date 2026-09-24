@@ -198,8 +198,8 @@ test-errors:  ## Error→Rule: юнит-тесты коллектора + гва
 errors-view:  ## 016: сводка sink (агрегаты/флаги) — что уйдёт в TG
 	.venv/bin/python scripts/errors_report.py
 
-errors-report:  ## 016: weekly-отчёт (TG=1 → отправка в чат; по умолчанию stdout)
-	.venv/bin/python scripts/errors_report.py $(if $(TG),--send-tg)
+errors-report:  ## 016: weekly-отчёт 6 секций, --weekly обязателен (TG=1 → отправка; по умолчанию stdout)
+	.venv/bin/python scripts/errors_report.py --weekly $(if $(TG),--send-tg)
 
 errors-alert:  ## 016: немедленные алерты new-P0/burst (TG=1 → отправка; dry-run по умолчанию)
 	.venv/bin/python scripts/errors_alert.py $(if $(TG),--send-tg)

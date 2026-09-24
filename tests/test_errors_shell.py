@@ -270,7 +270,14 @@ class TestCronInstall:
             f"Д4: alerts-джоба без --send-tg (алерты не отправляются): {lines[b + 2]}"
         assert lines[b + 3].startswith("2 10 * * 1")  # weekly Пн 10:02
         assert "errors_report.py" in lines[b + 3]
+        # Д5 (живая свивка 016): weekly-джоба ОБЯЗАНА иметь --weekly — без
+        # флага errors_report.py дефолтит в cmd_view (read-only, :392-394),
+        # --send-tg обрабатывается ТОЛЬКО внутри cmd_weekly ⇒ отчёт не
+        # отправлялся бы НИКОГДА.
+        assert "--weekly" in lines[b + 3], \
+            f"Д5: weekly-джоба без --weekly (упадёт в read-only view): {lines[b + 3]}"
         assert "--send-tg" in lines[b + 3]  # weekly с отправкой (фиксируем)
+        assert lines[b + 3].index("--weekly") < lines[b + 3].index("--send-tg")
         assert lines[b + 4] == MARK_END
         assert "17 3 * * * /usr/bin/existing-job" in lines  # чужое не тронуто
 
@@ -321,6 +328,8 @@ class TestCronInstall:
         # Д4: --send-tg ровно 2 (alerts + weekly) — идемпотентность не даёт
         # дублей флага, а отсутствие обоих = dry-run-дефект класса Д4.
         assert content.count("--send-tg") == 2
+        # Д5: --weekly ровно 1 (только weekly-джоба, не alerts/collector).
+        assert content.count("--weekly") == 1
 
     def test_config_overlay_cron_logs(self, tmp_path):
         """R9 (Д3): config-оверлей cron_logs — ТОЛЬКО в реальном режиме
@@ -485,6 +494,84 @@ class TestCronPreviewNoSideEffects:
         r = sh(CRON_SH, "--install", "--file", str(cf), "--data-root", str(tmp_path / "data"))
         assert r.returncode == 0, r.stderr
         assert "config overlay: пропущен (режим --file)" in r.stdout
+
+
+# ── Д5 (живая свивка 016): тесты-различители флагов запуска ──
+
+def _make_target_recipe(name):
+    """Рецепт make-таргета (строка `name:` + последующие таб-строки) или None."""
+    mk = (ROOT / "Makefile").read_text(encoding="utf-8").splitlines()
+    for i, ln in enumerate(mk):
+        if ln.startswith(f"{name}:"):
+            recipe = [ln]
+            j = i + 1
+            while j < len(mk) and mk[j].startswith("\t"):
+                recipe.append(mk[j])
+                j += 1
+            return "\n".join(recipe)
+    return None
+
+
+class TestRunFlagsMatrix:
+    """Д5: `errors_report.py` без `--weekly` дефолтит в read-only cmd_view
+    (:392-394: `if args.weekly … else cmd_view`) — cron-джоба weekly каждую
+    неделю печатала view-список и НИЧЕГО не отправляла (--send-tg живёт
+    только внутри cmd_weekly). Эталон: ansible/playbooks/errors.yml:71
+    `errors_report.py --weekly [--send-tg]`. Матрица флагов каждой джобы
+    и Makefile-таргета — различима, класс «потерянный флаг запуска» не
+    должен переживать тесты."""
+
+    def _jobs(self, tmp_path):
+        cf = tmp_path / "crontab.txt"
+        cf.write_text(MODEL_SEED, encoding="utf-8")
+        r = sh(CRON_SH, "--install", "--file", str(cf), "--data-root", str(tmp_path / "data"))
+        assert r.returncode == 0, r.stderr
+        lines = [ln for ln in cf.read_text().splitlines() if ln.strip()]
+        b = next(i for i, ln in enumerate(lines) if ln == MARK_BEGIN)
+        return lines[b + 1], lines[b + 2], lines[b + 3]  # collector, alerts, weekly
+
+    def test_weekly_line_weekly_and_send_tg(self, tmp_path):
+        """Д5: weekly-строка = И --weekly, И --send-tg (порядок --weekly --send-tg)."""
+        _c, _a, weekly = self._jobs(tmp_path)
+        assert "errors_report.py" in weekly
+        assert "--weekly" in weekly, f"Д5: weekly без --weekly → cmd_view: {weekly}"
+        assert "--send-tg" in weekly, f"Д5: weekly без --send-tg → нет доставки: {weekly}"
+        assert weekly.index("--weekly") < weekly.index("--send-tg")
+
+    def test_alerts_line_send_tg_no_weekly(self, tmp_path):
+        """Матрица: alerts = --send-tg БЕЗ --weekly (алерт, не отчёт)."""
+        _c, alerts, _w = self._jobs(tmp_path)
+        assert "errors_alert.py" in alerts
+        assert "--send-tg" in alerts
+        assert "--weekly" not in alerts
+
+    def test_collector_line_no_send_flags(self, tmp_path):
+        """Матрица: collector = чистый сбор (без --send-tg/--weekly)."""
+        collector, _a, _w = self._jobs(tmp_path)
+        assert "errors_collect.py" in collector
+        assert "--send-tg" not in collector
+        assert "--weekly" not in collector
+
+    def test_makefile_errors_report_runs_weekly(self):
+        """Д5-страховка: make errors-report обязан звать --weekly — иначе
+        `TG=1` печатает view-список и не отправляет ничего (живой кейс 016:
+        лог reports/tg-errors.log не обновлялся). Проверяем ТОЛЬКО командные
+        (таб-)строки рецепта: help-комментарий таргета не считается."""
+        recipe = _make_target_recipe("errors-report")
+        assert recipe, "нет таргета errors-report в Makefile"
+        cmd = "\n".join(ln for ln in recipe.splitlines() if ln.startswith("\t"))
+        assert "errors_report.py" in cmd
+        assert "--weekly" in cmd, (
+            f"Д5: make errors-report без --weekly → дефолт cmd_view: {cmd}")
+        assert cmd.index("--weekly") < cmd.index("--send-tg")
+
+    def test_makefile_errors_view_stays_view(self):
+        """Симметрия: errors-view остаётся read-only view-режимом (без --weekly)."""
+        recipe = _make_target_recipe("errors-view")
+        assert recipe, "нет таргета errors-view в Makefile"
+        cmd = "\n".join(ln for ln in recipe.splitlines() if ln.startswith("\t"))
+        assert "errors_report.py" in cmd
+        assert "--weekly" not in cmd
 
 
 # ── AC-collect-1(а): юнит collect_cron_logs на [CRON] exit=1 ──

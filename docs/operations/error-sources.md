@@ -260,7 +260,10 @@ cooldown 120 мин/сигнатуру · ≤2 основных + 1 хвост-�
 **Cron (3 строки, `scripts/errors_cron.sh --install`):** collector `*/5`
 (ПЕРВЫМ — данные важнее алертов), alerts `*/5` **с `--send-tg`** (Д4: без
 флага `errors_alert.py` — dry-run, немедленные алерты не уходили бы никогда),
-weekly `2 10 * * 1` `--send-tg`. Все
+weekly `2 10 * * 1` **`--weekly --send-tg`** (Д5: без `--weekly`
+`errors_report.py` дефолтит в read-only view — `--send-tg` обрабатывается
+только внутри weekly-режима, отчёт не уходил бы никогда; эталон —
+`ansible/playbooks/errors.yml:71`). Все
 обёрнуты `cron_wrap.sh` → `[CRON] job=… exit=…` строки (exit≠0 → P0-признак
 `cron_nonzero`, см. class:cron_exit выше). R8: пути абсолютные + `cd BASE`,
 валидация ДО записи (кривой блок → crontab не тронут). Config-оверлей:
@@ -282,8 +285,8 @@ proxy из vault + host из inventory_hostname, 0600); локально — sud
    оператором по HITL-гейту; для preview `FILE=model.txt`).
 
 Дежурные команды: `make errors-view` (сводка sink), `make errors-report`
-(stdout) / `TG=1` (отправка), `make errors-alert` (dry-run) / `TG=1`,
-`make errors-cron-status`.
+(weekly-отчёт 6 секций, stdout) / `TG=1` (отправка), `make errors-alert`
+(dry-run) / `TG=1`, `make errors-cron-status`.
 
 ## Durable-правило №1: queue-overflow = ожидаемый backpressure (code-2026-09-24-015, спека §7 .boardData.md)
 
