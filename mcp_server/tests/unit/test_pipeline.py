@@ -287,3 +287,50 @@ class TestPipelineOverflow:
         assert kid in pipeline._completed
         assert "kid-a" not in pipeline._completed
         assert len(pipeline._completed) == 1  # только batch entry
+
+
+class TestBackpressureMetric:
+    """015 (Б-минимум, OQ-2): counter mcp_pipeline_backpressure_total растёт
+    в ветке QueueFull; текст WARNING не меняется (часть сигнатуры sink).
+    """
+
+    @pytest.mark.asyncio
+    async def test_queue_full_increments_backpressure_counter(self, sample_entry, caplog):
+        """Синтетический QueueFull (max_queue=1): warning + counter +1,
+        blocking put завершается после освобождения места.
+        """
+        import logging
+
+        from mcp_server import metrics as M
+        from mcp_server.indexing.pipeline import IndexingPipeline
+
+        store = MagicMock()
+        store.reindex_scan = AsyncMock(return_value=[])
+        p = IndexingPipeline(store=store, qdrant=MagicMock(), embedder=MagicMock(),
+                             chunker=MagicMock(), max_queue=1)
+        p._queue.put_nowait({"filler": True})  # префилл: очередь полна → put_nowait падает
+
+        before = M.pipeline_backpressure._value.get()
+        with caplog.at_level(logging.WARNING, logger="mcp_knowledge.pipeline"):
+            task = asyncio.create_task(p.enqueue(sample_entry, wait_for_index=False))
+            await asyncio.sleep(0.05)  # put_nowait → QueueFull → warning → blocking put
+
+            # текст WARNING байт-идентичен (сигнатура sink стабильна)
+            assert "Очередь переполнена — blocking put" in caplog.text
+            assert M.pipeline_backpressure._value.get() == before + 1
+
+            # освобождаем место — blocking put завершается, enqueue возвращается
+            await p._queue.get()
+            await asyncio.wait_for(task, timeout=1.0)
+            assert p.stats["queued"] == 1
+
+    def test_backpressure_metric_exposed_in_prometheus_format(self):
+        """AC7: метрика присутствует в exposition-формате /metrics (endpoint
+        возвращает generate_latest()) — строка mcp_pipeline_backpressure_total.
+        """
+        from prometheus_client import generate_latest
+
+        from mcp_server import metrics as M
+
+        assert M.pipeline_backpressure._type == "counter"
+        assert b"mcp_pipeline_backpressure_total" in generate_latest()

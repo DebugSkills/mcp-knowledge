@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 
 from ..config import settings
 from ..embedding.manager import EmbeddingManager
+from ..metrics import pipeline_backpressure
 from ..models import Chunk, KnowledgeEntry, WriteResult
 from ..storage.markdown_store import MarkdownStore
 from ..storage.qdrant_client import QdrantClient
@@ -120,6 +121,9 @@ class IndexingPipeline:
             self._queue.put_nowait(item)
         except asyncio.QueueFull:
             logger.warning("Очередь переполнена — blocking put")
+            # 015 (Б-минимум, OQ-2): диагностируемость backpressure; текст
+            # warning НЕ меняем — он часть сигнатуры sink
+            pipeline_backpressure.inc()
             await self._queue.put(item)
 
         self.stats["queued"] += 1

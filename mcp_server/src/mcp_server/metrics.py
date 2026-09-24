@@ -98,6 +98,10 @@ pipeline_failed = Counter(
     "mcp_pipeline_failed_total",
     "Всего неудачных попыток индексации",
 )
+pipeline_backpressure = Counter(
+    "mcp_pipeline_backpressure_total",
+    "Blocking-put вставок в очередь индексации (ожидаемый backpressure, 015)",
+)
 quality_gate_skipped = Counter(
     "mcp_quality_gate_skipped_total",
     "Сколько раз quality-gate (collision check / dup-gate) был пропущен (non-fatal)",
