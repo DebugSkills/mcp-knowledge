@@ -149,8 +149,9 @@ def build_scan_progress(
         # 13.27: первый полл видит терминальный статус = скан завершился ДО
         # загрузки страницы. Помечаем on_done отработанным — повторных
         # срабатываний для уже завершённых сканов не будет.
+        # 011: cancelled — терминальный (UI-контракт, как core/utils.py import-контура)
         scan_id: str = snapshot.get("scan_id") or snapshot.get("import_id") or ""
-        if _last_done_id is None and snapshot.get("status") in ("done", "error"):
+        if _last_done_id is None and snapshot.get("status") in ("done", "error", "cancelled"):
             _last_done_id = scan_id
 
         with container:
@@ -159,7 +160,7 @@ def build_scan_progress(
             done_val: int = snapshot.get("imported", 0)
             total_val: int = snapshot.get("total", 0)
             percent: float = (done_val / total_val * 100) if total_val else 0
-            is_done: bool = status in ("done", "error")
+            is_done: bool = status in ("done", "error", "cancelled")
 
             # Заголовок: фаза + счётчик + процент
             ui.label(

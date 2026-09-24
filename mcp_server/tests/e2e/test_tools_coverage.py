@@ -1234,7 +1234,7 @@ async def test_s23_quality_lifecycle_via_http(e2e_http_app):
         assert resp.status_code == 200
         progress = resp.json()
         status = progress.get("status", "")
-        if status in ("done", "error"):
+        if status in ("done", "error", "cancelled"):  # 011: cancelled — терминальный
             scan_done = status == "done"
             break
         await asyncio.sleep(0.5)
@@ -1419,14 +1419,20 @@ async def test_s24_cancel_quality_scan_via_http(e2e_http_app):
     # Step 4: дождаться завершения скана (если был активен) чтобы не мешать другим тестам
     if cancel_result["cancelled"]:
         import asyncio
+        # 011: отмена завершает скан статусом cancelled (не error — P1-D)
         deadline = asyncio.get_running_loop().time() + 30.0
+        final_status = None
         while asyncio.get_running_loop().time() < deadline:
             resp = await e2e_http_app.get("/quality/scan/progress")
             assert resp.status_code == 200
             progress = resp.json()
-            if progress.get("status") in ("done", "error", "not_found"):
+            final_status = progress.get("status")
+            if final_status in ("done", "error", "cancelled", "not_found"):
                 break
             await asyncio.sleep(0.5)
+        assert final_status != "error", (
+            f"011: cancelled scan must not end as error: {progress}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1442,7 +1448,7 @@ async def test_s25_scan_state_survives_restart_via_http(e2e_http_app):
     1. Скан1 (замедленный) стартует → scan_state.json содержит running.
     2. «Рестарт»: новый ImportProgressTracker с тем же persist_path + новый
        lock (старый task/lock остаются в прошлом «процессе»), load().
-    3. Running-запись помечается прерванной (error) — как в main.py.
+    3. Running-запись помечается прерванной (cancelled — код 011, не error).
     4. run_quality_scan → prune_finished убирает прерванную запись,
        стартует Скан2 с НОВЫМ scan_id.
     5. /quality/scan/progress отдаёт новый скан; файл содержит новый running.
@@ -1501,8 +1507,9 @@ async def test_s25_scan_state_survives_restart_via_http(e2e_http_app):
         assert scan1_id in recovered, "recovery: running entry not loaded from disk"
         assert recovered[scan1_id]["status"] == "running"
 
-        # Step 3: прерванная запись → error (как в main.py recovery-блоке)
-        app.state.scan_progress.error(scan1_id, "scan interrupted by server restart (auto-resume)")
+        # Step 3: прерванная запись → cancelled (как в main.py recovery-блоке, код 011)
+        app.state.scan_progress.cancel(scan1_id, "scan interrupted by server restart (auto-resume)")
+        assert app.state.scan_progress.get(scan1_id)["status"] == "cancelled"
 
         # Step 4: новый скан — prune_finished + новый scan_id
         resp = await e2e_http_app.post(
@@ -1603,7 +1610,7 @@ async def _s26_run_scan_and_wait(e2e_http_app, headers_write, tag: str) -> dict:
         assert resp.status_code == 200
         progress = resp.json()
         status = progress.get("status", "")
-        if status in ("done", "error"):
+        if status in ("done", "error", "cancelled"):  # 011: cancelled — терминальный
             assert status == "done", f"{tag}: scan ended with error: {progress}"
             return {"scan_id": scan_id, "progress": progress}
         await asyncio.sleep(0.5)

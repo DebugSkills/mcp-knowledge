@@ -227,9 +227,11 @@ def build_quality() -> None:
 
     def _sync_scan_ui(snapshot: dict | None) -> None:
         nonlocal _scan_btn_blocked
+        # 011: cancelled — терминальный статус скана (как в import-контуре
+        # core/utils.py); иначе поллинг не остановится на отменённом скане
         active = (
             snapshot is not None
-            and snapshot.get("status") not in ("done", "error")
+            and snapshot.get("status") not in ("done", "error", "cancelled")
         )
         if active and not _scan_btn_blocked:
             scan_btn.disable()

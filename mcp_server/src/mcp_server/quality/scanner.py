@@ -136,7 +136,7 @@ async def run_scan(
         logger.info("Quality scan %s cancelled after filesystem walk (%d files)", pid, len(entries))
         if progress and pid:
             progress.log(pid, "warning", "scan cancelled by user")
-            progress.error(pid, "cancelled by user")
+            progress.cancel(pid, "cancelled by user")  # 011: честный статус вместо error (P1-D)
         return metrics
 
     if not entries:
@@ -202,7 +202,7 @@ async def run_scan(
         logger.info("Quality scan %s cancelled during scoring phase", pid)
         if progress and pid:
             progress.log(pid, "warning", "scan cancelled by user (during scoring)")
-            progress.error(pid, "cancelled by user")
+            progress.cancel(pid, "cancelled by user")  # 011: честный статус вместо error (P1-D)
         return metrics
 
     # Шаг 3: запись scores в Qdrant payload
@@ -210,7 +210,7 @@ async def run_scan(
         if _is_cancelled():
             if progress and pid:
                 progress.log(pid, "warning", "scan cancelled — skipping Qdrant update")
-                progress.error(pid, "cancelled by user")
+                progress.cancel(pid, "cancelled by user")  # 011: честный статус вместо error (P1-D)
             return metrics
         if progress and pid:
             progress.set_phase(pid, "updating_qdrant", "Запись scores в Qdrant payload...")
@@ -222,7 +222,7 @@ async def run_scan(
         logger.info("Quality scan %s cancelled after Qdrant update", pid)
         if progress and pid:
             progress.log(pid, "warning", "scan cancelled by user")
-            progress.error(pid, "cancelled by user")
+            progress.cancel(pid, "cancelled by user")  # 011: честный статус вместо error (P1-D)
         return metrics
 
     # Шаг 4: dup-pair scan по domain-бакетам
@@ -254,7 +254,7 @@ async def run_scan(
         logger.info("Quality scan %s cancelled after dup_scan", pid)
         if progress and pid:
             progress.log(pid, "warning", "scan cancelled by user")
-            progress.error(pid, "cancelled by user")
+            progress.cancel(pid, "cancelled by user")  # 011: честный статус вместо error (P1-D)
         return metrics
 
     # Шаг 5: создание issues для проблемных записей

@@ -929,3 +929,25 @@ def test_import_page_has_zone_select():
     src = inspect.getsource(import_page.build_import)
     assert "zone_select" in src, "build_import должна создавать ui.select зоны доступа"
     assert 'params["zone"]' in src, "do_import должна передавать zone в params"
+
+
+def test_scan_terminal_status_includes_cancelled():
+    """011: cancelled — терминальный статус скана (quality-страница + progress_panel).
+
+    UI-контракт: поллинг обязан остановиться на отменённом скане, кнопка
+    «Скан» — разблокироваться. Import-контур «cancelled» уже знает
+    (core/utils.py); quality-контур добавлен кодом 011 (R7-RED).
+    """
+    import inspect
+
+    from kb_console.components import progress_panel
+    from kb_console.pages import quality
+
+    q_src = inspect.getsource(quality)
+    assert 'not in ("done", "error", "cancelled")' in q_src, (
+        "quality._sync_scan_ui: терминальное множество обязано включать cancelled"
+    )
+    pp_src = inspect.getsource(progress_panel)
+    assert pp_src.count('("done", "error", "cancelled")') >= 2, (
+        "progress_panel: is_done и первый-полл-чек обязаны считать cancelled терминальным"
+    )

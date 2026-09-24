@@ -367,3 +367,69 @@ class TestImportProgressTracker:
         # И запись тоже не падает
         t.start("scan-v", total=1)
         t.done("scan-v", summary={})
+
+
+# ═══════════════════════════════════════════════════════════════
+# code-2026-09-24-011: статус cancelled (скан качества)
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestCancelStatus:
+    """cancel() / prune_finished / TTL — терминальный статус 'cancelled' (трасса 011).
+
+    P1-D: отмена скана писалась как error («scan interrupted/cancelled» без
+    реальной ошибки) → scan_state.json оставался status=error. Решение
+    оператора №2: честный статус cancelled + сохранить авто-ресюм 13.27.
+    """
+
+    def test_cancel_sets_status_and_logs(self):
+        """cancel() → status='cancelled', лог с reason (зеркально error())."""
+        t = ImportProgressTracker()
+        t.start("scan-1", total=10)
+        t.cancel("scan-1", "cancelled by user")
+        snap = t.get("scan-1")
+        assert snap["status"] == "cancelled"
+        assert any("cancelled by user" in m["text"] for m in snap["messages"])
+
+    def test_cancel_force_persists(self, tmp_path):
+        """cancel() пишет снапшот на диск немедленно (force), как error()."""
+        p = tmp_path / "scan_state.json"
+        t = ImportProgressTracker(persist_path=p)
+        t.start("scan-1", total=10)
+        t._last_persist = time.time()  # имитируем недавнюю запись (throttle-окно)
+        t.cancel("scan-1", "cancelled by user")
+        import json
+        raw = json.loads(p.read_text())
+        assert raw["scan-1"]["status"] == "cancelled"
+
+    def test_cancel_unknown_id_noop(self):
+        """cancel для неизвестного id — best-effort, не падает."""
+        t = ImportProgressTracker()
+        t.cancel("ghost", "reason")  # не должен бросить
+        assert t.get("ghost") is None
+
+    def test_prune_finished_removes_cancelled(self):
+        """prune_finished чистит cancelled наравне с done/error (R5-RED)."""
+        t = ImportProgressTracker()
+        t.start("a", total=1)
+        t.done("a")
+        t.start("b", total=1)
+        t.error("b", "boom")
+        t.start("c", total=1)
+        t.cancel("c", "cancelled by user")
+        t.start("live", total=1)  # running — не трогаем
+
+        removed = t.prune_finished(keep_id="live")
+        assert removed == 3
+        assert t.get("a") is None
+        assert t.get("b") is None
+        assert t.get("c") is None
+        assert t.get("live") is not None
+
+    def test_ttl_prunes_cancelled_after_expiry(self):
+        """get() удаляет просроченный cancelled по TTL (как done/error)."""
+        t = ImportProgressTracker(ttl_seconds=0)
+        t.start("c", total=1)
+        t.cancel("c", "cancelled by user")
+        t._data["c"]["updated_at"] = "2000-01-01T00:00:00+00:00"  # протухло
+        assert t.get("c") is None

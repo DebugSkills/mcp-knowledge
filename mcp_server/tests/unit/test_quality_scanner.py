@@ -912,3 +912,60 @@ class TestScanDupPairsBuffered:
 
         assert set(batch) == set(seq)
         assert batch == seq
+
+
+class TestRunScanCancelStatus:
+    """run_scan при отмене пишет честный статус cancelled, не error (P1-D, 011)."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_uses_progress_cancel_not_error(self):
+        """Cancel-пути run_scan зовут progress.cancel (R4-RED: error-статус запрещён)."""
+        import asyncio
+        import tempfile
+        from pathlib import Path
+
+        from mcp_server.quality.scanner import run_scan
+
+        class FakeTracker:
+            def __init__(self):
+                self.calls = []
+
+            def set_phase(self, pid, phase, text=None):
+                pass
+
+            def start(self, pid, total):
+                pass
+
+            def log(self, pid, level, text):
+                pass
+
+            def cancel(self, pid, reason):
+                self.calls.append(("cancel", reason))
+
+            def error(self, pid, reason):
+                self.calls.append(("error", reason))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            knowledge_dir = Path(tmp)
+            for i in range(3):
+                (knowledge_dir / f"entry_{i}.md").write_text(
+                    f"---\nknowledge_id: kid-{i}\ndomain: eng\nsubject: test\ntags: [t]\n"
+                    "created_at: 2026-08-01T10:00:00+03:00\n"
+                    f"updated_at: 2026-08-03T10:00:00+03:00\n---\n# Entry {i}\n"
+                )
+
+            cancel_event = asyncio.Event()
+            cancel_event.set()  # отмена сразу после обхода ФС
+
+            tracker = FakeTracker()
+            await run_scan(
+                knowledge_dir=knowledge_dir,
+                qdrant_client=None,
+                cancel_event=cancel_event,
+                progress=tracker,
+                progress_id="scan-x",
+            )
+
+        assert tracker.calls == [("cancel", "cancelled by user")], (
+            f"ожидался progress.cancel без error, получено: {tracker.calls}"
+        )

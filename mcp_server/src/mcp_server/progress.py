@@ -229,7 +229,7 @@ class ImportProgressTracker:
     # ── 13.19: Prune finished entries ──────────────────────
 
     def prune_finished(self, keep_id: str | None = None) -> int:
-        """Удалить все записи со статусом done/error, кроме keep_id.
+        """Удалить все записи со статусом done/error/cancelled, кроме keep_id.
 
         Best-effort: никогда не кидает исключений.
         Возвращает число удалённых записей.
@@ -242,7 +242,7 @@ class ImportProgressTracker:
                 import_id
                 for import_id, entry in self._data.items()
                 if isinstance(entry, dict)
-                and entry.get("status") in ("done", "error")
+                and entry.get("status") in ("done", "error", "cancelled")
                 and import_id != keep_id
             ]
             for import_id in to_remove:
@@ -265,6 +265,25 @@ class ImportProgressTracker:
         except Exception:
             pass
 
+    def cancel(self, import_id: str, reason: str) -> None:
+        """Пометить как отменённый (code-2026-09-24-011, P1-D).
+
+        Зеркально error(): status='cancelled', лог, force-persist. Отмена
+        скана/импорта — НЕ ошибка: раньше писалась через error() →
+        scan_state.json оставался status=error после отмены/рестарта без
+        реальной ошибки. Терминальное множество prune/TTL — см. prune_finished.
+        """
+        entry = self._ensure(import_id)
+        if entry is None:
+            return
+        try:
+            entry["status"] = "cancelled"
+            self.log(import_id, "warning", reason)
+            self._touch(entry)
+            self.persist(force=True)
+        except Exception:
+            pass
+
     def get(self, import_id: Any) -> dict[str, Any] | None:
         """Получить снапшот прогресса (копия, с TTL-очисткой).
 
@@ -276,14 +295,15 @@ class ImportProgressTracker:
 
         try:
             entry = self._data[import_id]
-            # TTL prune: удаляем ТОЛЬКО записи со status in ("done", "error").
-            # running-записи НЕ удаляем по TTL — даже если фаза застряла
+            # TTL prune: удаляем ТОЛЬКО терминальные записи
+            # (done | error | cancelled — код 011). running-записи НЕ
+            # удаляем по TTL — даже если фаза застряла
             # (останутся, пока не перезапишутся новым сканом).
             # Активные импорты постоянно трогают updated_at (на каждой секции/батче),
             # поэтому не старше ttl — никогда не удаляются живьём. Удаляются только
             # зависшие или завершённые (после ttl после последнего обновления).
             status = entry.get("status", "running")
-            if status in ("done", "error"):
+            if status in ("done", "error", "cancelled"):
                 now_ts = _time.time()
                 updated_at = entry.get("updated_at", "")
                 if updated_at:

@@ -359,7 +359,7 @@ async def lifespan(app: FastAPI):
             status = entry.get("status")
             if status == "running":
                 interrupted.append(sid)
-            elif status in ("done", "error") and app.state.scan_id is None:
+            elif status in ("done", "error", "cancelled") and app.state.scan_id is None:
                 app.state.scan_id = sid  # UI покажет финальные метрики прошлого скана
 
         async def _resume_interrupted() -> None:
@@ -375,11 +375,15 @@ async def lifespan(app: FastAPI):
 
         if interrupted:
             for sid in interrupted:
-                app.state.scan_progress.error(
+                # code-2026-09-24-011 (P1-D): прерванный рестартом скан — НЕ ошибка.
+                # Раньше писался как error → scan_state.json копил status=error без
+                # реальной ошибки. Решение оператора №2: честный статус cancelled
+                # + СОХРАНИТЬ авто-ресюм 13.27 (после фикса скан ~20 мин — ресюм полезен).
+                app.state.scan_progress.cancel(
                     sid, "scan interrupted by server restart (auto-resume)"
                 )
                 logger.warning(
-                    "🔄 Scan %s was interrupted by restart → marked, will auto-resume",
+                    "🔄 Scan %s was interrupted by restart → cancelled, will auto-resume",
                     sid,
                 )
             app.state.scan_resume_task = asyncio.create_task(_resume_interrupted())
