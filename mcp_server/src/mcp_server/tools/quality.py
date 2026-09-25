@@ -17,6 +17,7 @@ import asyncio
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 
 from mcp_server.quality import REVIEW_THRESHOLD
 from mcp_server.quality.audit import get_fp_rate, list_audit, write_audit
@@ -855,6 +856,19 @@ async def _bg_scan(
     """
     from mcp_server.quality.scanner import run_scan
 
+    # code-2026-09-25-022: generation-guard — зомби-_bg_scan (после stale-recovery)
+    # не должен перезаписывать терминальные записи НОВОГО скана (done/audit/error).
+    # generation фиксируется на старте; если app_state.scan_generation вырос —
+    # этот _bg_scan уже «мёртв», терминальные write пропускаются.
+    generation = getattr(app_state, "scan_generation", 0) if app_state is not None else 0
+
+    def _generation_stale() -> bool:
+        """True если generation изменился → этот _bg_scan — зомби."""
+        return (
+            app_state is not None
+            and getattr(app_state, "scan_generation", generation) != generation
+        )
+
     try:
         async with scan_state["lock"]:
             scan_progress.set_phase(scan_id, "scanning_fs", "Обход файлов...")
@@ -868,6 +882,11 @@ async def _bg_scan(
             )
             # run_scan сам вызывает progress.done() в нормальном потоке (13.18)
             # но если он НЕ вызвал (cancel без progress), делаем здесь
+            if _generation_stale():
+                logger.warning(
+                    "[SCAN-STALL] stale _bg_scan gen=%s skipping done() (zombie)", generation,
+                )
+                return
             scan_progress.done(scan_id, {"metrics": metrics})
             logger.info(
                 "Background scan %s complete: %d files, %d in review queue, %d dups, %d issues",
@@ -880,6 +899,12 @@ async def _bg_scan(
             # Фаза 3 (1b): scan_completed в audit — только полный скан
             # (отменённый/сбойный скан сюда не доходит). Н2: прогресс-трекер
             # prune_finished удаляет историю → счётчик сканов живёт в audit.
+            if _generation_stale():
+                logger.warning(
+                    "[SCAN-STALL] stale _bg_scan gen=%s skipping scan_completed audit (zombie)",
+                    generation,
+                )
+                return
             write_audit(
                 action="scan_completed",
                 knowledge_id="-",
@@ -889,6 +914,12 @@ async def _bg_scan(
             )
             # Фаза 3 (2f): пост-скан авто-хук ПОСЛЕ scan_completed-аудита.
             # Порядок критичен: гейт должен ВИДЕТЬ только что завершённый скан.
+            if _generation_stale():
+                logger.warning(
+                    "[SCAN-STALL] stale _bg_scan gen=%s skipping post-scan hook (zombie)",
+                    generation,
+                )
+                return
             try:
                 from mcp_server.config import settings
 
@@ -908,13 +939,205 @@ async def _bg_scan(
                 )
     except asyncio.CancelledError:
         logger.info("Background scan %s cancelled (shutdown)", scan_id)
-        scan_progress.error(scan_id, "scan cancelled (server shutdown)")
+        if not _generation_stale():
+            scan_progress.error(scan_id, "scan cancelled (server shutdown)")
         raise
     except Exception as exc:
         logger.exception("Background scan %s failed", scan_id)
-        scan_progress.error(scan_id, str(exc))
+        if not _generation_stale():
+            scan_progress.error(scan_id, str(exc))
     finally:
         scan_state["task_ref"][0] = None
+
+
+async def _scan_stall_state(app_state, *, now: datetime | None = None) -> dict:
+    """code-2026-09-25-022: определить, завис ли активный quality scan.
+
+    Ленивый детектор (Variant B-lazy): вызывается на коде-пути, который
+    сейчас возвращает ``already_running``. Не добавляет always-on watchdog.
+
+    Три условия stale (одновременно):
+      1. ``scan_lock.locked()`` — lock занят;
+      2. ``scan_id`` указывает на запись ``status=="running"``;
+      3. ``age(updated_at) > SCAN_STALL_SECONDS`` (heartbeat-непрогресс).
+
+    ``age = max(0, now - updated_at)`` — backward NTP трактуем как свежий.
+    Отсутствующий/невалидный ``updated_at`` → fail-open (не stalled) + warning (P3-2).
+    ``SCAN_STALL_SECONDS <= 0`` → detection off (поведение = today).
+
+    Returns:
+        dict с полями: stalled (bool), scan_id, phase, imported, total,
+        age (float|None), reason (str|None), orphan (bool).
+        ``orphan=True`` — lock держится, но живого scan_task нет (P2-3/N1).
+    """
+    scan_lock = getattr(app_state, "scan_lock", None)
+    scan_id = getattr(app_state, "scan_id", None)
+    scan_progress = getattr(app_state, "scan_progress", None)
+    scan_task = getattr(app_state, "scan_task", None)
+
+    # Базовый «не stalled» ответ
+    base = {
+        "stalled": False, "scan_id": scan_id, "phase": None,
+        "imported": None, "total": None, "age": None,
+        "reason": None, "orphan": False,
+    }
+
+    if scan_lock is None or not scan_lock.locked():
+        return base
+    if scan_progress is None or not scan_id:
+        return base
+
+    # Порог из settings (fallback 600); <=0 → detection off
+    try:
+        threshold = app_state.settings.SCAN_STALL_SECONDS
+    except (AttributeError, TypeError):
+        threshold = 600
+    if not isinstance(threshold, (int, float)) or threshold <= 0:
+        return base
+
+    entry = scan_progress.get(scan_id)
+    if entry is None:
+        return base
+    status = entry.get("status", "running")
+    if status != "running":
+        return base
+
+    updated_at = entry.get("updated_at", "")
+    if not updated_at:
+        logger.warning("[SCAN-STALL] no updated_at for scan %s — fail-open (not stalled)", scan_id)
+        return base
+
+    try:
+        updated_dt = datetime.fromisoformat(updated_at)
+    except (ValueError, TypeError):
+        logger.warning("[SCAN-STALL] invalid updated_at %r — fail-open", updated_at)
+        return base
+
+    now_dt = now or datetime.now(timezone.utc)
+    age = max(0.0, (now_dt - updated_dt).total_seconds())
+
+    result = {
+        **base,
+        "phase": entry.get("phase"),
+        "imported": entry.get("imported"),
+        "total": entry.get("total"),
+        "age": age,
+    }
+
+    if age <= threshold:
+        return result  # живой — heartbeat свежий
+
+    # Stale по возрасту. Проверяем живость scan_task (P2-3).
+    task_alive = scan_task is not None and not scan_task.done()
+    if not task_alive:
+        # N1: orphan-lock — lock держится, живого таска нет.
+        # Не писать stall() без проверки тяжёлых тасков (импорт/convert).
+        result["orphan"] = True
+        result["stalled"] = True
+        result["reason"] = "orphan lock — no live scan task"
+        return result
+
+    result["stalled"] = True
+    result["reason"] = f"stale: no heartbeat for {int(age)}s (> {int(threshold)}s threshold)"
+    return result
+
+
+def _has_live_heavy_task(app_state) -> bool:
+    """N1: есть ли живая тяжёлая задача (import/convert), держащая lock?
+
+    ``asyncio.Lock`` не знает владельца, поэтому orphan-ветка не может
+    вслепую освободить lock — если держатель импорт/convert, новый скан
+    пойдёт параллельно тяжёлому op. Guard: проверяем import_task и
+    convert_task (N1 — добавлен ref в main.py:930).
+    """
+    for attr in ("import_task", "convert_task"):
+        t = getattr(app_state, attr, None)
+        if t is not None and not t.done():
+            return True
+    return False
+
+
+async def _recover_stalled_scan(app_state, state: dict) -> None:
+    """code-2026-09-25-022: восстановиться после зависшего скана.
+
+    Шаги (атомарные — без await между reassign lock):
+      (a) ``scan_progress.stall(old_id, reason)`` — терминальная запись
+          (status=error+stalled), будет удалена ``prune_finished`` при старте
+          нового скана (quality.py:963);
+      (b) ``write_audit("scan_stalled", ...)`` — durable evidence;
+      (c) best-effort ``task.cancel()`` (не убивает executor-поток, но
+          останавливает корутину — generation-guard добьёт терминальные write);
+      (d) ``scan_generation += 1`` — зомби-_bg_scan увидит смену и пропустит
+          терминальные записи;
+      (e) атомарная замена ``heavy_ops_lock``/``scan_lock`` (новый, свободный);
+      (f) ``scan_id = None``.
+
+    N1 orphan-ветка: если ``state["orphan"]`` — release только при отсутствии
+    живых тяжёлых тасков (import/convert); иначе diagnostic-only (audit +
+    warning, без release — оператор должен разобраться вручную).
+    """
+    old_id = state.get("scan_id") or "?"
+    reason = state.get("reason") or "stale scan"
+    is_orphan = state.get("orphan", False)
+    scan_progress = getattr(app_state, "scan_progress", None)
+
+    # (a) stall-запись (терминальная, error+stalled)
+    if scan_progress is not None and old_id != "?":
+        try:
+            scan_progress.stall(old_id, reason)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[SCAN-STALL] stall() failed (non-fatal): %s", exc)
+
+    # (b) durable evidence в audit.jsonl
+    try:
+        write_audit(
+            action="scan_stalled",
+            knowledge_id="-",
+            actor="system",
+            reason=reason,
+            metadata={
+                "scan_id": old_id,
+                "age": state.get("age"),
+                "phase": state.get("phase"),
+                "orphan": is_orphan,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[SCAN-STALL] write_audit failed (non-fatal): %s", exc)
+
+    # N1: orphan-ветка — release только если нет живых тяжёлых тасков
+    if is_orphan and _has_live_heavy_task(app_state):
+        logger.warning(
+            "[SCAN-STALL] orphan lock for scan %s but live heavy task (import/convert) "
+            "holds it — diagnostic-only, NO lock release (operator action required)",
+            old_id,
+        )
+        return  # без release — скан не стартует (already_running останется)
+
+    # (c) best-effort cancel живого scan_task
+    task = getattr(app_state, "scan_task", None)
+    if task is not None and not task.done():
+        try:
+            task.cancel()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[SCAN-STALL] task.cancel() failed (non-fatal): %s", exc)
+
+    # (d) generation bump — зомби-_bg_scan пропустит терминальные write
+    cur_gen = getattr(app_state, "scan_generation", 0)
+    setattr(app_state, "scan_generation", cur_gen + 1)
+
+    # (e) атомарная замена lock (без await между reassign — single-worker loop)
+    new_lock = asyncio.Lock()
+    app_state.heavy_ops_lock = new_lock
+    app_state.scan_lock = new_lock
+
+    # (f) сброс scan_id
+    app_state.scan_id = None
+
+    logger.warning(
+        "[SCAN-STALL] recovered: old_scan=%s reason=%s orphan=%s gen=%d→%d lock_replaced=%s",
+        old_id, reason, is_orphan, cur_gen, cur_gen + 1, not is_orphan or True,
+    )
 
 
 async def run_quality_scan(params: dict, app_state) -> dict:
@@ -940,11 +1163,28 @@ async def run_quality_scan(params: dict, app_state) -> dict:
         # Проверяем lock — если уже залочен, скан активен
         scan_lock = app_state.scan_lock
         if scan_lock.locked():
-            return {
-                "scanned": False,
-                "status": "already_running",
-                "scan_id": getattr(app_state, "scan_id", None),
-            }
+            # code-2026-09-25-022: ленивый stale-детектор (Variant B-lazy).
+            # Проверяем, не завис ли активный скан (нет heartbeat > SCAN_STALL_SECONDS).
+            state = await _scan_stall_state(app_state)
+            if not state["stalled"]:
+                # Свежий живой скан — отдаём already_running (AC-2)
+                return {
+                    "scanned": False,
+                    "status": "already_running",
+                    "scan_id": getattr(app_state, "scan_id", None),
+                }
+            # Stale → recovery (stall + audit + cancel + generation++ + замена lock)
+            old_id = state.get("scan_id")
+            await _recover_stalled_scan(app_state, state)
+            # P1-1 (блокер): ОБЯЗАТЕЛЬНО перечитать scan_lock после recovery —
+            # _recover_stalled_scan заменил app_state.scan_lock на новый объект.
+            # Без re-read локальная scan_lock (:941) ушла бы в _bg_scan (:987)
+            # → новый скан держал бы СТАРЫЙ lock → heavy_ops_lock свободен →
+            # импорт параллельно / 2-й скан / cancel ломается.
+            scan_lock = app_state.scan_lock  # P1-1 RE-READ
+            recovery_msg_old_id = old_id  # P2-2: сообщение в новую запись
+        else:
+            recovery_msg_old_id = None
 
         knowledge_dir = (
             app_state.settings.KNOWLEDGE_DIR
@@ -974,6 +1214,19 @@ async def run_quality_scan(params: dict, app_state) -> dict:
 
         # Инициализируем прогресс (total — неизвестен до обхода, ставим 0)
         scan_progress.start(scan_id, total=0)
+
+        # P2-2: видимость recovery — сообщение о зависшем скане в НОВУЮ запись
+        # (старая к этому моменту удалена prune_finished; UI покажет новую).
+        if recovery_msg_old_id is not None:
+            try:
+                scan_progress.log(
+                    scan_id, "warning",
+                    f"previous scan {recovery_msg_old_id} stalled "
+                    f"(> {getattr(app_state.settings, 'SCAN_STALL_SECONDS', 600)}s "
+                    f"без heartbeat) — recovered; audit: scan_stalled",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[SCAN-STALL] recovery log failed (non-fatal): %s", exc)
 
         # task_ref: list чтобы _bg_scan мог мутировать app_state.scan_task
         task_ref: list = [None]

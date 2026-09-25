@@ -247,6 +247,7 @@ async def run_scan(
         await _update_scores_with_dup(
             qdrant_client, scored, dup_map,
             progress=progress, progress_id=pid,
+            cancel_event=cancel_event,  # code-2026-09-25-022 (N2): иначе cancel-break мёртв
         )
 
     # 13.18: проверка после dup_scan
@@ -574,12 +575,18 @@ async def _update_scores_with_dup(
     *,
     progress=None,
     progress_id: str | None = None,
+    cancel_event=None,  # code-2026-09-25-022 (P1-2): фаза была cancel-слепа
 ) -> None:
     """R2: пересчёт staleness_score с реальным dup_count + обновление Qdrant.
 
     Для записей с dup_count > 0 пересчитывает score через staleness_score()
     и обновляет payload через set_payload. Использует run_in_executor для
     sync-операций.
+
+    code-2026-09-25-022 (P1-2): heartbeat-хардненинг — progress.log каждые
+    200 обработанных записей + cancel-чек ВНУТРИ цикла (раньше фаза молчала
+    до конца и не реагировала на cancel → ложный stale при тысячах dup-записей
+    и медленном Qdrant).
     """
     from datetime import datetime, timezone
 
@@ -589,12 +596,28 @@ async def _update_scores_with_dup(
     loop = asyncio.get_running_loop()
     pid = progress_id
 
+    # code-2026-09-25-022 (P1-2): только записи с dup_count>0 (early-continue
+    # выше), но для cadence-ассерта считаем обработанные с dup_count>0.
     updated = 0
+    processed_with_dup = 0
+    total_with_dup = sum(1 for _f, fm, _s in scored if dup_map.get(fm.knowledge_id, 0) > 0)
     for _filepath, frontmatter, _old_score in scored:
         kid = frontmatter.knowledge_id
         dc = dup_map.get(kid, 0)
         if dc == 0:
             continue
+
+        processed_with_dup += 1
+
+        # code-2026-09-25-022 (P1-2): progress каждые 200 + cancel-чек
+        if processed_with_dup % 200 == 0 and progress and pid:
+            progress.log(
+                pid, "info",
+                f"scoring_dup: {processed_with_dup}/{total_with_dup} entries updated",
+            )
+        if cancel_event is not None and cancel_event.is_set():
+            logger.info("_update_scores_with_dup cancelled at %d/%d", processed_with_dup, total_with_dup)
+            break
 
         # Пересчитываем score с реальным dup_count
         new_score = _compute_score_with_dup(frontmatter, now, dc, _filepath)
@@ -733,7 +756,26 @@ def _scan_dup_pairs(
         if use_embedding:
             try:
                 texts = [_representative_text(fm) for _f, fm, _s in entries[:n]]
+                # code-2026-09-25-022 (P1-2): heartbeat ДО embed — bucket-лог
+                # стоял ДО embed, но сам embed (до 500 текстов одним блокирующим
+                # вызовом) мог молчать >600 с на холодном Ollama → ложный stale.
+                if progress and progress_id:
+                    progress.log(
+                        progress_id, "info",
+                        f"dup_scan: embedding batch {domain_idx}/{total_domains} ({len(texts)} texts)",
+                    )
+                import time as _emb_time
+                _emb_t0 = _emb_time.time()
                 vecs = embedder.embed_sync(texts)
+                _emb_secs = _emb_time.time() - _emb_t0
+                # code-2026-09-25-022 (P1-2): heartbeat ПОСЛЕ embed — фиксирует
+                # updated_at и делает детектор честным (embed ≤500 текстов —
+                # единственный потенциально длинный silent-путь).
+                if progress and progress_id:
+                    progress.log(
+                        progress_id, "info",
+                        f"dup_scan: embedded batch {domain_idx}/{total_domains} ({_emb_secs:.1f}s)",
+                    )
                 emb_vectors = {
                     i: (vec.tolist() if hasattr(vec, "tolist") else list(vec))
                     for i, vec in enumerate(vecs)
