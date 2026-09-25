@@ -159,7 +159,11 @@ AC6_SNAPSHOT = {
 
 
 def test_05_ac6_snapshot_priorities_unchanged(tmp_path):
-    evs = [ec.make_event(f"2026-09-23T10:{i:02d}:00Z", "docker_logs", line,
+    # ts(i) = f"{TODAY}T10:{i:02d}:00Z" — относительные даты от текущего дня
+    # (эталон test_errors_guard.py:36-48): corpus всегда внутри 7d-окна,
+    # last_seen/status остаются «свежими» — снапшот активных приоритетов
+    # не зависит от реальной даты прогона (time-bomb, trace 019).
+    evs = [ec.make_event(ts(i), "docker_logs", line,
                          level="INFO", error_code=str(st), status=st)
            for i, (line, st) in enumerate(AC6_CORPUS)]
     ec.update_aggregates(tmp_path, evs, {"e4_window_days": 7})
