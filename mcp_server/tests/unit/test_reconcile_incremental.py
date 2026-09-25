@@ -12,6 +12,7 @@ T8 — прямой вызов reconcile() в 3 конфигурациях, prom
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -45,6 +46,29 @@ class FakeQdrant:
 
     def get_all_knowledge_ids(self, collection_name: str | None = None) -> set[str]:
         return set(self._ids)
+
+    def get_knowledge_updated_at(
+        self, collection_name: str | None = None,
+    ) -> dict[str, str | None]:
+        """023-B: kid → updated_at_str (max по нормализованному datetime).
+
+        Возвращает dict по _points_by_kid; kid в _ids без точек (seeded) →
+        значение None (контракт P3-c: присутствует, но поля нет → порча).
+        """
+        from mcp_server.storage.qdrant_client import _max_updated_at
+        result: dict[str, str | None] = {}
+        # Сначала seeded kids (без точек → None = порча/легаси)
+        for kid in self._ids:
+            result[kid] = None
+        # Затем реальные точки (max по datetime перекрывает None)
+        for kid, points in self._points_by_kid.items():
+            for p in points:
+                upd = p.get("payload", {}).get("updated_at")
+                if kid in result:
+                    result[kid] = _max_updated_at(result[kid], upd)
+                else:
+                    result[kid] = upd
+        return result
 
     def upsert_points(self, points, collection_name: str | None = None):
         self.upsert_calls.append({
@@ -97,7 +121,9 @@ class FakeStore:
         return self._entries[path]
 
 
-def _make_entry(kid: str, zone: str = ZONE_PRIVATE) -> KnowledgeEntry:
+def _make_entry(
+    kid: str, zone: str = ZONE_PRIVATE, updated_at: datetime | None = None,
+) -> KnowledgeEntry:
     fm = KnowledgeFrontmatter(
         knowledge_id=kid,
         domain="test",
@@ -106,6 +132,7 @@ def _make_entry(kid: str, zone: str = ZONE_PRIVATE) -> KnowledgeEntry:
         tags=["test"],
         version=1,
         zone=zone,
+        **({} if updated_at is None else {"updated_at": updated_at}),
     )
     return KnowledgeEntry(frontmatter=fm, content=f"# {kid}\n\nTest content.")
 
@@ -553,3 +580,221 @@ async def test_t10_skip_reindex_skipped(monkeypatch):
     assert len(im_calls) == 0
     assert len(ra_calls) == 0
     assert result["skipped"] >= 1  # missing включён в skipped
+
+# ══════════════════════════════════════════════════════════════
+# D1-D10: детекция updated_at-дрейфа (Block B, §7.8)
+# ══════════════════════════════════════════════════════════════
+
+T0 = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+
+class _Point:
+    """Минимальная точка Qdrant для seeding payload."""
+
+    def __init__(self, kid: str, upd: str | None, idx: int = 0):
+        self.id = f"{kid}#{idx}"
+        self.payload = {"knowledge_id": kid, "updated_at": upd}
+
+
+def _seed(qdrant: FakeQdrant, kid: str, upd: str | None) -> None:
+    qdrant.upsert_points([_Point(kid, upd)])
+
+
+def _spy_pipeline(pipeline):
+    im_calls: list[int] = []
+    ra_calls: list[int] = []
+    orig_im, orig_ra = pipeline.index_missing, pipeline.reindex_all
+
+    async def _im(paths):
+        im_calls.append(len(paths))
+        return await orig_im(paths)
+
+    async def _ra():
+        ra_calls.append(1)
+        return await orig_ra()
+
+    pipeline.index_missing, pipeline.reindex_all = _im, _ra
+    return im_calls, ra_calls
+
+
+async def test_d1_drift_triggers_incremental(monkeypatch):
+    """D1: fm=T+1h, payload=T → drifted=1, index_missing вызван, mode=incremental."""
+    monkeypatch.setattr("mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50)
+    path = Path("/tmp/knowledge/test/demo/kid-d1.md")
+    store = FakeStore([path], {path: _make_entry("kid-d1", updated_at=T0 + timedelta(hours=1))})
+    qdrant = FakeQdrant(ids=set())
+    _seed(qdrant, "kid-d1", T0.isoformat())
+    pipeline = _make_mock_pipeline()
+    im_calls, ra_calls = _spy_pipeline(pipeline)
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=False, skip_orphan_detection=True)
+
+    assert res["drifted"] == 1
+    assert res["mode"] == "incremental"
+    assert im_calls == [1] and ra_calls == []
+
+
+async def test_d2_no_drift_no_reindex(monkeypatch):
+    """D2: fm == payload → drifted=0, mode=none, index_missing НЕ вызван."""
+    monkeypatch.setattr("mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50)
+    path = Path("/tmp/knowledge/test/demo/kid-d2.md")
+    store = FakeStore([path], {path: _make_entry("kid-d2", updated_at=T0)})
+    qdrant = FakeQdrant(ids=set())
+    _seed(qdrant, "kid-d2", T0.isoformat())
+    pipeline = _make_mock_pipeline()
+    im_calls, ra_calls = _spy_pipeline(pipeline)
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=False, skip_orphan_detection=True)
+
+    assert res["drifted"] == 0
+    assert res["mode"] == "none"
+    assert im_calls == [] and ra_calls == []
+
+
+async def test_d3_payload_without_updated_at_is_drift(monkeypatch):
+    """D3: kid есть в Qdrant без валидного updated_at → drifted (порча)."""
+    monkeypatch.setattr("mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50)
+    path = Path("/tmp/knowledge/test/demo/kid-d3.md")
+    store = FakeStore([path], {path: _make_entry("kid-d3", updated_at=T0)})
+    qdrant = FakeQdrant(ids={"kid-d3"})  # в _ids, точек нет → payload=None
+    pipeline = _make_mock_pipeline()
+    im_calls, _ = _spy_pipeline(pipeline)
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=False, skip_orphan_detection=True)
+
+    assert res["drifted"] == 1
+    assert res["mode"] == "incremental" and im_calls == [1]
+
+
+async def test_d4_combined_budget_over_k_falls_back_to_full(monkeypatch):
+    """D4: 30 missing + 25 drifted > K=50 → полный reindex_all, mode=full, drifted=25."""
+    monkeypatch.setattr("mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50)
+    paths, entries = [], {}
+    for i in range(30):  # missing
+        kid = f"kid-d4m-{i:02d}"
+        pp = Path(f"/tmp/knowledge/test/demo/{kid}.md")
+        paths.append(pp)
+        entries[pp] = _make_entry(kid, updated_at=T0)
+    qdrant = FakeQdrant(ids=set())
+    for i in range(25):  # drifted
+        kid = f"kid-d4d-{i:02d}"
+        pp = Path(f"/tmp/knowledge/test/demo/{kid}.md")
+        paths.append(pp)
+        entries[pp] = _make_entry(kid, updated_at=T0 + timedelta(hours=1))
+        _seed(qdrant, kid, T0.isoformat())
+    store = FakeStore(paths, entries)
+    pipeline = _make_mock_pipeline()
+    im_calls, ra_calls = _spy_pipeline(pipeline)
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=False, skip_orphan_detection=True)
+
+    assert res["drifted"] == 25
+    assert res["mode"] == "full"
+    assert ra_calls == [1] and im_calls == []
+
+
+async def test_d5_skip_reindex_includes_drifted(monkeypatch):
+    """D5: skip_reindex=True + drifted → mode=skipped, skipped включает drifted."""
+    monkeypatch.setattr("mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50)
+    path = Path("/tmp/knowledge/test/demo/kid-d5.md")
+    store = FakeStore([path], {path: _make_entry("kid-d5", updated_at=T0 + timedelta(hours=1))})
+    qdrant = FakeQdrant(ids=set())
+    _seed(qdrant, "kid-d5", T0.isoformat())
+    pipeline = _make_mock_pipeline()
+    im_calls, ra_calls = _spy_pipeline(pipeline)
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=True, skip_orphan_detection=True)
+
+    assert res["drifted"] == 1
+    assert res["mode"] == "skipped" and res["skipped"] == 1
+    assert im_calls == [] and ra_calls == []
+
+
+async def test_d6_tz_formats_same_instant_not_drift(monkeypatch):
+    """D6: fm +03:00 и payload Z, одно мгновение → не drifted."""
+    monkeypatch.setattr("mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50)
+    fm_dt = datetime(2026, 1, 1, 15, 0, tzinfo=timezone(timedelta(hours=3)))  # == 12:00Z
+    path = Path("/tmp/knowledge/test/demo/kid-d6.md")
+    store = FakeStore([path], {path: _make_entry("kid-d6", updated_at=fm_dt)})
+    qdrant = FakeQdrant(ids=set())
+    _seed(qdrant, "kid-d6", "2026-01-01T12:00:00Z")
+    pipeline = _make_mock_pipeline()
+    im_calls, _ = _spy_pipeline(pipeline)
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=False, skip_orphan_detection=True)
+
+    assert res["drifted"] == 0 and res["mode"] == "none" and im_calls == []
+
+
+async def test_d7_drift_metric_incremented(monkeypatch):
+    """D7: mcp_reconcile_drifted_total += 1 при дрейфе."""
+    from mcp_server import metrics as M
+
+    monkeypatch.setattr("mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50)
+    before = M.reconcile_drifted._value.get()
+    path = Path("/tmp/knowledge/test/demo/kid-d7.md")
+    store = FakeStore([path], {path: _make_entry("kid-d7", updated_at=T0 + timedelta(hours=1))})
+    qdrant = FakeQdrant(ids=set())
+    _seed(qdrant, "kid-d7", T0.isoformat())
+    pipeline = _make_mock_pipeline()
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=False, skip_orphan_detection=True)
+
+    assert res["drifted"] == 1
+    assert M.reconcile_drifted._value.get() == before + 1
+
+
+async def test_d8_naive_payload_no_typeerror(monkeypatch):
+    """D8: payload naive, fm с tz и новее → нет TypeError, drifted."""
+    monkeypatch.setattr("mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50)
+    path = Path("/tmp/knowledge/test/demo/kid-d8.md")
+    store = FakeStore([path], {path: _make_entry("kid-d8", updated_at=datetime(2026, 1, 1, 13, 0, tzinfo=timezone.utc))})
+    qdrant = FakeQdrant(ids=set())
+    _seed(qdrant, "kid-d8", "2026-01-01T12:00:00")  # naive
+    pipeline = _make_mock_pipeline()
+    im_calls, _ = _spy_pipeline(pipeline)
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=False, skip_orphan_detection=True)
+
+    assert res["errors"] == []
+    assert res["drifted"] == 1 and res["mode"] == "incremental" and im_calls == [1]
+
+
+async def test_d9_max_updated_at_over_points(monkeypatch):
+    """D9: точки T и T+1h, fm=T+1h → max → не drifted."""
+    monkeypatch.setattr("mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50)
+    path = Path("/tmp/knowledge/test/demo/kid-d9.md")
+    store = FakeStore([path], {path: _make_entry("kid-d9", updated_at=T0 + timedelta(hours=1))})
+    qdrant = FakeQdrant(ids=set())
+    _seed(qdrant, "kid-d9", T0.isoformat())
+    _seed(qdrant, "kid-d9", (T0 + timedelta(hours=1)).isoformat())
+    pipeline = _make_mock_pipeline()
+    im_calls, _ = _spy_pipeline(pipeline)
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=False, skip_orphan_detection=True)
+
+    assert res["drifted"] == 0 and im_calls == []
+
+
+async def test_d10_orphan_uses_qdrant_meta_keys(monkeypatch):
+    """D10: kid в Qdrant без .md → orphan удалён (keys() от qdrant_meta)."""
+    monkeypatch.setattr("mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50)
+    store = FakeStore([], {})
+    qdrant = FakeQdrant(ids=set())
+    _seed(qdrant, "kid-orphan-d10", T0.isoformat())
+    pipeline = _make_mock_pipeline()
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=False, skip_orphan_detection=True)
+
+    assert "kid-orphan-d10" in qdrant.delete_calls
+    assert res["deleted_orphans"] == 1

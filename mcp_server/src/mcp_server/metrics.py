@@ -63,6 +63,11 @@ reconcile_orphans = Counter(
     "mcp_reconcile_deleted_orphans_total",
     "Удалено сирот при reconciliation",
 )
+# 023-B: updated_at-дрейф (fm новее payload Qdrant) — детекция в reconcile.
+reconcile_drifted = Counter(
+    "mcp_reconcile_drifted_total",
+    "Записей с updated_at-дрейфом при reconciliation (023-B)",
+)
 
 # Histograms (latency distribution)
 search_latency = Histogram(
@@ -195,6 +200,8 @@ def record_reconcile_result(result: dict) -> None:
     reconcile_reindexed.inc(result.get("reindexed", 0))
     reconcile_skipped.inc(result.get("skipped", 0))
     reconcile_orphans.inc(result.get("deleted_orphans", 0))
+    # 023-B: drifted-счётчик (best-effort — поле может отсутствовать в старых summary)
+    reconcile_drifted.inc(result.get("drifted", 0))
 
 
 @asynccontextmanager

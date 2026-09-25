@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ..config import settings
@@ -75,6 +76,8 @@ class ReconcileResult:
         self.errors: list[str] = []
         # 023: режим доиндексации — none|incremental|full|skipped
         self.mode: str = "none"
+        # 023-B: число записей с updated_at-дрейфом (fm новее payload Qdrant)
+        self.drifted: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -85,6 +88,7 @@ class ReconcileResult:
             "orphaned_detected": self.orphaned_detected,
             "errors": self.errors,
             "mode": self.mode,
+            "drifted": self.drifted,
         }
 
 
@@ -112,13 +116,23 @@ async def reconcile(
     # ── Шаг 1: Прямая сверка — Markdown → Qdrant ──────────────────
     md_paths = await store.reindex_scan()
     # W2: union knowledge_id по ОБЕИМ зонам (public + private)
-    qdrant_ids: set[str] = set()
+    # 023-B: вместо set[str] собираем dict[kid → updated_at_str|None],
+    # чтобы в цикле presence детектировать updated_at-дрейф (§7.8).
+    qdrant_meta: dict[str, str | None] = {}
     for zone in (ZONE_PUBLIC, ZONE_PRIVATE):
-        qdrant_ids |= qdrant.get_all_knowledge_ids(
+        for kid, upd in qdrant.get_knowledge_updated_at(
             collection_name=collection_for_zone(zone)
-        )
+        ).items():
+            if kid in qdrant_meta:
+                # коллизия ключей между зонами (kid глобально уникален, но
+                # легаси-точки возможны) — max по нормализованному datetime
+                from ..storage.qdrant_client import _max_updated_at
+                qdrant_meta[kid] = _max_updated_at(qdrant_meta[kid], upd)
+            else:
+                qdrant_meta[kid] = upd
 
     missing_in_qdrant: list[Path] = []
+    drifted_paths: list[Path] = []
 
     for path in md_paths:
         result.checked += 1
@@ -126,43 +140,65 @@ async def reconcile(
             entry = store._parse_file(path)
             kid = entry.frontmatter.knowledge_id
 
-            if kid not in qdrant_ids:
+            if kid not in qdrant_meta:
                 # Запись есть в Markdown, но отсутствует в Qdrant
                 missing_in_qdrant.append(path)
                 logger.info("[RECONCILE] %s not in Qdrant — will reindex", kid)
             else:
-                # Проверяем updated_at (если доступен в payload)
-                result.skipped += 1
+                # 023-B: запись присутствует — проверяем updated_at-дрейф
+                # (комментарий «Проверяем updated_at» наконец становится правдой).
+                fm_updated = entry.frontmatter.updated_at
+                payload_updated = qdrant_meta[kid]
+                if _is_drifted(fm_updated, payload_updated):
+                    drifted_paths.append(path)
+                    result.drifted += 1
+                    logger.info(
+                        "[RECONCILE] %s updated_at drift (fm=%s > payload=%s) — will reindex",
+                        kid,
+                        fm_updated.isoformat() if fm_updated else None,
+                        payload_updated,
+                    )
+                else:
+                    result.skipped += 1
         except Exception as e:
             msg = f"Failed to parse {path}: {e}"
             result.errors.append(msg)
             logger.warning("[RECONCILE] %s", msg)
 
-    # Доиндексация отсутствующих
-    if missing_in_qdrant:
+    # 023-B: общий бюджет missing + drifted (cost-driver один — число
+    # переэмбедденных записей; раздельные пороги удваивают конфигурацию).
+    combined_reindex_paths = missing_in_qdrant + drifted_paths
+
+    # Доиндексация отсутствующих + дрейфнувших
+    if combined_reindex_paths:
         if skip_reindex:
             # Degraded (Ollama недоступна): не блокируем старт reindex-циклом —
             # файлы доиндексируются после запуска Ollama (ленивый retry embed
-            # или следующий старт сервера).
+            # или следующий старт сервера). drifted тоже пропускается.
             logger.warning(
-                "[RECONCILE] %d entries missing in Qdrant — reindex SKIPPED "
+                "[RECONCILE] %d entries (missing=%d, drifted=%d) — reindex SKIPPED "
                 "(embedding недоступна, degraded-режим)",
+                len(combined_reindex_paths),
                 len(missing_in_qdrant),
+                len(drifted_paths),
             )
-            result.skipped += len(missing_in_qdrant)
+            result.skipped += len(combined_reindex_paths)
             result.mode = "skipped"
         else:
-            # 023: гибрид с порогом — len(missing) <= K → incremental upsert
+            # 023: гибрид с порогом — len(combined) <= K → incremental upsert
             # через alias (без blue-green); иначе полный reindex_all.
             # K <= 0 → kill-switch: всегда полный (поведение = до 023).
             k = settings.RECONCILE_INCREMENTAL_MAX_ENTRIES
-            if k > 0 and len(missing_in_qdrant) <= k:
+            if k > 0 and len(combined_reindex_paths) <= k:
                 logger.info(
-                    "[RECONCILE] %d entries missing — incremental reindex (<=K=%d)",
-                    len(missing_in_qdrant), k,
+                    "[RECONCILE] %d entries (missing=%d, drifted=%d) — incremental reindex (<=K=%d)",
+                    len(combined_reindex_paths),
+                    len(missing_in_qdrant),
+                    len(drifted_paths),
+                    k,
                 )
                 try:
-                    inc = await pipeline.index_missing(missing_in_qdrant)
+                    inc = await pipeline.index_missing(combined_reindex_paths)
                     result.reindexed = inc.get("total_docs", 0)
                     result.mode = "incremental"
                     result.errors.extend(inc.get("errors", []))
@@ -172,12 +208,17 @@ async def reconcile(
                     logger.error("[RECONCILE] %s", msg)
             else:
                 logger.info(
-                    "[RECONCILE] %d entries missing — full reindex (K=%d)",
-                    len(missing_in_qdrant), k,
+                    "[RECONCILE] %d entries (missing=%d, drifted=%d) — full reindex (K=%d)",
+                    len(combined_reindex_paths),
+                    len(missing_in_qdrant),
+                    len(drifted_paths),
+                    k,
                 )
                 try:
                     reindex_result = await pipeline.reindex_all()
-                    result.reindexed = reindex_result.get("total_docs", len(missing_in_qdrant))
+                    result.reindexed = reindex_result.get(
+                        "total_docs", len(combined_reindex_paths)
+                    )
                     result.mode = "full"
                 except Exception as e:
                     msg = f"Reindex failed: {e}"
@@ -193,7 +234,9 @@ async def reconcile(
         except Exception:
             pass
 
-    orphan_ids = qdrant_ids - md_ids
+    # 023-B (P2-5): orphan-сверка по qdrant_meta.keys() — dict в set-вычитании
+    # дал бы TypeError/пустой orphan-список (регресс D10).
+    orphan_ids = set(qdrant_meta.keys()) - md_ids
     if orphan_ids:
         logger.info("[RECONCILE] %d orphan points in Qdrant — deleting", len(orphan_ids))
         loop = asyncio.get_running_loop()
@@ -235,8 +278,9 @@ async def reconcile(
     summary = result.to_dict()
     logger.info(
         "✅ RECONCILE complete: checked=%d, reindexed=%d, skipped=%d, "
-        "orphans=%d, orphaned_detected=%d, errors=%d, mode=%s",
+        "drifted=%d, orphans=%d, orphaned_detected=%d, errors=%d, mode=%s",
         result.checked, result.reindexed, result.skipped,
+        result.drifted,
         result.deleted_orphans, result.orphaned_detected, len(result.errors),
         result.mode,
     )
@@ -346,3 +390,38 @@ async def _detect_parent_child_orphans(
 
     if result.orphaned_detected > 0:
         logger.info("[RECONCILE] %d parent-child orphan issues detected", result.orphaned_detected)
+
+
+# ── 023-B: drift-detection helper ───────────────────────────
+
+
+def _is_drifted(fm_updated: datetime, payload_updated: str | None) -> bool:
+    """023-B: обнаружить updated_at-дрейф между frontmatter и Qdrant payload.
+
+    Вердикт:
+    - payload None/невалидный ⇒ drifted (порча точки — точки всегда пишутся
+      с полем `updated_at`; отсутствие = порча, переиндексируем).
+    - fm > payload (по нормализованному datetime) ⇒ drifted.
+    - fm == payload или payload новее (clock skew) ⇒ не drifted
+      (fail-closed к «не трогать»).
+
+    tz-нормализация (P2-1): naive → replace(timezone.utc) для ОБЕИХ сторон —
+    `fromisoformat` парсит naive-строку, а сравнение naive↔aware даёт
+    TypeError (шумный fail-open). Live-корпус сегодня весь `+00:00`, но
+    контракт не должен на этом полагаться (D8).
+
+    Helper вынесен из `reconcile()` чтобы держать CC ≤10 (P3-e, Critic iter2);
+    тестируется напрямую (D2/D6/D8/D9).
+    """
+    from ..storage.qdrant_client import _normalize_dt
+
+    payload_dt = _normalize_dt(payload_updated)
+    if payload_dt is None:
+        # payload без/с невалидным updated_at у присутствующего kid ⇒ порча
+        return True
+
+    fm_dt = fm_updated
+    if fm_dt.tzinfo is None:
+        fm_dt = fm_dt.replace(tzinfo=timezone.utc)
+
+    return fm_dt > payload_dt

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from qdrant_client import QdrantClient as QdrantSDKClient
 from qdrant_client.http import models as qmodels
@@ -470,26 +471,78 @@ class QdrantClient:
 
     # ── Reconciliation helpers ────────────────────────────
 
-    def get_all_knowledge_ids(self, collection_name: str | None = None) -> set[str]:
-        """Получить все knowledge_id в Qdrant (для reconciliation, задача 2.9)."""
+    def _scroll_all_points(
+        self,
+        collection_name: str | None,
+        with_payload: list[str],
+    ) -> list[qmodels.Record]:
+        """023-B (P3-2): общий scroll-цикл для reconciliation-хелперов.
+
+        Параметризуется `with_payload` — чтобы `get_all_knowledge_ids` и
+        `get_knowledge_updated_at` не дублировали цикл пагинации (:473-491).
+        """
         collection_name = self._require_collection(collection_name)
-        ids = set()
+        points: list[qmodels.Record] = []
         offset = None
         while True:
-            points, offset = self._client.scroll(
+            batch, offset = self._client.scroll(
                 collection_name=collection_name,
                 limit=1000,
                 offset=offset,
-                with_payload=["knowledge_id"],
+                with_payload=with_payload,
                 with_vectors=False,
             )
-            for point in points:
-                kid = point.payload.get("knowledge_id") if point.payload else None
-                if kid:
-                    ids.add(kid)
+            points.extend(batch)
             if offset is None:
                 break
+        return points
+
+    def get_all_knowledge_ids(self, collection_name: str | None = None) -> set[str]:
+        """Получить все knowledge_id в Qdrant (для reconciliation, задача 2.9)."""
+        points = self._scroll_all_points(collection_name, with_payload=["knowledge_id"])
+        ids = set()
+        for point in points:
+            kid = point.payload.get("knowledge_id") if point.payload else None
+            if kid:
+                ids.add(kid)
         return ids
+
+    def get_knowledge_updated_at(
+        self, collection_name: str | None = None,
+    ) -> dict[str, str | None]:
+        """023-B: kid → updated_at_str (max по нормализованному datetime).
+
+        Тот же scroll, что `get_all_knowledge_ids`, но `with_payload=
+        ["knowledge_id", "updated_at"]`. Несколько точек одного kid пишутся
+        одним батчем с одинаковым updated_at; при расхождении — max по
+        нормализованному datetime (P2-2: легаси-точки kid возможны, update-путь
+        не делает delete перед enqueue — crud.py:321-326).
+
+        Контракт reader'а (P3-c): kid присутствует в Qdrant, но БЕЗ поля
+        `updated_at` или с невалидным значением ⇒ попадает в результат со
+        значением None (НЕ выпадает из dict) — иначе presence-check отправит
+        его в missing-путь, и drift-вердикт не совпадёт с фактическим
+        поведением. «Нет поля» = порча точки (точки всегда пишутся с полем).
+        """
+        points = self._scroll_all_points(
+            collection_name, with_payload=["knowledge_id", "updated_at"],
+        )
+        result: dict[str, str | None] = {}
+        for point in points:
+            payload = point.payload or {}
+            kid = payload.get("knowledge_id")
+            if not kid:
+                continue
+            upd = payload.get("updated_at")
+            # Qdrant SDK может вернуть datetime для DATETIME-indexed поля;
+            # приводим к строке для единообразия с frontmatter-стороне.
+            if upd is not None and not isinstance(upd, str):
+                upd = str(upd)
+            if kid in result:
+                result[kid] = _max_updated_at(result[kid], upd)
+            else:
+                result[kid] = upd
+        return result
 
     def collection_info(self, collection_name: str | None = None) -> dict:
         """Информация о коллекции для /health.
@@ -586,3 +639,42 @@ class QdrantClient:
     def close(self) -> None:
         """Закрыть gRPC-соединение."""
         self._client.close()
+
+
+# ── 023-B: drift-detection helpers (module-level, тестируются напрямую) ──
+
+
+def _normalize_dt(value: str | None) -> datetime | None:
+    """Привести ISO-строку к aware-UTC datetime; None/невалид → None.
+
+    naive → replace(timezone.utc) (P2-1: naive↔aware даёт TypeError при сравнении).
+    """
+    from datetime import timezone
+    if value is None:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _max_updated_at(a: str | None, b: str | None) -> str | None:
+    """Max по нормализованному datetime (P2-2), НЕ по строке и НЕ first.
+
+    Возвращает исходную строку-победителя (не нормализованную), чтобы
+    frontmatter-сторона получала payload-значение как есть. None-значение
+    трактуется как «порча» и проигрывает любой валидной дате (но если обе
+    None — возвращаем None, сигнал порчи сохраняется).
+    """
+    da = _normalize_dt(a)
+    db = _normalize_dt(b)
+    if da is None and db is None:
+        return None
+    if da is None:
+        return b
+    if db is None:
+        return a
+    return b if db > da else a
