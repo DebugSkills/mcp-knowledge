@@ -235,7 +235,8 @@ async def test_s9e_health_responsive_during_quality_scan(e2e_http_app):
         assert elapsed_ms < 100, f"/health/live took {elapsed_ms:.1f}ms during scan (event loop blocked!)"
 
         # 2) прогресс-эндпоинт отдаёт данные скана
-        p = await e2e_http_app.get("/quality/scan/progress")
+        # (020: роут — реальный хендлер main.py, требует X-API-Key)
+        p = await e2e_http_app.get("/quality/scan/progress", headers=headers)
         assert p.status_code == 200
         progress = p.json()
         # ImportProgressTracker хранит запись под ключом import_id == scan_id
@@ -244,7 +245,7 @@ async def test_s9e_health_responsive_during_quality_scan(e2e_http_app):
 
         # 3) даём фону завершиться → прогресс в терминальном статусе
         await asyncio.sleep(0.7)
-        p2 = await e2e_http_app.get("/quality/scan/progress")
+        p2 = await e2e_http_app.get("/quality/scan/progress", headers=headers)
         progress2 = p2.json()
         assert progress2["status"] in ("done", "error")
 

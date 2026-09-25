@@ -23,6 +23,7 @@
 import asyncio
 import faulthandler
 import logging
+import os
 from pathlib import Path
 
 # ── Усиленное логирование (инцидент 2026-08-06) ─────────────
@@ -167,6 +168,38 @@ async def _migrate_legacy_collection(qdrant: QdrantClient) -> None:
     # SSOT — источник правды: legacy-коллекция удаляется, данные не теряются.
     qdrant.delete_collection_named(LEGACY_ALIAS)
     logger.info("W2 migration (B): legacy коллекция '%s' удалена", LEGACY_ALIAS)
+
+
+# ── 13.27 + code-2026-09-25-020: scan-трекер ────────────────
+
+# TTL терминальной записи скана (done/error/cancelled) — 7 суток.
+# До 020 действовал дефолт ImportProgressTracker(ttl_seconds=600): завершённый
+# скан, восстановленный recovery после рестарта, удалялся первым же GET-ом
+# → висячий app.state.scan_id → вечный 404 /quality/scan/progress, финальные
+# метрики (намерение 13.27) не показывались. Вечного удержания нет:
+# prune_finished() (tools/quality.py, старт нового скана) чистит терминальные
+# записи при каждом новом скане.
+SCAN_PROGRESS_TTL_SECONDS = 7 * 24 * 3600
+
+
+def build_scan_progress_tracker(
+    persist_path: str | os.PathLike | None = None,
+) -> ImportProgressTracker:
+    """Собрать scan-трекер с прод-параметрами.
+
+    Единая точка конструкции для lifespan и тестов (code-2026-09-25-020):
+    e2e-зеркало трекера не может разъехаться с продом. persist_path можно
+    переопределить (тесты пишут в tmp).
+    """
+    return ImportProgressTracker(
+        max_messages=200,
+        ttl_seconds=SCAN_PROGRESS_TTL_SECONDS,  # 020 (Fix1): 7 суток, не дефолт 600
+        persist_path=(
+            Path(persist_path) if persist_path
+            else Path(settings.QUALITY_DIR) / "scan_state.json"
+        ),
+        persist_every=2.0,
+    )
 
 
 # ── Lifespan: инициализация и останов ──────────────────────
@@ -337,17 +370,15 @@ async def lifespan(app: FastAPI):
     app.state.scan_task = None
     # 13.27: scan_progress пишется на диск (QUALITY_DIR/scan_state.json) —
     # состояние скана переживает рестарт сервера (recovery ниже).
-    app.state.scan_progress = ImportProgressTracker(
-        max_messages=200,
-        persist_path=Path(settings.QUALITY_DIR) / "scan_state.json",
-        persist_every=2.0,
-    )
+    app.state.scan_progress = build_scan_progress_tracker()
     app.state.scan_id: str | None = None
     app.state.scan_cancel_event = None  # 13.18: asyncio.Event для отмены скана
     logger.info("🔒 Heavy-ops lock + scan state initialized (phase 13.15+13.18+13.21+13.27)")
 
     # ── 13.27: Recovery персистентного состояния скана после рестарта ──
-    # Завершённый скан → показываем финальные метрики в UI (scan_id сохраняем).
+    # Завершённый скан → показываем финальные метрики в UI (scan_id сохраняем;
+    # запись удерживается SCAN_PROGRESS_TTL_SECONDS = 7 суток либо до prune
+    # при старте нового скана — 020/Fix1).
     # Прерванный (status=running при старте = сервер упал/рестартнулся в
     # середине скана) → помечаем как прерванный и АВТО-перезапускаем, чтобы
     # качество не простаивало. Авто-рестарт идемпотентен: скан перечитывает
@@ -673,10 +704,15 @@ async def import_log(import_id: str, request: Request):
 async def scan_progress(request: Request):
     """GET /quality/scan/progress — снапшот прогресса quality scan.
 
-    Возвращает JSON с полями: scan_id, status, phase, done, total,
-    messages[], started_at, updated_at, metrics? (при status=done).
+    Возвращает JSON с полями: import_id (ключ записи; kb-console читает его
+    через fallback scan_id/import_id), status, phase, imported, total,
+    failed, messages[], started_at, updated_at; при терминальном статусе —
+    summary.metrics {files_scanned, review_queue_size,
+    duplicates_detected, issues_created}.
 
     Без path-параметра: всегда возвращает текущий/последний скан.
+    Терминальная запись удерживается трекером SCAN_PROGRESS_TTL_SECONDS
+    (7 суток) либо до prune при старте нового скана — не бессрочно.
     Если скана нет — 404.
     """
     auth = getattr(request.state, "auth", None)
@@ -690,7 +726,16 @@ async def scan_progress(request: Request):
     tracker = getattr(request.app.state, "scan_progress", None)
     snapshot = tracker.get(scan_id) if tracker else None
     if snapshot is None:
-        raise HTTPException(404, f"scan {scan_id} not found or expired")
+        # 020 (Fix3): self-heal висячего указателя — запись удалена
+        # TTL-прунингом (или файл потерян), сбрасываем scan_id, чтобы роут
+        # не отвечал вечно 404 «scan ... not found or expired», а вёл себя
+        # как ветка «скан не запускался». Гард: сброс только если указатель
+        # всё ещё указывает на прочитанный скан. Гонки нет — между get()
+        # и сбросом нет await (кооперативный asyncio не переключает контекст);
+        # running-записи TTL не прунятся → живой скан сбросить нельзя.
+        if getattr(request.app.state, "scan_id", None) == scan_id:
+            request.app.state.scan_id = None
+        raise HTTPException(404, "no scan has been started")
     return snapshot
 
 

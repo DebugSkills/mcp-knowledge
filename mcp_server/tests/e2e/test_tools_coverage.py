@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 
 import pytest
@@ -1230,7 +1231,7 @@ async def test_s23_quality_lifecycle_via_http(e2e_http_app):
     deadline = asyncio.get_running_loop().time() + 60.0
     scan_done = False
     while asyncio.get_running_loop().time() < deadline:
-        resp = await e2e_http_app.get("/quality/scan/progress")
+        resp = await e2e_http_app.get("/quality/scan/progress", headers=headers_write)
         assert resp.status_code == 200
         progress = resp.json()
         status = progress.get("status", "")
@@ -1423,7 +1424,9 @@ async def test_s24_cancel_quality_scan_via_http(e2e_http_app):
         deadline = asyncio.get_running_loop().time() + 30.0
         final_status = None
         while asyncio.get_running_loop().time() < deadline:
-            resp = await e2e_http_app.get("/quality/scan/progress")
+            resp = await e2e_http_app.get(
+                "/quality/scan/progress", headers=headers_write,
+            )
             assert resp.status_code == 200
             progress = resp.json()
             final_status = progress.get("status")
@@ -1528,7 +1531,7 @@ async def test_s25_scan_state_survives_restart_via_http(e2e_http_app):
         assert scan2_id != scan1_id, "auto-resume must start a NEW scan_id"
 
         # Step 5: /progress → новый скан; файл содержит новый running
-        p = await e2e_http_app.get("/quality/scan/progress")
+        p = await e2e_http_app.get("/quality/scan/progress", headers=headers_write)
         progress = p.json()
         assert progress.get("import_id") == scan2_id, (
             f"/quality/scan/progress should return new scan, got: {progress}"
@@ -1542,6 +1545,133 @@ async def test_s25_scan_state_survives_restart_via_http(e2e_http_app):
         assert scan1_id not in on_disk2, (
             f"interrupted scan {scan1_id} should be pruned, still on disk: {on_disk2}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════
+# code-2026-09-25-020: висячий scan_id + TTL-прунинг (404 /quality/scan/progress)
+# ═══════════════════════════════════════════════════════════════
+# Диагноз §7 (.boardData.md): recovery ставит app.state.scan_id из
+# scan_state.json, но progress.get() TTL-прунит терминальную запись старше
+# ttl → висячий указатель → вечный 404 «scan ... not found or expired»,
+# панель прогресса/финальные метрики в UI не показываются (13.27).
+# Роут в e2e — РЕАЛЬНЫЙ хендлер main.py (делегирование из conftest, P1).
+# Все даты — динамические от now (анти-мина, урок 019).
+
+
+def _write_stale_done_scan(state_path: Path, sid: str, age) -> None:
+    """Записать в scan_state.json терминальную (done) запись с бэкдейтом age.
+
+    Прод-фабрика трекера (main.build_scan_progress_tracker) — файл на диске
+    байт-в-байт как после настоящего завершённого скана.
+    """
+    from datetime import datetime, timezone
+
+    from mcp_server.main import build_scan_progress_tracker
+
+    t = build_scan_progress_tracker(persist_path=state_path)
+    t.start(sid, total=8406)
+    t._data[sid]["imported"] = 8406
+    t.done(sid, summary={"metrics": {
+        "files_scanned": 8406,
+        "review_queue_size": 0,
+        "duplicates_detected": 0,
+        "issues_created": 0,
+    }})
+    # Бэкдейт: finished_at = now - age (динамически) + force-persist
+    finished_at = datetime.now(timezone.utc) - age
+    t._data[sid]["updated_at"] = finished_at.isoformat()
+    t.persist(force=True)
+
+
+@pytest.mark.e2e
+async def test_s020_done_scan_older_than_default_ttl_returns_final_metrics(e2e_http_app):
+    """020-A (Fix1): done-скан возрастом 2ч — старше ДЕФОЛТНОГО ttl=600с, но
+    моложе прод-TTL (7 суток) → «рестарт» (recovery ставит scan_id) →
+    GET /quality/scan/progress отдаёт 200 с финальными метриками (намерение
+    13.27), а не 404 «not found or expired» (дефект §7.3)."""
+    import asyncio
+    from datetime import timedelta
+
+    from mcp_server.main import SCAN_PROGRESS_TTL_SECONDS, build_scan_progress_tracker
+
+    headers_write = {"X-API-Key": "e2e-write-key"}
+    app = e2e_http_app.app
+    state_path = Path(app.state.settings.KNOWLEDGE_DIR).parent / "scan_state.json"
+
+    age = timedelta(hours=2)
+    # Предусловия кейса: возраст в окне «дефолтный TTL < age < прод-TTL»
+    assert age.total_seconds() > 600, "предусловие: старше дефолтного ttl=600"
+    assert age.total_seconds() < SCAN_PROGRESS_TTL_SECONDS, (
+        "предусловие: моложе прод-TTL"
+    )
+    sid = f"scan020a{uuid.uuid4().hex[:10]}"
+    _write_stale_done_scan(state_path, sid, age)
+
+    # «Рестарт»: новый трекер (прод-фабрика) + recovery-блок main.py —
+    # терминальная запись → app.state.scan_id (финальные метрики в UI)
+    app.state.scan_progress = build_scan_progress_tracker(persist_path=state_path)
+    app.state.scan_lock = asyncio.Lock()
+    app.state.scan_id = None
+    recovered = app.state.scan_progress.load()
+    for rid, entry in recovered.items():
+        if entry.get("status") in ("done", "error", "cancelled"):
+            app.state.scan_id = rid
+    assert app.state.scan_id == sid, f"recovery должен поставить scan_id={sid}"
+
+    resp = await e2e_http_app.get("/quality/scan/progress", headers=headers_write)
+    assert resp.status_code == 200, (
+        f"020: expected 200 with final metrics, got {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    assert body["status"] == "done"
+    assert body["imported"] == 8406
+    assert body["total"] == 8406
+    assert body["summary"]["metrics"]["files_scanned"] == 8406
+
+
+@pytest.mark.e2e
+async def test_s020_dangling_scan_id_self_heals_to_404_no_scan(e2e_http_app):
+    """020-B (Fix3+Fix2): терминальная запись старше прод-TTL (7 суток) →
+    первый GET TTL-прунит её; роут ОБЯЗАН сбросить висячий app.state.scan_id
+    и ответить 404 «no scan has been started» (ветка пустого указателя), а не
+    «scan ... not found or expired» навсегда. Повторный GET — та же ветка.
+    Плюс Fix2: удалённая запись исчезает из scan_state.json (петля рестартов
+    разорвана — recovery больше не поднимает висячий указатель)."""
+    import asyncio
+    from datetime import timedelta
+
+    from mcp_server.main import SCAN_PROGRESS_TTL_SECONDS, build_scan_progress_tracker
+
+    headers_write = {"X-API-Key": "e2e-write-key"}
+    app = e2e_http_app.app
+    state_path = Path(app.state.settings.KNOWLEDGE_DIR).parent / "scan_state.json"
+
+    age = timedelta(seconds=SCAN_PROGRESS_TTL_SECONDS + 3600)  # на час старше прод-TTL
+    sid = f"scan020b{uuid.uuid4().hex[:10]}"
+    _write_stale_done_scan(state_path, sid, age)
+
+    app.state.scan_progress = build_scan_progress_tracker(persist_path=state_path)
+    app.state.scan_lock = asyncio.Lock()
+    app.state.scan_id = sid  # recovery присвоил, а запись протухла
+    app.state.scan_progress.load()
+
+    resp = await e2e_http_app.get("/quality/scan/progress", headers=headers_write)
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "no scan has been started", (
+        f"020: dangling scan_id must self-heal to 'no scan has been started', "
+        f"got: {resp.text}"
+    )
+    # Указатель сброшен — повторный GET отвечает той же веткой (не «not found»)
+    assert app.state.scan_id is None, "020: scan_id must be reset (no dangling pointer)"
+    resp2 = await e2e_http_app.get("/quality/scan/progress", headers=headers_write)
+    assert resp2.status_code == 404
+    assert resp2.json()["detail"] == "no scan has been started"
+
+    # Fix2: TTL-удаление персистится — файл не хранит устаревшую запись
+    on_disk = json.loads(state_path.read_text(encoding="utf-8"))
+    assert sid not in on_disk, (
+        f"020: stale entry must be persisted-away, still on disk: {on_disk}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1606,7 +1736,7 @@ async def _s26_run_scan_and_wait(e2e_http_app, headers_write, tag: str) -> dict:
 
     deadline = asyncio.get_running_loop().time() + 60.0
     while asyncio.get_running_loop().time() < deadline:
-        resp = await e2e_http_app.get("/quality/scan/progress")
+        resp = await e2e_http_app.get("/quality/scan/progress", headers=headers_write)
         assert resp.status_code == 200
         progress = resp.json()
         status = progress.get("status", "")

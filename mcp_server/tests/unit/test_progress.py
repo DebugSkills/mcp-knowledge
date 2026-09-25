@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import json
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from mcp_server.progress import ImportProgressTracker
@@ -215,6 +217,43 @@ class TestImportProgressTracker:
         t.done("done-job", summary={})
         time.sleep(0.01)  # ttl истёк
         assert t.get("done-job") is None
+
+    def test_progress_ttl_delete_persists_removal(self, tmp_path):
+        """020 Fix2: TTL-удаление терминальной записи ПЕРСИСТИТСЯ (force).
+
+        Иначе scan_state.json хранит устаревшую запись → recovery после
+        рестарта снова ставит висячий scan_id (петля между рестартами, §7.3-4).
+        Бэкдейт динамический (now - 1ч, анти-мина — урок 019).
+        """
+        p = tmp_path / "scan_state.json"
+        t = ImportProgressTracker(persist_path=p, ttl_seconds=0)
+        t.start("stale-done", total=3)
+        t.done("stale-done", summary={"metrics": {"files_scanned": 3}})
+        # Запись на диске есть (done пишет force)...
+        assert "stale-done" in json.loads(p.read_text(encoding="utf-8"))
+        # ...бэкдейтим updated_at за пределы TTL (динамически, без sleep)
+        t._data["stale-done"]["updated_at"] = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).isoformat()
+        assert t.get("stale-done") is None  # TTL-удаление сработало
+        # ...и удаление ушло на диск (Fix2): файла запись больше не содержит
+        assert "stale-done" not in json.loads(p.read_text(encoding="utf-8")), (
+            "020: TTL-удаление должно персиститься (persist(force=True))"
+        )
+
+    def test_progress_ttl_delete_without_persist_path_noop(self):
+        """020 Fix2: import-трекер (persist_path=None) — TTL-удаление без I/O.
+
+        persist() на трекере без persist_path — no-op (progress.py), путь
+        чтения import-прогресса не получает дисковых записей.
+        """
+        t = ImportProgressTracker(ttl_seconds=0)
+        t.start("x", total=1)
+        t.done("x")
+        t._data["x"]["updated_at"] = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).isoformat()
+        assert t.get("x") is None  # удалено, без исключений и без I/O
 
     def test_progress_ttl_error_deleted(self):
         """error-запись старше TTL удаляется."""

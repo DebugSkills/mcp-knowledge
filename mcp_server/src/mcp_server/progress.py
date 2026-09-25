@@ -312,6 +312,12 @@ class ImportProgressTracker:
                         age = now_ts - updated_dt.timestamp()
                         if age > self._ttl_seconds:
                             del self._data[import_id]
+                            # 020 (Fix2): персистим удаление — иначе
+                            # персистентный файл хранит устаревшую запись, и
+                            # recovery после рестарта снова ставит висячий
+                            # scan_id (петля между рестартами). У import-трекера
+                            # persist_path=None → no-op (путь чтения без I/O).
+                            self.persist(force=True)
                             return None
                     except (ValueError, OSError):
                         pass  # невалидный timestamp — не удаляем
