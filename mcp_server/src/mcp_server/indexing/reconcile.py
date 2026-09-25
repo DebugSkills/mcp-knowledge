@@ -17,6 +17,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from ..config import settings
 from ..storage.markdown_store import MarkdownStore
@@ -99,6 +100,11 @@ async def reconcile(
     knowledge_index: KnowledgeIndex,
     skip_reindex: bool = False,
     skip_orphan_detection: bool = False,
+    # 023 Block C (§7.9(а)): heavy_ops_lock для full-reindex + owner-ручки.
+    # Дефолт None ⇒ харнессы T/D (без лока) остаются зелёными без правок.
+    get_heavy_lock: Callable[[], asyncio.Lock] | None = None,
+    set_lock_owner: Callable[[str | None], None] | None = None,
+    get_lock_owner: Callable[[], str | None] | None = None,
 ) -> dict:
     """Выполнить полную сверку Markdown SSOT ↔ Qdrant при старте.
 
@@ -106,6 +112,12 @@ async def reconcile(
         skip_reindex: True при недоступном embed (degraded-режим) — пропустить
             доиндексацию missing-записей (иначе reindex_all падает на каждом
             файле и блокирует старт сервера / уводит в рестарт-цикл).
+        get_heavy_lock: callable, возвращающий текущий ``heavy_ops_lock`` из
+            ``app.state`` (ре-рид объекта на момент acquire — recovery 022
+            атомно заменяет lock новым объектом). None ⇒ лок не берётся
+            (поведение = до Block C; харнессы T/D).
+        set_lock_owner / get_lock_owner: рушки маркера владельца лока
+            (``heavy_lock_owner``). Протокол compare-and-clear в ``finally``.
 
     Returns:
         dict с результатами: {checked, reindexed, skipped, deleted_orphans, errors}
@@ -214,16 +226,70 @@ async def reconcile(
                     len(drifted_paths),
                     k,
                 )
-                try:
-                    reindex_result = await pipeline.reindex_all()
-                    result.reindexed = reindex_result.get(
-                        "total_docs", len(combined_reindex_paths)
-                    )
-                    result.mode = "full"
-                except Exception as e:
-                    msg = f"Reindex failed: {e}"
-                    result.errors.append(msg)
-                    logger.error("[RECONCILE] %s", msg)
+                # 023 Block C (§7.9(а)): full-reindex берёт heavy_ops_lock —
+                # bounded wait + identity-check (P1-3) + compare-and-clear owner.
+                # Без get_heavy_lock (харнессы T/D, дефолт) — прежнее поведение
+                # без лока (гонка R5 остаётся known-gap, закрывается только при
+                # передаче лока из main.py).
+                proceed = True
+                lock_obj: asyncio.Lock | None = None
+                lock_acquired = False
+                if get_heavy_lock is not None:
+                    lock_obj = get_heavy_lock()
+                    try:
+                        await asyncio.wait_for(
+                            lock_obj.acquire(),
+                            timeout=settings.RECONCILE_LOCK_WAIT_SECONDS,
+                        )
+                        lock_acquired = True
+                    except asyncio.TimeoutError:
+                        # (б) Лок занят дольше таймаута → defer на следующий
+                        # старт (missing остаются → естественный retry).
+                        proceed = False
+                        result.mode = "deferred"
+                        logger.warning(
+                            "[RECONCILE] heavy_ops_lock busy >%ds — "
+                            "full reindex deferred to next start",
+                            settings.RECONCILE_LOCK_WAIT_SECONDS,
+                        )
+                    if lock_acquired:
+                        # P1-3: identity-check — лок могли заменить recovery-путём
+                        # 022, пока мы ждали; acquire резолвится на СТАРОМ объекте.
+                        if lock_obj is not get_heavy_lock():
+                            lock_obj.release()
+                            lock_acquired = False
+                            proceed = False
+                            result.mode = "deferred"
+                            logger.warning(
+                                "[RECONCILE] heavy lock replaced during wait — "
+                                "full reindex deferred"
+                            )
+                        else:
+                            # (г) set owner ПОСЛЕ identity-check (не до — иначе
+                            # маркер фантомного лока искажает диагностику guard'а).
+                            if set_lock_owner is not None:
+                                set_lock_owner("reconcile")
+                if proceed:
+                    try:
+                        reindex_result = await pipeline.reindex_all()
+                        result.reindexed = reindex_result.get(
+                            "total_docs", len(combined_reindex_paths)
+                        )
+                        result.mode = "full"
+                    except Exception as e:
+                        msg = f"Reindex failed: {e}"
+                        result.errors.append(msg)
+                        logger.error("[RECONCILE] %s", msg)
+                    finally:
+                        # (г) compare-and-clear — не затереть чужой маркер.
+                        if lock_acquired:
+                            if (
+                                get_lock_owner is not None
+                                and get_lock_owner() == "reconcile"
+                            ):
+                                if set_lock_owner is not None:
+                                    set_lock_owner(None)
+                            lock_obj.release()
 
     # ── Шаг 2: Обратная сверка — Qdrant → Markdown ──────────────────
     md_ids = set()

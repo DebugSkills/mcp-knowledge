@@ -73,6 +73,10 @@ def _make_app_state(
         ),
         heavy_ops_lock=scan_lock,
         scan_lock=scan_lock,
+        # 023 Block C (P2-A): дефолт owner="scan" — без него краснеют 7 тестов
+        # 022 после ввода owner-guard/cancel-по-owner в C-commit-2. L8/L9
+        # переопределяют owner на "reconcile" в своих кейсах.
+        heavy_lock_owner="scan",
         scan_progress=tracker,
         scan_id=scan_id,
         scan_task=None,

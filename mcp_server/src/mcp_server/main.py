@@ -316,6 +316,14 @@ async def lifespan(app: FastAPI):
                 store, qdrant, pipeline, knowledge_index,
                 skip_reindex=not embedder.is_ready,
                 skip_orphan_detection=True,
+                # code-2026-09-25-023 Block C: передача лока + owner-ручек.
+                # get_heavy_lock — ре-рид объекта на момент acquire (не замыкание
+                # объекта): _recover_stalled_scan (022) атомно заменяет
+                # heavy_ops_lock новым объектом — заранее захваченный старый стал
+                # бы фантомным. set/get_lock_owner — протокол compare-and-clear.
+                get_heavy_lock=lambda: app.state.heavy_ops_lock,
+                set_lock_owner=lambda v: setattr(app.state, "heavy_lock_owner", v),
+                get_lock_owner=lambda: getattr(app.state, "heavy_lock_owner", None),
             )
             logger.info(
                 "✅ Reconciliation: checked=%d, reindexed=%d, skipped=%d, orphans=%d, mode=%s",
@@ -368,6 +376,10 @@ async def lifespan(app: FastAPI):
     app.state.heavy_ops_lock = asyncio.Lock()
     # legacy alias (используется в quality.py, tools/__init__.py)
     app.state.scan_lock = app.state.heavy_ops_lock
+    # code-2026-09-25-023 Block C: маркер владельца лока — кто держит heavy_ops_lock
+    # в данный момент ("scan"|"reconcile"|"admin_reindex"|"import"|"convert"|None).
+    # Guard в _recover_stalled_scan (C-2) проверяет owner перед recovery.
+    app.state.heavy_lock_owner = None
     app.state.scan_task = None
     # 13.27: scan_progress пишется на диск (QUALITY_DIR/scan_state.json) —
     # состояние скана переживает рестарт сервера (recovery ниже).
@@ -929,7 +941,12 @@ async def start_convert(request: Request):
         tracker.start(import_id, 0, {"file": display_name, "content_type": "pdf"})
 
     heavy_ops_lock = getattr(request.app.state, "heavy_ops_lock", None)
-    if heavy_ops_lock is not None and heavy_ops_lock.locked():
+    # code-2026-09-25-023 Block C (P1-4): фолбэк `or asyncio.Lock()` убран —
+    # фантомный лок вне состояния ломает сериализацию. Fail-closed по паттерну
+    # submit_import (content.py:136-138).
+    if heavy_ops_lock is None:
+        return {"import_id": import_id, "status": "error", "error": "heavy_ops_lock not initialized"}
+    if heavy_ops_lock.locked():
         rec["status"] = "queued"
         logger.info("[CONVERT] lock busy — queued %s", import_id)
         return {"import_id": import_id, "status": "queued"}
@@ -943,7 +960,7 @@ async def start_convert(request: Request):
             pdf_path=pdf_path,
             app_state=request.app.state,
             cancel_event=cancel_event,
-            lock=heavy_ops_lock or asyncio.Lock(),
+            lock=heavy_ops_lock,
         )
     )
     logger.info("[CONVERT] started %s (%s)", import_id, display_name)

@@ -85,6 +85,11 @@ class Settings(BaseSettings):
     # <=0 → kill-switch: всегда полный reindex (поведение = до 023).
     RECONCILE_INCREMENTAL_MAX_ENTRIES: int = 50
 
+    # code-2026-09-25-023 Block C: bounded wait для heavy_ops_lock в full-reindex
+    # (reconcile + admin). <=0 → не ждать вовсе (немедленный defer/error).
+    # 1800 с = 30 мин — покрывает типичный quality-скан ~20 мин после фикса 022.
+    RECONCILE_LOCK_WAIT_SECONDS: int = 1800
+
     # Token store (W3, план two-zone-access §2.3) — SSOT токенов доступа.
     # TOKENS_DIR: паттерн QUALITY_DIR (pydantic-settings → env-override);
     # локально /app недоступен → тесты задают TokenStore(tokens_dir=...) или env.
