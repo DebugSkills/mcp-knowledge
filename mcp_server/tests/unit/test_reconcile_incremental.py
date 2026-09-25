@@ -129,7 +129,10 @@ class FakeStore:
 
 
 def _make_entry(
-    kid: str, zone: str = ZONE_PRIVATE, updated_at: datetime | None = None,
+    kid: str,
+    zone: str = ZONE_PRIVATE,
+    updated_at: datetime | None = None,
+    updated_at_explicit: bool = True,
 ) -> KnowledgeEntry:
     fm = KnowledgeFrontmatter(
         knowledge_id=kid,
@@ -140,6 +143,7 @@ def _make_entry(
         version=1,
         zone=zone,
         **({} if updated_at is None else {"updated_at": updated_at}),
+        updated_at_explicit=updated_at_explicit,
     )
     return KnowledgeEntry(frontmatter=fm, content=f"# {kid}\n\nTest content.")
 
@@ -805,3 +809,118 @@ async def test_d10_orphan_uses_qdrant_meta_keys(monkeypatch):
 
     assert "kid-orphan-d10" in qdrant.delete_calls
     assert res["deleted_orphans"] == 1
+
+# ══════════════════════════════════════════════════════════════
+# T24-*: default-ловушка updated_at (трасса 024)
+# ══════════════════════════════════════════════════════════════
+
+
+def test_t24_5_parse_text_sets_explicit_marker():
+    """T24-5 (P1-1 Critic 024): прямой тест парсера — маркер явности.
+
+    FakeStore минует `_parse_text`, поэтому единственное RED-доказательство
+    фикса parse-site — этот тест (без него регрессия parse-site невидима).
+    """
+    from mcp_server.storage.markdown_store import MarkdownStore
+
+    with_field = (
+        "---\nknowledge_id: kid-t24x\ndomain: test\nsubject: demo\n"
+        "updated_at: '2026-01-01T00:00:00+00:00'\n---\n# body\n"
+    )
+    without_field = (
+        "---\nknowledge_id: kid-t24x\ndomain: test\nsubject: demo\n---\n# body\n"
+    )
+    assert MarkdownStore._parse_text(with_field).frontmatter.updated_at_explicit is True
+    assert (
+        MarkdownStore._parse_text(without_field).frontmatter.updated_at_explicit is False
+    )
+
+
+def test_t24_4_marker_not_persisted():
+    """T24-4: derived-маркер не протекает в dump и в записанный YAML."""
+    from mcp_server.storage.markdown_store import MarkdownStore
+    import tempfile
+
+    fm = _make_entry("kid-t24w").frontmatter
+    assert "updated_at_explicit" not in fm.model_dump()
+    assert "updated_at_explicit" not in fm.model_dump_json()
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "kid-t24w.md"
+        MarkdownStore._write_file(path, _make_entry("kid-t24w"))
+        assert "updated_at_explicit" not in path.read_text(encoding="utf-8")
+
+
+async def test_t24_1_fieldless_no_drift(monkeypatch):
+    """T24-1: поле отсутствовало (маркер False) + payload старее → НЕ дрейф."""
+    monkeypatch.setattr(
+        "mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50
+    )
+    path = Path("/tmp/knowledge/test/demo/kid-t24a.md")
+    # updated_at = now (default_factory), но явного поля в файле не было
+    store = FakeStore([path], {path: _make_entry("kid-t24a", updated_at_explicit=False)})
+    qdrant = FakeQdrant(ids=set())
+    _seed(qdrant, "kid-t24a", T0.isoformat())
+    pipeline = _make_mock_pipeline()
+    im_calls, _ = _spy_pipeline(pipeline)
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=False, skip_orphan_detection=True)
+
+    assert res["drifted"] == 0
+    assert res["mode"] == "none"
+    assert im_calls == []
+
+
+async def test_t24_6_corrupt_payload_beats_fieldless(monkeypatch):
+    """T24-6 (P2-1): fieldless + порча payload → дрейф (порча проверяется первой)."""
+    monkeypatch.setattr(
+        "mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50
+    )
+    path = Path("/tmp/knowledge/test/demo/kid-t24b.md")
+    store = FakeStore([path], {path: _make_entry("kid-t24b", updated_at_explicit=False)})
+    qdrant = FakeQdrant(ids={"kid-t24b"})  # точек нет ⇒ payload updated_at = None (порча)
+    pipeline = _make_mock_pipeline()
+    im_calls, _ = _spy_pipeline(pipeline)
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=False, skip_orphan_detection=True)
+
+    assert res["drifted"] == 1
+    assert res["mode"] == "incremental"
+    assert im_calls == [1]
+
+
+async def test_t24_2_explicit_newer_still_drifts(monkeypatch):
+    """T24-2: явное поле новее payload → дрейф (поведение 023-B сохранено)."""
+    monkeypatch.setattr(
+        "mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50
+    )
+    path = Path("/tmp/knowledge/test/demo/kid-t24c.md")
+    store = FakeStore([path], {path: _make_entry("kid-t24c", updated_at=T0 + timedelta(hours=1))})
+    qdrant = FakeQdrant(ids=set())
+    _seed(qdrant, "kid-t24c", T0.isoformat())
+    pipeline = _make_mock_pipeline()
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=False, skip_orphan_detection=True)
+
+    assert res["drifted"] == 1 and res["mode"] == "incremental"
+
+
+async def test_t24_3_explicit_equal_no_drift(monkeypatch):
+    """T24-3: явное поле == payload → не дрейф."""
+    monkeypatch.setattr(
+        "mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50
+    )
+    path = Path("/tmp/knowledge/test/demo/kid-t24d.md")
+    store = FakeStore([path], {path: _make_entry("kid-t24d", updated_at=T0)})
+    qdrant = FakeQdrant(ids=set())
+    _seed(qdrant, "kid-t24d", T0.isoformat())
+    pipeline = _make_mock_pipeline()
+    im_calls, _ = _spy_pipeline(pipeline)
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=False, skip_orphan_detection=True)
+
+    assert res["drifted"] == 0 and res["mode"] == "none" and im_calls == []

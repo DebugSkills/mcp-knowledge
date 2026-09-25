@@ -58,6 +58,15 @@ class KnowledgeFrontmatter(BaseModel):
         default_factory=lambda: datetime.now(timezone.utc),
         description="Дата обновления (← ключ reconciliation #19)",
     )
+    # 024: derived-маркер «поле updated_at было ЯВНО задано в frontmatter».
+    # Отсутствие поля парсер заполняет default_factory=now — это НЕ признак
+    # свежести документа; reconcile._is_drifted по маркеру не даёт ложный дрейф.
+    # exclude=True: не персистится в YAML/JSON (проверено Critic 024, pydantic v2).
+    updated_at_explicit: bool = Field(
+        default=True,
+        exclude=True,
+        description="Было ли updated_at явно задано в исходном frontmatter (derived)",
+    )
 
     @field_validator("knowledge_id")
     @classmethod

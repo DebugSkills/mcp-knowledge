@@ -271,7 +271,10 @@ class MarkdownStore:
 
         fm_raw = match.group(1)
         fm_dict = yaml.safe_load(fm_raw) or {}
-        fm = KnowledgeFrontmatter(**fm_dict)
+        # 024: derived-маркер явности (рукописный ключ в YAML не подменяет).
+        fm = KnowledgeFrontmatter(
+            **{**fm_dict, "updated_at_explicit": "updated_at" in fm_dict}
+        )
 
         # Контент — всё после закрывающего ---
         content = text[match.end():].strip()

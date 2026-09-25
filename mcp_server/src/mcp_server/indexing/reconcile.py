@@ -165,7 +165,10 @@ async def reconcile(
                 # (комментарий «Проверяем updated_at» наконец становится правдой).
                 fm_updated = entry.frontmatter.updated_at
                 payload_updated = qdrant_meta[kid]
-                if _is_drifted(fm_updated, payload_updated):
+                if _is_drifted(
+                    fm_updated, payload_updated,
+                    getattr(entry.frontmatter, "updated_at_explicit", True),
+                ):
                     drifted_paths.append(path)
                     result.drifted += 1
                     logger.info(
@@ -472,12 +475,20 @@ async def _detect_parent_child_orphans(
 # ── 023-B: drift-detection helper ───────────────────────────
 
 
-def _is_drifted(fm_updated: datetime, payload_updated: str | None) -> bool:
-    """023-B: обнаружить updated_at-дрейф между frontmatter и Qdrant payload.
+def _is_drifted(
+    fm_updated: datetime,
+    payload_updated: str | None,
+    fm_explicit: bool = True,
+) -> bool:
+    """023-B + 024: обнаружить updated_at-дрейф между frontmatter и Qdrant payload.
 
-    Вердикт:
-    - payload None/невалидный ⇒ drifted (порча точки — точки всегда пишутся
-      с полем `updated_at`; отсутствие = порча, переиндексируем).
+    Вердикт (порядок проверок существенен — P2-1 Critic 024):
+    - payload None/невалидный ⇒ drifted (**порча точки** — проверяется ДО
+      явности, иначе fieldless+порча маскируется как «нет сигнала»).
+    - `fm_explicit=False` (024: поля `updated_at` не было в исходном YAML ⇒
+      парсер подставил default_factory=now) ⇒ **не drifted**: сигнала о
+      свежести нет, а `now` — не свежесть (иначе ложный дрейф на каждом
+      проходе). Граница документирована в каноне §13.16/§13.17.
     - fm > payload (по нормализованному datetime) ⇒ drifted.
     - fm == payload или payload новее (clock skew) ⇒ не drifted
       (fail-closed к «не трогать»).
@@ -495,7 +506,13 @@ def _is_drifted(fm_updated: datetime, payload_updated: str | None) -> bool:
     payload_dt = _normalize_dt(payload_updated)
     if payload_dt is None:
         # payload без/с невалидным updated_at у присутствующего kid ⇒ порча
+        # (проверяется ДО явности — P2-1 Critic 024: порча не маскируется).
         return True
+
+    if not fm_explicit:
+        # 024: поля updated_at не было в исходном YAML ⇒ парсер подставил now
+        # (default_factory). Это не сигнал свежести ⇒ дрейф не выводим.
+        return False
 
     fm_dt = fm_updated
     if fm_dt.tzinfo is None:
