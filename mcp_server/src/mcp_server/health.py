@@ -19,7 +19,7 @@ router = APIRouter(tags=["health"])
 _embedding_manager = None
 _qdrant_client = None
 _pipeline = None
-_reconcile_state = {"state": "pending", "checked": 0, "reindexed": 0, "skipped": 0, "orphans": 0, "error": None}
+_reconcile_state = {"state": "pending", "checked": 0, "reindexed": 0, "skipped": 0, "orphans": 0, "mode": "none", "error": None}
 
 # Пороги для deep checks
 QUEUE_UTILIZATION_THRESHOLD = 0.9  # >90% заполнения → degraded
@@ -50,6 +50,7 @@ def set_reconcile_state(state: str, result: dict | None = None, error: str | Non
         "reindexed": (result or {}).get("reindexed", 0),
         "skipped": (result or {}).get("skipped", 0),
         "orphans": (result or {}).get("deleted_orphans", 0),
+        "mode": (result or {}).get("mode", "none"),
         "error": error,
     }
 

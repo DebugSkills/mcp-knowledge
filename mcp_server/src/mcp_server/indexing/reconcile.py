@@ -17,6 +17,7 @@ import asyncio
 import logging
 from pathlib import Path
 
+from ..config import settings
 from ..storage.markdown_store import MarkdownStore
 from ..storage.qdrant_client import QdrantClient
 from ..storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
@@ -72,6 +73,8 @@ class ReconcileResult:
         self.deleted_orphans: int = 0
         self.orphaned_detected: int = 0  # Фаза 5: parent-child orphans
         self.errors: list[str] = []
+        # 023: режим доиндексации — none|incremental|full|skipped
+        self.mode: str = "none"
 
     def to_dict(self) -> dict:
         return {
@@ -81,6 +84,7 @@ class ReconcileResult:
             "deleted_orphans": self.deleted_orphans,
             "orphaned_detected": self.orphaned_detected,
             "errors": self.errors,
+            "mode": self.mode,
         }
 
 
@@ -146,15 +150,39 @@ async def reconcile(
                 len(missing_in_qdrant),
             )
             result.skipped += len(missing_in_qdrant)
+            result.mode = "skipped"
         else:
-            logger.info("[RECONCILE] %d entries missing in Qdrant — reindexing", len(missing_in_qdrant))
-            try:
-                reindex_result = await pipeline.reindex_all()
-                result.reindexed = reindex_result.get("total_docs", len(missing_in_qdrant))
-            except Exception as e:
-                msg = f"Reindex failed: {e}"
-                result.errors.append(msg)
-                logger.error("[RECONCILE] %s", msg)
+            # 023: гибрид с порогом — len(missing) <= K → incremental upsert
+            # через alias (без blue-green); иначе полный reindex_all.
+            # K <= 0 → kill-switch: всегда полный (поведение = до 023).
+            k = settings.RECONCILE_INCREMENTAL_MAX_ENTRIES
+            if k > 0 and len(missing_in_qdrant) <= k:
+                logger.info(
+                    "[RECONCILE] %d entries missing — incremental reindex (<=K=%d)",
+                    len(missing_in_qdrant), k,
+                )
+                try:
+                    inc = await pipeline.index_missing(missing_in_qdrant)
+                    result.reindexed = inc.get("total_docs", 0)
+                    result.mode = "incremental"
+                    result.errors.extend(inc.get("errors", []))
+                except Exception as e:
+                    msg = f"Incremental reindex failed: {e}"
+                    result.errors.append(msg)
+                    logger.error("[RECONCILE] %s", msg)
+            else:
+                logger.info(
+                    "[RECONCILE] %d entries missing — full reindex (K=%d)",
+                    len(missing_in_qdrant), k,
+                )
+                try:
+                    reindex_result = await pipeline.reindex_all()
+                    result.reindexed = reindex_result.get("total_docs", len(missing_in_qdrant))
+                    result.mode = "full"
+                except Exception as e:
+                    msg = f"Reindex failed: {e}"
+                    result.errors.append(msg)
+                    logger.error("[RECONCILE] %s", msg)
 
     # ── Шаг 2: Обратная сверка — Qdrant → Markdown ──────────────────
     md_ids = set()
@@ -207,10 +235,20 @@ async def reconcile(
     summary = result.to_dict()
     logger.info(
         "✅ RECONCILE complete: checked=%d, reindexed=%d, skipped=%d, "
-        "orphans=%d, orphaned_detected=%d, errors=%d",
+        "orphans=%d, orphaned_detected=%d, errors=%d, mode=%s",
         result.checked, result.reindexed, result.skipped,
         result.deleted_orphans, result.orphaned_detected, len(result.errors),
+        result.mode,
     )
+    # 023 (P1-1): запись метрики внутри reconcile() — call-site тестируем
+    # прямым вызовом reconcile() (main-обёртка _run_reconcile вложена в lifespan
+    # и нетестируема). Чинит мёртвую метрику mcp_reconcile_reindexed_total.
+    try:
+        from ..metrics import record_reconcile_result
+        record_reconcile_result(summary)
+    except Exception:  # noqa: BLE001, S110
+        # Метрика — best-effort: сбой логирования не должен валить reconcile.
+        pass
     return summary
 
 

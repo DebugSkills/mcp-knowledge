@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import asyncio
 import logging
 import resource
@@ -174,6 +176,67 @@ class IndexingPipeline:
         if result.indexed:
             self._completed.add(knowledge_id)
 
+        return result
+
+    async def index_missing(self, paths: list[Path]) -> dict:
+        """023: доиндексировать ТОЛЬКО missing-записи в активные коллекции.
+
+        Без blue-green: upsert через alias зоны (collection_for_zone).
+        delete_by_knowledge_id перед upsert — идемпотентность + защита от
+        гонки с параллельным write той же записи (uuid4-point_id не дедуплицирует).
+
+        Per-file изоляция ошибок (fail-open partial): ошибка на одном файле
+        не прерывает остальные — упавший файл остаётся missing и ретраится
+        на следующем старте.
+
+        Returns:
+            {mode:"incremental", total_docs, total_chunks, failed, errors}
+        """
+        logger.info("[REINDEX] incremental start paths=%d", len(paths))
+        t0 = datetime.now(timezone.utc)
+
+        total_docs = 0
+        total_chunks = 0
+        failed = 0
+        errors: list[str] = []
+        loop = asyncio.get_running_loop()
+
+        for path in paths:
+            try:
+                entry = self._store._parse_file(path)
+                kid = entry.frontmatter.knowledge_id
+                chunks = self._chunker.chunk(
+                    knowledge_id=kid,
+                    content=entry.content,
+                )
+                if chunks:
+                    # delete-before-upsert: идемпотентность + защита от гонки
+                    # с параллельным write той же записи (R2).
+                    await loop.run_in_executor(
+                        None, self._qdrant.delete_by_knowledge_id, kid
+                    )
+                    await self._index_chunks(entry, chunks, collection_name=None)
+                    total_chunks += len(chunks)
+                total_docs += 1
+            except Exception as e:  # noqa: BLE001
+                msg = f"{path}: {e}"
+                errors.append(msg)
+                failed += 1
+                logger.error("[REINDEX] incremental error file=%s: %s", path, e)
+
+        elapsed = (datetime.now(timezone.utc) - t0).total_seconds()
+        result = {
+            "mode": "incremental",
+            "total_docs": total_docs,
+            "total_chunks": total_chunks,
+            "failed": failed,
+            "errors": errors,
+            "elapsed_sec": round(elapsed, 1),
+        }
+        logger.info(
+            "[REINDEX] incremental done docs=%d chunks=%d failed=%d elapsed=%.1fs",
+            total_docs, total_chunks, failed, elapsed,
+        )
         return result
 
     async def reindex_all(self) -> dict:

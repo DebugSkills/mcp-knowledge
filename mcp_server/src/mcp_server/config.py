@@ -79,6 +79,12 @@ class Settings(BaseSettings):
     # <=0 → detection off (поведение = today: already_running без проверки stale).
     SCAN_STALL_SECONDS: int = 600
 
+    # code-2026-09-25-023: reconcile incremental reindex — порог инкрементального
+    # пути. len(missing) <= RECONCILE_INCREMENTAL_MAX_ENTRIES → точечный upsert
+    # через alias активной коллекции (без blue-green); иначе — полный reindex_all.
+    # <=0 → kill-switch: всегда полный reindex (поведение = до 023).
+    RECONCILE_INCREMENTAL_MAX_ENTRIES: int = 50
+
     # Token store (W3, план two-zone-access §2.3) — SSOT токенов доступа.
     # TOKENS_DIR: паттерн QUALITY_DIR (pydantic-settings → env-override);
     # локально /app недоступен → тесты задают TokenStore(tokens_dir=...) или env.

@@ -318,11 +318,12 @@ async def lifespan(app: FastAPI):
                 skip_orphan_detection=True,
             )
             logger.info(
-                "✅ Reconciliation: checked=%d, reindexed=%d, skipped=%d, orphans=%d",
+                "✅ Reconciliation: checked=%d, reindexed=%d, skipped=%d, orphans=%d, mode=%s",
                 reconcile_result["checked"],
                 reconcile_result["reindexed"],
                 reconcile_result["skipped"],
                 reconcile_result["deleted_orphans"],
+                reconcile_result.get("mode", "none"),
             )
             set_reconcile_state("done", reconcile_result)
         except Exception as exc:
