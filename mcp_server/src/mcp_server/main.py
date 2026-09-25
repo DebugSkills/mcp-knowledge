@@ -373,6 +373,10 @@ async def lifespan(app: FastAPI):
     app.state.scan_progress = build_scan_progress_tracker()
     app.state.scan_id: str | None = None
     app.state.scan_cancel_event = None  # 13.18: asyncio.Event для отмены скана
+    # code-2026-09-25-022: generation-guard — зомби-_bg_scan (после stale-recovery)
+    # видит смену generation и пропускает терминальные write (done/audit/error),
+    # не перезаписывая запись НОВОГО скана.
+    app.state.scan_generation = 0
     logger.info("🔒 Heavy-ops lock + scan state initialized (phase 13.15+13.18+13.21+13.27)")
 
     # ── 13.27: Recovery персистентного состояния скана после рестарта ──
@@ -425,6 +429,8 @@ async def lifespan(app: FastAPI):
     app.state.import_task = None
     app.state.import_cancel_event = None
     app.state.import_queue: list[dict] = []  # ImportRecord[] — сессионная очередь
+    # code-2026-09-25-022 (N1): ref на convert-таск для orphan-lock guard
+    app.state.convert_task = None
     # code-2026-08-11-queue: лимит одновременных analyze-операций (P2-1, перегруз Ollama)
     app.state.analyze_semaphore = asyncio.Semaphore(3)
     logger.info("📦 Import queue state initialized (phase 13.21 + convert/analyze ops)")
@@ -927,7 +933,10 @@ async def start_convert(request: Request):
         logger.info("[CONVERT] lock busy — queued %s", import_id)
         return {"import_id": import_id, "status": "queued"}
 
-    asyncio.create_task(
+    # code-2026-09-25-022 (N1): ref на convert-таск для orphan-lock guard в
+    # _recover_stalled_scan — иначе orphan-ветка не отличит «lock держит convert»
+    # от «lock держит зависший скан» и освободит lock вслепую.
+    request.app.state.convert_task = asyncio.create_task(
         _bg_convert(
             import_id=import_id,
             pdf_path=pdf_path,

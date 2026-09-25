@@ -44,6 +44,8 @@ AUDIT_ACTIONS: frozenset[str] = frozenset({
     "scan_completed", "fp_rejection",
     # W4: курирование public-слоя (двухконтурная модель доступа)
     "set_zone",
+    # code-2026-09-25-022: stale-running recovery — durable evidence зависшего скана
+    "scan_stalled",
 })
 
 

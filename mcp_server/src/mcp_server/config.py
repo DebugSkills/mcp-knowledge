@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     # Quality (Фаза 4)
     QUALITY_DIR: str = "/app/data/quality"
 
+    # code-2026-09-25-022: stale-running detection — порог «нет heartbeat» (сек).
+    # 600 с = 10 мин ≈ 15× наблюдённого max inter-heartbeat (39 с) и ≈3.5× полного скана (170 с).
+    # <=0 → detection off (поведение = today: already_running без проверки stale).
+    SCAN_STALL_SECONDS: int = 600
+
     # Token store (W3, план two-zone-access §2.3) — SSOT токенов доступа.
     # TOKENS_DIR: паттерн QUALITY_DIR (pydantic-settings → env-override);
     # локально /app недоступен → тесты задают TokenStore(tokens_dir=...) или env.

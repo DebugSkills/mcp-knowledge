@@ -284,6 +284,31 @@ class ImportProgressTracker:
         except Exception:
             pass
 
+    def stall(self, import_id: str, reason: str) -> None:
+        """Пометить как зависший (code-2026-09-25-022, stale-running recovery).
+
+        Зеркало cancel(): status='error' (терминальное множество prune/TTL
+        уже включает error — progress.py:245), флаг ``stalled=True`` для
+        отличия stall от реального сбоя, лог, force-persist. Запись удаляется
+        ``prune_finished`` при старте следующего скана (quality.py:963);
+        durable-след остаётся в ``audit.jsonl`` (``scan_stalled``).
+
+        Args:
+            import_id: id зависшей записи скана.
+            reason: человекочитаемая причина (для messages + scan_state.json).
+        """
+        entry = self._ensure(import_id)
+        if entry is None:
+            return
+        try:
+            entry["status"] = "error"
+            entry["stalled"] = True
+            self.log(import_id, "error", reason)
+            self._touch(entry)
+            self.persist(force=True)
+        except Exception:
+            pass
+
     def get(self, import_id: Any) -> dict[str, Any] | None:
         """Получить снапшот прогресса (копия, с TTL-очисткой).
 
