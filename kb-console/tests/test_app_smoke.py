@@ -19,6 +19,7 @@ import time
 
 import httpx
 import pytest
+from _local_http import local_get  # 021: без env-прокси
 
 # Порт для smoke-тестов (избегаем конфликта с другими тестами).
 _SMOKE_PORT = 9877
@@ -74,7 +75,7 @@ def _wait_for_server(port: int, timeout: float = 15.0) -> None:
     while time.monotonic() < deadline:
         time.sleep(0.5)
         try:
-            r = httpx.get(f"http://localhost:{port}/status", timeout=3.0)
+            r = local_get(f"http://localhost:{port}/status", timeout=3.0)
             if r.status_code == 200:
                 return
         except httpx.HTTPError as e:
@@ -103,14 +104,14 @@ def test_root_redirects_to_status():
     _get_or_start_console()
     # NiceGUI @ui.page("/") с ui.navigate.to("/status") даёт HTML-страницу
     # (200), которая делает клиентский редирект. Проверяем, что / отвечает.
-    r = httpx.get(f"http://localhost:{_SMOKE_PORT}/", timeout=5.0, follow_redirects=False)
+    r = local_get(f"http://localhost:{_SMOKE_PORT}/", timeout=5.0, follow_redirects=False)
     assert r.status_code in (200, 302, 303, 307, 308), f"Root should respond: {r.status_code}"
 
 
 def test_status_page_200():
     """GET /status → 200 HTML."""
     _get_or_start_console()
-    r = httpx.get(f"http://localhost:{_SMOKE_PORT}/status", timeout=5.0)
+    r = local_get(f"http://localhost:{_SMOKE_PORT}/status", timeout=5.0)
     assert r.status_code == 200
     assert "<html" in r.text.lower()
 
@@ -118,7 +119,7 @@ def test_status_page_200():
 def test_books_page_200():
     """GET /books → 200 HTML."""
     _get_or_start_console()
-    r = httpx.get(f"http://localhost:{_SMOKE_PORT}/books", timeout=5.0)
+    r = local_get(f"http://localhost:{_SMOKE_PORT}/books", timeout=5.0)
     assert r.status_code == 200
     assert "<html" in r.text.lower()
 
@@ -126,7 +127,7 @@ def test_books_page_200():
 def test_import_page_200():
     """GET /import → 200 HTML."""
     _get_or_start_console()
-    r = httpx.get(f"http://localhost:{_SMOKE_PORT}/import", timeout=5.0)
+    r = local_get(f"http://localhost:{_SMOKE_PORT}/import", timeout=5.0)
     assert r.status_code == 200
     assert "<html" in r.text.lower()
 
@@ -134,7 +135,7 @@ def test_import_page_200():
 def test_search_page_200():
     """GET /search → 200 HTML."""
     _get_or_start_console()
-    r = httpx.get(f"http://localhost:{_SMOKE_PORT}/search", timeout=5.0)
+    r = local_get(f"http://localhost:{_SMOKE_PORT}/search", timeout=5.0)
     assert r.status_code == 200
     assert "<html" in r.text.lower()
 
@@ -142,7 +143,7 @@ def test_search_page_200():
 def test_books_page_survives_reload():
     """Reload /books → остаётся на /books (не редиректит на /status)."""
     _get_or_start_console()
-    r = httpx.get(f"http://localhost:{_SMOKE_PORT}/books", timeout=5.0)
+    r = local_get(f"http://localhost:{_SMOKE_PORT}/books", timeout=5.0)
     assert r.status_code == 200
     # Не должно быть редиректа
     assert not r.is_redirect

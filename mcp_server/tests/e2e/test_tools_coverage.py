@@ -300,7 +300,7 @@ async def test_s15_reindex_blue_green_false_via_http(e2e_http_app):
 
     # Step 4: Verify НЕТ knowledge_v1/v2 коллекций (blue_green=false не должен создавать)
     import httpx
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(trust_env=False) as c:  # 021: без env-прокси
         r = await c.get("http://localhost:6333/collections", timeout=5.0)
         collections_data = r.json()
         collection_names = [col["name"] for col in collections_data.get("result", {}).get("collections", [])]

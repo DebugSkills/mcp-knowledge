@@ -22,6 +22,7 @@ import time
 
 import httpx
 import pytest
+from _local_http import local_get  # 021: без env-прокси
 
 _SMOKE_PORT = 9878
 _PASSWORD = "test"
@@ -73,7 +74,7 @@ def _wait_for_server(port: int, timeout: float = 15.0) -> None:
     while time.monotonic() < deadline:
         time.sleep(0.5)
         try:
-            httpx.get(f"http://localhost:{port}/status", timeout=3.0)
+            local_get(f"http://localhost:{port}/status", timeout=3.0)
             return
         except httpx.HTTPError as e:
             last_exc = e
@@ -97,7 +98,7 @@ def _get_or_start_console() -> subprocess.Popen:
 def test_status_without_credentials_401():
     """GET /status без кредов → 401 + Basic-челлендж."""
     _get_or_start_console()
-    r = httpx.get(f"http://localhost:{_SMOKE_PORT}/status", timeout=5.0)
+    r = local_get(f"http://localhost:{_SMOKE_PORT}/status", timeout=5.0)
     assert r.status_code == 401
     assert r.headers.get("www-authenticate") == 'Basic realm="kb-console"'
 
@@ -105,7 +106,7 @@ def test_status_without_credentials_401():
 def test_status_with_credentials_200():
     """GET /status с верными кредами → 200 HTML."""
     _get_or_start_console()
-    r = httpx.get(
+    r = local_get(
         f"http://localhost:{_SMOKE_PORT}/status",
         auth=("", _PASSWORD),
         timeout=5.0,
@@ -117,14 +118,14 @@ def test_status_with_credentials_200():
 def test_nicegui_static_without_credentials_401():
     """Статика /_nicegui/* без кредов → 401 (JS-каркас за auth)."""
     _get_or_start_console()
-    r = httpx.get(f"http://localhost:{_SMOKE_PORT}/_nicegui/nicegui.js", timeout=5.0)
+    r = local_get(f"http://localhost:{_SMOKE_PORT}/_nicegui/nicegui.js", timeout=5.0)
     assert r.status_code == 401
 
 
 def test_socketio_polling_without_credentials_401():
     """socket.io-polling /_nicegui_ws/* без кредов → 401 (обход через polling закрыт)."""
     _get_or_start_console()
-    r = httpx.get(
+    r = local_get(
         f"http://localhost:{_SMOKE_PORT}/_nicegui_ws/socket.io/"
         "?EIO=4&transport=polling",
         timeout=5.0,

@@ -25,6 +25,17 @@ os.environ.setdefault("KNOWLEDGE_DIR", "/tmp/test-knowledge")
 os.environ.setdefault("DLQ_DIR", "/tmp/test-dlq")
 os.environ.setdefault("QUALITY_DIR", "/tmp/test-quality")
 
+# 021 (Block 1+, trace code-2026-09-25-021): локальные сервисы (Qdrant/Ollama)
+# не должны ходить через внешний HTTP(S)_PROXY. httpx по умолчанию читает env
+# (trust_env=True) — снятие NO_PROXY в shell/CI/air-gap уводит localhost на
+# прокси и даёт ConnectError [Errno 111] и ложные ошибки/skip. Гарантируем
+# localhost в NO_PROXY для процесса тестов (подпроцессы наследуют os.environ).
+_LOCAL_NO_PROXY = "localhost,127.0.0.1,::1"
+_existing_no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+_merged_no_proxy = ",".join(p for p in (_existing_no_proxy, _LOCAL_NO_PROXY) if p)
+os.environ["NO_PROXY"] = _merged_no_proxy
+os.environ["no_proxy"] = _merged_no_proxy
+
 from mcp_server.models import (
     KnowledgeEntry,
     KnowledgeFrontmatter,

@@ -94,20 +94,25 @@ def _e2e_services_available():
     """Skip-guard: проверяет доступность Qdrant REST + Ollama."""
     import httpx
 
+    # 021 (Block 1): проверки доступности — ТОЛЬКО напрямую к localhost.
+    # trust_env=False отключает чтение HTTP(S)_PROXY: иначе сбой/отсутствие
+    # NO_PROXY превращал живые сервисы в «недоступные» (fail-open skip e2e).
+    # Причина skip содержит класс исключения — прокси-ошибка отличима от
+    # «сервис не поднят».
     try:
-        r = httpx.get(f"{QDRANT_REST_URL}/collections", timeout=5.0)
+        r = httpx.get(f"{QDRANT_REST_URL}/collections", timeout=5.0, trust_env=False)
         r.raise_for_status()
-    except Exception:
-        pytest.skip("E2E requires Qdrant REST at localhost:6333")
+    except Exception as exc:
+        pytest.skip(f"E2E requires Qdrant REST at localhost:6333 ({type(exc).__name__}: {exc})")
 
     try:
-        r = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5.0)
+        r = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5.0, trust_env=False)
         r.raise_for_status()
         models = [m["name"] for m in r.json().get("models", [])]
         if not any(m.startswith(OLLAMA_MODEL) for m in models):
             pytest.skip(f"E2E requires Ollama model '{OLLAMA_MODEL}'")
-    except Exception:
-        pytest.skip(f"E2E requires Ollama at {OLLAMA_BASE_URL}")
+    except Exception as exc:
+        pytest.skip(f"E2E requires Ollama at {OLLAMA_BASE_URL} ({type(exc).__name__}: {exc})")
 
 
 # П-1 (code-2026-09-22-001): scope="package", НЕ session. Session-scope протекал:
