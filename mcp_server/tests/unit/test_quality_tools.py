@@ -67,6 +67,9 @@ def mock_app_state_with_settings():
     state.scan_progress = MagicMock()
     state.scan_id = None
     state.scan_task = None
+    # 023 Block C-2: heavy_lock_owner — явно None (иначе MagicMock auto-attr
+    # truthy ≠ "scan" → cancel-guard срабатывает ложно).
+    state.heavy_lock_owner = None
     return state
 
 

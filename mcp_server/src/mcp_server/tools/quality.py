@@ -1057,22 +1057,34 @@ async def _scan_stall_state(app_state, *, now: datetime | None = None) -> dict:
 
 
 def _has_live_heavy_task(app_state) -> bool:
-    """N1: есть ли живая тяжёлая задача (import/convert), держащая lock?
+    """N1: есть ли живая тяжёлая задача (import/convert/reconcile), держащая lock?
 
     ``asyncio.Lock`` не знает владельца, поэтому orphan-ветка не может
-    вслепую освободить lock — если держатель импорт/convert, новый скан
-    пойдёт параллельно тяжёлому op. Guard: проверяем import_task и
-    convert_task (N1 — добавлен ref в main.py:930).
+    вслепую освободить lock — если держатель импорт/convert/reconcile, новый
+    скан пойдёт параллельно тяжёлому op. Guard: проверяем import_task,
+    convert_task и reconcile_task (N1 — добавлен ref в main.py:930;
+    023 Block C-2 L4: +reconcile_task).
+
+    023 Block C-2 (L4): ``reconcile_task`` добавлен в проверяемый набор —
+    orphan-ветка не должна решить, что «тяжёлых задач нет», пока идёт
+    full-reconcile (держит тот же ``heavy_ops_lock``).
     """
-    for attr in ("import_task", "convert_task"):
+    for attr in ("import_task", "convert_task", "reconcile_task"):
         t = getattr(app_state, attr, None)
         if t is not None and not t.done():
             return True
     return False
 
 
-async def _recover_stalled_scan(app_state, state: dict) -> None:
+async def _recover_stalled_scan(app_state, state: dict) -> dict:
     """code-2026-09-25-022: восстановиться после зависшего скана.
+
+    023 Block C-2 (P2-B/P2-C): в самом верху — guard владельца лока.
+    Если ``heavy_lock_owner`` ≠ ``"scan"`` (лок удерживает reconcile/admin/
+    import/convert), recovery НЕ выполняется: живой тяжёлый op не должен
+    «восстанавливаться» как зависший скан (P1-2). Возвращает
+    ``{"recovered": False, ...}`` — вызывающий (``run_quality_scan``)
+    отдаёт честный ``already_running`` + ``lock_holder`` без дубль-скана.
 
     Шаги (атомарные — без await между reassign lock):
       (a) ``scan_progress.stall(old_id, reason)`` — терминальная запись
@@ -1087,9 +1099,28 @@ async def _recover_stalled_scan(app_state, state: dict) -> None:
       (f) ``scan_id = None``.
 
     N1 orphan-ветка: если ``state["orphan"]`` — release только при отсутствии
-    живых тяжёлых тасков (import/convert); иначе diagnostic-only (audit +
-    warning, без release — оператор должен разобраться вручную).
+    живых тяжёлых тасков (import/convert/reconcile); иначе diagnostic-only
+    (audit + warning, без release — оператор должен разобраться вручную).
+
+    Returns:
+        ``{"recovered": bool, "diagnostic": str|None, "lock_holder": str|None}``.
+        ``recovered=False`` — diagnostic-only (лок НЕ заменён, дубль-скан
+        не стартует); ``recovered=True`` — recovery выполнен.
     """
+    # 023 Block C-2 (P2-B): guard владельца — в САМОМ ВЕРХУ, ДО любых мутаций.
+    owner = getattr(app_state, "heavy_lock_owner", None)
+    if owner is not None and owner != "scan":
+        logger.warning(
+            "[SCAN-STALL] heavy lock owned by %r (scan_id=%s, age=%s, phase=%s) — "
+            "diagnostic-only, NO recovery (live heavy op holds lock)",
+            owner, state.get("scan_id"), state.get("age"), state.get("phase"),
+        )
+        return {
+            "recovered": False,
+            "diagnostic": f"heavy lock owned by {owner}",
+            "lock_holder": owner,
+        }
+
     old_id = state.get("scan_id") or "?"
     reason = state.get("reason") or "stale scan"
     is_orphan = state.get("orphan", False)
@@ -1122,11 +1153,15 @@ async def _recover_stalled_scan(app_state, state: dict) -> None:
     # N1: orphan-ветка — release только если нет живых тяжёлых тасков
     if is_orphan and _has_live_heavy_task(app_state):
         logger.warning(
-            "[SCAN-STALL] orphan lock for scan %s but live heavy task (import/convert) "
+            "[SCAN-STALL] orphan lock for scan %s but live heavy task (import/convert/reconcile) "
             "holds it — diagnostic-only, NO lock release (operator action required)",
             old_id,
         )
-        return  # без release — скан не стартует (already_running останется)
+        return {
+            "recovered": False,
+            "diagnostic": "orphan lock with live heavy task",
+            "lock_holder": owner,
+        }
 
     # (c) best-effort cancel живого scan_task
     task = getattr(app_state, "scan_task", None)
@@ -1152,6 +1187,7 @@ async def _recover_stalled_scan(app_state, state: dict) -> None:
         "[SCAN-STALL] recovered: old_scan=%s reason=%s orphan=%s gen=%d→%d lock_replaced=%s",
         old_id, reason, is_orphan, cur_gen, cur_gen + 1, not is_orphan or True,
     )
+    return {"recovered": True, "diagnostic": None, "lock_holder": None}
 
 
 async def run_quality_scan(params: dict, app_state) -> dict:
@@ -1182,14 +1218,28 @@ async def run_quality_scan(params: dict, app_state) -> dict:
             state = await _scan_stall_state(app_state)
             if not state["stalled"]:
                 # Свежий живой скан — отдаём already_running (AC-2)
+                # 023 Block C-2: +lock_holder (владелец маркера) + stalled
                 return {
                     "scanned": False,
                     "status": "already_running",
                     "scan_id": getattr(app_state, "scan_id", None),
+                    "lock_holder": getattr(app_state, "heavy_lock_owner", None),
+                    "stalled": False,
                 }
             # Stale → recovery (stall + audit + cancel + generation++ + замена lock)
             old_id = state.get("scan_id")
-            await _recover_stalled_scan(app_state, state)
+            recovery = await _recover_stalled_scan(app_state, state)
+            # 023 Block C-2 (P2-C): diagnostic-only — лок НЕ заменён.
+            # НЕ стартовать дубль-скан и НЕ врать started — честный
+            # already_running с lock_holder (владелец, предотвративший recovery).
+            if not recovery.get("recovered", True):
+                return {
+                    "scanned": False,
+                    "status": "already_running",
+                    "scan_id": old_id,
+                    "lock_holder": recovery.get("lock_holder"),
+                    "stalled": True,
+                }
             # P1-1 (блокер): ОБЯЗАТЕЛЬНО перечитать scan_lock после recovery —
             # _recover_stalled_scan заменил app_state.scan_lock на новый объект.
             # Без re-read локальная scan_lock (:941) ушла бы в _bg_scan (:987)
@@ -1269,19 +1319,41 @@ async def run_quality_scan(params: dict, app_state) -> dict:
 
 
 async def cancel_quality_scan(params: dict, app_state) -> dict:
-    """Отменить активный quality scan (13.18).
+    """Отменить активный quality scan (13.18 + 023 Block C-2 P2-4).
 
     Устанавливает scan_cancel_event → run_scan проверяет между фазами
     и возвращает частичные метрики. Lock освобождается автоматически
     при выходе из async with scan_state["lock"] в _bg_scan.
 
+    023 Block C-2 (P2-4/L9): честный ответ — если отменять нечего
+    (лок свободен ИЛИ владелец лока не ``"scan"``), вернуть
+    ``{"status": "no_scan", "cancelled": False, ...}`` вместо
+    ``cancelled=True``. Живой reconcile/admin/import под локом не
+    «отменяется» как несуществующий скан.
+
     Returns:
-        {"cancelled": True, "scan_id": "..."}  — отмена отправлена
-        {"cancelled": False, "reason": "no active scan"}  — нечего отменять
+        {"status": "cancelled", "cancelled": True, "scan_id": "..."}  — отмена отправлена
+        {"status": "no_scan", "cancelled": False, "reason": "no active scan"}  — лок свободен
+        {"status": "no_scan", "cancelled": False, "reason": "heavy op holds lock",
+         "lock_holder": "reconcile"}  — лок занят, но не сканом
     """
     scan_lock = getattr(app_state, "scan_lock", None)
     if scan_lock is None or not scan_lock.locked():
-        return {"cancelled": False, "reason": "no active scan"}
+        return {
+            "status": "no_scan",
+            "cancelled": False,
+            "reason": "no active scan",
+        }
+
+    # 023 Block C-2 (P2-4): владелец лока ≠ "scan" → отменять нечего.
+    owner = getattr(app_state, "heavy_lock_owner", None)
+    if owner is not None and owner != "scan":
+        return {
+            "status": "no_scan",
+            "cancelled": False,
+            "reason": "heavy op holds lock",
+            "lock_holder": owner,
+        }
 
     cancel_event = getattr(app_state, "scan_cancel_event", None)
     if cancel_event is None:
@@ -1292,6 +1364,7 @@ async def cancel_quality_scan(params: dict, app_state) -> dict:
     cancel_event.set()
     logger.info("Cancel signal sent for scan %s", getattr(app_state, "scan_id", "?"))
     return {
+        "status": "cancelled",
         "cancelled": True,
         "scan_id": getattr(app_state, "scan_id", None),
     }
