@@ -11,6 +11,7 @@ _OllamaAdapter duck-type под контракт pipeline (embed_sync) + search-
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 from pathlib import Path
@@ -410,6 +411,14 @@ async def e2e_http_app(real_qdrant, real_embedder, e2e_store, e2e_pipeline,
     # _build_toc кэш никогда не инвалидируется (getattr default 0 == 0).
     app.state.data_version = 0
 
+    # 023 Block C: heavy_ops_lock + маркер владельца — прод инициализирует их в
+    # lifespan (main.py), тулы (admin.reindex / quality-scan / writers) ждут
+    # await lock.acquire() и читают app_state.heavy_ops_lock. Без них admin
+    # честно отвечает {"status":"error","error":"heavy_ops_lock not initialized"}
+    # (регресс e2e s15 после 023-C-1b).
+    app.state.heavy_ops_lock = asyncio.Lock()
+    app.state.heavy_lock_owner = None
+
     # Ф0: settings для quality-сканера (KNOWLEDGE_DIR → изолированное хранилище).
     # Без этого run_quality_scan берёт None → fallback на прод /app/knowledge.
     # ВАЖНО: (1) Path, не str — scanner.py:74-77 оборачивает в Path ТОЛЬКО None,
@@ -433,7 +442,6 @@ async def e2e_http_app(real_qdrant, real_embedder, e2e_store, e2e_pipeline,
     app.state.rate_limiter = app.state.rate_limiter_read
 
     # 13.15: фоновый quality scan — lock/task/progress (для S9e health-during-scan)
-    import asyncio
 
     # code-2026-09-25-020: трекер строится ПРОД-фабрикой main.py — e2e-зеркало
     # не может разъехаться с продом (TTL/max_messages/persist_every).
