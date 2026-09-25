@@ -870,7 +870,14 @@ async def _bg_scan(
         )
 
     try:
-        async with scan_state["lock"]:
+        # 023 Block C-1b (§7.9-г): ручной acquire + owner "scan" +
+        # compare-and-clear в finally (вместо async with). _bg_scan —
+        # первичный держатель (recovery-цель), identity-check не нужен
+        # (waiter-протокол P1-3 применяется к reconcile/admin/writers).
+        await scan_state["lock"].acquire()
+        if app_state is not None:
+            app_state.heavy_lock_owner = "scan"
+        try:
             scan_progress.set_phase(scan_id, "scanning_fs", "Обход файлов...")
             metrics = await run_scan(
                 knowledge_dir=knowledge_dir,
@@ -937,6 +944,13 @@ async def _bg_scan(
                 logger.error(
                     "[AUTO-DEDUP] post-scan hook failed (scan result unaffected): %s", exc
                 )
+        finally:
+            # 023 Block C-1b (§7.9-г): compare-and-clear + release.
+            if app_state is not None and getattr(
+                app_state, "heavy_lock_owner", None
+            ) == "scan":
+                app_state.heavy_lock_owner = None
+            scan_state["lock"].release()
     except asyncio.CancelledError:
         logger.info("Background scan %s cancelled (shutdown)", scan_id)
         if not _generation_stale():

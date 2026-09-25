@@ -216,8 +216,30 @@ async def _bg_import(
                 rec.update(kwargs)
                 break
 
+    requeued = False  # 023 Block C-1b: skip temp-file cleanup if re-queued
     try:
-        async with lock:
+        # 023 Block C-1b (P1-4): ручной acquire + identity-check + owner.
+        # Фантомный лок (recovery 022 заменил O→N пока мы ждали) НЕ держим —
+        # запись возвращается в очередь, _start_next_import подхватит её
+        # с актуальным N (вызывается в outer finally).
+        try:
+            await asyncio.wait_for(
+                lock.acquire(), timeout=settings.RECONCILE_LOCK_WAIT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            _update_queue(status="queued")
+            requeued = True
+            return
+        # P1-3: identity-check — лок могли заменить recovery-путём 022.
+        if lock is not app_state.heavy_ops_lock:
+            lock.release()
+            _update_queue(status="queued")
+            requeued = True
+            return
+        # owner ПОСЛЕ identity-check (безусловный сет ДО запрещён — затирает
+        # маркер нового владельца).
+        app_state.heavy_lock_owner = "import"
+        try:
             _update_queue(status="running", phase="starting")
             _update_log(import_id, "info", "import started")
 
@@ -329,7 +351,11 @@ async def _bg_import(
                 "[IMPORT] done import=%s imported=%d failed=%d",
                 import_id, result.get("imported", 0), result.get("failed", 0),
             )
-
+        finally:
+            # 023 Block C-1b (§7.9-г): compare-and-clear + release.
+            if getattr(app_state, "heavy_lock_owner", None) == "import":
+                app_state.heavy_lock_owner = None
+            lock.release()
     except asyncio.CancelledError:
         logger.info("[IMPORT] task cancelled (shutdown): %s", import_id)
         _update_queue(status="cancelled", error="Server shutdown", collection_id="")
@@ -339,8 +365,9 @@ async def _bg_import(
         _update_queue(status="error", error=str(exc), collection_id="")
         _update_log(import_id, "error", f"error: {str(exc)[:250]}")
     finally:
-        # [P0-3] Cleanup temp file — only if in /tmp/ (server-owned temp files)
-        if source_path and _os.path.exists(source_path) and source_path.startswith("/tmp/"):
+        # [P0-3] Cleanup temp file — only if in /tmp/ (server-owned temp files).
+        # 023 Block C-1b: skip if re-queued (new _bg_import needs the file).
+        if not requeued and source_path and _os.path.exists(source_path) and source_path.startswith("/tmp/"):
             try:
                 _os.unlink(source_path)
                 logger.info("[IMPORT] temp file deleted: %s", source_path)
@@ -677,7 +704,21 @@ async def _bg_convert(
                 break
 
     try:
-        async with lock:
+        # 023 Block C-1b (P1-4): ручной acquire + identity-check + owner.
+        # Тот же протокол, что _bg_import/reconcile/admin.
+        try:
+            await asyncio.wait_for(
+                lock.acquire(), timeout=settings.RECONCILE_LOCK_WAIT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            _update_queue(status="error", error="heavy_ops_lock busy")
+            return
+        if lock is not app_state.heavy_ops_lock:
+            lock.release()
+            _update_queue(status="error", error="heavy lock replaced during wait")
+            return
+        app_state.heavy_lock_owner = "convert"
+        try:
             if cancel_event.is_set():
                 _update_queue(status="cancelled", error="Cancelled while queued")
                 _update_log(import_id, "error", "cancelled: while queued")
@@ -707,6 +748,11 @@ async def _bg_convert(
             _p(tracker, import_id, "done", result)
             _update_log(import_id, "info", f"done: {len(text):,} chars")
             logger.info("[CONVERT] done %s chars=%d", import_id, len(text))
+        finally:
+            # 023 Block C-1b (§7.9-г): compare-and-clear + release.
+            if getattr(app_state, "heavy_lock_owner", None) == "convert":
+                app_state.heavy_lock_owner = None
+            lock.release()
     except asyncio.CancelledError:
         _update_queue(status="cancelled", error="Server shutdown")
         _update_log(import_id, "error", "cancelled: server shutdown")

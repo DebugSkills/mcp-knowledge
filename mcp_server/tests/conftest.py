@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -379,8 +379,13 @@ def app_state(
     state.knowledge_index = mock_knowledge_index
     state.data_version = 0  # Task 1
     # scan_lock (for quality scan tests)
-    _scan_lock = MagicMock()
-    _scan_lock.locked.return_value = False
+    # 023: лок обязан быть awaitable (await lock.acquire()) — AsyncMock,
+    # при этом .locked остаётся MagicMock (идиома .locked.return_value
+    # используется другими тестами).
+    _scan_lock = AsyncMock()
+    _scan_lock.locked = MagicMock(return_value=False)
+    _scan_lock.acquire = AsyncMock(return_value=True)
+    _scan_lock.release = MagicMock()
     state.scan_lock = _scan_lock
     # 13.21: heavy_ops_lock alias
     state.heavy_ops_lock = _scan_lock

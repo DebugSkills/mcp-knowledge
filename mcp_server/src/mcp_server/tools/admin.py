@@ -25,6 +25,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+from ..config import settings
 from ..quality.audit import write_audit
 from ..quality.issues import list_issue_ids
 from ..storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
@@ -279,10 +280,46 @@ async def reindex(params: dict, app_state) -> dict:
     logger.info("reindex: starting full reindex (domain=%s, blue_green=%s)",
                  domain or "all", blue_green)
 
-    if blue_green:
-        result = await pipeline.reindex_blue_green()
-    else:
-        result = await pipeline.reindex_all()
+    # 023 Block C-1b (§7.9(а)): heavy_ops_lock для admin-reindex —
+    # bounded wait + identity-check (P1-3) + compare-and-clear owner.
+    # Протокол тот же, что в reconcile.py full-ветке и writer-путях.
+    lock = getattr(app_state, "heavy_ops_lock", None)
+    if lock is None:
+        return {"status": "error", "error": "heavy_ops_lock not initialized"}
+
+    lock_acquired = False
+    try:
+        try:
+            await asyncio.wait_for(
+                lock.acquire(),
+                timeout=settings.RECONCILE_LOCK_WAIT_SECONDS,
+            )
+            lock_acquired = True
+        except asyncio.TimeoutError:
+            # (б) Лок занят дольше таймаута → честная ошибка.
+            return {"status": "error", "error": "heavy_ops_lock busy"}
+
+        # P1-3: identity-check — лок могли заменить recovery-путём 022,
+        # пока мы ждали; acquire резолвится на СТАРОМ объекте.
+        if lock is not app_state.heavy_ops_lock:
+            lock.release()
+            lock_acquired = False
+            return {"status": "error", "error": "heavy lock replaced during wait"}
+
+        # (г) owner ПОСЛЕ identity-check (не до — иначе маркер фантомного
+        # лока искажает диагностику guard'а).
+        app_state.heavy_lock_owner = "admin_reindex"
+
+        if blue_green:
+            result = await pipeline.reindex_blue_green()
+        else:
+            result = await pipeline.reindex_all()
+    finally:
+        # (г) compare-and-clear — не затереть чужой маркер.
+        if lock_acquired:
+            if getattr(app_state, "heavy_lock_owner", None) == "admin_reindex":
+                app_state.heavy_lock_owner = None
+            lock.release()
 
     total_docs = result.get("total_docs", 0) or result.get("reindex_result", {}).get("total_docs", 0)
     total_chunks = result.get("total_chunks", 0) or result.get("reindex_result", {}).get("total_chunks", 0)
