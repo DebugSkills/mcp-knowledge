@@ -14,6 +14,13 @@
   become: true
 
   tasks:
+    # ─── preflight: инварианты корней данных (ДО любых изменений) ───
+    # Гейт против молчаливого раскола data-дерева: пустой/неабсолютный data_root или
+    # data_root внутри клона ⇒ `up` создал бы ВТОРУЮ базу. trace code-2026-09-25-023.
+    - name: "Preflight: корни данных (deploy_root/data_root, .env)"
+      tags: [preflight]
+      ansible.builtin.import_tasks: tasks/preflight_data_root.yml
+
     # ─── dirs: создание структуры каталогов deploy_root (бывшая роль mcp_kb_dirs) ───
     # Корень — {{ deploy_root }} из inventory/group_vars/all.yml (по умолчанию /opt/mcp-knowledge).
     #

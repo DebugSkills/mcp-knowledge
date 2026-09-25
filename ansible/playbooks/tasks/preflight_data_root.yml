@@ -1,0 +1,60 @@
+---
+# Preflight-инварианты корней данных (deploy.yml, fresh-install).
+#
+# Контракт DATA_ROOT (code-2026-09-22-002): данные живут в ОДНОМ дереве {{ data_root }},
+# ВНЕ git-клона. Пустой/неабсолютный data_root либо data_root внутри клона = молчаливый
+# раскол данных: `docker compose up` создал бы ВТОРУЮ базу, а клон и данные делили бы дерево
+# (пересоздание/очистка клона затронула бы Qdrant/Ollama/console). Аналогичный гейт на update
+# — P2-12 (update.yml: mount qdrant == data_root/qdrant).
+#
+# trace code-2026-09-25-023
+
+- name: "Preflight: deploy_root/data_root определены и абсолютны"
+  ansible.builtin.assert:
+    that:
+      - deploy_root is defined
+      - (deploy_root | string | length) > 0
+      - (deploy_root | string) is match('^/')
+      - data_root is defined
+      - (data_root | string | length) > 0
+      - (data_root | string) is match('^/')
+    fail_msg: >-
+      deploy_root/data_root не заданы или не абсолютны: deploy_root='{{ deploy_root | default('<undefined>') }}',
+      data_root='{{ data_root | default('<undefined>') }}'. Проверьте inventory хоста
+      {{ inventory_hostname }} (group_vars/all.yml: data_root = <deploy_root>/data).
+    success_msg: "deploy_root={{ deploy_root }} · data_root={{ data_root }}"
+    quiet: true
+
+- name: "Preflight: данные ВНЕ git-клона (клон и данные не делят дерево)"
+  ansible.builtin.assert:
+    that: >-
+      not (data_root | string ~ '/').startswith((deploy_root | string) ~ '/' ~ (repo_name | string) ~ '/')
+    fail_msg: >-
+      data_root ('{{ data_root }}') лежит ВНУТРИ git-клона ({{ deploy_root }}/{{ repo_name }}):
+      очистка/пересоздание клона затронет данные (Qdrant/Ollama/console). DATA_ROOT-контракт
+      требует дерево ВНЕ клона (code-2026-09-22-002).
+    quiet: true
+
+- name: "Preflight: найти существующий .env (rerun поверх живой инсталляции)"
+  ansible.builtin.stat:
+    path: "{{ deploy_root }}/{{ repo_name }}/.env"
+  register: preflight_env_file
+
+- name: "Preflight: .env → DATA_ROOT совпадает с inventory"
+  when: preflight_env_file.stat.exists
+  block:
+    - name: "Preflight: прочитать существующий .env"
+      ansible.builtin.slurp:
+        src: "{{ deploy_root }}/{{ repo_name }}/.env"
+      register: preflight_env_content
+
+    - name: "Preflight: DATA_ROOT в .env == inventory data_root"
+      ansible.builtin.assert:
+        that: >-
+          (preflight_env_content.content | b64decode)
+          is search('(?m)^DATA_ROOT=' ~ (data_root | regex_escape) ~ '\s*$')
+        fail_msg: >-
+          Существующий {{ deploy_root }}/{{ repo_name }}/.env содержит DATA_ROOT, отличный от inventory
+          ('{{ data_root }}'): compose смонтирует ДРУГОЕ дерево (раскол данных, ср. P2-12 update.yml).
+          Приведите .env и inventory к одному значению.
+        quiet: true
