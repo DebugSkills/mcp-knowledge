@@ -9,6 +9,7 @@
 # Гейты:
 #   G1  lint        ruff: src+tests обоих пакетов + tests/ + errors-скрипты
 #   G2  unit mcp    pytest mcp_server/tests (~1023; e2e-маркеры — по addopts)
+#   G2b e2e live    pytest mcp_server/tests/e2e -m e2e (нужен поднятый стек; иначе SKIP)
 #   G3  unit console pytest kb-console/tests (~258)
 #   G4  root tests  pytest tests/ (~50: errors_lib + E5-скан)
 #   G5  E5-отчёт    test_error_sources.py → COVERAGE OK (gap>0 → FAIL)
@@ -18,8 +19,8 @@
 #   G9  smoke E→R   errors_collect/report/prune на свежем temp-sink (нет docker → SKIP)
 #   G10 make         make -n prod-errors* (проброс не сломан)
 #
-# Флаги: --quick (G1+G4+G5+G10) · --full (+e2e и контейнерные test/lint при
-#        поднятом стеке) · --no-smoke (без G9) · --fail-fast · --help
+# Флаги: --quick (G1+G4+G5+G10) · --full (то же + e2e-slow) · --no-smoke
+#        (без G9) · --fail-fast · --help. G2 герметичен (без e2e), G2b — live e2e.
 # Выход: exit = число упавших гейтов (0 = зелёно). Никаких rm в репо:
 # temp-sink живёт в mktemp -d (системный /tmp, вне репозитория).
 
@@ -112,6 +113,14 @@ run_gate 1 "lint ruff" "$([ "$HAS_PY" = 1 ] && echo 0 || echo 1)" \
 if [ "$QUICK" = 0 ]; then
     run_gate 2 "unit mcp_server" "$([ "$HAS_PY" = 1 ] && echo 0 || echo 1)" \
         "$PY" -m pytest mcp_server/tests -q
+fi
+
+# ── G2b e2e live (default/full; нужен поднятый стек Qdrant+Ollama) ──
+# 021 (Block 2): addopts исключает e2e из G2 (герметичность) — покрытие e2e
+# сохраняется здесь; preflight — единственный авто-гейт в `make push`.
+if [ "$QUICK" = 0 ]; then
+    run_gate 2b "e2e live (Qdrant+Ollama)" "$([ "$HAS_PY" = 1 ] && [ "$STACK_UP" = 1 ] && echo 0 || echo 1)" \
+        "$PY" -m pytest mcp_server/tests/e2e -m "e2e and not e2e_slow" -q
 fi
 
 # ── G3 unit kb-console (default/full) ──

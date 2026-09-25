@@ -39,7 +39,10 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests/"]
-addopts = "--strict-markers -m 'not e2e_slow'"
+# 021 (trace code-2026-09-25-021, Block 2): дефолтный прогон ГЕРМЕТИЧЕН —
+# e2e (живые Qdrant/Ollama) исключены; их покрытие сохранено гейтом G2b
+# в scripts/preflight.sh и целью `make e2e`.
+addopts = "--strict-markers -m 'not e2e and not e2e_slow'"
 markers = [
     "e2e: end-to-end tests (require real Qdrant+Ollama)",
     "e2e_slow: slow E2E — not in default e2e run (только через `make e2e-slow`)",
