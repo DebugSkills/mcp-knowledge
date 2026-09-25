@@ -8,6 +8,7 @@
 import importlib.util
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -432,6 +433,105 @@ class TestRoutineClassification:
             ec.update_aggregates(sink, [_ev(expected=True, **ev_kw)], {})
             aggs = json.loads((sink / "aggregates" / "signatures.json").read_text())
             assert next(iter(aggs.values()))["priority"] != "P3"  # залипло
+
+
+# ── 018: канонический heartbeat `[CRON] job=<j> exit=0` (без dur/ts) ──
+
+
+def _fresh_cron_log(tmp_path, lines):
+    """cron-лог с динамическими ts (анти-time-bomb, урок 019) → события."""
+    now = datetime.now(timezone.utc)
+    rows = []
+    for i, (job, exit_code, dur) in enumerate(lines):
+        ts = (now - timedelta(minutes=10 - i)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        rows.append(f"[CRON] job={job} exit={exit_code} dur={dur} ts={ts}")
+    logf = tmp_path / "cron.log"
+    logf.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return ec.collect_cron_logs(tmp_path / "sink", {}, {"cron_logs": [str(logf)]})
+
+
+_spec_r = importlib.util.spec_from_file_location(
+    "errors_report", ROOT / "scripts" / "errors_report.py")
+er = importlib.util.module_from_spec(_spec_r)
+_spec_r.loader.exec_module(er)
+
+
+class TestCronHeartbeat018:
+    """018 (code-2026-09-25-018, §7.6): exit=0 → expected=True + канон."""
+
+    def test_t5_weekly_p12_excludes_heartbeat(self, tmp_path, capsys):
+        """018 T5: weekly p12 («Топ-10 P1/P2») НЕ содержит heartbeat; p3 — содержит.
+
+        Агрегаты на живом пути (collect_cron_logs → update_aggregates) +
+        чужая P2 вручную; выборка — настоящая cmd_weekly (p12 :273-275,
+        p3 :276-277). RED-мутация: expected=False на ингесте → heartbeat
+        станет P2 → попадёт в p12 → красный.
+        """
+        events = _fresh_cron_log(tmp_path, [("collector", 0, "0s"), ("collector", 0, "1s")])
+        assert len(events) == 2
+        ec.update_aggregates(tmp_path, events, {})
+        agg_path = tmp_path / "aggregates" / "signatures.json"
+        aggs = json.loads(agg_path.read_text())
+        canon = next(s for s in aggs if "job=collector" in s)
+        assert aggs[canon]["priority"] == "P3"  # предусловие живого пути
+        now = datetime.now(timezone.utc)
+        fresh = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        aggs["docker_logs|-|foreign p2 noise"] = {
+            "priority": "P2", "class": "U", "first_seen": fresh, "last_seen": fresh,
+            "count_total": 3, "daily": {now.strftime("%Y-%m-%d"): 3},
+            "actors": ["aaaa1111"], "sources": ["docker_logs"],
+            "last_example": {"ts": fresh, "message": "foreign-p2-marker"},
+            "status": "active", "fixed_at": None,
+        }
+        ec.atomic_write_json(agg_path, aggs)
+
+        er.cmd_weekly(tmp_path, False)
+        out = capsys.readouterr().out
+        sec3 = out.split("## 3.")[1].split("## 4.")[0]
+        sec4 = out.split("## 4.")[1].split("## 5.")[0]
+        assert "job=collector" not in sec3  # heartbeat НЕ в «Топ-10 P1/P2»
+        assert "job=collector" in sec4  # heartbeat в P3-baseline (живой пульс)
+        assert "foreign-p2-marker" in sec3  # чужая P2 осталась в топе
+
+    def test_t6_p28_anchor_survives_canonical_message(self, tmp_path):
+        """018 T6: P2-8 якорь — канонический `job=prod-update exit=0` (без
+        dur/ts) + docker restart в окне ±15 мин → restart expected=True.
+
+        RED-мутация: наивный фильтр exit=0 на ингесте (отклонённый вариант
+        B) → deploy_crons пуст → якорь потерян → красный.
+        """
+        cron_events = _fresh_cron_log(tmp_path, [("prod-update", 0, "90s")])
+        assert cron_events[0]["message"] == "[CRON] job=prod-update exit=0"  # канон
+        restart_ts = (datetime.now(timezone.utc) - timedelta(minutes=5)
+                      ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        restart = _ev(ts=restart_ts, source="docker_events", priority_hint="restart",
+                      message="docker event: restart container=x")
+        events = ec.mark_expected_restarts(cron_events + [restart])
+        assert events[-1]["expected"] is True  # плановый restart — НЕ P0
+
+    def test_t7_silent_active_key_stays_active(self, tmp_path):
+        """018 T7 (документирующий): замолчавший active-ключ БЕЗ событий в
+        цикле НЕ пересматривается — status остаётся active (ленивые статусы:
+        update_aggregates обходит только by_sig, resolve — внутри цикла).
+
+        Сид с last_seen 30d назад (заведомо за окном E4): будь пересмотр —
+        стал бы resolved. RED-мутация: глобальный stale-sweep в коллекторе
+        (пересмотр всех ключей каждый цикл) → статус resolved → красный.
+        """
+        old = (datetime.now(timezone.utc) - timedelta(days=30)
+               ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        seed_sig = "docker_logs|-|silent old key"
+        seed = {"priority": "P2", "class": "T", "first_seen": old, "last_seen": old,
+                "count_total": 5, "daily": {}, "actors": [], "sources": ["docker_logs"],
+                "last_example": None, "status": "active", "fixed_at": None}
+        ec.atomic_write_json(tmp_path / "aggregates" / "signatures.json", {seed_sig: seed})
+        # цикл с ЧУЖИМ событием (пустой батч = ранний return коллектора)
+        ec.update_aggregates(tmp_path, [_ev(marker="REQ", message="[REQ] GET /",
+                                            expected=True)], {})
+        aggs = json.loads((tmp_path / "aggregates" / "signatures.json").read_text())
+        assert seed_sig in aggs
+        assert aggs[seed_sig]["status"] == "active"  # замолчал — но не resolved
+        assert aggs[seed_sig]["last_seen"] == old  # last_seen заморожен
 
 
 # ── 015: durable-правило №1 — queue-overflow = ожидаемый backpressure ──

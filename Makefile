@@ -3,7 +3,7 @@ DATA_DIR := ../data
 KNOWLEDGE_DIR := ../knowledge
 MODELS_DIR := ../models_cache
 
-.PHONY: dev deploy down logs test lint clean dlq-replay reindex backup prereq-dirs errors-view errors-report errors-alert errors-notify-import errors-cron-install errors-cron-remove errors-cron-status
+.PHONY: dev deploy down logs test lint clean dlq-replay reindex backup prereq-dirs errors-view errors-report errors-alert errors-notify-import errors-cron-install errors-cron-remove errors-cron-status errors-cron-cleanup prod-errors-cron-cleanup
 
 # Проверка и создание необходимых директорий перед запуском
 prereq-dirs:
@@ -181,11 +181,14 @@ prod-errors-report:  ## Прод: weekly-отчёт 6 секций (+TG при T
 prod-errors-prune:  ## Прод: ретенция sink (dry-run; реальное удаление CONFIRM=--confirm)
 	$(MAKE) -C ansible errors-prune $(if $(CONFIRM),CONFIRM=$(CONFIRM))
 
+prod-errors-cron-cleanup:  ## Прод: 018 миграция legacy cron-ключей exit=0 из P2 (dry-run; CONFIRM=--confirm)
+	$(MAKE) -C ansible errors-cron-cleanup $(if $(CONFIRM),CONFIRM=$(CONFIRM))
+
 prod-errors-sources:  ## Прод: E5-проверка реестра охвата источников ошибок
 	$(MAKE) -C ansible errors-sources
 
-test-errors:  ## Error→Rule: юнит-тесты коллектора + гварда + sender/алертов + shell + E5-реестр (P2-9 008; P3-e 016)
-	.venv/bin/python -m pytest tests/test_error_sources.py tests/test_errors_lib.py tests/test_errors_guard.py tests/test_errors_notify.py tests/test_errors_alert.py tests/test_errors_shell.py -v
+test-errors:  ## Error→Rule: юнит-тесты коллектора + гварда + sender/алертов + shell + E5-реестр (P2-9 008; P3-e 016; T1-T8 018)
+	.venv/bin/python -m pytest tests/test_error_sources.py tests/test_errors_lib.py tests/test_errors_guard.py tests/test_errors_notify.py tests/test_errors_alert.py tests/test_errors_shell.py tests/test_errors_cron_cleanup.py -v
 
 # ─── TG-оповещения Error→Rule (code-2026-09-24-016) ───
 # Каналы: weekly-отчёт (Пн 10:02) + немедленные алерты new-P0/burst (*/5).
@@ -215,6 +218,9 @@ errors-cron-remove:  ## 016: снять cron-джобы 016 (обратимо; F
 
 errors-cron-status:  ## 016: статус cron-джоб 016 + config-оверлея (FILE=… модель)
 	bash scripts/errors_cron.sh --status $(if $(FILE),--file $(FILE))
+
+errors-cron-cleanup:  ## 018: миграция legacy cron-ключей exit=0 из P2-рейтинга (dry-run; CONFIRM=--confirm; SINK=…)
+	.venv/bin/python scripts/errors_cleanup_cron_legacy.py $(if $(CONFIRM),$(CONFIRM)) $(if $(SINK),--sink $(SINK))
 
 # ─── Storm-guard (code-2026-09-23-008): suppression-лист known-noise ───
 # Файл: $DATA_ROOT/logs/errors/suppression.json (в sink — вне клона, НЕ

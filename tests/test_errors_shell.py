@@ -604,6 +604,13 @@ class TestCollectCronLogsUnit:
         # повторный прогон: byte-offset дедуп — не дублирует
         again = mod.collect_cron_logs(sink, state, cfg)
         assert again == []
+        # 018 T4: агрегатный ассерт — exit≠0 → P0/T на живом пути
+        # (RED-мутация: убрать hint-путь cron_nonzero → P0-ассерт падает)
+        agg_sink = tmp_path / "agg"
+        mod.update_aggregates(agg_sink, events, {})
+        aggs = json.loads((agg_sink / "aggregates" / "signatures.json").read_text())
+        a = aggs[ev["signature"]]
+        assert (a["priority"], a["class"]) == ("P0", "T")
 
     def test_cron_exit_zero_not_collected(self, tmp_path):
         mod = self._mod()
@@ -617,6 +624,62 @@ class TestCollectCronLogsUnit:
         ev = events[0]
         assert ev["level"] == "INFO"  # exit=0 → INFO
         assert ev.get("priority_hint") is None  # БЕЗ P0-признака — алерты не триггерит
+        # 018 T1 (A+): exit=0 — heartbeat: expected=True + каноническое
+        # сообщение без dur/ts → ОДНА стабильная сигнатура на джобу.
+        # RED-мутации: убрать expected=heartbeat → падает expected-ассерт;
+        # вернуть полный line → падает сигнатурный ассерт.
+        assert ev["expected"] is True
+        assert ev["message"] == "[CRON] job=collector exit=0"
+        assert ev["signature"] == "cron_log|CRON|[CRON] job=collector exit=<n>"
+
+    def test_cron_exit_zero_canonical_single_signature(self, tmp_path):
+        """018 T3: две exit=0 строки с разными dur/ts → РОВНО одна сигнатура.
+
+        До 018 полная строка фрагментировалась (job×час×dur = отдельные
+        P2-ключи, чурн ~48/сутки); канонический heartbeat схлопывает их.
+        RED-мутация: полный line вместо канона → 2 сигнатуры → красный.
+        """
+        mod = self._mod()
+        logf = tmp_path / "collector.log"
+        logf.write_text(
+            "[CRON] job=collector exit=0 dur=0s ts=2026-09-25T01:00:00+00:00\n"
+            "[CRON] job=collector exit=0 dur=1s ts=2026-09-25T02:30:00+00:00\n",
+            encoding="utf-8")
+        sink = tmp_path / "sink"
+        sink.mkdir()
+        events = mod.collect_cron_logs(sink, {}, {"cron_logs": [str(logf)]})
+        assert len(events) == 2
+        assert {e["signature"] for e in events} == {
+            "cron_log|CRON|[CRON] job=collector exit=<n>"}
+
+    def test_cron_exit_zero_aggregate_is_p3_routine(self, tmp_path):
+        """018 T2: 2 exit=0 события → агрегат ("P3","T"), без has_non_routine.
+
+        «≥2 акторов ⇒ P1» к routine НЕ применяется (лестница: routine-ветка
+        раньше акторов) — проверяем инъекцией второго актора в ту же
+        сигнатуру (синтетика: канон содержит job ⇒ реально актор один).
+        RED-мутация: expected=False → ("P2",…) → красный.
+        Динамические ts (анти-time-bomb, урок 019) — E4-статус не зависит
+        от даты прогона.
+        """
+        import datetime as _dt
+        mod = self._mod()
+        fresh = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        logf = tmp_path / "collector.log"
+        logf.write_text(
+            f"[CRON] job=collector exit=0 dur=0s ts={fresh}\n"
+            f"[CRON] job=collector exit=0 dur=1s ts={fresh}\n",
+            encoding="utf-8")
+        events = mod.collect_cron_logs(tmp_path / "sink", {}, {"cron_logs": [str(logf)]})
+        events[1]["actor_id"] = "cron:alerts"  # синтетический 2-й актор
+        agg_sink = tmp_path / "agg"
+        mod.update_aggregates(agg_sink, events, {})
+        aggs = json.loads((agg_sink / "aggregates" / "signatures.json").read_text())
+        assert len(aggs) == 1
+        a = next(iter(aggs.values()))
+        assert (a["priority"], a["class"]) == ("P3", "T")
+        assert "has_non_routine" not in a
+        assert sorted(a["actors"]) == ["cron:alerts", "cron:collector"]
 
 
 # ── AC-host-3: jinja2-рендер errors-notify.json.j2 (без деплоя) ──

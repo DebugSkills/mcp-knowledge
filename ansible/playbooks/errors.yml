@@ -1,9 +1,10 @@
 ---
 # errors.yml — цикл Error→Rule на проде (Ф4, code-2026-09-22-003).
-# Теги (ровно один): setup | view | report | prune | sources
+# Теги (ровно один): setup | view | report | prune | cron_cleanup | sources
 #   make -C ansible errors                    # view: топ-сигнатуры sink (read-only)
 #   make -C ansible errors-report [TG=1]      # weekly-отчёт 6 секций (+TG если TG=1)
 #   make -C ansible errors-prune [CONFIRM=--confirm]   # ретенция (dry-run по умолчанию!)
+#   make -C ansible errors-cron-cleanup [CONFIRM=--confirm]  # 018: миграция legacy cron (dry-run!)
 #   make -C ansible errors-sources            # E5: проверка реестра охвата
 #
 # setup рендерит config.json (без секретов) + notify.json (bot_token из vault,
@@ -90,6 +91,20 @@
       tags: [prune]
       ansible.builtin.debug:
         var: prune_out.stdout_lines
+
+    # ════════════════════ cron_cleanup (018: миграция legacy cron-ключей) ════════════════════
+    - name: "Cron-cleanup: миграция legacy cron-ключей exit=0 из P2 (dry-run БЕЗ CONFIRM=--confirm)"
+      tags: [cron_cleanup]
+      ansible.builtin.command:
+        cmd: python3 {{ scripts }}/errors_cleanup_cron_legacy.py {{ cron_cleanup_confirm | default('') }} --sink {{ errors_sink }}
+      register: cron_cleanup_out
+      changed_when: "'CLEANED' in cron_cleanup_out.stdout"
+      failed_when: cron_cleanup_out.rc != 0  # rc=1 = невалидный JSON sink — стоп, а не тихий skip
+
+    - name: "Cron-cleanup: вывод"
+      tags: [cron_cleanup]
+      ansible.builtin.debug:
+        var: cron_cleanup_out.stdout_lines
 
     # ════════════════════ sources (E5, read-only) ════════════════════
     - name: "Sources: E5-проверка реестра охвата (скан кода клона; exit 1 = новый источник без строки)"

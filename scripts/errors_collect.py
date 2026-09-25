@@ -480,11 +480,20 @@ def collect_cron_logs(sink: Path, state: dict, cfg: dict):
             cron_m = CRON_LINE_RE.search(line)
             if cron_m:
                 job, exit_code = cron_m.group(1), int(cron_m.group(2))
+                # 018 (code-2026-09-25-018, A+): exit=0 — канонический
+                # heartbeat: expected=True → P3/T и ОДНА сигнатура на джобу
+                # (dur/ts не входят: deep_normalize не маскирует цифры в
+                # dur=0s/…T01: → чурн ~48 ключей/сутки). job= сохранён —
+                # regex P2-8 (:702) продолжает матчить успешный деплой.
+                # exit≠0 — байт-в-байт как раньше (полная строка → P0).
+                heartbeat = exit_code == 0
                 events.append(make_event(
-                    cron_m.group(4), "cron_log", line, level="INFO" if exit_code == 0 else "ERROR",
+                    cron_m.group(4), "cron_log",
+                    f"[CRON] job={job} exit=0" if heartbeat else line,
+                    level="INFO" if heartbeat else "ERROR",
                     marker="CRON", exit_code=exit_code,
-                    priority_hint=None if exit_code == 0 else "cron_nonzero",
-                    actor_id=f"cron:{job}",
+                    priority_hint=None if heartbeat else "cron_nonzero",
+                    actor_id=f"cron:{job}", expected=heartbeat,
                 ))
             elif re.search(r"\b(WARN|ERROR|CRITICAL|FAILED|Traceback)\b", line):
                 level = "CRITICAL" if "CRITICAL" in line else ("ERROR" if "ERROR" in line else "WARNING")

@@ -11,7 +11,7 @@ APB := ansible-playbook -i $(INVENTORY)
 .PHONY: deps test lint check run run-tag vault-create vault-edit \
         update update-check logs events health metrics stats \
         backup backup-verify restore \
-        errors errors-report errors-prune errors-sources
+        errors errors-report errors-prune errors-cron-cleanup errors-sources
 deps:
 	# --break-system-packages: Debian 12 PEP 668 (externally-managed); пакеты идут в ~/.local
 	python3 -m pip install --user --break-system-packages -r requirements.txt
@@ -98,6 +98,13 @@ errors-report:
 #   make errors-prune CONFIRM=--confirm   (плюс config.prune.enabled=true)
 errors-prune:
 	$(APB) playbooks/errors.yml --tags prune $(if $(CONFIRM),-e prune_confirm=$(CONFIRM))
+
+# 018: one-shot миграция legacy cron-ключей exit=0 (P2/active → DELETE с
+# backup; до деплоя фикса коллектора бессмысленна — legacy-ключи плодятся).
+# Dry-run по умолчанию; применение и порядок (deploy → dry-run → confirm →
+# срез AC1) — см. scripts/errors_cleanup_cron_legacy.py docstring.
+errors-cron-cleanup:
+	$(APB) playbooks/errors.yml --tags cron_cleanup $(if $(CONFIRM),-e cron_cleanup_confirm=$(CONFIRM))
 
 # E5: проверка реестра охвата (новый источник без строки → COVERAGE FAIL).
 errors-sources:

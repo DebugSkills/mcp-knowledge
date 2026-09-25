@@ -47,7 +47,7 @@
 | class:access_4xx_5xx | uvicorn-access 4xx/5xx (2xx/3xx не пишутся — поток проб) | sink: errors_collect.py ACCESS_RE | covered |
 | class:mcp_hang | `[MCP] tool=X start` без `ok` за окно 30 мин (инцидент 2026-08-06) | sink: errors_collect.py detect_hangs (hint=hang → P0) | covered |
 | class:auth | [AUTH]-класс (захватывается, baseline P3 — пересмотр Q3 trace 002) | sink: errors_collect.py capture-first; отображение P3 | covered |
-| class:cron_exit | `[CRON] job=<name> exit=<N> dur=<s>` от cron_wrap.sh | sink: errors_collect.py collect_cron_logs (exit≠0 → P0) | covered |
+| class:cron_exit | `[CRON] job=<name> exit=<N> dur=<s>` от cron_wrap.sh | sink: errors_collect.py collect_cron_logs (exit=0 → expected=True + канонический heartbeat-msg `[CRON] job=<name> exit=0` → P3-baseline, 018; exit≠0 → P0 без изменений) | covered |
 | class:health_probe | health-пробы коллектора (4×/5 мин, P3-baseline) | sink: errors_collect.py collect_health | covered |
 
 ## Контейнеры (docker logs + docker events)
@@ -109,6 +109,7 @@
 | script:errors_notify_import.sh | sudo-helper notify.json 0600 из /etc/backup-status.env (016, руками оператора) | sink: — | gap: self — имя отсутствующей переменной в stderr (без значений, R5), не в sink |
 | script:errors_cron.sh | cron-инсталлятор 3 джоб 016 (--install/--remove/--status, R8-валидация до записи) | sink: — | gap: self — валидационные отказы в stderr, не в sink; сам НЕ в crontab |
 | script:errors_prune.py | prune (ручной/make, dry-run-first) | sink: — | gap: self — вывод только в stdout/stderr |
+| script:errors_cleanup_cron_legacy.py | 018: one-shot миграция legacy cron-ключей exit=0 (make errors-cron-cleanup / prod-errors-cron-cleanup) | sink: — | gap: self — ручной пост-деплой шаг; backup в .trash/, dry-run по умолчанию |
 | script:errors_guard.py | write-side гвард (cap/burst) + suppression-CLI | sink: — | gap: self — сам не источник; решения оператора → sink/suppression.json + audit.jsonl |
 
 ## Известные дыры (честный бэклог, канон §9)
@@ -265,7 +266,13 @@ weekly `2 10 * * 1` **`--weekly --send-tg`** (Д5: без `--weekly`
 только внутри weekly-режима, отчёт не уходил бы никогда; эталон —
 `ansible/playbooks/errors.yml:71`). Все
 обёрнуты `cron_wrap.sh` → `[CRON] job=… exit=…` строки (exit≠0 → P0-признак
-`cron_nonzero`, см. class:cron_exit выше). R8: пути абсолютные + `cd BASE`,
+`cron_nonzero`, см. class:cron_exit выше; exit=0 → канонический
+heartbeat-msg `[CRON] job=<name> exit=0` — dur/ts в сигнатуру/сообщение
+НЕ входят: одна сигнатура на джобу, P3-baseline, 018; длительность видна
+только в исходном cron-лог-файле). Legacy-ключи полной строки (до 018,
+P2/active) убираются one-shot миграцией `make errors-cron-cleanup` /
+`prod-errors-cron-cleanup` (dry-run; `CONFIRM=--confirm`, backup в
+`.trash/`, идемпотентно). R8: пути абсолютные + `cd BASE`,
 валидация ДО записи (кривой блок → crontab не тронут). Config-оверлей:
 `cron_logs` += 3 наших лога в `$DATA_ROOT/logs/errors/config.json`
 (union, чужие сохраняются, бэкап старого в `.trash/`). Повторный `--install`
