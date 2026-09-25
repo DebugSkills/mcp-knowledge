@@ -212,10 +212,14 @@ class IndexingPipeline:
                 if chunks:
                     # delete-before-upsert: идемпотентность + защита от гонки
                     # с параллельным write той же записи (R2).
+                    # Зональный контракт (live-дефект 2026-09-26): прод-клиент
+                    # ТРЕБУЕТ явное имя коллекции (qdrant_client._require_collection);
+                    # резолвим алиас зоны так же, как это делает _index_chunks.
+                    collection = collection_for_zone(entry.frontmatter.zone)
                     await loop.run_in_executor(
-                        None, self._qdrant.delete_by_knowledge_id, kid
+                        None, self._qdrant.delete_by_knowledge_id, kid, collection
                     )
-                    await self._index_chunks(entry, chunks, collection_name=None)
+                    await self._index_chunks(entry, chunks, collection_name=collection)
                     total_chunks += len(chunks)
                 total_docs += 1
             except Exception as e:  # noqa: BLE001

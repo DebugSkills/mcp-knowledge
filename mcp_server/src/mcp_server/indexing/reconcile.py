@@ -131,10 +131,14 @@ async def reconcile(
     # 023-B: вместо set[str] собираем dict[kid → updated_at_str|None],
     # чтобы в цикле presence детектировать updated_at-дрейф (§7.8).
     qdrant_meta: dict[str, str | None] = {}
+    # 2026-09-26: kid → набор зон, где он найден (нужно orphan-удалению:
+    # прод-клиент требует явную коллекцию, qdrant_client._require_collection).
+    qdrant_zones: dict[str, set[str]] = {}
     for zone in (ZONE_PUBLIC, ZONE_PRIVATE):
         for kid, upd in qdrant.get_knowledge_updated_at(
             collection_name=collection_for_zone(zone)
         ).items():
+            qdrant_zones.setdefault(kid, set()).add(zone)
             if kid in qdrant_meta:
                 # коллизия ключей между зонами (kid глобально уникален, но
                 # легаси-точки возможны) — max по нормализованному datetime
@@ -308,7 +312,14 @@ async def reconcile(
         loop = asyncio.get_running_loop()
         for kid in orphan_ids:
             try:
-                await loop.run_in_executor(None, qdrant.delete_by_knowledge_id, kid)
+                # Зональный контракт (live-дефект 2026-09-26): коллекция
+                # обязательна; зона известна из scroll-обхода (legacy-коллизии —
+                # удаляем во всех зонах, где видели kid; no-op безопасен).
+                for zone in sorted(qdrant_zones.get(kid) or {ZONE_PRIVATE}):
+                    await loop.run_in_executor(
+                        None, qdrant.delete_by_knowledge_id, kid,
+                        collection_for_zone(zone),
+                    )
                 result.deleted_orphans += 1
             except Exception as e:
                 msg = f"Failed to delete orphan {kid}: {e}"

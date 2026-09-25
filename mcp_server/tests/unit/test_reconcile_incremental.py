@@ -21,6 +21,7 @@ from mcp_server.indexing.pipeline import IndexingPipeline
 from mcp_server.indexing.reconcile import reconcile
 from mcp_server.models import Chunk, KnowledgeEntry, KnowledgeFrontmatter
 from mcp_server.storage.schema import (
+    COLLECTION_PRIVATE,
     ZONE_PRIVATE,
     ZONE_PUBLIC,
     collection_for_zone,
@@ -71,6 +72,10 @@ class FakeQdrant:
         return result
 
     def upsert_points(self, points, collection_name: str | None = None):
+        # 2026-09-26: как прод — коллекция обязательна (live-дефект
+        # "collection_name is required", который мок-пайплайн маскировал).
+        if collection_name is None:
+            raise ValueError("collection_name is required")
         self.upsert_calls.append({
             "collection": collection_name,
             "points": list(points),
@@ -86,6 +91,8 @@ class FakeQdrant:
                     self._ids.add(kid)
 
     def delete_by_knowledge_id(self, knowledge_id: str, collection_name: str | None = None):
+        if collection_name is None:
+            raise ValueError("collection_name is required")
         self.delete_calls.append(knowledge_id)
         self._points_by_kid.pop(knowledge_id, None)
         # НЕ удаляем из _ids — presence-check по knowledge_id; delete только
@@ -597,7 +604,7 @@ class _Point:
 
 
 def _seed(qdrant: FakeQdrant, kid: str, upd: str | None) -> None:
-    qdrant.upsert_points([_Point(kid, upd)])
+    qdrant.upsert_points([_Point(kid, upd)], collection_name=COLLECTION_PRIVATE)
 
 
 def _spy_pipeline(pipeline):
