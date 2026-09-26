@@ -49,7 +49,7 @@ from errors_collect import (  # sibling-импорт по прецеденту e
     load_json,
     parse_ts,
 )
-from errors_guard import load_suppression
+from errors_guard import audit_event, load_suppression
 from errors_notify import log_tg_error, notify_ready, send_telegram
 
 EPOCH0 = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -226,9 +226,66 @@ def run_alerts(sink, send_tg=False, chat=None, host=None, dry_run=False, now=Non
     return 0
 
 
+# 028-B: канонический стаб aggregates (errors_collect.py:792-799) — для создания
+# отсутствующей половины при resolve (N-1c: скелет обязан проходить реальные
+# update_aggregates и classify_weekly без KeyError).
+AGG_STUB = {"priority": "P2", "class": "T", "count_total": 0, "daily": {},
+            "actors": [], "sources": [], "last_example": None,
+            "status": "active", "fixed_at": None}
+
+
+def resolve_sig(sink, sig, reason=None, actor=None, dry_run=False) -> int:
+    """028-B: пометить сигнатуру «исправлено» НЕМЕДЛЕННО (не ждать E4-тишину).
+
+    Пишет ОБЕ половины (N-1: иначе classify_weekly вернёт regressed и обнулит
+    fixed_at). Цель ищется в любом файле; отсутствующая половина создаётся по
+    канонам. exit: 0 — применено/no-op, 1 — сигнатуры нет ни в одном файле.
+    """
+    agg_path = sink / "aggregates" / "signatures.json"
+    alert_path = sink / "alert_state.json"
+    aggs = load_json(agg_path, {})
+    alert = load_json(alert_path, {})
+    in_agg, in_alert = sig in aggs, sig in alert
+    if not in_agg and not in_alert:
+        print(f"resolve: сигнатура не найдена ни в aggregates, ни в alert_state: {sig[:110]}")
+        near = [k for k in list(aggs) + list(alert) if sig[:8] in k][:5]
+        if near:
+            print("  похожие:")
+            for k in near:
+                print(f"    {k[:110]}")
+        return 1
+    now = _iso(_now())
+    a = aggs.get(sig) or dict(AGG_STUB, first_seen=now, last_seen=now)
+    st = alert.get(sig) or {
+        "first_seen": a.get("first_seen") or now, "last_seen": a.get("last_seen") or now,
+        "last_reported_week": None, "status": "new", "reported_by_user": False,
+        "fixed_at": None, "investigating": False, "cooldown_until": None,
+    }
+    was = (a.get("status"), st.get("status"))
+    if was == ("resolved", "resolved") and a.get("fixed_at") and st.get("fixed_at"):
+        print(f"resolve: no-op — уже resolved (fixed_at={st.get('fixed_at')}): {sig[:110]}")
+        return 0
+    if dry_run:
+        print(f"resolve (DRY-RUN): {sig[:110]} — было {was} → станет resolved")
+        return 0
+    a["status"], a["fixed_at"] = "resolved", now
+    st["status"], st["fixed_at"] = "resolved", now
+    st["resolve_reason"], st["resolved_by"] = reason, actor or "operator"
+    aggs[sig], alert[sig] = a, st
+    atomic_write_json(agg_path, aggs)    # B-7: сначала aggregates, затем alert
+    atomic_write_json(alert_path, alert)
+    audit_event(sink, "resolve", sig, reason, None, actor or "operator")
+    print(f"resolved: {sig[:110]} (было {was} → resolved, fixed_at={now})")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Error→Rule: немедленные алерты new-P0/burst (+TG)")
     ap.add_argument("--sink", default=None, help="override каталога sink (dev/фикстуры)")
+    ap.add_argument("--resolve", default=None, metavar="SIG",
+                    help="028-B: пометить сигнатуру исправленной (resolved + fixed_at, обе половины)")
+    ap.add_argument("--reason", default=None, help="причина resolve (пишется в alert_state/audit)")
+    ap.add_argument("--actor", default=None, help="кто зафиксировал (по умолчанию operator)")
     ap.add_argument("--send-tg", action="store_true", help="отправить алерты в TG (best-effort)")
     ap.add_argument("--chat", default=None, help="override chat_id (ручной запас)")
     ap.add_argument("--host", default=None, help="override host-тега источника (дельта 3)")
@@ -236,6 +293,9 @@ def main(argv=None):
                     help="план алертов без отправки и без записи стейта (HITL)")
     args = ap.parse_args(argv)
     sink = Path(args.sink) if args.sink else DATA_ROOT / "logs" / "errors"
+    if args.resolve:  # B-5: ветка resolve — ВЫХОД до run_alerts (алерты не отправляем)
+        return resolve_sig(sink, args.resolve, reason=args.reason, actor=args.actor,
+                           dry_run=args.dry_run)
     try:
         return run_alerts(sink, send_tg=args.send_tg, chat=args.chat,
                           host=args.host, dry_run=args.dry_run)

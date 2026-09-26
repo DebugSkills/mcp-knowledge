@@ -233,6 +233,11 @@ def _audit(sink, action, sig, reason, until, actor) -> None:
                            ensure_ascii=False) + "\n")
 
 
+# 028-B5: публичное имя для переиспользования (resolve в errors_alert.py).
+# Приватное `_audit` сохранено как алиас — обратная совместимость тестов/вызовов.
+audit_event = _audit
+
+
 def cli_add(sink, sig, reason, until, actor) -> int:
     data = load_suppression(sink)
     data[sig] = {"reason": reason, "until": until, "added_at": now_iso(),

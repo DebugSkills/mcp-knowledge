@@ -234,6 +234,9 @@ errors-guard-add:  ## Гвард: заглушить ТОЧНУЮ сигнату
 errors-guard-remove:  ## Гвард: снять глушение (SIG=…)
 	.venv/bin/python scripts/errors_guard.py remove "$(SIG)"
 
+errors-resolve:  ## 028-B: пометить сигнатуру исправленной (SIG=… [REASON=…] [ACTOR=…] [DRY=1])
+	.venv/bin/python scripts/errors_alert.py --resolve "$(SIG)" $(if $(REASON),--reason "$(REASON)") $(if $(ACTOR),--actor "$(ACTOR)") $(if $(DRY),--dry-run)
+
 errors-guard-list:  ## Гвард: показать suppression-лист (+истёкшие)
 	.venv/bin/python scripts/errors_guard.py list
 

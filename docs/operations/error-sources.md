@@ -105,7 +105,7 @@
 | script:errors_collect.py | сам коллектор (cron */5) | sink: — | gap: self — анти-рекурсия (P2-2); stderr → mcp-errors-collect.log с ротацией |
 | script:errors_report.py | weekly-отчёт (ручной/make) | sink: — | gap: self — свои ошибки в reports/tg-errors.log + stderr, не в sink |
 | script:errors_notify.py | общий TG-sender (016: weekly+алерты) | sink: — | gap: self — ошибки доставки → reports/tg-errors.log (маскировка <token>/<proxy>), не в sink |
-| script:errors_alert.py | немедленные алерты new-P0/burst (016, cron */5) | sink: — | gap: self — анти-шторм/skip-решения → reports/tg-errors.log + stdout, не в sink |
+| script:errors_alert.py | немедленные алерты new-P0/burst (016, cron */5) + **`--resolve SIG`** 028-B (немедленная фиксация: обе половины + audit) | sink: — | gap: self — анти-шторм/skip-решения → reports/tg-errors.log + stdout, не в sink |
 | script:errors_notify_import.sh | sudo-helper notify.json 0600 из /etc/backup-status.env (016, руками оператора) | sink: — | gap: self — имя отсутствующей переменной в stderr (без значений, R5), не в sink |
 | script:errors_cron.sh | cron-инсталлятор **4 джоб** (016 + prune 028-A: Пн 10:33) (--install/--remove/--status, R8-валидация до записи) | sink: — | gap: self — валидационные отказы в stderr, не в sink; сам НЕ в crontab |
 | script:errors_prune.py | prune: ретенция + истечение «мёртвых» сигнатур (ручной/make + **cron Пн 10:33** 028-A; dry-run-first, kill-switch, внутренний flock `.prune.lock` — N-3b) | sink: — | gap: self — вывод только в stdout/stderr |

@@ -442,3 +442,139 @@ class TestInjectedClockStamps:
         assert run(sink) == 0
         st = json.loads((sink / "alert_state.json").read_text())
         assert st["_alerts_meta"]["last_run"] == ISO
+
+
+# ══ 028-B: resolve (немедленная фиксация) + правило ручной фиксации в weekly ══
+
+_RSIG = "docker_logs|TEST|028-resolve"
+
+
+def _iso(days_ago=0.0):
+    return (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+
+
+def _load_collect():
+    spec = importlib.util.spec_from_file_location(
+        "errors_collect_028b", ROOT / "scripts" / "errors_collect.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def _alert_known(days_last=3.0):
+    return {"status": "known", "first_seen": _iso(9), "last_seen": _iso(days_last),
+            "last_reported_week": None, "reported_by_user": False, "fixed_at": None,
+            "investigating": False, "cooldown_until": None}
+
+
+class TestResolve:
+    """028-B: `--resolve` фиксирует «исправлено» немедленно — обе половины (N-1)."""
+
+    def test_resolve_alert_only_creates_aggregates_half(self, tmp_path, sender):
+        """N-1/N-1c: цель только в alert_state (живой кейс: 2 таких сигнатуры) →
+        создаётся half по канонам; скелет проходит classify_weekly и
+        update_aggregates без KeyError (S6/S7 критики)."""
+        sink = mk_sink(tmp_path, aggs={}, alert_state={_RSIG: _alert_known()})
+        rc = ea.main(["--sink", str(sink), "--resolve", _RSIG,
+                      "--reason", "исправлено вручную", "--actor", "orchestrator"])
+        assert rc == 0
+        al = json.loads((sink / "alert_state.json").read_text())
+        ag = json.loads((sink / "aggregates" / "signatures.json").read_text())
+        assert al[_RSIG]["status"] == "resolved" and al[_RSIG]["fixed_at"]
+        assert al[_RSIG]["resolved_by"] == "orchestrator"
+        assert al[_RSIG]["resolve_reason"] == "исправлено вручную"
+        assert ag[_RSIG]["status"] == "resolved" and ag[_RSIG]["fixed_at"]  # N-1
+        assert sender.calls == []  # B-5: выход до run_alerts (ничего не отправлено)
+        res = er.classify_weekly(ag, al)  # N-1c: ключи first/last_seen на месте
+        assert [s for s, _ in res["resolved"]] == [_RSIG]
+        ec = _load_collect()
+        ev = {"signature": _RSIG, "ts": _iso(0), "source": "docker_logs",
+              "message": "boom", "priority_hint": "ERROR", "expected": False}
+        ec.update_aggregates(sink, [ev], ec.load_config(sink))  # N-1c: daily/count_total
+
+    def test_resolve_survives_real_weekly_after_fix(self, tmp_path):
+        """N-1 ядро: resolve → weekly-прогон не переводит в regressed/known."""
+        sink = mk_sink(tmp_path, aggs={}, alert_state={_RSIG: _alert_known()})
+        ea.main(["--sink", str(sink), "--resolve", _RSIG, "--reason", "fixed"])
+        ag = json.loads((sink / "aggregates" / "signatures.json").read_text())
+        al = json.loads((sink / "alert_state.json").read_text())
+        res = er.classify_weekly(ag, al)
+        assert [s for s, _ in res["resolved"]] == [_RSIG], res
+        assert al[_RSIG]["status"] == "resolved" and al[_RSIG]["fixed_at"]
+
+    def test_resolve_then_recurrence_becomes_regressed(self, tmp_path):
+        """B-3: реальные новые события после resolve ⇒ weekly = regressed."""
+        sink = mk_sink(tmp_path, aggs={}, alert_state={_RSIG: _alert_known()})
+        ea.main(["--sink", str(sink), "--resolve", _RSIG, "--reason", "fixed"])
+        ec = _load_collect()
+        ev = {"signature": _RSIG, "ts": _iso(0), "source": "docker_logs",
+              "message": "boom again", "priority_hint": "ERROR", "expected": False}
+        ec.update_aggregates(sink, [ev], ec.load_config(sink))
+        ag = json.loads((sink / "aggregates" / "signatures.json").read_text())
+        al = json.loads((sink / "alert_state.json").read_text())
+        res = er.classify_weekly(ag, al)
+        assert [s for s, _ in res["regressed"]] == [_RSIG], (res, ag[_RSIG], al[_RSIG])
+
+    def test_resolve_idempotent_keeps_fixed_at(self, tmp_path):
+        """N-1d/F4: повторный вызов при обеих resolved = no-op (fixed_at не перезаписан)."""
+        sink = mk_sink(tmp_path, aggs={}, alert_state={_RSIG: _alert_known()})
+        ea.main(["--sink", str(sink), "--resolve", _RSIG, "--reason", "fixed"])
+        first = json.loads((sink / "alert_state.json").read_text())[_RSIG]["fixed_at"]
+        rc = ea.main(["--sink", str(sink), "--resolve", _RSIG, "--reason", "fixed again"])
+        assert rc == 0
+        after = json.loads((sink / "alert_state.json").read_text())[_RSIG]["fixed_at"]
+        assert after == first, "028-N-1d: no-op не должен перезаписывать fixed_at"
+
+    def test_resolve_unknown_sig_exit1(self, tmp_path):
+        sink = mk_sink(tmp_path, aggs={}, alert_state={})
+        rc = ea.main(["--sink", str(sink), "--resolve", "нет-такой-сигнатуры", "--reason", "x"])
+        assert rc == 1
+
+    def test_resolve_writes_audit(self, tmp_path):
+        sink = mk_sink(tmp_path, aggs={}, alert_state={_RSIG: _alert_known()})
+        ea.main(["--sink", str(sink), "--resolve", _RSIG, "--reason", "fix",
+                 "--actor", "orchestrator"])
+        audit = (sink / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+        recs = [json.loads(x) for x in audit]
+        assert any(r["action"] == "resolve" and r["sig"] == _RSIG
+                   and r["actor"] == "orchestrator" and r["reason"] == "fix" for r in recs), recs
+
+    def test_resolve_dry_run_writes_nothing(self, tmp_path):
+        sink = mk_sink(tmp_path, aggs={}, alert_state={_RSIG: _alert_known()})
+        before = (sink / "alert_state.json").read_text()
+        rc = ea.main(["--sink", str(sink), "--resolve", _RSIG, "--reason", "x", "--dry-run"])
+        assert rc == 0
+        assert (sink / "alert_state.json").read_text() == before
+        assert not (sink / "aggregates" / "signatures.json").read_text().strip() not in ("{}", "")
+
+
+class TestManualResolveRule:
+    """028-B-2: `(manual or not age7)` — resolve выживает, рецидив НЕ маскируется (N-1b)."""
+
+    def test_manual_resolve_survives_weekly_with_fresh_last_seen(self):
+        ts = _iso(1)  # ОДНА метка: resolve ставит fixed_at ПОЗЖЕ last_seen последнего события
+        aggs = {_RSIG: {"status": "resolved", "fixed_at": ts, "last_seen": ts,
+                        "first_seen": _iso(10), "count_total": 0, "daily": {}}}
+        alert = {_RSIG: {"status": "resolved", "fixed_at": ts, "last_seen": ts,
+                         "first_seen": _iso(10), "resolved_by": "orchestrator",
+                         "resolve_reason": "fix"}}
+        res = er.classify_weekly(aggs, alert)
+        assert [s for s, _ in res["resolved"]] == [_RSIG], res  # без правила было бы known
+
+    def test_manual_resolve_does_not_mask_recurrence(self):
+        aggs = {_RSIG: {"status": "resolved", "fixed_at": _iso(3), "last_seen": _iso(2),
+                        "first_seen": _iso(10), "count_total": 0, "daily": {}}}
+        alert = {_RSIG: {"status": "resolved", "fixed_at": _iso(3), "last_seen": _iso(2),
+                         "first_seen": _iso(10), "resolved_by": "orchestrator",
+                         "resolve_reason": "fix"}}
+        res = er.classify_weekly(aggs, alert)
+        assert [s for s, _ in res["regressed"]] == [_RSIG], res
+
+    def test_e4_recurrence_marks_regressed(self):
+        """E4 обнулил fixed_at в aggregates, alert помнит resolved ⇒ regressed."""
+        aggs = {_RSIG: {"status": "active", "fixed_at": None, "last_seen": _iso(0.2),
+                        "first_seen": _iso(10), "count_total": 1, "daily": {}}}
+        alert = {_RSIG: {"status": "resolved", "fixed_at": _iso(3), "last_seen": _iso(0.2),
+                         "first_seen": _iso(10), "resolved_by": "orchestrator"}}
+        res = er.classify_weekly(aggs, alert)
+        assert [s for s, _ in res["regressed"]] == [_RSIG], res

@@ -118,7 +118,11 @@ def classify_weekly(aggs, alert):
             age7, fresh = True, True
         fixed_at = a.get("fixed_at")
         regressed_now = bool(fixed_at and a["last_seen"] > fixed_at and age7)
-        if a.get("status") == "resolved" and not age7 and not regressed_now:
+        # 028-B2: ручная фиксация (resolve) ослабляет ТОЛЬКО требование age7;
+        # рецидив (not regressed_now / ветвь elif) не переопределяется — иначе
+        # вернувшаяся ошибка маскировалась бы под resolved (N-1b).
+        manual = bool(st.get("resolved_by") or st.get("resolve_reason"))
+        if a.get("status") == "resolved" and not regressed_now and (manual or not age7):
             status, st["fixed_at"] = "resolved", fixed_at or a["last_seen"]
         elif regressed_now or (st.get("fixed_at") and a.get("status") == "active"
                                and st.get("status") == "resolved"):
