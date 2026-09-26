@@ -24,6 +24,15 @@
 	}
 }
 
+# Удобный вход: http://<LAN_IP>/ → редирект на https://…:8443.
+# Порт 80 служит ТОЛЬКО редиректом (никакой аутентификации и контента по http),
+# иначе оператор, набравший адрес без схемы, получил бы ошибку Caddy.
+# bind ограничивает листенер LAN-интерфейсом (не все сети хоста).
+http://{$CONSOLE_LAN_IP} {
+	bind {$CONSOLE_LAN_IP}
+	redir https://{$CONSOLE_LAN_IP}:8443{uri} permanent
+}
+
 https://{$CONSOLE_LAN_IP}:8443 {
 	tls internal
 

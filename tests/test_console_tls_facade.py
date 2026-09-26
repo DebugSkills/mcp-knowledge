@@ -99,6 +99,21 @@ class TestCaddyfile:
         lines = _effective_lines(CADDYFILE.read_text(encoding="utf-8"))
         assert "auto_https disable_redirects" in [line.strip() for line in lines]
 
+    def test_http_port_only_redirects_not_proxies(self) -> None:
+        """Порт 80 — только редирект на HTTPS (для набравших адрес без схемы).
+
+        Ключевой инвариант безопасности: по открытому http консоль НЕ проксируется
+        (иначе Basic-пароль в cleartext и обход TLS-модели).
+        """
+        text = CADDYFILE.read_text(encoding="utf-8")
+        http_site, _, _ = text.partition("https://{$CONSOLE_LAN_IP}:8443 {")
+        assert "http://{$CONSOLE_LAN_IP} {" in http_site, "нет http-сайта для редиректа"
+        assert "redir https://{$CONSOLE_LAN_IP}:8443{uri}" in http_site
+        assert "bind {$CONSOLE_LAN_IP}" in http_site, "http-листенер должен быть ограничен LAN-IP"
+        assert "reverse_proxy" not in http_site, (
+            "консоль нельзя проксировать по открытому http — пароль ушёл бы в cleartext"
+        )
+
     def test_admin_api_off(self) -> None:
         assert any(
             line.strip() == "admin off"
