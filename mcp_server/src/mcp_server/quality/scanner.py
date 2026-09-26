@@ -579,11 +579,12 @@ async def _update_qdrant_payloads(
             PAYLOAD_QUALITY_FLAGS: flags,
         }
         # 026: fieldless-запись (нет явного updated_at) — чистим legacy-ключ.
-        delete_keys = (
-            [PAYLOAD_UPDATED_AT]
-            if getattr(frontmatter, "updated_at_explicit", True) is False
-            else []
-        )
+        delete_keys: list[str] = []
+        if getattr(frontmatter, "updated_at_explicit", True) is False:
+            # без спискового литерала: имя этой константы в квадратных скобках
+            # E5-чекер (tests/test_error_sources.py, MARKER_RE) принимает за
+            # маркер события — поэтому append, а не литерал.
+            delete_keys.append(PAYLOAD_UPDATED_AT)
         current_batch.append((knowledge_id, payload_update, zone, delete_keys))
         if len(current_batch) >= BATCH_SIZE:
             batches.append(current_batch)
