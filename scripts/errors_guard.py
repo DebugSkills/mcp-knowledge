@@ -87,7 +87,7 @@ def _suppression_active(entry, today) -> bool:
 
 # ── Burst-детектор «×N за 5 мин» (§7.3, пробел «б») ──
 
-def detect_bursts(full_counts, burst_state, cfg, now=None):
+def detect_bursts(full_counts, burst_state, cfg, now=None, routine_sigs=None):
     """Полный поток цикла → ([GUARD]-маркеры, burst_delta жертвам).
 
     Мутирует burst_state[sig] = {history≤12, state, last_fire_ts,
@@ -95,6 +95,11 @@ def detect_bursts(full_counts, burst_state, cfg, now=None):
     (mean_prev ≥ 1 И count ≥ burst_ratio × mean_prev). Held — маркер не
     дублируется, burst_ts не обновляется; спад ≥1 цикл → re-armed; новое
     срабатывание — только после кулдана 24 цикла (анти-флаппинг).
+
+    029-A4: routine_sigs (optional) — сигнатуры, чьи события все expected=True.
+    Routine-шторм → маркер-литерал ``[GUARD] burst_routine: …`` с
+    priority_hint="burst_routine" (→ P2/T, не P1/TG). Error-шторм — путь
+    hint="burst" без изменений. Поле ``routine`` сохраняется в burst_delta.
     """
     g = cfg.get("guard") or {}
     burst_abs = int(g.get("burst_abs", 50))
@@ -102,6 +107,7 @@ def detect_bursts(full_counts, burst_state, cfg, now=None):
     window = int(g.get("burst_window_cycles", 12))
     ttl_days = int(g.get("state_ttl_days", 7))
     now = now or now_iso()
+    routine_sigs = routine_sigs or set()
     markers, burst_delta = [], {}
     for sig in sorted(full_counts):
         count = full_counts[sig]
@@ -121,13 +127,23 @@ def detect_bursts(full_counts, burst_state, cfg, now=None):
         elif threshold:  # armed | re-armed: кулдаун — гейт нового срабатывания
             since = st.get("cycles_since_fire")
             if since is None or since >= GUARD_COOLDOWN_CYCLES:
-                markers.append(make_event(
-                    now, "guard", f"[GUARD] burst: {sig[:120]} count={count}/5min (threshold)",
-                    level="ERROR", marker="GUARD", priority_hint="burst",
-                ))
+                routine = bool(sig in routine_sigs)
+                if routine:
+                    markers.append(make_event(
+                        now, "guard",
+                        f"[GUARD] burst_routine: {sig[:120]} count={count}/5min (threshold)",
+                        level="ERROR", marker="GUARD", priority_hint="burst_routine",
+                    ))
+                else:
+                    markers.append(make_event(
+                        now, "guard",
+                        f"[GUARD] burst: {sig[:120]} count={count}/5min (threshold)",
+                        level="ERROR", marker="GUARD", priority_hint="burst",
+                    ))
                 st["state"], st["last_fire_ts"] = "fired", now
                 st["cycles_since_fire"] = 0
-                burst_delta[sig] = {"burst_ts": now, "burst_count_5m": count}
+                burst_delta[sig] = {"burst_ts": now, "burst_count_5m": count,
+                                    "routine": routine}
                 fired = True
             else:
                 st["state"] = "held"  # порог есть, кулдаун не прошёл
@@ -178,9 +194,17 @@ def apply_write_guard(events, state, cfg, suppression=None, now=None):
     now = now or now_iso()
     # burst считает ПОЛНЫЙ поток (до гварда) — иначе гвард съест свой сигнал
     full_counts = {}
+    # 029-A1: routine_sigs — сигнатуры, чьи события все expected=True
+    # (сгруппированы по сигнатуре для detect_bursts).
+    sig_events = {}
     for ev in events:
-        full_counts[ev["signature"]] = full_counts.get(ev["signature"], 0) + 1
-    markers, burst_delta = detect_bursts(full_counts, state.setdefault("burst", {}), cfg, now)
+        sig = ev["signature"]
+        full_counts[sig] = full_counts.get(sig, 0) + 1
+        sig_events.setdefault(sig, []).append(ev)
+    routine_sigs = {sig for sig, evs in sig_events.items()
+                    if all(e.get("expected", False) for e in evs)}
+    markers, burst_delta = detect_bursts(full_counts, state.setdefault("burst", {}),
+                                         cfg, now, routine_sigs=routine_sigs)
     suppression = suppression or {}
     today = now[:10]
     cap = int(g.get("cap_per_minute", 5))

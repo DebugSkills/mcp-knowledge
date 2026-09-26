@@ -136,6 +136,8 @@
 |---|---|---|
 | cap/sampling | 5 событий/60 с на сигнатуру (минутные ведра ts-based) | сверх — НЕ пишется в raw: `suppressed_pending` переносится в следующее разрешённое событие (`suppressed_count`+`sampled=true`), `suppressed_total/suppressed_daily` — в агрегат немедленно; `count_total/daily` = полный поток |
 | burst-детектор | ≥50/цикл(5 мин) ИЛИ ×10 к среднему за 12 циклов (~1 ч) | маркер `[GUARD]` (P1, `priority_hint=burst`) + жертве `burst/burst_ts/burst_count_5m`; эскалация P2/P3→P1 sticky в окне 7d (декей), re-arm после спада с кулдауном 24 цикла; БЕЗ немедленных алертов (M7 weekly-only) |
+| burst-детектор — **routine-ветвь** (029-A) | тот же порог, но все события цикла `expected=True` | маркер-литерал `[GUARD] burst_routine:` (`priority_hint=burst_routine` → **P2/T**, НЕ P1/TG) + жертве `burst_routine`; окно 7d → P2 всегда (P0 не понижается), истекло → `priority_base` (нет базы → skip); отчёт метит `[P2/routine]`; TG не рождается (`kind=burst` требует P0/P1) |
+| `exit_codes` (029-B) | гистограмма кодов выхода cron в агрегате (инкремент, cap top-8 + `__other__`, `-1`→`__unknown__`) | weekly-строка «коды: 5×1, 1×137» + короткий суффикс в alert-тексте; величина `exit=1/137/255` больше не теряется |
 | suppression-лист | ключ = ТОЛЬКО точная сигнатура | файл `sink/suppression.json` (НЕ рендерится ansible); `until` опционален |
 
 **Иммунитет-матрица (никогда не глушится автоматикой):** 4xx-с-актором
@@ -315,7 +317,9 @@ fail-word-гард `AUDIT_FAIL_RE` по `low`, прецедент ERRORS_QUERY 0
 **Эскалация устойчивого backpressure — ТОЛЬКО** через burst-гвард 008
 (`[GUARD]` → P1/T sticky 7d) или 503-readiness; routine-класс сам не
 эскалирует (рост неделя-к-неделе для routine приоритет не поднимает — класс
-ожидаем). Наблюдаемость: counter `mcp_pipeline_backpressure_total` в `/metrics`
+ожидаем). С 029-A routine-шторм виден как **P2** (`[GUARD] burst_routine:` /
+`[P2/routine]` в weekly) — видимость без TG; «тишина по нагрузке» не
+гарантируется (OQ-5): повышение до P1 — действием оператора. Наблюдаемость: counter `mcp_pipeline_backpressure_total` в `/metrics`
 (Б-минимум, решение оператора OQ-2; текст WARNING не меняется — часть
 сигнатуры) + `/health` queue_size/max/utilization. Дрейф текста источника
 поймает t1-литерал (`tests/test_errors_lib.py`,

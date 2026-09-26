@@ -60,6 +60,21 @@ def _ep_top(a, top=3):
                   key=lambda kv: (-kv[1], kv[0]))[:top]
 
 
+def _pri_label(a) -> str:
+    """029-A5: метка приоритета с routine-суффиксом — ``P2/routine`` если
+    burst_routine, иначе просто priority. Используется в fmt_list и burst-подсекции."""
+    pri = a.get("priority")
+    if a.get("burst_routine"):
+        return f"{pri}/routine"
+    return pri
+
+
+def _exit_codes_top(a, top=3):
+    """029-B2: топ-3 exit_codes сигнатуры — [(code, n)], count desc, key asc."""
+    return sorted((a.get("exit_codes") or {}).items(),
+                  key=lambda kv: (-kv[1], kv[0]))[:top]
+
+
 def cmd_view(sink, top):
     aggs = load_aggregates(sink)
     if not aggs:
@@ -320,8 +335,13 @@ def cmd_weekly(sink, send_tg):
                 top_eps = _ep_top(a)
                 if top_eps:
                     ep_part = " · ep: " + ", ".join(f"{k}×{v}" for k, v in top_eps)
-            lines.append(f"- [{a.get('priority')}] 7d={a.get('count_7d', 0)}{sup_part} "
-                         f"actors={','.join(a.get('actors', [])[:2]) or '-'} — {ex}{ep_part}")
+            # 029-B2: суффикс топ-3 exit_codes — «коды: 5×1, 1×137» (за всё время)
+            ec_part = ""
+            top_codes = _exit_codes_top(a)
+            if top_codes:
+                ec_part = " · коды: " + ", ".join(f"{v}×{k}" for k, v in top_codes)
+            lines.append(f"- [{_pri_label(a)}] 7d={a.get('count_7d', 0)}{sup_part} "
+                         f"actors={','.join(a.get('actors', [])[:2]) or '-'} — {ex}{ep_part}{ec_part}")
         return lines or ["- (пусто)"]
 
     L = []
@@ -367,8 +387,9 @@ def cmd_weekly(sink, send_tg):
     L.append("### Burst-инциденты за 7d ([GUARD]-гвард)")
     if bursts:
         for s, a in bursts[:10]:
+            # 029-A5: [P2/routine] в burst-подсекции (по burst_routine)
             L.append(f"- burst_ts={str(a['burst_ts'])[:16]} count_5m={a.get('burst_count_5m')} "
-                     f"7d={a.get('count_7d', 0)} [{a.get('priority')}] — {s[:120]}")
+                     f"7d={a.get('count_7d', 0)} [{_pri_label(a)}] — {s[:120]}")
     else:
         L.append("- (пусто)")
     L.append("")

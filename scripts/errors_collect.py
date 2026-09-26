@@ -60,6 +60,11 @@ CRON_LINE_RE = re.compile(r"\[CRON\] job=(\S+) exit=(\d+) dur=(\S+) ts=(\S+)")
 UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
 HEX16_RE = re.compile(r"\b[0-9a-f]{16,}\b", re.IGNORECASE)
 PATH_RE = re.compile(r"(?<![\w./-])/(?:[\w.-]+/)*[\w.-]+")
+# 029-C1: ISO-таймстемпы маскируются ДО DUR_RE/NUM_RE. Причина (трасса 029):
+# `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}...` не покрывается NUM_RE (цифры
+# склеены с T/Z/+) ⇒ у падения cron — новый ключ каждый час (56 живых ключей:
+# 27 агрегатов + 29 alert_state). Склейка → <ts> даёт одну сигнатуру на джобу.
+ISO_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?")
 # 027-D1: длительности маскируются ДО NUM_RE. Причина (трасса 027): `\b\d+\b`
 # не захватывает цифры, склеенные с единицей после десятичной точки
 # («7.8s»→«<n>.8s», «85.209578ms»→«<n>.209578ms») ⇒ одна сигнатура распадалась
@@ -83,6 +88,7 @@ P0_HINTS = frozenset(
 BASELINE_4XX = frozenset({401, 403, 404, 429})
 DAILY_KEEP_DAYS = 21  # окно расчёта роста неделя-к-неделе + запас
 ENDPOINTS_KEEP = 20  # 009: cap ключей endpoints в агрегате (хвост → __others__)
+EXIT_CODES_KEEP = 8  # 029-B1: cap ключей exit_codes в агрегате (хвост → __other__)
 
 
 def now_iso() -> str:
@@ -119,16 +125,19 @@ def mask_secrets(text: str) -> str:
 
 
 def deep_normalize(text: str) -> str:
-    """Нормализация сигнатуры (E2, порядок фиксирован; изменён трассой 027):
-    key-hash → uuid → hex≥16 → пути → **длительности** → числа → пробелы.
+    """Нормализация сигнатуры (E2, порядок фиксирован; изменён трассами 027/029):
+    key-hash → uuid → hex≥16 → пути → **ISO-ts** → длительности → числа → пробелы.
     key=<hex> схлопывается ПЕРВЫМ: актор не входит в
     сигнатуру (иначе разные акторы = разные сигнатуры = P1 «≥2 акторов» не
     сработает; канон §9: нормализация идентификаторов дала 171→47 сигнатур).
+    ISO_TS_RE идёт ПЕРЕД DUR_RE/NUM_RE (029-C1): иначе цифры, склеенные с T/Z/+,
+    выживают ⇒ часовой чурн ключей cron-падений.
     DUR_RE идёт ПЕРЕД NUM_RE (027-D1): иначе дробная часть с единицей выживает."""
     text = re.sub(r"\bkey=[0-9a-f]{4,64}\b", "key=<key>", text, flags=re.IGNORECASE)
     text = UUID_RE.sub("<uuid>", text)
     text = HEX16_RE.sub("<hex>", text)
     text = PATH_RE.sub("<path>", text)
+    text = ISO_TS_RE.sub("<ts>", text)
     text = DUR_RE.sub("<dur>", text)
     text = NUM_RE.sub("<n>", text)
     return WS_RE.sub(" ", text).strip()
@@ -757,6 +766,64 @@ def mark_expected_restarts(events, window_min: int = 15):
 
 # ── Агрегат E3 (приоритет сигнатуры — агрегатный, замороженный словарь) ──
 
+def _bump_exit_codes(a: dict, evs) -> None:
+    """029-B1: инкремент гистограммы exit_codes в агрегате (за всё время).
+
+    Для каждого события с exit_code is not None: ключ ``"__unknown__"`` если
+    int(exit_code) == -1, иначе ``str(int(exit_code))``. Cap top-8 по
+    (-count, key); хвост → ``"__other__"`` с суммой (по образцу merge endpoints).
+    """
+    codes = a.get("exit_codes") or {}
+    for e in evs:
+        ec = e.get("exit_code")
+        if ec is None:
+            continue
+        try:
+            key = "__unknown__" if int(ec) == -1 else str(int(ec))
+        except (TypeError, ValueError):
+            key = "__unknown__"
+        codes[key] = codes.get(key, 0) + 1
+    if len(codes) > EXIT_CODES_KEEP:
+        ranked = sorted(codes.items(), key=lambda kv: (-kv[1], kv[0]))
+        codes = dict(ranked[:EXIT_CODES_KEEP])
+        codes["__other__"] = codes.get("__other__", 0) + sum(
+            n for _, n in ranked[EXIT_CODES_KEEP:])
+    if codes:
+        a["exit_codes"] = codes
+
+
+def _apply_burst_priority(aggregates, now) -> None:
+    """029-A3/F2-3: burst-пост-шаг — честный декей приоритета.
+
+    В окне 7d от burst_ts:
+      • routine (burst_routine=True) → P2 всегда (в т.ч. если base=P1);
+        P0 не понижается (проверка по текущему priority).
+      • не-routine / флаг отсутствует → P1 (как было — I1); P0/P1 не трогаем.
+    Окно истекло:
+      • priority_base есть → вернуть base;
+      • priority_base отсутствует → SKIP (не None, без исключений — N-3).
+    """
+    for a in aggregates.values():
+        if not (a.get("burst") and a.get("burst_ts")):
+            continue
+        try:
+            age_s = (now - parse_ts(a["burst_ts"])).total_seconds()
+        except ValueError:
+            continue
+        cur = a.get("priority")
+        if age_s <= 7 * 86400:
+            if a.get("burst_routine"):
+                if cur != "P0":
+                    a["priority"] = "P2"
+            else:
+                if cur not in ("P0", "P1"):
+                    a["priority"] = "P1"
+        else:
+            if "priority_base" in a:
+                a["priority"] = a["priority_base"]
+            # else: SKIP — самолечение циклом с событиями (N-3)
+
+
 def update_aggregates(sink: Path, events, cfg: dict,
                       suppressed_delta=None, burst_delta=None):
     """Инкремент aggregates/signatures.json; resolved = last_seen старше окна E4 (7d).
@@ -808,6 +875,14 @@ def update_aggregates(sink: Path, events, cfg: dict,
                 a["has_non_routine"] = True
             routine_all = (not a.get("has_non_routine")
                            and all(e.get("expected", False) for e in evs))
+            # 029-A1/F2-2: однократный бэкфилл burst_routine — ТОЛЬКО внутри
+            # if evs: (живые жертвы самолечатся на первом цикле с событиями).
+            # Критерий — ВСЕ события ЦИКЛА expected (не routine_all!): routine_all
+            # включает залипший lifetime-флаг has_non_routine (GIN: 14 129
+            # пред-D2 событий) ⇒ GIN навсегда остался бы P1 (AC-1 GIN-only).
+            # При отсутствии событий флаг не пересчитывается (в окне сохраняется).
+            if a.get("burst") and "burst_routine" not in a:
+                a["burst_routine"] = all(e.get("expected", False) for e in evs)
             a["last_seen"] = max(e["ts"] for e in evs)
             a["actors"] = sorted(set(a.get("actors", [])) | actors)[:50]
             a["sources"] = sorted(set(a.get("sources", [])) | {e["source"] for e in evs})
@@ -828,6 +903,8 @@ def update_aggregates(sink: Path, events, cfg: dict,
                     n for _, n in ranked[ENDPOINTS_KEEP:])
             if eps:
                 a["endpoints"] = eps
+            # 029-B1: гистограмма exit_codes (инкремент, cap top-8 + __other__)
+            _bump_exit_codes(a, evs)
         # инкременты: события + suppressed-дельта — ПОЛНАЯ правда о частоте (P2-new-1)
         a["daily"][day] = a["daily"].get(day, 0) + len(evs) + delta
         for d in [d for d in a["daily"] if d < cutoff]:
@@ -857,6 +934,10 @@ def update_aggregates(sink: Path, events, cfg: dict,
             elif slow:
                 # D1: '[MCP] … ok <ms ≥ slow_ms>' — реальная аномалия (не рутина и не P2)
                 a["priority"], a["class"], a["slow"] = "P1", "U", True
+            # 029-A4/I3: аддитивная ветвь — routine-шторм → P2/T (до error-burst).
+            # priority_hint="burst_routine" — литерал, НЕ в P0_HINTS (A4/OQ4).
+            elif any(h == "burst_routine" for h, _ in hints):
+                a["priority"], a["class"] = "P2", "T"
             elif any(h == "burst" for h, _ in hints):
                 # 008: [GUARD]-маркер с ЯВНЫМ priority_hint="burst" → P1/T (P2-5)
                 a["priority"], a["class"] = "P1", "T"
@@ -872,12 +953,17 @@ def update_aggregates(sink: Path, events, cfg: dict,
             else:
                 a["priority"] = "P2"
                 a["class"] = "U" if a["actors"] else "T"
+            # 029-A2: priority_base — снимок приоритета из лестницы (для декея).
+            a["priority_base"] = a["priority"]
         # 008 (P1-1): жертва burst-эскалации получает burst_ts + burst_count_5m
         b = burst_delta.get(sig)
         if b:
             a["burst"] = True
             a["burst_ts"] = b.get("burst_ts")
             a["burst_count_5m"] = b.get("burst_count_5m")
+            # 029-A1: сохраняем флаг routine в момент срабатывания (из guard).
+            if "routine" in b:
+                a["burst_routine"] = bool(b.get("routine"))
         # E4: resolved = тишина ≥ окна; рецидив — last_seen обновится, report пометит regressed
         if a["status"] == "active" and (now - parse_ts(a["last_seen"])).days >= e4_days:
             a["status"], a["fixed_at"] = "resolved", a["last_seen"]
@@ -885,17 +971,8 @@ def update_aggregates(sink: Path, events, cfg: dict,
             a["status"] = "active"  # рецидив в окне наблюдения
             a["fixed_at"] = None
         aggregates[sig] = a
-    # 008 (P1-1): burst-пост-шаг КАЖДЫЙ цикл после замороженной лестницы —
-    # sticky-эскалация P2/P3→P1 в окне 7d от burst_ts (декей: старше 7d не влияет)
-    for a in aggregates.values():
-        if not (a.get("burst") and a.get("burst_ts")):
-            continue
-        try:
-            age_s = (now - parse_ts(a["burst_ts"])).total_seconds()
-        except ValueError:
-            continue
-        if age_s <= 7 * 86400 and a.get("priority") not in ("P0", "P1"):
-            a["priority"] = "P1"
+    # 029-A3: burst-пост-шаг — честный декей (helper, F-2: держать CC низким).
+    _apply_burst_priority(aggregates, now)
     atomic_write_json(agg_path, aggregates)
 
 

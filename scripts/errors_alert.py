@@ -139,6 +139,11 @@ def alert_body(cand):
     parts = f"{head} · {sig[:120]} · 7d={a.get('count_7d', 0)} total={a.get('count_total', 0)}"
     if cand["kind"] == "burst":
         parts += f" count_5m={a.get('burst_count_5m')}"
+    # 029-B2: топ-3 exit_codes — короткий суффикс при наличии
+    codes = a.get("exit_codes") or {}
+    if codes:
+        top3 = sorted(codes.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+        parts += " коды:" + ",".join(f"{v}×{k}" for k, v in top3)
     return f"{parts} — {ex} — детали: make errors-view / errors_query"
 
 
