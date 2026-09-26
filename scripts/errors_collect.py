@@ -925,6 +925,9 @@ DEFAULT_CONFIG = {
     "thresholds": {"df_warn_pct": 85, "df_crit_pct": 95, "ram_avail_min_pct": 10,
                    "load15_factor": 2, "vram_warn_pct": 95},
     "retention_days": 90, "hold_days": 14, "e4_window_days": 7,
+    # 028-A4: порог истечения «мёртвых» сигнатур виден в конфиге
+    # (был только inline-дефолтом errors_prune.STALE_SIG_DAYS_DEFAULT).
+    "stale_sig_days": 45,
     "prune": {"enabled": False},
     "health_urls": ["http://localhost:8000/health", "http://localhost:6333/healthz",
                     "http://localhost:11435/api/tags", "http://localhost:8085/"],

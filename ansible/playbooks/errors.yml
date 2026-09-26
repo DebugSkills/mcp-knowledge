@@ -85,7 +85,9 @@
         cmd: python3 {{ scripts }}/errors_prune.py {{ prune_confirm | default('') }} --sink {{ errors_sink }}
       register: prune_out
       changed_when: "'PRUNED' in prune_out.stdout"
-      failed_when: prune_out.rc not in [0, 1]  # rc=1 = kill-switch/--confirm-конфликт: показать, не ронять
+      # 028-N-2: skip (kill-switch / занятый лок) теперь rc=0 — «нечего делать»
+      # не ошибка; rc≠0 = реальный сбой.
+      failed_when: prune_out.rc != 0
 
     - name: "Prune: вывод"
       tags: [prune]

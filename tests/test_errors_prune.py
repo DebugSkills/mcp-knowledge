@@ -100,14 +100,41 @@ def test_confirm_removes_both_halves_and_backups(tmp_path, capsys):
         assert list(snap) == ["old-new"]
 
 
-def test_confirm_without_killswitch_refuses(tmp_path):
+def test_confirm_without_killswitch_is_skip_rc0(tmp_path, capsys):
+    """028-N-2: kill-switch выключен ⇒ skip + rc 0, НЕ rc 1.
+
+    rc=1 кормил cron_nonzero → ложный P0 + TG каждую неделю на контуре с
+    prune.enabled=false (блокер N-2 Critic iter1/iter2).
+    """
     alert = {"old-new": {"status": "new", "last_seen": _iso(50), "investigating": False}}
     sink = _sink(tmp_path, alert)
     ec.atomic_write_json(sink / "config.json",
                          {"prune": {"enabled": False}, "stale_sig_days": 45})
     rc = pr.main(["--sink", str(sink), "--confirm"])
-    assert rc == 1
+    out = capsys.readouterr().out
+    assert rc == 0, f"028-N-2: rc={rc} (должен быть 0 — иначе cron_nonzero→P0)"
+    assert "skip: prune disabled" in out, out
     assert "old-new" in json.loads((sink / "alert_state.json").read_text())
+
+
+def test_lock_busy_is_skip_rc0(tmp_path, capsys):
+    """028-N-3b: параллельный запуск (занятый лок) ⇒ rc 0 + строка skip."""
+    import fcntl
+    alert = {"old-new": {"status": "new", "last_seen": _iso(50), "investigating": False}}
+    sink = _sink(tmp_path, alert)
+    lock = sink / ".prune.lock"
+    with open(lock, "w") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        rc = pr.main(["--sink", str(sink), "--confirm"])
+        out = capsys.readouterr().out
+    assert rc == 0, f"028-N-3b: rc={rc} (занятый лок не должен давать rc≠0)"
+    assert "skip: prune already running" in out, out
+    assert "old-new" in json.loads((sink / "alert_state.json").read_text())
+
+
+def test_default_config_has_stale_sig_days():
+    """028-A4: порог истечения виден в DEFAULT_CONFIG (был только inline-дефолт)."""
+    assert ec.DEFAULT_CONFIG.get("stale_sig_days") == 45
 
 
 def test_clean_sink_is_noop(tmp_path, capsys):

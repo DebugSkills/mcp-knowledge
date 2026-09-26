@@ -2,7 +2,7 @@
 
 Спека §7.5/§7.6: AC-import-1 (0600/владелец/fingerprint/идемпотентность/
 exit≠0 с именем переменной) · AC-host-4 (host: --host / hostname -s) · R5
-(секреты не в stdout/stderr) · AC-cron-1 (3 джобы, маркер-блок, бэкап .trash,
+(секреты не в stdout/stderr) · AC-cron-1 (4 джобы, маркер-блок, бэкап .trash,
 config-оверлей cron_logs, дедуп, --remove обратимо, абсолютность путей/R8) ·
 AC-collect-1(а) (collect_cron_logs на [CRON] exit=1 → событие cron_log) ·
 AC-host-3 (jinja2-рендер errors-notify.json.j2 с fake inventory).
@@ -249,8 +249,8 @@ def fake_crontab_env(tmp_path):
 
 
 class TestCronInstall:
-    def test_install_three_jobs(self, tmp_path):
-        """AC-cron-1: 3 джобы в маркер-блоке, collector ПЕРВЫМ (P3-c)."""
+    def test_install_four_jobs(self, tmp_path):
+        """AC-cron-1 (028-A): 4 джобы в маркер-блоке, collector ПЕРВЫМ (P3-c)."""
         cf = tmp_path / "crontab.txt"
         cf.write_text("17 3 * * * /usr/bin/existing-job\n", encoding="utf-8")
         r = sh(CRON_SH, "--install", "--file", str(cf), "--data-root", str(tmp_path / "data"))
@@ -278,7 +278,15 @@ class TestCronInstall:
             f"Д5: weekly-джоба без --weekly (упадёт в read-only view): {lines[b + 3]}"
         assert "--send-tg" in lines[b + 3]  # weekly с отправкой (фиксируем)
         assert lines[b + 3].index("--weekly") < lines[b + 3].index("--send-tg")
-        assert lines[b + 4] == MARK_END
+        # 028-A: 4-я джоба prune — off-grid минута 10:33 (N-3b), --confirm обязателен
+        # (иначе вечный dry-run), лок — ВНУТРИ errors_prune.py (A-3), не в cron-строке.
+        assert lines[b + 4].startswith("33 10 * * 1"), \
+            f"028-A: prune-джоба должна быть off-grid (33 10 * * 1): {lines[b + 4]}"
+        assert "errors_prune.py" in lines[b + 4]
+        assert "--confirm" in lines[b + 4], \
+            f"028-A: prune-джоба без --confirm = вечный dry-run: {lines[b + 4]}"
+        assert "flock" not in lines[b + 4], "028-A3: лок реализуется внутри errors_prune.py"
+        assert lines[b + 5] == MARK_END
         assert "17 3 * * * /usr/bin/existing-job" in lines  # чужое не тронуто
 
     def test_absolute_paths_and_cd(self, tmp_path):
@@ -325,6 +333,8 @@ class TestCronInstall:
         assert content.count("errors_collect.py") == 1
         assert content.count("errors_alert.py") == 1
         assert content.count("errors_report.py") == 1
+        assert content.count("errors_prune.py") == 1  # 028-A
+        assert content.count("--confirm") == 1  # 028-A
         # Д4: --send-tg ровно 2 (alerts + weekly) — идемпотентность не даёт
         # дублей флага, а отсутствие обоих = dry-run-дефект класса Д4.
         assert content.count("--send-tg") == 2
@@ -385,6 +395,15 @@ class TestCronInstall:
         assert r.returncode == 0, r.stderr
         assert "errors_collect.py" not in cf.read_text()
 
+    def test_remove_orphan_prune_line(self, tmp_path):
+        """028-N-4: сиротская prune-строка вне блока тоже вынимается --remove
+        (strip_ours обязан знать про errors_prune)."""
+        cf = tmp_path / "crontab.txt"
+        cf.write_text("33 10 * * 1 cd /x && /x/scripts/errors_prune.py --confirm\n", encoding="utf-8")
+        r = sh(CRON_SH, "--remove", "--file", str(cf), "--data-root", str(tmp_path / "data"))
+        assert r.returncode == 0, r.stderr
+        assert "errors_prune.py" not in cf.read_text(), "028-N-4: strip_ours не знает errors_prune"
+
     def test_status(self, tmp_path):
         cf = tmp_path / "crontab.txt"
         cf.write_text(MODEL_SEED, encoding="utf-8")
@@ -396,7 +415,8 @@ class TestCronInstall:
         r1 = sh(CRON_SH, "--status", *args)
         assert r1.returncode == 0
         assert "errors_collect.py" in r1.stdout
-        assert "3" in r1.stdout  # счётчик джобов
+        # 028-F7: точная строка счётчика (подстрока «3» вечно-зелёная из-за минуты 33)
+        assert "джоб: 4" in r1.stdout, r1.stdout
 
     def test_validator_rejects_relative(self, tmp_path):
         """R8 (unit): --validate на файле с относительной строкой → exit≠0."""
@@ -537,6 +557,19 @@ class TestRunFlagsMatrix:
         assert "--weekly" in weekly, f"Д5: weekly без --weekly → cmd_view: {weekly}"
         assert "--send-tg" in weekly, f"Д5: weekly без --send-tg → нет доставки: {weekly}"
         assert weekly.index("--weekly") < weekly.index("--send-tg")
+
+    def test_prune_line_confirm_offgrid(self, tmp_path):
+        """028-A: prune-джоба = off-grid минута + --confirm, без флагов доставки."""
+        cf = tmp_path / "crontab.txt"
+        cf.write_text(MODEL_SEED, encoding="utf-8")
+        r = sh(CRON_SH, "--install", "--file", str(cf), "--data-root", str(tmp_path / "data"))
+        assert r.returncode == 0, r.stderr
+        lines = [ln for ln in cf.read_text().splitlines() if ln.strip()]
+        b = next(i for i, ln in enumerate(lines) if ln == MARK_BEGIN)
+        prune = lines[b + 4]
+        assert "errors_prune.py" in prune
+        assert "--confirm" in prune
+        assert "--send-tg" not in prune and "--weekly" not in prune
 
     def test_alerts_line_send_tg_no_weekly(self, tmp_path):
         """Матрица: alerts = --send-tg БЕЗ --weekly (алерт, не отчёт)."""

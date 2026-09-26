@@ -22,10 +22,12 @@
 Перед первым реальным удалением — tar-срез events/prune-backup-<ts>.tar.gz
 удаляемых файлов (обратимость; храним последние 4 среза, старые — в план).
 
-Выход: 0 dry-run/успех; 1 — --confirm при kill-switch off или ошибка.
+Выход (028): 0 — dry-run/успех/**skip** (kill-switch выключен или лок занят;
+028-N-2: rc≠0 на skip кормил cron_nonzero → ложный P0); ≠0 — реальная ошибка.
 """
 
 import argparse
+import fcntl
 import json
 import os
 import sys
@@ -163,6 +165,19 @@ def main(argv=None) -> int:
     if not sink.exists():
         print(f"prune: sink отсутствует ({sink}) — нечего чистить.")
         return 0
+    # 028-A3: один prune за раз. Неблокирующий flock; занят → skip + rc 0
+    # (N-3b: rc≠0 попал бы в cron_nonzero и дал ложный P0). Контекст-менеджер:
+    # лок держится ровно на время работы и снимается при выходе (в т.ч. в тестах).
+    with open(sink / ".prune.lock", "w") as lock_fh:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("skip: prune already running (lock busy) — выход 0")
+            return 0
+        return _prune(sink, args)
+
+def _prune(sink: Path, args) -> int:
+
     cfg = load_config(sink)
     alert = load_json(sink / "alert_state.json", {})
 
@@ -177,7 +192,7 @@ def main(argv=None) -> int:
     print(f"=== errors prune · sink={sink} · retention={retention}d "
           f"· stale-sig={stale_days}d ===")
     print(f"план: {len(day_files)} raw-дней ({lines} строк, {_fmt_mb(size)}), "
-          f"{len(sigs)} resolved-сигнатур, {len(stale_sigs)} истёкших сигнатур "
+          f"{len(sigs)} resolved-сигнатур (fixed_at), {len(stale_sigs)} истёкших сигнатур "
           f"(alert_state), {len(old_backups)} старых prune-бэкапов")
     for f in day_files[:5]:
         print(f"  ✂ день: {f.name}")
@@ -194,9 +209,9 @@ def main(argv=None) -> int:
         return 0
 
     if not cfg.get("prune", {}).get("enabled"):
-        print("KILL-SWITCH: config.prune.enabled=false — удаление ЗАПРЕЩЕНО "
-              "(включить в ansible: vault/group_vars → errors.yml setup).")
-        return 1
+        print("skip: prune disabled (kill-switch: config.prune.enabled=false) — "
+              "удаление запрещено, выход 0 (028-N-2).")
+        return 0
 
     if not day_files and not sigs and not stale_sigs and not old_backups:
         print("prune: нечего удалять.")

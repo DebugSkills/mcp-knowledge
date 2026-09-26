@@ -107,8 +107,8 @@
 | script:errors_notify.py | общий TG-sender (016: weekly+алерты) | sink: — | gap: self — ошибки доставки → reports/tg-errors.log (маскировка <token>/<proxy>), не в sink |
 | script:errors_alert.py | немедленные алерты new-P0/burst (016, cron */5) | sink: — | gap: self — анти-шторм/skip-решения → reports/tg-errors.log + stdout, не в sink |
 | script:errors_notify_import.sh | sudo-helper notify.json 0600 из /etc/backup-status.env (016, руками оператора) | sink: — | gap: self — имя отсутствующей переменной в stderr (без значений, R5), не в sink |
-| script:errors_cron.sh | cron-инсталлятор 3 джоб 016 (--install/--remove/--status, R8-валидация до записи) | sink: — | gap: self — валидационные отказы в stderr, не в sink; сам НЕ в crontab |
-| script:errors_prune.py | prune (ручной/make, dry-run-first) | sink: — | gap: self — вывод только в stdout/stderr |
+| script:errors_cron.sh | cron-инсталлятор **4 джоб** (016 + prune 028-A: Пн 10:33) (--install/--remove/--status, R8-валидация до записи) | sink: — | gap: self — валидационные отказы в stderr, не в sink; сам НЕ в crontab |
+| script:errors_prune.py | prune: ретенция + истечение «мёртвых» сигнатур (ручной/make + **cron Пн 10:33** 028-A; dry-run-first, kill-switch, внутренний flock `.prune.lock` — N-3b) | sink: — | gap: self — вывод только в stdout/stderr |
 | script:errors_migrate_keys_027.py | key-migration merge 027 (ручной, dry-run-first; требует остановки cron коллектора) | sink: — | gap: self — вывод только в stdout/stderr; бэкапы+манифест в .trash/ |
 | script:errors_cleanup_cron_legacy.py | 018: one-shot миграция legacy cron-ключей exit=0 (make errors-cron-cleanup / prod-errors-cron-cleanup) | sink: — | gap: self — ручной пост-деплой шаг; backup в .trash/, dry-run по умолчанию |
 | script:errors_guard.py | write-side гвард (cap/burst) + suppression-CLI | sink: — | gap: self — сам не источник; решения оператора → sink/suppression.json + audit.jsonl |
@@ -259,7 +259,7 @@ cooldown 120 мин/сигнатуру · ≤2 основных + 1 хвост-�
 **Degraded-режим:** нет `notify.json`/токена → «TG: skip» + лог, exit 0,
 стейт алертов НЕ мутируется (алерты «дозреют» после починки доставки).
 
-**Cron (3 строки, `scripts/errors_cron.sh --install`):** collector `*/5`
+**Cron (4 строки, `scripts/errors_cron.sh --install`):** collector `*/5`
 (ПЕРВЫМ — данные важнее алертов), alerts `*/5` **с `--send-tg`** (Д4: без
 флага `errors_alert.py` — dry-run, немедленные алерты не уходили бы никогда),
 weekly `2 10 * * 1` **`--weekly --send-tg`** (Д5: без `--weekly`

@@ -11,9 +11,12 @@
 # Что делает (--install):
 #   1) бэкап текущего crontab в .trash/crontab-backup-<ts>.txt ДО правки (R6);
 #   2) вынимает старый блок/сироты-строки (идемпотентность: 0 дублей);
-#   3) добавляет маркер-блок из 3 джоб (collector */5 ПЕРВЫМ — P3-c, alerts */5
+#   3) добавляет маркер-блок из 4 джоб (collector */5 ПЕРВЫМ — P3-c, alerts */5
 #      с --send-tg — Д4: без флага errors_alert.py dry-run и алерты не уходят,
 #      weekly Пн 10:02 --weekly --send-tg — Д5: без --weekly errors_report.py
+#      prune Пн 10:33 --confirm — 028-A: истечение/resolved-чистка; off-grid
+#      минута (N-3b: не на сетке */5, иначе гонка RMW с collector/alerts);
+#      лок — ВНУТРИ errors_prune.py (A-3), не в cron-строке
 #      дефолтит в read-only view и отчёт не уходит) — все пути абсолютные +
 #      cd BASE, обёртки cron_wrap.sh
 #      пишут [CRON]-строки (exit≠0 → P0-признак cron_nonzero, AC-collect-1);
@@ -59,7 +62,7 @@ validate_file() {  # $1 = файл со строками cron; проверяе�
   return 0
 }
 
-# ── наши 3 джобы (абсолютные пути; collector ПЕРВЫМ — P3-c) ──
+# ── наши 4 джобы (абсолютные пути; collector ПЕРВЫМ — P3-c) ──
 cron_lines() {
   local CRON_DIR="$DATA_ROOT/logs/cron"
   cat <<EOF
@@ -67,6 +70,7 @@ $MARK_BEGIN
 */5 * * * * cd $BASE && bash $BASE/scripts/cron_wrap.sh collector $CRON_DIR/collector.log -- $BASE/.venv/bin/python $BASE/scripts/errors_collect.py >> $CRON_DIR/collector.log 2>&1
 */5 * * * * cd $BASE && bash $BASE/scripts/cron_wrap.sh alerts $CRON_DIR/alerts.log -- $BASE/.venv/bin/python $BASE/scripts/errors_alert.py --send-tg >> $CRON_DIR/alerts.log 2>&1
 2 10 * * 1 cd $BASE && bash $BASE/scripts/cron_wrap.sh weekly $CRON_DIR/weekly.log -- $BASE/.venv/bin/python $BASE/scripts/errors_report.py --weekly --send-tg >> $CRON_DIR/weekly.log 2>&1
+33 10 * * 1 cd $BASE && bash $BASE/scripts/cron_wrap.sh prune $CRON_DIR/prune.log -- $BASE/.venv/bin/python $BASE/scripts/errors_prune.py --confirm >> $CRON_DIR/prune.log 2>&1
 $MARK_END
 EOF
 }
@@ -76,7 +80,7 @@ strip_ours() {  # stdin → stdout
   awk -v mb="$MARK_BEGIN" -v me="$MARK_END" '
     $0 == mb { inblock = 1 }
     inblock && $0 == me { inblock = 0; next }
-    !inblock && !/errors_(collect|alert|report)\.py|errors_cron\.sh/ { print }
+    !inblock && !/errors_(collect|alert|report|prune)\.py|errors_cron\.sh/ { print }
     inblock { next }
   '
 }
@@ -98,7 +102,7 @@ if cfgp.exists():
     except (ValueError, OSError):
         cfg = {}
 cron_dir = data_root / "logs" / "cron"
-ours = [str(cron_dir / f"{n}.log") for n in ("collector", "alerts", "weekly")]
+ours = [str(cron_dir / f"{n}.log") for n in ("collector", "alerts", "weekly", "prune")]
 cl = list(cfg.get("cron_logs", []))
 for p in ours:
     if p not in cl:
@@ -195,7 +199,7 @@ case "$ACTION" in
     else
       overlay_config "$TS"
     fi
-    echo "[errors_cron] install OK: 3 джобы (collector */5, alerts */5, weekly Пн 10:02); бэкап: $BACKUP"
+    echo "[errors_cron] install OK: 4 джобы (collector */5, alerts */5, weekly Пн 10:02, prune Пн 10:33); бэкап: $BACKUP"
     if [ -n "$MODEL_FILE" ]; then
       echo "[errors_cron] режим --file: реальный crontab НЕ тронут (модель: $MODEL_FILE)"
     fi
@@ -208,14 +212,14 @@ case "$ACTION" in
     printf '%s\n' "$CURRENT" | strip_ours | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba' > "$OUT_TMP"
     write_crontab "$OUT_TMP"
     rm -f "$OUT_TMP"
-    echo "[errors_cron] remove OK: маркер-блок + строки errors_{collect,alert,report} вынуты; config-оверлей оставлен; бэкап: $BACKUP"
+    echo "[errors_cron] remove OK: маркер-блок + строки errors_{collect,alert,report,prune} вынуты; config-оверлей оставлен; бэкап: $BACKUP"
     ;;
   status)
     CURRENT="$(read_crontab)"
-    CNT="$(printf '%s\n' "$CURRENT" | grep -cE 'errors_(collect|alert|report)\.py' || true)"
+    CNT="$(printf '%s\n' "$CURRENT" | grep -cE 'errors_(collect|alert|report|prune)\.py' || true)"
     if printf '%s\n' "$CURRENT" | grep -qF "$MARK_BEGIN"; then
       echo "errors-notify cron: установлен (маркер-блок найден, джоб: $CNT)"
-      printf '%s\n' "$CURRENT" | grep -E 'errors_(collect|alert|report)\.py' | sed 's/^/  /'
+      printf '%s\n' "$CURRENT" | grep -E 'errors_(collect|alert|report|prune)\.py' | sed 's/^/  /'
     elif [ "${CNT:-0}" -gt 0 ]; then
       echo "errors-notify cron: ЧАСТИЧНО (строки без маркер-блока: $CNT) — запустите --install для миграции"
     else
@@ -223,7 +227,7 @@ case "$ACTION" in
     fi
     CFG="$DATA_ROOT/logs/errors/config.json"
     if [ -f "$CFG" ]; then
-      python3 -c "import json,sys; cl=json.load(open('$CFG')).get('cron_logs',[]); ours=[p for p in cl if 'logs/cron/' in p]; print(f'config overlay: {len(ours)}/3 наших логов в cron_logs')" 2>/dev/null || echo "config overlay: config.json не читается"
+      python3 -c "import json,sys; cl=json.load(open('$CFG')).get('cron_logs',[]); ours=[p for p in cl if 'logs/cron/' in p]; print(f'config overlay: {len(ours)}/4 наших логов в cron_logs')" 2>/dev/null || echo "config overlay: config.json не читается"
     else
       echo "config overlay: нет config.json"
     fi

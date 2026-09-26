@@ -210,13 +210,13 @@ errors-alert:  ## 016: немедленные алерты new-P0/burst (TG=1 �
 errors-notify-import:  ## 016: sudo-хелпер notify.json 0600 из /etc/backup-status.env (БЕЗ внешнего sudo!; ENV=… OUT=… HOST=…)
 	sudo bash scripts/errors_notify_import.sh $(if $(ENV),--env $(ENV)) $(if $(OUT),--out $(OUT)) $(if $(HOST),--host $(HOST))
 
-errors-cron-install:  ## 016: установить 3 cron-джобы (collector/alerts */5, weekly Пн 10:02); FILE=… модель
+errors-cron-install:  ## 016+028: установить 4 cron-джобы (collector/alerts */5, weekly Пн 10:02, prune Пн 10:33); FILE=… модель
 	bash scripts/errors_cron.sh --install $(if $(FILE),--file $(FILE))
 
 errors-cron-remove:  ## 016: снять cron-джобы 016 (обратимо; FILE=… модель)
 	bash scripts/errors_cron.sh --remove $(if $(FILE),--file $(FILE))
 
-errors-cron-status:  ## 016: статус cron-джоб 016 + config-оверлея (FILE=… модель)
+errors-cron-status:  ## 016+028: статус cron-джоб (4) + config-оверлея (FILE=… модель)
 	bash scripts/errors_cron.sh --status $(if $(FILE),--file $(FILE))
 
 errors-cron-cleanup:  ## 018: миграция legacy cron-ключей exit=0 из P2-рейтинга (dry-run; CONFIRM=--confirm; SINK=…)
