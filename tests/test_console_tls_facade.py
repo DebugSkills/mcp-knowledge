@@ -155,8 +155,9 @@ class TestCompose:
     def test_facade_healthcheck_is_tcp_liveness(self, compose: Path) -> None:
         """wget на ответ 401 отдаёт exit≠0 → ложный unhealthy; liveness = `nc -z`."""
         block = _service_block(compose.read_text(encoding="utf-8"), "kb-console-tls")
-        assert "nc -z" in block
-        assert "wget" not in block
+        effective = "\n".join(_effective_lines(block))
+        assert "nc -z" in effective
+        assert "wget" not in effective, "wget как healthcheck даёт ложный unhealthy на 401"
 
 
 # ── verify-deploy ────────────────────────────────────────────────────────────
