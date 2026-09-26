@@ -190,7 +190,13 @@ async def get_entry(params: dict, app_state) -> dict:
         "cross_subjects": fm.cross_subjects,
         "tags": fm.tags,
         "version": fm.version,
-        "created_at": fm.created_at.isoformat(),
+        # 025-D: fieldless — дата создания тоже неизвестна (не «время парса»).
+        "created_at": (
+            fm.created_at.isoformat()
+            if getattr(fm, "created_at_explicit", True)
+            else ""
+        ),
+        "created_at_explicit": bool(getattr(fm, "created_at_explicit", True)),
         # 025: fieldless-запись не имеет настоящей даты обновления — отдаём
         # пусто (конвенция кодовой базы, UI-guard в kb-console) + флаг.
         "updated_at": (

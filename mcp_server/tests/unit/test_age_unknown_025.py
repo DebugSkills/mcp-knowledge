@@ -183,3 +183,45 @@ async def test_t25_10b_get_entry_explicit_display(app_state):
 
     assert res["updated_at"] == T0.isoformat()
     assert res["updated_at_explicit"] is True
+
+
+# ── 025-D: created_at — та же ловушка ──────────────────────────
+
+
+def test_t25_13_created_at_marker_both_parse_sites():
+    """T25-13: оба parse-сайта ставят маркер явности created_at."""
+    from mcp_server.storage.markdown_store import MarkdownStore
+    from mcp_server.quality.scanner import _parse_frontmatter
+
+    with_ca = (
+        "---\nknowledge_id: kid-25j\ndomain: d\nsubject: s\n"
+        "created_at: '2026-01-01T00:00:00+00:00'\n---\n# b\n"
+    )
+    without_ca = "---\nknowledge_id: kid-25j\ndomain: d\nsubject: s\n---\n# b\n"
+    assert MarkdownStore._parse_text(with_ca).frontmatter.created_at_explicit is True
+    assert MarkdownStore._parse_text(without_ca).frontmatter.created_at_explicit is False
+    assert _parse_frontmatter(with_ca, yaml).created_at_explicit is True
+    assert _parse_frontmatter(without_ca, yaml).created_at_explicit is False
+
+
+async def test_t25_14_get_entry_fieldless_created_at(app_state):
+    """T25-14: fieldless → created_at пуст + флаг; явный → значение + флаг."""
+    from unittest.mock import AsyncMock
+
+    from mcp_server.models import KnowledgeEntry
+    from mcp_server.tools.read import get_entry
+
+    fm_bad = KnowledgeFrontmatter(
+        knowledge_id="kid-25k", domain="d", subject="s", zone="public",
+        created_at_explicit=False,
+    )
+    app_state.store.read = AsyncMock(return_value=KnowledgeEntry(frontmatter=fm_bad, content="# x"))
+    res = await get_entry({"knowledge_id": "kid-25k"}, app_state)
+    assert res["created_at"] == "" and res["created_at_explicit"] is False
+
+    fm_ok = KnowledgeFrontmatter(
+        knowledge_id="kid-25l", domain="d", subject="s", zone="public", created_at=T0,
+    )
+    app_state.store.read = AsyncMock(return_value=KnowledgeEntry(frontmatter=fm_ok, content="# x"))
+    res2 = await get_entry({"knowledge_id": "kid-25l"}, app_state)
+    assert res2["created_at"] == T0.isoformat() and res2["created_at_explicit"] is True

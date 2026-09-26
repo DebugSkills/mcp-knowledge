@@ -54,6 +54,13 @@ class KnowledgeFrontmatter(BaseModel):
         default_factory=lambda: datetime.now(timezone.utc),
         description="Дата создания",
     )
+    # 025-D: derived-маркер явности created_at (та же ловушка default_factory:
+    # без него fieldless-запись показывает время парса как «дату создания»).
+    created_at_explicit: bool = Field(
+        default=True,
+        exclude=True,
+        description="Было ли created_at явно задано в исходном frontmatter (derived)",
+    )
     updated_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         description="Дата обновления (← ключ reconciliation #19)",

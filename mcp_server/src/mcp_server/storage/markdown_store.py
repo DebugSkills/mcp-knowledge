@@ -273,7 +273,11 @@ class MarkdownStore:
         fm_dict = yaml.safe_load(fm_raw) or {}
         # 024: derived-маркер явности (рукописный ключ в YAML не подменяет).
         fm = KnowledgeFrontmatter(
-            **{**fm_dict, "updated_at_explicit": "updated_at" in fm_dict}
+            **{
+                **fm_dict,
+                "updated_at_explicit": "updated_at" in fm_dict,
+                "created_at_explicit": "created_at" in fm_dict,
+            }
         )
 
         # Контент — всё после закрывающего ---

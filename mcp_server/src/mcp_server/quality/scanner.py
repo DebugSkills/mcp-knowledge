@@ -448,7 +448,11 @@ def _parse_frontmatter(
         # 025: derived-маркер явности поля (как 024 в markdown_store) — свой
         # parse-хелпер сканера, иначе fieldless-файлы дают age≈0 («самый свежий»).
         return KnowledgeFrontmatter(
-            **{**fm_dict, "updated_at_explicit": "updated_at" in fm_dict}
+            **{
+                **fm_dict,
+                "updated_at_explicit": "updated_at" in fm_dict,
+                "created_at_explicit": "created_at" in fm_dict,
+            }
         )
     except Exception:  # noqa: BLE001
         return None
