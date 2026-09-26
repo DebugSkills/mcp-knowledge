@@ -58,6 +58,7 @@
 | service:ollama | docker-compose.yml `ollama` (mcp-knowledge-ollama) | sink: errors_collect.py docker logs + docker events | covered |
 | service:mcp-server | docker-compose.yml `mcp-server` (mcp-knowledge-server) | sink: errors_collect.py docker logs + docker events | covered |
 | service:kb-console | docker-compose.yml `kb-console` (kb-console) | sink: errors_collect.py docker logs + docker events | covered |
+| service:kb-console-tls | docker-compose.yml `kb-console-tls` (Caddy TLS-фасад, трасса 030) | sink: errors_collect.py docker logs + docker events (runtime-логи; per-site access-лог не включён) | covered |
 | service:qdrant-prod | docker-compose.prod.yml (mcp-qdrant-prod) | sink: — (air-gap-бандл offline-deploy.sh; вне основного деплоя) | gap: air-gap-контур; при переходе на offline-deploy добавить имя в config.json контейнеров (P2-7) |
 | service:ollama-prod | docker-compose.prod.yml (mcp-knowledge-ollama-prod) | sink: — (air-gap-бандл) | gap: air-gap-контур; аналогично qdrant-prod (P2-7) |
 | source:docker_events | docker events die/oom/restart/health_status | sink: errors_collect.py collect_docker_events | covered |

@@ -45,6 +45,17 @@ class Settings(BaseSettings):
     # extra_forbidden при чтении env_file=".env" (паттерн MCP_API_KEY выше).
     CONSOLE_AUTH: str = ""
     CONSOLE_PASSWORD: str = ""
+    # kb-console-roles Ф3.1 + TLS-фасад (трасса 030): per-role ключи консоли и
+    # переменные фасада тоже живут в общем .env. Сервер их НЕ использует
+    # (ключи консоль шлёт как X-API-Key, фасад их читает сам) — поля только чтобы
+    # не падать на extra_forbidden (тот же паттерн).
+    MCP_API_KEY_ADMIN: str = ""
+    MCP_API_KEY_EDITOR: str = ""
+    MCP_API_KEY_CONTRIBUTOR: str = ""
+    CONSOLE_LAN_IP: str = ""
+    CONSOLE_LAN_CIDR: str = ""
+    CONSOLE_ADMIN_USER: str = ""
+    CONSOLE_ADMIN_PASSWORD: str = ""
 
     # Git audit (#21) + SSOT
     GIT_AUDIT: bool = True

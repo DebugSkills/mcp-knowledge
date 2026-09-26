@@ -997,7 +997,8 @@ def rotate_own_log(logfile: str, max_bytes: int = 10 * 1024 * 1024, keep_lines: 
 # ── Конфиг (рендер ansible; дефолты inline — работает без config.json на dev) ──
 
 DEFAULT_CONFIG = {
-    "containers": ["mcp-knowledge-server", "kb-console", "mcp-qdrant-dev", "mcp-knowledge-ollama"],
+    "containers": ["mcp-knowledge-server", "kb-console", "mcp-qdrant-dev", "mcp-knowledge-ollama",
+                   "kb-console-tls"],
     "cron_logs": ["/var/log/mcp-backup.log", "/var/log/mcp-quality.log"],
     "thresholds": {"df_warn_pct": 85, "df_crit_pct": 95, "ram_avail_min_pct": 10,
                    "load15_factor": 2, "vram_warn_pct": 95},
