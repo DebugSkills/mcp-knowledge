@@ -100,10 +100,11 @@ class TestCaddyfile:
         assert "auto_https disable_redirects" in [line.strip() for line in lines]
 
     def test_http_port_only_redirects_not_proxies(self) -> None:
-        """Порт 80 — только редирект на HTTPS (для набравших адрес без схемы).
+        """Порт 80 — редирект на HTTPS + отдача публичного CA (для установки доверия).
 
         Ключевой инвариант безопасности: по открытому http консоль НЕ проксируется
-        (иначе Basic-пароль в cleartext и обход TLS-модели).
+        (иначе Basic-пароль в cleartext и обход TLS-модели), а file_server отдаёт
+        ТОЛЬКО каталог CA Caddy.
         """
         text = CADDYFILE.read_text(encoding="utf-8")
         http_site, _, _ = text.partition("https://{$CONSOLE_LAN_IP}:8443 {")
@@ -113,6 +114,12 @@ class TestCaddyfile:
         assert "reverse_proxy" not in http_site, (
             "консоль нельзя проксировать по открытому http — пароль ушёл бы в cleartext"
         )
+        # file_server допустим только для каталога CA и с типом сертификата
+        if "file_server" in http_site:
+            assert "root * /data/caddy/pki/authorities/local" in http_site, (
+                "file_server обязан отдавать только каталог CA Caddy"
+            )
+            assert "Content-Type application/x-x509-ca-cert" in http_site
 
     def test_admin_api_off(self) -> None:
         assert any(

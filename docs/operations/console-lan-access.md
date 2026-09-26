@@ -186,11 +186,27 @@ docker exec mcp-knowledge-server python -m mcp_server.cli token revoke <token_id
 Caddy генерирует локальный CA сам (`tls internal`), сертификат продлевается
 автоматически. Файлы лежат в volume фасада: `/data/caddy/pki/authorities/local/`
 (на хосте — `data/caddy/data/caddy/pki/authorities/local/`, каталог принадлежит
-root). Забрать корневой сертификат можно **без sudo**:
+root).
+
+**Самый простой путь для оператора (без пересылки файлов):** открыть в браузере
+`http://<LAN_IP>/root.crt` — фасад отдаёт корневой сертификат с типом
+`application/x-x509-ca-cert` → сохранить → «Установить сертификат» → **Локальный
+компьютер** → **Доверенные корневые центры сертификации**. После этого
+`https://<LAN_IP>:8443` открывается без предупреждений. В офисе это единственное
+действие на машину (или раскатать через GPO).
+
+Забрать сертификат на сервере/скриптом (без sudo):
 
 ```bash
+curl -s http://<LAN_IP>/root.crt -o root.crt          # с любой машины
 docker exec kb-console-tls cat /data/caddy/pki/authorities/local/root.crt > root.crt
 # либо: sudo cp data/caddy/data/caddy/pki/authorities/local/root.crt .
+```
+
+Перед установкой сверяйте отпечаток SHA-256 (защита от подмены на пути):
+
+```bash
+openssl x509 -in root.crt -noout -fingerprint -sha256
 ```
 
 Раздать/установить один раз на машине оператора (или принять предупреждение браузера):
