@@ -22,6 +22,11 @@
 		output stdout
 		format json
 	}
+	# HTTP/3 отключён: UDP 8443 закрыт фаерволом, а анонс Alt-Svc h3 заставляет
+	# браузер ждать неудачный QUIC прежде чем упасть на TCP. Для LAN-консоли h1/h2 достаточно.
+	servers {
+		protocols h1 h2
+	}
 }
 
 # Удобный вход: http://<LAN_IP>/ → редирект на https://…:8443.
@@ -45,6 +50,12 @@ http://{$CONSOLE_LAN_IP} {
 }
 
 https://{$CONSOLE_LAN_IP}:8443 {
+	# Access-лог в stdout (docker logs kb-console-tls): отладка доступа операторов.
+	log {
+		output stdout
+		format json
+	}
+
 	tls internal
 
 	# Слушать ТОЛЬКО LAN-интерфейс: на хосте есть virbr*/docker0 — bind 0.0.0.0
