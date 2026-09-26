@@ -949,3 +949,41 @@ async def test_t24_3_explicit_equal_no_drift(monkeypatch):
                           skip_reindex=False, skip_orphan_detection=True)
 
     assert res["drifted"] == 0 and res["mode"] == "none" and im_calls == []
+
+# ── T25-12: интеграция payload-билдера (живой дефект 2026-09-26) ──
+
+
+async def test_t25_12_index_missing_fieldless_omits_payload_date():
+    """T25-12: РЕАЛЬНЫЙ пайплайн для fieldless-записи не падает и не пишет дату.
+
+    Живой дефект: `build_payload_point()` требовал `updated_at` позиционно ⇒
+    fieldless-запись не индексировалась вовсе (`missing 1 required positional
+    argument`). Юнит-тесты helper'а это не ловили — нужен интеграционный прогон
+    реального пайплайна (FakeStore/FakeQdrant + мок embedder/chunker).
+    """
+    path = Path("/tmp/knowledge/test/demo/kid-t25x.md")
+    store = FakeStore([path], {path: _make_entry("kid-t25x", updated_at_explicit=False)})
+    qdrant = FakeQdrant(ids=set())
+    pipeline = _make_pipeline(store, qdrant)
+
+    res = await pipeline.index_missing([path])
+
+    assert res["failed"] == 0
+    assert res["total_docs"] == 1
+    assert qdrant.upsert_calls, "upsert не вызван"
+    for p in qdrant.upsert_calls[-1]["points"]:
+        assert "updated_at" not in p.payload
+
+
+async def test_t25_12b_index_missing_explicit_keeps_payload_date():
+    """T25-12b: явная запись — дата в payload на месте (нулевой дифф)."""
+    path = Path("/tmp/knowledge/test/demo/kid-t25y.md")
+    store = FakeStore([path], {path: _make_entry("kid-t25y", updated_at=T0)})
+    qdrant = FakeQdrant(ids=set())
+    pipeline = _make_pipeline(store, qdrant)
+
+    res = await pipeline.index_missing([path])
+
+    assert res["failed"] == 0
+    for p in qdrant.upsert_calls[-1]["points"]:
+        assert p.payload.get("updated_at") == T0.isoformat()
