@@ -1,0 +1,56 @@
+# kb-console — TLS-фасад для доступа из локальной сети (трасса code-2026-09-26-030).
+#
+# Правило проекта (kb-console/USER_GUIDE.md): прямая публикация :8085 в сеть без TLS
+# запрещена — Basic-пароль уходит base64 в каждом запросе. Поэтому консоль остаётся
+# на 127.0.0.1:8085 (loopback, audit P1 У-1), а в сеть смотрит только этот фасад:
+# HTTPS + локальный CA Caddy (`tls internal`) + allow-list подсети.
+#
+# Переносимость (офис/другой хост): задать CONSOLE_LAN_IP и CONSOLE_LAN_CIDR под свою
+# сеть. Операторам — исключение прокси для адреса консоли: на хосте через ansible
+# `docker_no_proxy` (ansible/inventory/group_vars/all.yml), в браузере — no-proxy правило.
+#
+# Корневой сертификат для операторов (раздать/установить в доверенные):
+#   data/caddy/data/caddy/pki/authorities/local/root.crt
+#
+# Проверка конфига:  docker compose exec kb-console-tls caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+{
+	admin off
+	# Без редиректа :80 → :443: сайт внутренний и на нестандартном порту 8443,
+	# а в host-сети листенер :80 открылся бы на ВСЕХ интерфейсах хоста.
+	auto_https disable_redirects
+	log {
+		output stdout
+		format json
+	}
+}
+
+https://{$CONSOLE_LAN_IP}:8443 {
+	tls internal
+
+	# Слушать ТОЛЬКО LAN-интерфейс: на хосте есть virbr*/docker0 — bind 0.0.0.0
+	# выставил бы консоль во все сети (в т.ч. во внутренние лаб-сети).
+	bind {$CONSOLE_LAN_IP}
+
+	# Второй контур после TLS: доступ только из разрешённой подсети.
+	@lan remote_ip {$CONSOLE_LAN_CIDR}
+
+	handle @lan {
+		# Консоль — NiceGUI (websocket): reverse_proxy сам обрабатывает upgrade.
+		reverse_proxy 127.0.0.1:8085 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	handle {
+		respond "kb-console: доступ только из локальной сети" 403
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}

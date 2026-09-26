@@ -70,7 +70,11 @@ mcp_kb_host_prepare__docker_repo: deb [arch=amd64 signed-by=/etc/apt/keyrings/do
 
 # Прокси наследуется из group_vars/all.yml (docker_proxy/docker_no_proxy)
 mcp_kb_host_prepare__proxy: "{{ docker_proxy | default('') }}"
-mcp_kb_host_prepare__no_proxy: "{{ docker_no_proxy | default('localhost,127.0.0.1,::1') }}"
+# LAN-адрес kb-console (TLS-фасад, трасса code-2026-09-26-030). Обязательно в NO_PROXY:
+# иначе корпоративный Squid отвечает 403 на внутренний адрес (диагностировано 2026-09-26).
+# Для офиса: переопределить console_lan_ip (или docker_no_proxy целиком) под свою подсеть.
+console_lan_ip: "192.168.2.3"
+mcp_kb_host_prepare__no_proxy: "{{ docker_no_proxy | default('localhost,127.0.0.1,::1,' ~ console_lan_ip) }}"
 
 # — Параметры клонирования репозиториев (бывшая роль mcp_kb_repos, инлайн в playbooks/deploy.yml) —
 # Все переменные имеют префикс mcp_kb_repos__

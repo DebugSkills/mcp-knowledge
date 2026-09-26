@@ -195,3 +195,42 @@ services:
     # Ресурсы зеркально dev (П-2 аудита code-2026-09-22-001): NiceGUI-клиент лёгкий
     mem_limit: 512m
     cpus: 1
+
+  # kb-console-tls — TLS-фасад (Caddy) для доступа к консоли из локальной сети.
+  # Трасса code-2026-09-26-030: консоль остаётся loopback, в сеть смотрит только
+  # https://<CONSOLE_LAN_IP>:8443 (локальный CA + allow-list подсети).
+  # Fail-closed: без CONSOLE_LAN_IP контейнер не стартует.
+  kb-console-tls:
+    image: caddy:2-alpine
+    container_name: kb-console-tls
+    network_mode: host            # видит консоль на 127.0.0.1:8085
+    env_file:
+      - .env
+    environment:
+      - CONSOLE_LAN_IP=${CONSOLE_LAN_IP:-}
+      - CONSOLE_LAN_CIDR=${CONSOLE_LAN_CIDR:-192.168.2.0/24}
+    volumes:
+      - ./kb-console/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy/data:/data      # локальный CA + сертификаты (переживают пересоздание)
+      - ./data/caddy/config:/config
+    command:
+      - sh
+      - -c
+      - 'test -n "$$CONSOLE_LAN_IP" || { echo "kb-console-tls: CONSOLE_LAN_IP не задан — TLS-фасад не поднимаю (fail-closed)"; exit 1; }; exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile'
+    depends_on:
+      kb-console:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-check-certificate --server-response -o /dev/null -O /dev/null https://$$CONSOLE_LAN_IP:8443/ 2>&1 | grep -q 'HTTP/'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    mem_limit: 128m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped

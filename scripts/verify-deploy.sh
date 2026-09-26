@@ -217,9 +217,12 @@ print(len(d["result"]["tools"]))
 
 # ── V4 console: auth-aware проверка :8085 (пароль не печатается) ──
 v4_console() {
-    local mode passwd code headers
+    local mode user passwd code headers
     mode="$(env_val CONSOLE_AUTH)"
-    passwd="$(env_val CONSOLE_PASSWORD)"
+    # Per-user стор (непустой users.jsonl) отклоняет legacy CONSOLE_PASSWORD —
+    # приоритет у bootstrap-админа (как в healthcheck консоли, трасса 030).
+    user="$(env_val CONSOLE_ADMIN_USER)"; passwd="$(env_val CONSOLE_ADMIN_PASSWORD)"
+    if [ -z "$passwd" ]; then user="verify"; passwd="$(env_val CONSOLE_PASSWORD)"; fi
     code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$CONSOLE_URL" 2>/dev/null || true)"
     if [ -z "$code" ] || [ "$code" = "000" ]; then
         FAILED=$((FAILED + 1)); FAILED_IDS+=("V4")
@@ -236,13 +239,22 @@ v4_console() {
     fi
 
     if [ "$auth_on" = "1" ]; then
-        local code_auth www
+        local code_auth www legacy
         code_auth="$(curl -s -o /dev/null -w '%{http_code}' -m 10 \
-            -u "verify:$passwd" "$CONSOLE_URL" 2>/dev/null || true)"
+            -u "${user}:${passwd}" "$CONSOLE_URL" 2>/dev/null || true)"
+        # Переходный режим: если per-user креды не сработали, пробуем legacy-пароль.
+        if [ "$code_auth" != "200" ] && [ "$user" != "verify" ]; then
+            legacy="$(env_val CONSOLE_PASSWORD)"
+            if [ -n "$legacy" ] && [ "$legacy" != "$passwd" ]; then
+                code_auth="$(curl -s -o /dev/null -w '%{http_code}' -m 10 \
+                    -u "verify:${legacy}" "$CONSOLE_URL" 2>/dev/null || true)"
+                [ "$code_auth" = "200" ] && user="verify"
+            fi
+        fi
         www="$(printf '%s' "$headers" | grep -i '^www-authenticate:' || true)"
         if [ "$code" = "401" ] && [ -n "$www" ] && [ "$code_auth" = "200" ]; then
             PASSED=$((PASSED + 1))
-            say_pass 4 "console (auth=on, mode=${mode:-auto})" \
+            say_pass 4 "console (auth=on, mode=${mode:-auto}, user=$user)" \
                 "без кредов 401+WWW-Authenticate, с кредами 200"
         else
             FAILED=$((FAILED + 1)); FAILED_IDS+=("V4")
@@ -263,9 +275,57 @@ v4_console() {
     return 0
 }
 
+# ── V5 console-tls: TLS-фасад kb-console для доступа из локальной сети (трасса 030) ──
+# Проверяем: с LAN-адреса фасад отвечает TLS-ом, без кредов 401 + WWW-Authenticate,
+# с кредами 200. Всё через --noproxy (иначе корпоративный Squid отвечает 403).
+# Нет CONSOLE_LAN_IP → SKIP (фасад не сконфигурирован — это валидная конфигурация).
+v5_console_tls() {
+    local lan_ip cidr url code code_auth www user passwd
+    lan_ip="$(env_val CONSOLE_LAN_IP)"
+    cidr="$(env_val CONSOLE_LAN_CIDR)"
+    if [ -z "$lan_ip" ]; then
+        SKIPPED=$((SKIPPED + 1))
+        say_skip 5 "console-tls" "CONSOLE_LAN_IP не задан — TLS-фасад не сконфигурирован"
+        return 0
+    fi
+    url="https://${lan_ip}:8443/"
+
+    # per-user стор может быть активен → приоритет у bootstrap-админа (как в healthcheck)
+    user="$(env_val CONSOLE_ADMIN_USER)"; [ -n "$user" ] || user="verify"
+    passwd="$(env_val CONSOLE_ADMIN_PASSWORD)"
+    [ -n "$passwd" ] || passwd="$(env_val CONSOLE_PASSWORD)"
+
+    code="$(curl -s --noproxy '*' -k -o /dev/null -w '%{http_code}' -m 10 "$url" 2>/dev/null || true)"
+    if [ -z "$code" ] || [ "$code" = "000" ]; then
+        FAILED=$((FAILED + 1)); FAILED_IDS+=("V5")
+        say_fail 5 "console-tls $url" "нет ответа (фасад не поднят? docker logs kb-console-tls)"
+        return 0
+    fi
+    www="$(curl -s --noproxy '*' -k -D - -o /dev/null -m 10 "$url" 2>/dev/null | grep -i '^www-authenticate:' || true)"
+
+    if [ -z "$passwd" ]; then
+        SKIPPED=$((SKIPPED + 1))
+        say_skip 5 "console-tls (lan=$lan_ip cidr=${cidr:-—})" "пароль консоли не задан — проверить креды нечем (код $code)"
+        return 0
+    fi
+    code_auth="$(curl -s --noproxy '*' -k -o /dev/null -w '%{http_code}' -m 12 \
+        -u "${user}:${passwd}" "$url" 2>/dev/null || true)"
+    if [ "$code" = "401" ] && [ -n "$www" ] && [ "$code_auth" = "200" ]; then
+        PASSED=$((PASSED + 1))
+        say_pass 5 "console-tls (lan=$lan_ip cidr=${cidr:-—})" \
+            "TLS ок, без кредов 401+WWW-Authenticate, с кредами 200"
+    else
+        FAILED=$((FAILED + 1)); FAILED_IDS+=("V5")
+        say_fail 5 "console-tls (lan=$lan_ip)" \
+            "без кредов=$code (WWW-Authenticate: $([ -n "$www" ] && echo yes || echo no)), с кредами=$code_auth — ожидалось 401+hdr / 200"
+    fi
+    return 0
+}
+
 v1_health
 v2_logs
 v3_tools
 v4_console
+v5_console_tls
 
 finish
