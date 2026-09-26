@@ -54,7 +54,7 @@ def test_regressed_section_lists_recurrence_with_command(tmp_path, capsys):
 
 
 def test_regressed_section_empty(tmp_path, capsys):
-    sink = _sink(tmp_path, {("s|A|%d" % 1): _agg()})
+    sink = _sink(tmp_path, {"s|A|1": _agg()})
     er.cmd_weekly(sink, send_tg=False)
     out = capsys.readouterr().out
     assert "## 7. Рецидивы к разбору" in out and "- (пусто)" in out
