@@ -222,6 +222,24 @@ Import-Certificate -FilePath root.crt -CertStoreLocation Cert:\LocalMachine\Root
 
 При ротации CA (пересоздание `data/caddy` без бэкапа) сертификат нужно раздать заново.
 
+### 6.1 Проверка доверия без браузера
+
+Быстрый способ отделить «сертификат» от «прокси/браузера» (Windows, PowerShell):
+
+```powershell
+certutil -store Root 2>$null | findstr /I Caddy   # CA должен быть в МАШИННОМ хранилище
+curl.exe --ssl-no-revoke -sS -o NUL -w "code=%{http_code}`n" https://<LAN_IP>:8443/
+# ожидаем code=401 («нужен логин»). Без --ssl-no-revoke curl падает с 0x80092012 —
+# у локального CA нет CRL/OCSP, а curl проверяет отзыв строго; браузеры проверяют мягко.
+```
+
+```powershell
+# вход с кредами без браузера: ожидаем 200 и ~9 КБ HTML
+$u='admin'; $sec=Read-Host "Пароль" -AsSecureString
+$p=[Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+Invoke-WebRequest 'https://<LAN_IP>:8443/' -UseBasicParsing -Headers @{Authorization=('Basic ' + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$u`:$p")))} | Select-Object StatusCode
+```
+
 ## 7. Прокси (обязательный шаг для операторов)
 
 Симптом: браузер отдаёт **403** и в заголовках `Server: squid`, `X-Squid-Error:
@@ -250,10 +268,23 @@ ERR_ACCESS_DENIED` — это прокси, а не консоль.
 | Консоль недоступна с хоста по `https://LAN_IP` | так и должно быть, если консоль в auth-режиме | используйте креды; без кредов ожидаем 401 |
 | WS-ошибки в Safari | Safari не шлёт Basic на websocket-upgrade | штатный HTTP-polling, не ошибка (USER_GUIDE) |
 
+### 8.1 Живые грабли (проверено при первом подключении оператора, 2026-09-26)
+
+| Симптом | Что это на самом деле | Действие |
+|---|---|---|
+| `curl.exe` → `schannel: 0x80092012 - Функция отзыва не смогла произвести проверку отзыва` | у локального CA нет CRL/OCSP, а `curl.exe` проверяет отзыв строго. **Не дефект консоли и не про браузер** (Chromium проверяет мягко) | тестировать с `--ssl-no-revoke` либо `Invoke-WebRequest` (§6.1): `401` без кредов, `200` с ними |
+| Сертификат установлен, но Chrome «не работает» | залипший в профиле `Alt-Svc h3`: фасад анонсировал QUIC, Chrome помнит его до 30 дней, а UDP-8443 закрыт фаерволом | `chrome://net-internals/#sockets` → *Flush socket pools*; `chrome://net-internals/#hsts` → удалить адрес; `chrome://restart`. В `Caddyfile` h3 уже отключён (`servers { protocols h1 h2 }`) — не включать, пока UDP не открыт |
+| Сертификат «установлен», а доверия нет | попал в пользовательское хранилище, а Chrome/службы смотрят в машинное | ставить в **«Локальный компьютер» → «Доверенные корневые»** (§6); проверка: `certutil -store Root \| findstr Caddy` |
+| Непонятно, дошёл ли запрос оператора | access-логи фасада включены (`log { output stdout format json }` в обоих сайтах) | `docker logs kb-console-tls --since 5m` → `remote_ip`, `status`, `User-Agent`. **Тишина в логе ≠ прокси:** при ошибке сертификата браузер вообще не отправляет HTTP, поэтому записи нет; при неверном пароле будет `401` |
+| Браузер грузит страницу рывками/висит | пробует QUIC (выше) либо уходит в прокси (§7) | см. строки выше и §7 |
+
 ## 9. Переносимость в офис
 
 1. Определить LAN-адрес хоста и подсеть → `CONSOLE_LAN_IP`, `CONSOLE_LAN_CIDR` в `.env`
-   (+ `console_lan_ip` в ansible-inventory).
+   (+ `console_lan_ip` в ansible-inventory). **Учесть удалённые подсети:** операторы могут
+   приходить не из LAN (пример: VPN-пул `10.8.x` — так подключался первый оператор).
+   Тогда `CONSOLE_LAN_CIDR`/ufw-правило должны покрывать и LAN, и VPN-пул; «только LAN»
+   отрежет удалённых операторов (симптом — 403 «доступ только из локальной сети»).
 2. `make push` (или `docker compose up -d kb-console-tls`) на целевом хосте.
 3. Раздать операторам `root.crt` (§6) и исключение прокси (§7).
 4. Завести учётки операторов с ролями (§5).
