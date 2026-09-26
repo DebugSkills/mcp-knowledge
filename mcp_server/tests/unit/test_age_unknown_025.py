@@ -95,3 +95,91 @@ def test_t25_7_metrics_key_present():
     """T25-7: счётчик `age_unknown_count` есть в контракте метрик скана."""
     res = _empty_result()
     assert res.get("age_unknown_count") == 0
+
+
+# ── 025-B: payload-чейн и дисплеи ──────────────────────────────
+
+
+def test_t25_8_is_drifted_matrix():
+    """T25-8: координация «нет поля в payload» ↔ явность fm (порча vs легитимно)."""
+    from mcp_server.indexing.reconcile import _is_drifted
+
+    t_old = T0 - timedelta(days=1)
+    assert _is_drifted(T0, None, False) is False  # обе стороны не знают
+    assert _is_drifted(T0, None, True) is True  # порча (явный fm)
+    assert _is_drifted(T0, t_old.isoformat(), False) is False  # нет сигнала свежести
+    assert _is_drifted(T0, t_old.isoformat(), True) is True  # явный новее payload
+    assert _is_drifted(T0, T0.isoformat(), True) is False  # равно
+    assert _is_drifted(t_old, T0.isoformat(), True) is False  # payload новее
+
+
+def test_t25_9_payload_omits_updated_at_for_fieldless():
+    """T25-9: payload fieldless-записи не несёт синтетическую дату."""
+    from mcp_server.indexing.pipeline import _updated_at_payload
+
+    fm_fieldless = KnowledgeFrontmatter(
+        knowledge_id="kid-25d", domain="d", subject="s", updated_at_explicit=False
+    )
+    fm_explicit = KnowledgeFrontmatter(
+        knowledge_id="kid-25e", domain="d", subject="s", updated_at=T0
+    )
+    assert _updated_at_payload(fm_fieldless) == {}
+    assert _updated_at_payload(fm_explicit) == {"updated_at": T0.isoformat()}
+
+
+def test_t25_11_index_meta_no_false_date():
+    """T25-11: INDEX-мета fieldless-записи — без ложной даты."""
+    from mcp_server.indexing.knowledge_index import _index_file_meta
+
+    fm_fieldless = KnowledgeFrontmatter(
+        knowledge_id="kid-25g", domain="d", subject="s", updated_at_explicit=False
+    )
+    fm_explicit = KnowledgeFrontmatter(
+        knowledge_id="kid-25h", domain="d", subject="s", updated_at=T0
+    )
+    assert _index_file_meta(fm_fieldless)["updated_at"] == ""
+    assert _index_file_meta(fm_explicit)["updated_at"] == T0.isoformat()
+
+
+async def test_t25_10_get_entry_fieldless_display(app_state):
+    """T25-10: get_entry для fieldless-записи — пустая дата + флаг явности."""
+    from unittest.mock import AsyncMock
+
+    from mcp_server.models import KnowledgeEntry
+    from mcp_server.tools.read import get_entry
+
+    fm = KnowledgeFrontmatter(
+        knowledge_id="kid-25f",
+        domain="d",
+        subject="s",
+        zone="public",
+        updated_at_explicit=False,
+    )
+    app_state.store.read = AsyncMock(return_value=KnowledgeEntry(frontmatter=fm, content="# x"))
+
+    res = await get_entry({"knowledge_id": "kid-25f"}, app_state)
+
+    assert res["updated_at"] == ""
+    assert res["updated_at_explicit"] is False
+
+
+async def test_t25_10b_get_entry_explicit_display(app_state):
+    """T25-10b: явная запись — дата на месте, флаг True."""
+    from unittest.mock import AsyncMock
+
+    from mcp_server.models import KnowledgeEntry
+    from mcp_server.tools.read import get_entry
+
+    fm = KnowledgeFrontmatter(
+        knowledge_id="kid-25i",
+        domain="d",
+        subject="s",
+        zone="public",
+        updated_at=T0,
+    )
+    app_state.store.read = AsyncMock(return_value=KnowledgeEntry(frontmatter=fm, content="# x"))
+
+    res = await get_entry({"knowledge_id": "kid-25i"}, app_state)
+
+    assert res["updated_at"] == T0.isoformat()
+    assert res["updated_at_explicit"] is True

@@ -483,8 +483,9 @@ def _is_drifted(
     """023-B + 024: обнаружить updated_at-дрейф между frontmatter и Qdrant payload.
 
     Вердикт (порядок проверок существенен — P2-1 Critic 024):
-    - payload None/невалидный ⇒ drifted (**порча точки** — проверяется ДО
-      явности, иначе fieldless+порча маскируется как «нет сигнала»).
+    - payload None/невалидный ⇒ drifted **только если fm_explicit** (порча);
+      если поля не было и в YAML (обе стороны не знают) ⇒ не дрейф (025:
+      payload для fieldless больше не пишется — координация политики записи).
     - `fm_explicit=False` (024: поля `updated_at` не было в исходном YAML ⇒
       парсер подставил default_factory=now) ⇒ **не drifted**: сигнала о
       свежести нет, а `now` — не свежесть (иначе ложный дрейф на каждом
@@ -505,9 +506,11 @@ def _is_drifted(
 
     payload_dt = _normalize_dt(payload_updated)
     if payload_dt is None:
-        # payload без/с невалидным updated_at у присутствующего kid ⇒ порча
-        # (проверяется ДО явности — P2-1 Critic 024: порча не маскируется).
-        return True
+        # 025 (координация с политикой записи): «нет поля в payload» ЛЕГИТИМНО
+        # ровно тогда, когда и в YAML поля не было (обе стороны не знают
+        # возраст — 025 перестал писать синтетическую дату). Для ЯВНОГО fm
+        # отсутствие поля остаётся порчей.
+        return fm_explicit
 
     if not fm_explicit:
         # 024: поля updated_at не было в исходном YAML ⇒ парсер подставил now

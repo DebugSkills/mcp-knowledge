@@ -872,14 +872,39 @@ async def test_t24_1_fieldless_no_drift(monkeypatch):
     assert im_calls == []
 
 
-async def test_t24_6_corrupt_payload_beats_fieldless(monkeypatch):
-    """T24-6 (P2-1): fieldless + порча payload → дрейф (порча проверяется первой)."""
+async def test_t24_6_fieldless_missing_payload_legit_no_drift(monkeypatch):
+    """T24-6 (семантика 025): fieldless + нет поля в payload = ЛЕГИТИМНО, не дрейф.
+
+    025 перестал писать синтетическую дату в payload для fieldless-записей
+    (иначе list_collections/TOC/UI показывали бы время индексации как «дату
+    обновления»). Поэтому «нет поля + неявный fm» = обе стороны не знают
+    возраст ⇒ дрейф не выводим (иначе вечный drift-цикл на каждом reconcile).
+    """
     monkeypatch.setattr(
         "mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50
     )
     path = Path("/tmp/knowledge/test/demo/kid-t24b.md")
     store = FakeStore([path], {path: _make_entry("kid-t24b", updated_at_explicit=False)})
-    qdrant = FakeQdrant(ids={"kid-t24b"})  # точек нет ⇒ payload updated_at = None (порча)
+    qdrant = FakeQdrant(ids={"kid-t24b"})  # точек нет ⇒ payload updated_at отсутствует
+    pipeline = _make_mock_pipeline()
+    im_calls, _ = _spy_pipeline(pipeline)
+
+    res = await reconcile(store, qdrant, pipeline, _make_knowledge_index(),
+                          skip_reindex=False, skip_orphan_detection=True)
+
+    assert res["drifted"] == 0
+    assert res["mode"] == "none"
+    assert im_calls == []
+
+
+async def test_t24_6b_explicit_missing_payload_is_drift(monkeypatch):
+    """T24-6b: ЯВНЫЙ updated_at + нет поля в payload ⇒ порча ⇒ дрейф."""
+    monkeypatch.setattr(
+        "mcp_server.indexing.reconcile.settings.RECONCILE_INCREMENTAL_MAX_ENTRIES", 50
+    )
+    path = Path("/tmp/knowledge/test/demo/kid-t24b2.md")
+    store = FakeStore([path], {path: _make_entry("kid-t24b2", updated_at=T0)})
+    qdrant = FakeQdrant(ids={"kid-t24b2"})
     pipeline = _make_mock_pipeline()
     im_calls, _ = _spy_pipeline(pipeline)
 

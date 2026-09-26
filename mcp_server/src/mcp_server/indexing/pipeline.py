@@ -43,6 +43,21 @@ from .sync_barrier import SyncBarrier
 logger = logging.getLogger("mcp_knowledge.pipeline")
 
 
+def _updated_at_payload(fm) -> dict:
+    """025: `updated_at` в payload — только для ЯВНО заданного поля.
+
+    Fieldless-запись (парсер подставил `now` через default_factory) не имеет
+    настоящей даты: писать в payload время индексации нельзя — его увидят
+    `get_knowledge_updated_at`/TOC/`list_collections`/kb-console как «дату
+    обновления». Читатели толерантны к отсутствию поля (`read.py` →
+    `payload.get("updated_at", "")`); `_is_drifted` трактует «нет поля +
+    неявный fm» как «обе стороны не знают» (не дрейф, 025).
+    """
+    if getattr(fm, "updated_at_explicit", True) is False:
+        return {}
+    return {"updated_at": fm.updated_at.isoformat()}
+
+
 class IndexingPipeline:
     """Асинхронный пайплайн: chunk → embed → Qdrant upsert."""
 
@@ -576,7 +591,7 @@ class IndexingPipeline:
                 cross_subjects=fm.cross_subjects,
                 section_header=ch.section_header,
                 chunk_index=ch.chunk_index,
-                updated_at=fm.updated_at.isoformat(),
+                **_updated_at_payload(fm),
                 parent_knowledge_id=getattr(fm, "parent_knowledge_id", None),
                 content_type=getattr(fm, "content_type", None),
                 sequence_number=getattr(fm, "sequence_number", None),
@@ -688,7 +703,7 @@ class IndexingPipeline:
                     cross_subjects=fm.cross_subjects,
                     section_header=ch.section_header,
                     chunk_index=ch.chunk_index,
-                    updated_at=fm.updated_at.isoformat(),
+                    **_updated_at_payload(fm),
                     parent_knowledge_id=getattr(fm, "parent_knowledge_id", None),
                     content_type=getattr(fm, "content_type", None),
                     sequence_number=getattr(fm, "sequence_number", None),

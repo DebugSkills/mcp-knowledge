@@ -191,7 +191,14 @@ async def get_entry(params: dict, app_state) -> dict:
         "tags": fm.tags,
         "version": fm.version,
         "created_at": fm.created_at.isoformat(),
-        "updated_at": fm.updated_at.isoformat(),
+        # 025: fieldless-запись не имеет настоящей даты обновления — отдаём
+        # пусто (конвенция кодовой базы, UI-guard в kb-console) + флаг.
+        "updated_at": (
+            fm.updated_at.isoformat()
+            if getattr(fm, "updated_at_explicit", True)
+            else ""
+        ),
+        "updated_at_explicit": bool(getattr(fm, "updated_at_explicit", True)),
         "content": entry.content,
         # Variant A (13.10): информативные поля для UI (список книг + поиск)
         "title": _derive_title(entry.content, fm.knowledge_id),

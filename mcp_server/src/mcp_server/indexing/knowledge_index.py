@@ -46,6 +46,26 @@ SECTION_SIZE_LIMIT = 8192  # bytes
 REQUIRED_FIELDS = ["domain", "subject", "tags"]
 
 
+def _index_file_meta(fm) -> dict:
+    """025: мета записи для INDEX.gen.yaml.
+
+    `updated_at` — пусто для fieldless-записи (дата неизвестна; иначе INDEX
+    фиксировал бы время индексации — ложная дата и чурн).
+    """
+    return {
+        "knowledge_id": fm.knowledge_id,
+        "subject": fm.subject,
+        "project": fm.project,
+        "tags": fm.tags,
+        "version": fm.version,
+        "updated_at": (
+            fm.updated_at.isoformat()
+            if getattr(fm, "updated_at_explicit", True)
+            else ""
+        ),
+    }
+
+
 class KnowledgeIndex:
     """Генератор INDEX.gen.yaml — структурная карта Markdown SSOT."""
 
@@ -248,14 +268,7 @@ class KnowledgeIndex:
 
         for entry in entries:
             fm = entry.frontmatter
-            files.append({
-                "knowledge_id": fm.knowledge_id,
-                "subject": fm.subject,
-                "project": fm.project,
-                "tags": fm.tags,
-                "version": fm.version,
-                "updated_at": fm.updated_at.isoformat(),
-            })
+            files.append(_index_file_meta(fm))
 
             for tag in fm.tags:
                 domain_tags[tag] += 1
