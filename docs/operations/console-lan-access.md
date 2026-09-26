@@ -77,6 +77,21 @@ Healthcheck самого фасада — **TCP-liveness** (`nc -z -w 3 $CONSOLE
 `wget` на ответ 401 отдаёт exit≠0 и даёт ложный `unhealthy` (проверено на деплое 030).
 Корректность TLS/HTTP проверяет V5.
 
+**Проверка websocket через фасад** (NiceGUI без него не работает; V5 этого не видит):
+
+```bash
+# HTML и WS-хендшейк с Basic-кредами (python-сниппет или любой WS-клиент):
+#   GET /_nicegui_ws/socket.io/?EIO=4&transport=websocket + Authorization: Basic …
+#   → ожидаем "HTTP/1.1 101 Switching Protocols"
+```
+Живой прогон 030: HTML фасада — **200** (9 289 байт, NiceGUI 3.17.1), WS-хендшейк —
+**101 Switching Protocols**, в логе Caddy 0 ошибок. То есть Basic-auth закрывает и WS
+(обход через upgrade невозможен), а TLS-фасад пропускает upgrade.
+
+> ℹ️ `curl` по этому адресу без `-k` покажет ошибку проверки сертификата
+> (`ssl_verify_result=20` — локальный CA не в системном хранилище). Для CLI —
+> `curl -k` или установить `root.crt` (§6); браузер после установки CA — без предупреждений.
+
 ## 5. Учётные записи операторов
 
 Пока `data/console/users.jsonl` пуст, действует единый legacy-пароль
