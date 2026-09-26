@@ -516,14 +516,21 @@ class TestResolve:
         assert [s for s, _ in res["regressed"]] == [_RSIG], (res, ag[_RSIG], al[_RSIG])
 
     def test_resolve_idempotent_keeps_fixed_at(self, tmp_path):
-        """N-1d/F4: повторный вызов при обеих resolved = no-op (fixed_at не перезаписан)."""
+        """N-1d/F4: повторный вызов при обеих resolved = no-op.
+
+        Проверяем НЕ равенство метки (она секундной гранулярности — перезапись
+        в ту же секунду невидима), а side-эффекты: reason НЕ перезаписан и
+        второй audit-записи НЕТ (no-op выходит до audit_event). Мутация M-B2
+        («снять no-op») обязана краснеть именно здесь.
+        """
         sink = mk_sink(tmp_path, aggs={}, alert_state={_RSIG: _alert_known()})
         ea.main(["--sink", str(sink), "--resolve", _RSIG, "--reason", "fixed"])
-        first = json.loads((sink / "alert_state.json").read_text())[_RSIG]["fixed_at"]
         rc = ea.main(["--sink", str(sink), "--resolve", _RSIG, "--reason", "fixed again"])
         assert rc == 0
-        after = json.loads((sink / "alert_state.json").read_text())[_RSIG]["fixed_at"]
-        assert after == first, "028-N-1d: no-op не должен перезаписывать fixed_at"
+        rec = json.loads((sink / "alert_state.json").read_text())[_RSIG]
+        assert rec["resolve_reason"] == "fixed", "028-N-1d: no-op перезаписал resolve_reason"
+        recs = [json.loads(x) for x in (sink / "audit.jsonl").read_text().splitlines()]
+        assert len([r for r in recs if r["action"] == "resolve"]) == 1, recs
 
     def test_resolve_unknown_sig_exit1(self, tmp_path):
         sink = mk_sink(tmp_path, aggs={}, alert_state={})
