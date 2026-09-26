@@ -211,6 +211,36 @@ class TestAnsibleNoProxy:
             "LAN-адрес консоли обязан входить в NO_PROXY, иначе прокси отдаёт 403"
         )
 
+    def test_firewall_opens_facade_port(self) -> None:
+        """ufw с DEFAULT_INPUT_POLICY=DROP даёт таймаут снаружи — порт обязан быть открыт,
+        а подсеть правила совпадать с allow-list фасада."""
+        text = GROUP_VARS.read_text(encoding="utf-8")
+        assert re.search(r"^mcp_kb_host_prepare__lan_ports:", text, re.MULTILINE)
+        ports_line = next(
+            line for line in text.splitlines()
+            if line.startswith("mcp_kb_host_prepare__lan_ports")
+        )
+        assert "8443" in ports_line, f"порт фасада не открыт в фаерволе: {ports_line}"
+        cidr_line = next(
+            line for line in text.splitlines()
+            if line.startswith("mcp_kb_host_prepare__lan_cidr")
+        )
+        env_cidr = re.search(
+            r"^CONSOLE_LAN_CIDR=(.+)$", ENV_EXAMPLE.read_text(encoding="utf-8"), re.MULTILINE
+        )
+        assert env_cidr, "CONSOLE_LAN_CIDR отсутствует в .env.example"
+        assert env_cidr.group(1).strip() in cidr_line, (
+            "подсеть ufw-правила должна совпадать с allow-list фасада (CONSOLE_LAN_CIDR)"
+        )
+
+    def test_host_prepare_has_ufw_task(self) -> None:
+        playbook = (ROOT / "ansible" / "playbooks" / "host-prepare.yml").read_text(
+            encoding="utf-8"
+        )
+        assert "community.general.ufw" in playbook
+        reqs = (ROOT / "ansible" / "requirements.yml").read_text(encoding="utf-8")
+        assert "community.general" in reqs, "коллекция с ufw-модулем не объявлена"
+
 
 # ── .env.example ─────────────────────────────────────────────────────────────
 

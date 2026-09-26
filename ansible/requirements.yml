@@ -1,3 +1,4 @@
 ---
 collections:
   - name: ansible.posix
+  - name: community.general   # ufw-модуль для LAN-правил (трасса 030)

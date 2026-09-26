@@ -57,6 +57,31 @@ docker compose logs -f kb-console-tls        # JSON-лог Caddy, ошибок �
 `kb-console-tls` описан в `docker-compose.yml` и `docker-compose.prod.yml`
 (`network_mode: host`, конфиг `kb-console/caddy/Caddyfile`, стор `data/caddy/`).
 
+### 3.1 Фаервол — обязательный шаг (иначе снаружи таймаут)
+
+На хостах с `ufw` и политикой `DEFAULT_INPUT_POLICY=DROP` (так на `lup`) весь
+входящий трафик дропается: **изнутри хоста всё работает, с других машин —
+`ERR_CONNECTION_TIMED_OUT`**. Диагностировано 2026-09-26 (трасса 030): были
+недоступны и `kb-console-tls:8443`, и MCP `:8000`.
+
+```bash
+# порт TLS-фасада консоли
+sudo ufw allow from 192.168.2.0/24 to any port 8443 proto tcp comment 'kb-console TLS facade (030)'
+# если с других машин нужен сам MCP-сервер
+sudo ufw allow from 192.168.2.0/24 to any port 8000 proto tcp comment 'MCP knowledge server (LAN)'
+sudo ufw status numbered | grep -E '8443|8000'
+```
+
+Подсеть в правиле должна совпадать с `CONSOLE_LAN_CIDR` (allow-list фасада).
+Автоматизация для новых хостов — `ansible/playbooks/host-prepare.yml`
+(переменные `mcp_kb_host_prepare__lan_cidr`, `mcp_kb_host_prepare__lan_ports`;
+модуль `community.general.ufw`). Проверка снаружи (не с хоста!):
+
+```bash
+# Windows: Test-NetConnection 192.168.2.3 -Port 8443
+# Linux:   nc -z -w 3 192.168.2.3 8443 && echo open
+```
+
 ## 4. Проверка
 
 ```bash
@@ -187,6 +212,8 @@ ERR_ACCESS_DENIED` — это прокси, а не консоль.
 
 | Симптом | Причина | Действие |
 |---|---|---|
+| **Таймаут / `ERR_CONNECTION_TIMED_OUT` с другой машины** (локально на хосте всё работает) | фаервол: `ufw` c `DEFAULT_INPUT_POLICY=DROP` без правила для порта | добавить правило (§3.1) |
+| 400 от Caddy при `http://…:8443` | запрос ушёл в открытом виде на TLS-порт (HTTP-листенера нет) | открывать **`https://`** |
 | 403 + `Server: squid` | запрос ушёл в прокси | исключить адрес из прокси (§7) |
 | 403 + текст «доступ только из локальной сети» | источник вне `CONSOLE_LAN_CIDR` | проверить подсеть/VPN-адрес |
 | 000 / нет ответа | фасад не поднят или упал fail-closed | `docker ps \| grep kb-console-tls`, `docker logs kb-console-tls`, проверить `CONSOLE_LAN_IP` |

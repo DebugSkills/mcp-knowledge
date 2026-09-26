@@ -345,6 +345,34 @@
               Установите драйвер ВРУЧНУЮ (non-free + nvidia-driver + reboot, см. приватный
               RUNBOOK, Сценарий B) либо включите mcp_kb_host_prepare__install_nvidia_driver: true.
 
+        # ─── Фаервол: LAN-доступ к портам сервисов (трасса 030) ───
+        # На хостах с ufw и DEFAULT_INPUT_POLICY=DROP без правила снаружи ТАЙМАУТ,
+        # а изнутри всё работает (диагностировано 2026-09-26: kb-console-tls на 8443
+        # и MCP на 8000 были недоступны с других машин). Порты/подсеть — переменные.
+        - name: Проверить наличие ufw
+          ansible.builtin.stat:
+            path: /usr/sbin/ufw
+          register: mcp_kb_host_prepare__ufw_bin
+
+        - name: Узнать состояние ufw
+          ansible.builtin.command:
+            cmd: ufw status
+          register: mcp_kb_host_prepare__ufw_status
+          changed_when: false
+          failed_when: false
+          when: mcp_kb_host_prepare__ufw_bin.stat.exists
+
+        - name: Разрешить доступ из LAN к портам сервисов (ufw)
+          community.general.ufw:
+            rule: allow
+            port: "{{ item }}"
+            proto: tcp
+            from_ip: "{{ mcp_kb_host_prepare__lan_cidr }}"
+          loop: "{{ mcp_kb_host_prepare__lan_ports }}"
+          when:
+            - mcp_kb_host_prepare__ufw_bin.stat.exists
+            - "'Status: active' in (mcp_kb_host_prepare__ufw_status.stdout | default(''))"
+
         - name: ГОТОВО — хост подготовлен для mcp-knowledge
           ansible.builtin.debug:
             msg: >-
