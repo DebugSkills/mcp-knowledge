@@ -139,7 +139,7 @@ def build_payload_point(
     cross_subjects: list[str],
     section_header: str,
     chunk_index: int,
-    updated_at: str,
+    updated_at: str | None = None,
     parent_knowledge_id: str | None = None,
     content_type: str | None = None,
     sequence_number: int | None = None,
@@ -157,8 +157,11 @@ def build_payload_point(
         "cross_subjects": cross_subjects,
         "section_header": section_header,
         "chunk_index": chunk_index,
-        "updated_at": updated_at,
     }
+    # 025: поле пишем только когда оно есть (fieldless-запись не имеет
+    # настоящей даты; синтетическая была бы ложью для UI/выдачи).
+    if updated_at is not None:
+        payload["updated_at"] = updated_at
     if parent_knowledge_id:
         payload["parent_knowledge_id"] = parent_knowledge_id
     if content_type:
