@@ -133,3 +133,21 @@ def test_lock_requires_force(tmp_path, capsys):
     mg.atomic_write_json(sink / "collector_state.json", {"fresh": True})  # только что
     rc = mg.main(["--sink", str(sink), "--confirm", "--trash-dir", str(sink / "trash")])
     assert rc == 1 and "ЛОК" in capsys.readouterr().out
+
+def test_meta_key_not_orphan_and_invariant_ok(tmp_path, capsys):
+    """Служебный `_alerts_meta` — не орфан и НЕ ломает инвариант (exit 0)."""
+    old1 = 'docker_logs|EMBED|[EMBED] SLOW <n>.4s'
+    sink = tmp_path
+    (sink / "aggregates").mkdir(parents=True)
+    mg.atomic_write_json(sink / "aggregates" / "signatures.json",
+                         {old1: _agg("[EMBED] SLOW 7.4s", 1, {})})
+    mg.atomic_write_json(sink / "alert_state.json", {
+        "_alerts_meta": {"hour_bucket": "2026-09-26T11", "sent_this_hour": 1},
+        old1: {"status": "known", "last_seen": "2026-09-25T00:00:00Z"},
+    })
+    rc = mg.main(["--sink", str(sink), "--confirm", "--force",
+                  "--trash-dir", str(sink / "trash")])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "инвариант alert ⊆ aggregates ∪ orphans — соблюдён" in out
+    assert "_alerts_meta" in json.loads((sink / "alert_state.json").read_text())

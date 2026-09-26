@@ -151,7 +151,8 @@ def migrate(aggs: dict, alert: dict):
             new_alert[nk] = dict(st)
 
     orphans = sorted(k for k in new_alert
-                     if k not in new_aggs and isinstance(new_alert[k], dict))
+                     if k not in new_aggs and isinstance(new_alert[k], dict)
+                     and not k.startswith("_"))  # служебные (_alerts_meta) — не орфаны
     stats = {"mapping": len(mapping), "underivable": underivable,
              "agg_groups": groups, "alert_groups": a_groups,
              "agg_before": len(aggs), "agg_after": len(new_aggs),
@@ -229,6 +230,7 @@ def main(argv=None) -> int:
           f"бэкапы + манифест: .trash/errors-migrate-027-*-{ts}.*")
     # инвариант (P1-1): alert ⊆ aggs ∪ orphans
     viol = [k for k in new_alert if isinstance(new_alert[k], dict)
+            and not k.startswith("_")  # служебные (_alerts_meta) — вне инварианта
             and k not in new_aggs and k not in set(st["orphans"])]
     if viol:
         print(f"ВНИМАНИЕ: нарушен инвариант alert ⊆ aggs ∪ orphans ({len(viol)} ключей)")
