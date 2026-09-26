@@ -41,8 +41,57 @@ class TestDeepNormalize:
             "failed to read <path>"
 
     def test_numbers_replaced(self):
-        # \b\d+\b: «1» заменён, «4» в «1.4s» — часть слова (нет границы) — стабильность ок
-        assert ec.deep_normalize("elapsed=1.4s count=42") == "elapsed=<n>.4s count=<n>"
+        # 027-D1: длительности маскируются ПЕРЕД числами ⇒ «1.4s» → «<dur>»
+        # (E2-заморозка изменена осознанно, трасса 027 — см. test_durations_masked)
+        assert ec.deep_normalize("elapsed=1.4s count=42") == "elapsed=<dur> count=<n>"
+
+    def test_durations_masked(self):
+        # T27-1 (трасса 027, D1): длительности → <dur>; до фикса было <n>.8s / <n>.209578ms
+        for src, exp in [
+            ("7.8s", "<dur>"),
+            ("1.842µs", "<dur>"),
+            ("85.209578ms", "<dur>"),
+            ("2m0s", "<dur>"),
+            ("60000 ms", "<dur>"),
+            ("[EMBED] SLOW 7.8s n=1", "[EMBED] SLOW <dur> n=<n>"),
+            ("[START] ready backend=ollama elapsed=0.2s rss=116 MB",
+             "[START] ready backend=ollama elapsed=<dur> rss=<n> MB"),
+        ]:
+            assert ec.deep_normalize(src) == exp, src
+
+    def test_durations_golden_negatives(self):
+        # T27-2: байты/версии/счётчики/даты/ip НЕ маскируются как длительность
+        for src, exp in [
+            ("rss=116 MB", "rss=<n> MB"),
+            ("v0.1.0", "v0.<n>.<n>"),
+            ("queue 921/1000", "queue <n>/<n>"),
+            ("n=500", "n=<n>"),
+            ("2026-09-26 04:26:03", "<n>-<n>-<n> <n>:<n>:<n>"),
+            ("172.18.0.1", "<n>.<n>.<n>.<n>"),
+            # «min»-суффикс НЕ покрыт DUR_RE (осознанно, см. §7.16.5(е));
+            # «5min» не матчится и NUM_RE (нет границы) ⇒ остаётся как есть
+            ("5min", "5min"),
+        ]:
+            assert ec.deep_normalize(src) == exp, src
+
+    def test_normalize_idempotent(self):
+        # T27-3: повторная нормализация не меняет результат
+        for src in ('[EMBED] SLOW 7.8s n=1',
+                    '[GIN] 2026/09/26 | 200 | 85.2ms | 1.2.3.4 | GET "/api/tags"'):
+            once = ec.deep_normalize(src)
+            assert ec.deep_normalize(once) == once
+
+    def test_same_signature_for_different_durations(self):
+        # T27-4: разные длительности одной строки → ОДНА сигнатура (было 10 дублей
+        # EMBED-SLOW / 14k GIN); разные пути GIN → РАЗНЫЕ сигнатуры
+        a = ec.make_signature("docker_logs", "EMBED", None, "[EMBED] SLOW 7.8s n=1")
+        b = ec.make_signature("docker_logs", "EMBED", None, "[EMBED] SLOW 9.5s n=1")
+        assert a == b
+        g1 = ec.make_signature("docker_logs", "GIN", None,
+                               '[GIN] 2026/09/26 | 200 | 957.721µs | 1.2.3.4 | GET "/api/tags"')
+        g2 = ec.make_signature("docker_logs", "GIN", None,
+                               '[GIN] 2026/09/26 | 200 | 85.209578ms | 1.2.3.4 | POST "/api/embed"')
+        assert g1 != g2
 
     def test_whitespace_collapsed(self):
         assert ec.deep_normalize("a   b\t c") == "a b c"
@@ -299,6 +348,40 @@ class TestMakeEvent:
 # ── Ф5 (iter2): routine-класс D1, slow_ms, скоуп docker events D2 ──
 
 LOG_LINE = "2026-09-22T10:00:00Z {}"
+
+
+class TestGinRoutine:
+    """T27-5 (трасса 027, D2): access-лог ollama (Gin) routine только 2xx/3xx.
+
+    Статус GIN приходит из GIN_STATUS_RE («| 200 |»), а не из ACCESS_RE ⇒
+    4xx/5xx перестают быть невидимыми; 5xx → hint='5xx' (P0-таксономия)."""
+
+    def _events(self, rest, slow_ms=60000):
+        return ec.parse_docker_log_events(
+            "mcp-knowledge-ollama", [LOG_LINE.format(rest)], "", slow_ms)
+
+    def test_2xx_is_routine(self):
+        evs = self._events('[GIN] 2026/09/26 - 11:05:02 | 200 | 85.209578ms | 172.18.0.1 | POST "/api/embed"')
+        assert len(evs) == 1
+        assert evs[0]["status"] == 200 and evs[0]["expected"] is True
+
+    def test_404_not_routine(self):
+        evs = self._events('[GIN] 2026/09/26 - 11:05:02 | 404 | 1.2ms | 172.18.0.1 | GET "/nope"')
+        assert len(evs) == 1
+        assert evs[0]["status"] == 404 and evs[0]["expected"] is False
+
+    def test_500_not_routine_and_hint_5xx(self):
+        evs = self._events('[GIN] 2026/09/26 - 11:05:02 | 500 | 1.2ms | 172.18.0.1 | POST "/api/embed"')
+        assert len(evs) == 1
+        assert evs[0]["status"] == 500
+        assert evs[0]["expected"] is False
+        assert evs[0]["priority_hint"] == "5xx"
+
+    def test_gin_without_status_not_routine(self):
+        # строка без «| NNN |» — статус неизвестен ⇒ не routine (fail-closed)
+        evs = self._events('[GIN] 2026/09/26 - 11:05:02 | GET "/api/tags"')
+        assert len(evs) == 1
+        assert evs[0]["status"] is None and evs[0]["expected"] is False
 
 
 class TestRoutineClassification:

@@ -56,17 +56,21 @@ def sink(tmp_path, ec):
 
     * legacy exit=0 P2/active (полная строка с dur= — ПОД удаление);
     * канонический heartbeat P3/active (БЕЗ dur= — не выбирается);
-    * [CRON] exit=1 P0/active (legacy-форма c dur=, но P0 — НЕ трогаем НИКОГДА);
+    * [CRON] weekly exit=1 P0/active (legacy-форма c dur=, но P0 — НЕ трогаем НИКОГДА);
+      (job=weekly отличает его от legacy: 027-D1 убрал различие по цифрам dur)
     * чужая docker P2/active (не-cron — не выбирается).
     """
     fresh = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
     legacy_sig = _sig(ec, f"[CRON] job=collector exit=0 dur=0s ts={fresh}")
     canon_sig = _sig(ec, "[CRON] job=collector exit=0")
-    p0_sig = _sig(ec, f"[CRON] job=collector exit=1 dur=2s ts={fresh}")
+    # 027-D1: dur-цифры больше НЕ различают ключи (dur=0s/dur=2s → <dur>) ⇒
+    # различаем job-именем (иначе legacy=P2 и P0 слились бы в один ключ —
+    # вскрытая D1 давняя дыра: exit=0/exit=1 маскировались и раньше)
+    p0_sig = _sig(ec, f"[CRON] job=weekly exit=1 dur=2s ts={fresh}")
     aggs = {
         legacy_sig: _agg("P2", "active", "[CRON] job=collector exit=0 dur=0s …"),
         canon_sig: _agg("P3", "active", "[CRON] job=collector exit=0"),
-        p0_sig: _agg("P0", "active", "[CRON] job=collector exit=1 dur=2s …"),
+        p0_sig: _agg("P0", "active", "[CRON] job=weekly exit=1 dur=2s …"),
         "docker_logs|-|foreign p2": _agg("P2", "active", "foreign", source="docker_logs"),
     }
     # критерий отбора виден в самой фикстуре (динамически, §7.8-1):

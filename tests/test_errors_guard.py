@@ -365,7 +365,8 @@ def test_16_baseline_priorities_unchanged(tmp_path):
     a = aggregates(tmp_path)
     assert a["docker_logs|REQ|[REQ] GET <path>"]["priority"] == "P3"
     assert a["docker_logs|-|oom killed"]["priority"] == "P0"
-    slow_sig = "docker_logs|MCP|[MCP] tool=x ok <n> ms"
+    # 027-D1: длительности маскируются ⇒ "<n> ms" → "<dur>" (E2-заморозка изменена осознанно)
+    slow_sig = "docker_logs|MCP|[MCP] tool=x ok <dur>"
     assert a[slow_sig]["priority"] == "P1" and a[slow_sig]["slow"] is True
 
 

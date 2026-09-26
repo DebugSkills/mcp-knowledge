@@ -60,7 +60,18 @@ CRON_LINE_RE = re.compile(r"\[CRON\] job=(\S+) exit=(\d+) dur=(\S+) ts=(\S+)")
 UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
 HEX16_RE = re.compile(r"\b[0-9a-f]{16,}\b", re.IGNORECASE)
 PATH_RE = re.compile(r"(?<![\w./-])/(?:[\w.-]+/)*[\w.-]+")
+# 027-D1: длительности маскируются ДО NUM_RE. Причина (трасса 027): `\b\d+\b`
+# не захватывает цифры, склеенные с единицей после десятичной точки
+# («7.8s»→«<n>.8s», «85.209578ms»→«<n>.209578ms») ⇒ одна сигнатура распадалась
+# на варианты (замер: 14 018 GIN-сигнатур из 14 201; 10 дублей EMBED-SLOW).
+# Составной вид покрывает «2m0s». Регистрозависимо: «MB»/«KB» (пробел+верхний
+# регистр) НЕ матчатся — байтовые величины сохраняют различимость.
+DUR_RE = re.compile(r"\b(?:\d+(?:\.\d+)?\s?(?:ns|µs|us|ms|s|m|h))+\b")
 NUM_RE = re.compile(r"\b\d+\b")
+# 027-D2: статус access-лога ollama (Gin) — формат «| 200 |», не совпадает с
+# ACCESS_RE (mcp-server: '"METHOD target HTTP/x" NNN'). Нужен, чтобы 4xx/5xx
+# GIN не были невидимы (5xx → hint='5xx' → P0-таксономия).
+GIN_STATUS_RE = re.compile(r"\|\s*(\d{3})\s*\|")
 WS_RE = re.compile(r"\s+")
 
 # P0-признаки (E3-словарь, заморожен; см. docstring модуля)
@@ -108,14 +119,17 @@ def mask_secrets(text: str) -> str:
 
 
 def deep_normalize(text: str) -> str:
-    """Нормализация сигнатуры (E2, порядок фиксирован): key-hash → uuid → hex≥16
-    → пути → числа → пробелы. key=<hex> схлопывается ПЕРВЫМ: актор не входит в
+    """Нормализация сигнатуры (E2, порядок фиксирован; изменён трассой 027):
+    key-hash → uuid → hex≥16 → пути → **длительности** → числа → пробелы.
+    key=<hex> схлопывается ПЕРВЫМ: актор не входит в
     сигнатуру (иначе разные акторы = разные сигнатуры = P1 «≥2 акторов» не
-    сработает; канон §9: нормализация идентификаторов дала 171→47 сигнатур)."""
+    сработает; канон §9: нормализация идентификаторов дала 171→47 сигнатур).
+    DUR_RE идёт ПЕРЕД NUM_RE (027-D1): иначе дробная часть с единицей выживает."""
     text = re.sub(r"\bkey=[0-9a-f]{4,64}\b", "key=<key>", text, flags=re.IGNORECASE)
     text = UUID_RE.sub("<uuid>", text)
     text = HEX16_RE.sub("<hex>", text)
     text = PATH_RE.sub("<path>", text)
+    text = DUR_RE.sub("<dur>", text)
     text = NUM_RE.sub("<n>", text)
     return WS_RE.sub(" ", text).strip()
 
@@ -295,6 +309,13 @@ def classify_routine(rest: str, level, marker, status, slow_ms: float):
         # иначе default P2, а при ≥2 admin-ключах/росте — P1 (портит noise_ratio).
         # P2-new-3: сбойные строки (error/failed/exception как СЛОВА) НЕ глотаем.
         return True, None
+    if marker == "GIN" and status is not None and 200 <= status < 400:
+        # 027-D2: access-лог ollama (Gin) 2xx/3xx — routine (аналог '[REQ] 2xx').
+        # 4xx → не routine (сигнал), 5xx перехвачен гейтом выше (hint='5xx' → P0).
+        # Статус НЕ входит в ключ сигнатуры (NUM_RE: «| 200 |»→«| <n> |») ⇒ 200 и
+        # 500 одного маршрута дают ОДИН агрегат; severity определяется
+        # has_non_routine (5xx-событие expected=False), см. §7.16.2a спеки 027.
+        return True, None
     return False, None
 
 
@@ -339,6 +360,11 @@ def parse_docker_log_events(container: str, lines, last_ts: str, slow_ms: float 
         marker = extract_marker(rest)
         acc = ACCESS_RE.search(rest)
         status = int(acc.group(3)) if acc else None
+        if status is None and marker == "GIN":
+            # 027-D2: access-лог ollama (Gin) — формат «| 200 |»; даёт 4xx/5xx
+            # видимость (иначе status=None ⇒ ни '5xx', ни 4xx-фильтр не сработают).
+            gacc = GIN_STATUS_RE.search(rest)
+            status = int(gacc.group(1)) if gacc else None
         want = marker or level in ("WARNING", "ERROR", "CRITICAL") or (status is not None and status >= 400)
         if want:
             hint = None
