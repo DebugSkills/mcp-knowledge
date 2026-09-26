@@ -303,6 +303,25 @@ class QdrantClient:
             points=points_filter,
         )
 
+    def delete_payload_keys(
+        self,
+        keys: list[str],
+        points_filter: qmodels.Filter | None = None,
+        collection_name: str | None = None,
+    ) -> None:
+        """Удалить ключи payload у точек по фильтру (026: самолечение legacy).
+
+        Используется quality-сканом: у fieldless-записей удаляется синтетический
+        `updated_at`, записанный кодом до 025 (иначе TOC/`list_collections`/UI
+        показывают время индексации как «дату обновления»). Идемпотентно.
+        """
+        collection_name = self._require_collection(collection_name)
+        self._client.delete_payload(
+            collection_name=collection_name,
+            keys=keys,
+            points=points_filter,
+        )
+
     def delete_all(self, collection_name: str | None = None) -> None:
         """Удалить все точки (для сине-зелёного reindex)."""
         collection_name = self._require_collection(collection_name)

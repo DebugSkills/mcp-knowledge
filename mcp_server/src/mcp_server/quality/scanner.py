@@ -46,6 +46,8 @@ logger = logging.getLogger("mcp_knowledge.quality.scanner")
 # ── Qdrant payload keys ──────────────────────────────────────
 PAYLOAD_STALENESS_SCORE = "staleness_score"
 PAYLOAD_QUALITY_FLAGS = "quality_flags"
+# 026: legacy-ключ, который удаляем у fieldless-записей (синтетическая дата до 025)
+PAYLOAD_UPDATED_AT = "updated_at"
 PAYLOAD_STATUS = "status"
 
 # ── Конфигурация dup-scan ────────────────────────────────────
@@ -533,7 +535,7 @@ async def _update_qdrant_payloads(
     def _do_batch(batch: list[tuple[str, dict, str]]) -> list[str]:
         """Синхронный set_payload для батча (выполняется в executor)."""
         errors: list[str] = []
-        for knowledge_id, payload_update, zone in batch:
+        for knowledge_id, payload_update, zone, delete_keys in batch:
             try:
                 # Зона из frontmatter записи (резолвится при подготовке батча) — P1-2 W2.
                 client.set_payload(
@@ -543,6 +545,21 @@ async def _update_qdrant_payloads(
                     ),
                     collection_name=collection_for_zone(zone),
                 )
+                # 026: самолечение legacy — у fieldless-записи удаляем
+                # синтетический updated_at (записан кодом до 025).
+                if delete_keys:
+                    client.delete_payload_keys(
+                        keys=delete_keys,
+                        points_filter=Filter(
+                            must=[
+                                FieldCondition(
+                                    key="knowledge_id",
+                                    match=MatchValue(value=knowledge_id),
+                                )
+                            ]
+                        ),
+                        collection_name=collection_for_zone(zone),
+                    )
             except Exception as exc:  # noqa: BLE001
                 msg = f"Failed to set_payload for {knowledge_id}: {exc}"
                 logger.error(msg)
@@ -550,8 +567,8 @@ async def _update_qdrant_payloads(
         return errors
 
     # Подготовка батчей
-    batches: list[list[tuple[str, dict, str]]] = []
-    current_batch: list[tuple[str, dict, str]] = []
+    batches: list[list[tuple[str, dict, str, list[str]]]] = []
+    current_batch: list[tuple[str, dict, str, list[str]]] = []
     for _filepath, frontmatter, score in scored:
         knowledge_id = frontmatter.knowledge_id
         # Зона из frontmatter (public/private), default — private (P1-2 W2).
@@ -561,7 +578,13 @@ async def _update_qdrant_payloads(
             PAYLOAD_STALENESS_SCORE: score,
             PAYLOAD_QUALITY_FLAGS: flags,
         }
-        current_batch.append((knowledge_id, payload_update, zone))
+        # 026: fieldless-запись (нет явного updated_at) — чистим legacy-ключ.
+        delete_keys = (
+            [PAYLOAD_UPDATED_AT]
+            if getattr(frontmatter, "updated_at_explicit", True) is False
+            else []
+        )
+        current_batch.append((knowledge_id, payload_update, zone, delete_keys))
         if len(current_batch) >= BATCH_SIZE:
             batches.append(current_batch)
             current_batch = []
