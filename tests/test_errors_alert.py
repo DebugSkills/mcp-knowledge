@@ -368,7 +368,7 @@ class TestStateAdditive:
                               "last_run": ISO}
         (sink / "alert_state.json").write_text(json.dumps(st), encoding="utf-8")
         cfg = {"retention_days": 90, "hold_days": 14}
-        day_files, sigs, _old_backups, _ = epr.plan(sink, cfg, st)
+        day_files, sigs, _stale_sigs, _old_backups, _ret = epr.plan(sink, cfg, st)  # 027-D3: 5-tuple
         assert sigs == []  # новые поля/мета не делают сигнатуру prune-кандидатом
         assert day_files == []
 

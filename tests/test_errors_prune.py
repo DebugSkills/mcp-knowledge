@@ -11,7 +11,6 @@ alert_state И aggregates; regressed/investigating — НИКОГДА; dry-run �
 
 import importlib.util
 import json
-import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -56,7 +55,7 @@ def test_expiry_scope_statuses(tmp_path):
         "_alerts_meta": {"anything": 1},
     }
     sink = _sink(tmp_path, alert)
-    _, sigs, stale, _, _ = pr.plan(sink, {"stale_sig_days": 45}, alert)
+    _, _sigs, stale, _, _ = pr.plan(sink, {"stale_sig_days": 45}, alert)
     assert sorted(stale) == ["old-known", "old-new", "old-resolved"]
     assert "fresh-new" not in stale
     assert "old-regressed" not in stale and "old-investigating" not in stale
