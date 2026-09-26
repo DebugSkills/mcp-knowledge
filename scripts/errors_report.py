@@ -24,6 +24,7 @@ dev: make errors-report [TG=1]. Python ≥3.9, stdlib-only. Выход 0 все�
 import argparse
 import json
 import os
+import shlex
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -98,6 +99,30 @@ def cmd_view(sink, top):
 
 
 # ── known-list (M7): new / known / regressed / resolved ──
+
+# 028-C: «ожидаемый ответ» — признак ложного P0/P1 (совет, авто-действий НЕТ:
+# осознанно отвергнуто §7.17.4 — риск замаскировать настоящую деградацию).
+SUPPRESS_HINTS = (
+    ("degraded:http_401", "401 = auth-required (ожидаемый ответ консоли)"),
+    ("|LIFECYCLE|docker event: die", "lifecycle Docker (перезапуск/деплой)"),
+    ("|404|", "404 пробы/сканера — ожидаемый ответ"),
+    ("|400|", "400 пробы/сканера — ожидаемый ответ"),
+)
+
+
+def _suppress_hint(sig, a):
+    """028-C: почему сигнатура похожа на ложный P0/P1, или None.
+
+    Условие: нет НИ ОДНОГО не-рутинного события (has_non_routine) И сигнатура
+    содержит «ожидаемый ответ» (401/404/400/lifecycle).
+    """
+    if a.get("has_non_routine"):
+        return None
+    for needle, why in SUPPRESS_HINTS:
+        if needle in sig:
+            return why
+    return None
+
 
 def classify_weekly(aggs, alert):
     """→ {status: [(sig, agg)]}; мутирует alert (first/last_seen, переходы, week)."""
@@ -363,6 +388,38 @@ def cmd_weekly(sink, send_tg):
         L.append(f"    → {rule_hint(sig, a)}; P0 → postmortem в incidents.md")
     if not candidates:
         L.append("- (пусто)")
+    # 028-B4: рецидивы к разбору (вернувшиеся после фикса) + готовая команда
+    L.append("")
+    L.append("## 7. Рецидивы к разбору (вернулись после фикса)")
+    reg = sorted(classes["regressed"], key=lambda kv: -kv[1].get("count_7d", 0))
+    if reg:
+        for sig, a in reg[:10]:
+            L.append(f"- [{a.get('priority')}] 7d={a.get('count_7d', 0)} — {sig[:110]}")
+            L.append(f"  разобрать или заглушить: make errors-guard-add "
+                     f"SIG={shlex.quote(sig)} REASON='разобран'")
+    else:
+        L.append("- (пусто)")
+
+    # 028-C: кандидаты на глушение — ТОЛЬКО совет (авто-глушение отвергнуто)
+    L.append("")
+    L.append("## 8. Кандидаты на глушение (совет; авто-действий НЕТ)")
+    cands = []
+    for sig, a in sorted(aggs.items(), key=lambda kv: -kv[1].get("count_7d", 0)):
+        if a.get("priority") not in ("P0", "P1") or a.get("status") == "resolved":
+            continue
+        why = _suppress_hint(sig, a)
+        if why:
+            cands.append((sig, a, why))
+    if cands:
+        for sig, a, why in cands[:10]:
+            L.append(f"- [{a.get('priority')}] 7d={a.get('count_7d', 0)} — {why}: {sig[:100]}")
+            L.append("  " + f"make errors-guard-add SIG={shlex.quote(sig)} "
+                     f"REASON={shlex.quote('ложный ' + str(a.get('priority')) + ': ' + why)} "
+                     "UNTIL=YYYY-MM-DD")
+    else:
+        L.append("- (пусто)")
+    L.append("")
+
     report = "\n".join(L)
 
     reports_dir = sink / "reports"
@@ -388,7 +445,7 @@ def main(argv=None):
     ap.add_argument("--sink", default=None, help="override каталога sink (dev/фикстуры)")
     ap.add_argument("--view", action="store_true", help="read-only просмотр топ-сигнатур")
     ap.add_argument("--top", type=int, default=50, help="сколько сигнатур в --view (дефолт 50)")
-    ap.add_argument("--weekly", action="store_true", help="weekly-отчёт (6 секций) + alert_state")
+    ap.add_argument("--weekly", action="store_true", help="weekly-отчёт (8 секций) + alert_state")
     ap.add_argument("--send-tg", action="store_true", help="отправить отчёт в TG (best-effort)")
     args = ap.parse_args(argv)
 
