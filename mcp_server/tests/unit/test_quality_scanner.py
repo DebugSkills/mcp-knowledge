@@ -115,6 +115,7 @@ class TestEmptyResult:
             "duplicates_detected",
             "issues_created",
             "review_queue_size",
+            "age_unknown_count",  # 025: наблюдаемый счётчик fieldless-записей
         }
         assert set(result.keys()) == expected_keys
 

@@ -44,6 +44,7 @@ class StalenessInput:
     """Входные данные для staleness_score() — только то что нужно формуле."""
 
     __slots__ = (
+        "age_unknown",  # 025: derived-признак «возраст неизвестен»
         "broken_links",
         "dup_count",
         "edit_war",
@@ -65,8 +66,13 @@ class StalenessInput:
         edit_war: bool = False,
         broken_links: int = 0,
         total_links: int = 0,
+        age_unknown: bool = False,
     ) -> None:
         self.updated_at = updated_at
+        # 025: поле updated_at отсутствовало в YAML ⇒ парсер подставил now
+        # (default_factory). Возраст НЕИЗВЕСТЕН: не штрафуем (иначе ложное
+        # «устарел»), но и не льстим — признак уходит в payload-флаги/метрику.
+        self.age_unknown = age_unknown
         self.evergreen = evergreen
         self.dup_count = dup_count
         self.recommended_missing = recommended_missing
@@ -83,8 +89,21 @@ def _clip01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
 
-def _age_norm(updated_at: datetime, evergreen: bool, now: datetime | None = None) -> float:
-    """Нормализованный возраст записи: 0 (только что) → 1 (предельный возраст)."""
+def _age_norm(
+    updated_at: datetime,
+    evergreen: bool,
+    now: datetime | None = None,
+    age_unknown: bool = False,
+) -> float:
+    """Нормализованный возраст записи: 0 (только что) → 1 (предельный возраст).
+
+    025: `age_unknown=True` (поля updated_at не было в YAML) ⇒ 0.0 — «нет
+    сигнала о возрасте». Замечание честности: сам по себе этот ранний выход
+    НЕ наблюдаем (для fieldless updated_at=now ⇒ age уже 0.0); наблюдаемый
+    канал фикса — флаг `age_unknown` в payload и счётчик в метриках.
+    """
+    if age_unknown:
+        return 0.0
     if now is None:
         now = datetime.now(timezone.utc)
 
@@ -148,7 +167,9 @@ def staleness_score(
         float [0, 0.78], округлённый до 4 знаков.
         0 = идеально свежая; чем выше — тем критичнее (максимум 0.78).
     """
-    age_component = W_AGE * _age_norm(inp.updated_at, inp.evergreen, now)
+    age_component = W_AGE * _age_norm(
+        inp.updated_at, inp.evergreen, now, getattr(inp, "age_unknown", False)
+    )
     incomplete_component = W_INCOMPLETE * _incomplete_factor(
         inp.recommended_missing, inp.recommended_total
     )

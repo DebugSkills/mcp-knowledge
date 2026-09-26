@@ -115,6 +115,7 @@ async def run_scan(
         "duplicates_detected": 0,
         "issues_created": 0,
         "review_queue_size": 0,
+        "age_unknown_count": 0,
     }
 
     pid = progress_id
@@ -196,6 +197,10 @@ async def run_scan(
         None, _compute_all_scores, entries, now, cancel_event,
     )
     metrics["review_queue_size"] = review_queue_size
+    # 025: наблюдаемый счётчик fieldless-записей (возраст неизвестен).
+    metrics["age_unknown_count"] = sum(
+        1 for _f, _fm, _s in scored if getattr(_fm, "updated_at_explicit", True) is False
+    )
 
     # 13.18: проверка отмены после scoring executor
     if scoring_cancelled or _is_cancelled():
@@ -440,9 +445,28 @@ def _parse_frontmatter(
         fm_dict = yaml_module.safe_load(parts[1])
         if not isinstance(fm_dict, dict):
             return None
-        return KnowledgeFrontmatter(**fm_dict)
+        # 025: derived-маркер явности поля (как 024 в markdown_store) — свой
+        # parse-хелпер сканера, иначе fieldless-файлы дают age≈0 («самый свежий»).
+        return KnowledgeFrontmatter(
+            **{**fm_dict, "updated_at_explicit": "updated_at" in fm_dict}
+        )
     except Exception:  # noqa: BLE001
         return None
+
+
+def _quality_flags(frontmatter: KnowledgeFrontmatter, score: float) -> list[str]:
+    """025: флаги качества для payload-канала (наблюдаемость фикса default-ловушки).
+
+    `age_unknown` — поля updated_at не было в YAML (парсер подставил now):
+    возраст неизвестен, score для такой записи не меняется (0.0 возрастной
+    компонент и до фикса), поэтому единственный честный канал — флаг.
+    """
+    flags: list[str] = []
+    if score >= REVIEW_THRESHOLD:
+        flags.append("needs_review")
+    if getattr(frontmatter, "updated_at_explicit", True) is False:
+        flags.append("age_unknown")
+    return flags
 
 
 def _compute_score(
@@ -468,6 +492,7 @@ def _compute_score(
 
     inp = StalenessInput(
         updated_at=frontmatter.updated_at,
+        age_unknown=not getattr(frontmatter, "updated_at_explicit", True),
         evergreen=is_evergreen,
         dup_count=0,
         recommended_missing=recommended_missing,
@@ -527,9 +552,7 @@ async def _update_qdrant_payloads(
         knowledge_id = frontmatter.knowledge_id
         # Зона из frontmatter (public/private), default — private (P1-2 W2).
         zone = getattr(frontmatter, "zone", None) or ZONE_PRIVATE
-        flags: list[str] = []
-        if score >= REVIEW_THRESHOLD:
-            flags.append("needs_review")
+        flags = _quality_flags(frontmatter, score)
         payload_update = {
             PAYLOAD_STALENESS_SCORE: score,
             PAYLOAD_QUALITY_FLAGS: flags,
@@ -673,6 +696,7 @@ def _compute_score_with_dup(
 
     inp = StalenessInput(
         updated_at=frontmatter.updated_at,
+        age_unknown=not getattr(frontmatter, "updated_at_explicit", True),
         evergreen=is_evergreen,
         dup_count=dup_count,  # R2: реальный dup_count
         recommended_missing=recommended_missing,
@@ -1134,4 +1158,5 @@ def _empty_result() -> dict:
         "duplicates_detected": 0,
         "issues_created": 0,
         "review_queue_size": 0,
+        "age_unknown_count": 0,
     }
