@@ -221,7 +221,9 @@ services:
       kb-console:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-check-certificate --server-response -o /dev/null -O /dev/null https://$$CONSOLE_LAN_IP:8443/ 2>&1 | grep -q 'HTTP/'"]
+      # Liveness = TCP-листенер фасада (busybox `nc -z`; wget на 401 отдаёт exit≠0 и
+      # давал ложный unhealthy). Корректность TLS проверяет verify-deploy V5.
+      test: ["CMD-SHELL", "nc -z -w 3 \"$$CONSOLE_LAN_IP\" 8443"]
       interval: 30s
       timeout: 5s
       retries: 3

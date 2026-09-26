@@ -73,6 +73,10 @@ docker exec kb-console-tls caddy validate --config /etc/caddy/Caddyfile --adapte
 с кредами **200**, `Strict-Transport-Security` в ответе, в `docker logs kb-console-tls`
 **0 ошибок**, `ss -ltn` не показывает листенер на `:80` (redirect отключён намеренно).
 
+Healthcheck самого фасада — **TCP-liveness** (`nc -z -w 3 $CONSOLE_LAN_IP 8443`):
+`wget` на ответ 401 отдаёт exit≠0 и даёт ложный `unhealthy` (проверено на деплое 030).
+Корректность TLS/HTTP проверяет V5.
+
 ## 5. Учётные записи операторов
 
 Пока `data/console/users.jsonl` пуст, действует единый legacy-пароль
@@ -115,13 +119,27 @@ docker exec mcp-knowledge-server python -m mcp_server.cli token revoke <token_id
 **403**, `write_knowledge` с заведомо неверными аргументами — ошибку валидации
 (не 403); contributor-ключом `write_knowledge` → **403**, `import_content` разрешён.
 
+> ⚠️ **Как выглядит отказ на транспорте (проверено живьём, трасса 030):** запрет
+> приходит **внутри JSON-RPC — HTTP 200 + `error.code = -32002`**, текст
+> `Forbidden: <level> key cannot access tool '<tool>'`. Мониторить только HTTP-код
+> бесполезно. На серверной стороне каждый отказ попадает в лог:
+> `Auth FORBIDDEN: <level>-key attempted <tool>` (logger.warning) → виден в sink
+> Error→Rule через `docker logs mcp-knowledge-server`.
+
+Живой прогон 030 (7/7): admin `errors_query` — разрешён; editor `errors_query`/
+`set_zone` — запрещены, `delete_entry` — разрешён; contributor `write_knowledge` —
+запрещён, `search_knowledge` — разрешён; read `write_knowledge` — запрещён.
+
 ## 6. Сертификат для операторов
 
 Caddy генерирует локальный CA сам (`tls internal`), сертификат продлевается
-автоматически. Корневой сертификат лежит на хосте:
+автоматически. Файлы лежат в volume фасада: `/data/caddy/pki/authorities/local/`
+(на хосте — `data/caddy/data/caddy/pki/authorities/local/`, каталог принадлежит
+root). Забрать корневой сертификат можно **без sudo**:
 
-```
-data/caddy/data/caddy/pki/authorities/local/root.crt
+```bash
+docker exec kb-console-tls cat /data/caddy/pki/authorities/local/root.crt > root.crt
+# либо: sudo cp data/caddy/data/caddy/pki/authorities/local/root.crt .
 ```
 
 Раздать/установить один раз на машине оператора (или принять предупреждение браузера):

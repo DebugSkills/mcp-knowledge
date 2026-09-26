@@ -152,6 +152,12 @@ class TestCompose:
         block = _service_block(compose.read_text(encoding="utf-8"), "kb-console-tls")
         assert "service_healthy" in block
 
+    def test_facade_healthcheck_is_tcp_liveness(self, compose: Path) -> None:
+        """wget на ответ 401 отдаёт exit≠0 → ложный unhealthy; liveness = `nc -z`."""
+        block = _service_block(compose.read_text(encoding="utf-8"), "kb-console-tls")
+        assert "nc -z" in block
+        assert "wget" not in block
+
 
 # ── verify-deploy ────────────────────────────────────────────────────────────
 
