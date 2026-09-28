@@ -172,7 +172,7 @@ def render_login_html(
         ""
         if legacy
         else (
-            "<input id='f-user' name='username' autocomplete='username' "
+            "<input id='f-user' type='text' name='username' autocomplete='username' "
             "placeholder='Логин' required autocapitalize='none'>"
         )
     )

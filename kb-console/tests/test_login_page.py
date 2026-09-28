@@ -166,6 +166,15 @@ class TestLoginUiContract:
         assert "f-user" in page
         assert "Логин" in page
 
+    def test_username_input_has_type_text_css_match(self):
+        """Регресс прод-нита 035: без type атрибут не матчился CSS-селектором
+        `input[type=text],input[type=password]` → поле «Логин» рендерилось
+        системным (узкое, без скругления). Оба поля должны покрываться CSS."""
+        page = render_login_html(legacy=False, next_path="/x")
+        assert "id='f-user' type='text'" in page
+        # CSS-селектор покрывает оба поля (самопроверка стилей)
+        assert "input[type=text],input[type=password]" in page
+
     def test_legacy_hides_username_field(self):
         page = render_login_html(legacy=True, next_path="/x")
         # контракт: нет ПОЛЯ ввода логина (JS-обращение к 'f-user'
