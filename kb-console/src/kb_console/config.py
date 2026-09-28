@@ -125,6 +125,38 @@ APP_COPYRIGHT: str = f"© {APP_DEVELOPER}"
 """Подпись авторского права: /login (подвал) + футер консоли (render_header).
 Копирайт-тест импортирует отсюда — литералов в UI-кодах быть не должно."""
 
+# ── 036: заявки на доступ — стор SQLite + лимиты ────────────
+
+CONSOLE_ACCESS_REQUESTS_DB: str = os.environ.get(
+    "CONSOLE_ACCESS_REQUESTS_DB", "/app/data/console/access_requests.db"
+)
+"""Путь к SQLite-БД заявок (volume data/console; права 0600/каталог 0700).
+journal_mode=DELETE (один файл, tar-дружелюбно — план 036 §2.1), снапшот
+бэкапа — VACUUM INTO под каноническим именем (§2.2)."""
+
+CONSOLE_ACCESS_REQUESTS_MAX: int = int(
+    os.environ.get("CONSOLE_ACCESS_REQUESTS_MAX", "500")
+)
+"""Hard cap записей (по ВСЕМ, после prune): ≥cap → 503 без раскрытия деталей.
+
+Потолок файла ≈ 500 × ~3 КБ ≈ 1.5 МБ — слой анти-залива после rate-limit
+5/5мин и потокового капа 8 КБ (план 036 §3)."""
+
+CONSOLE_ACCESS_REQUESTS_RETENTION_DAYS: int = int(
+    os.environ.get("CONSOLE_ACCESS_REQUESTS_RETENTION_DAYS", "180")
+)
+"""Retention терминальных заявок (access_granted/rejected) и их events:
+авто-prune при каждом append (152-ФЗ, план 036 §4). new/in_progress
+авто-удалению не подлежат."""
+
+ACCESS_REQUEST_CONSENT_TEXT: str = (
+    "Согласен(на) на обработку указанных персональных данных для рассмотрения "
+    "заявки; данные хранятся локально на сервере сообщества, доступны только "
+    "администратору, срок хранения — до 180 дней после рассмотрения"
+)
+"""Текст согласия (152-ФЗ): обязательный чекбокс формы заявки (SSOT —
+текст правится в одном месте; сервер требует consent=true)."""
+
 ACCESS_REQUEST_FIELDS: tuple[str, ...] = (
     "ФИО (фамилия, имя, отчество)",
     "Отдел",
