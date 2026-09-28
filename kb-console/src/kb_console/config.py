@@ -77,6 +77,70 @@ CONSOLE_ADMIN_PASSWORD: str = os.environ.get("CONSOLE_ADMIN_PASSWORD", "")
 Ротация: /users-страница (reset-password) — env-пароль больше не нужен.
 """
 
+CONSOLE_STORAGE_SECRET: str = os.environ.get("CONSOLE_STORAGE_SECRET", "")
+"""Секрет подписи cookie-сессий (035; пусто → файл/автогенерация).
+
+Разрешение (core/storage_secret.py): env → файл `<dir(CONSOLE_USERS_FILE)>/
+storage_secret` (0600, volume, air-gap) → ephemeral + WARNING. Ротация
+(env/удаление файла) = logout-all всех сессий — штатный ответ на инцидент.
+Значение НЕ логируется.
+"""
+
+CONSOLE_ADMIN_CONTACT: str = os.environ.get("CONSOLE_ADMIN_CONTACT", "")
+"""Контакт администратора для заявки на доступ (Telegram-username, 035).
+
+Пусто (air-gap default) → t.me-блок на /login скрыт; канал заявки —
+копирование шаблона и mailto. Без @, напр. `oksigen_07`.
+"""
+
+CONSOLE_TRUST_XFF: bool = os.environ.get("CONSOLE_TRUST_XFF", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+"""Доверять X-Forwarded-For для ключа rate-limit /api/login (035, N2).
+
+Default on: единственный вход — наш Caddy-фасад (ставит XFF, incoming
+значения игнорирует по дефолту → спуфинг закрыт). Прямой доступ без
+фасада (air-gap) → можно `0` (ключ = transport client host).
+"""
+
+# ── 035: заявка на доступ — SSOT-константы (план §4) ────────
+
+ACCESS_REQUEST_EMAIL: str = os.environ.get(
+    "CONSOLE_ACCESS_REQUEST_EMAIL", "oksigen_07@bk.ru"
+)
+"""Адрес администратора для mailto-канала заявки на доступ."""
+
+ACCESS_REQUEST_SUBJECT: str = "Заявка на доступ kb-console"
+"""Тема письма-заявки (mailto и t.me используют общий шаблон тела)."""
+
+ACCESS_REQUEST_FIELDS: tuple[str, ...] = (
+    "ФИО (фамилия, имя, отчество)",
+    "Отдел",
+    "Телефон для связи",
+    "Перечень проводимых работ",
+)
+"""Обязательные поля заявки на доступ (требование оператора 2026-09-28).
+
+SSOT: все каналы (textarea-шаблон, mailto body, t.me ?text=) строятся
+из access_request_template(); тест-контракт сверяет каналы с этим
+кортежем (рассинхрон = RED).
+"""
+
+
+def access_request_template() -> str:
+    """Шаблон заявки на доступ — единый источник для всех каналов (035 §4)."""
+    lines = [
+        "Здравствуйте!",
+        "Прошу предоставить доступ к консоли управления базой знаний (kb-console).",
+        "",
+    ]
+    lines += [f"{field}: " for field in ACCESS_REQUEST_FIELDS]
+    return "\n".join(lines)
+
+
 # ── kb-console-roles Ф3.1: маппинг роль→MCP-ключ ────────────
 
 MCP_API_KEY_ADMIN: str = os.environ.get("MCP_API_KEY_ADMIN", "")
