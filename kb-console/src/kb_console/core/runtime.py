@@ -13,3 +13,6 @@ from typing import Any
 
 USERS_STORE: Any = None
 """UserStore, созданный app.py при старте (None в unit/CLI-контексте)."""
+
+AUTH_MODE: str = ""
+"""Режим gate-middleware ('on'/'off'), кладёт app.py (035: кнопка «Выйти»)."""

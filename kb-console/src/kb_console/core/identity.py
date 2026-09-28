@@ -1,13 +1,16 @@
-"""Identity-хелперы kb-console (Ф2.4/Ф3, kb-console-roles B2).
+"""Identity-хелперы kb-console (Ф2.4/Ф3, kb-console-roles B2; 035 — v2).
 
-Пер-юзер идентичность в NiceGUI page-context: повторная верификация Basic
-из headers запроса через UserStore-TTL-кэш (кэш горячий — middleware уже
-верифицировал тот же заголовок, CPU-работы нет; R5 закрыт: Client.request
-доступен в nicegui 3.15.0/3.17.1).
+Per-юзер идентичность в NiceGUI page-context. Порядок источников (035 P1-1):
+1. cookie-сессия (identity_from_session): middleware уже ревалидировал её
+   против UserStore на этом же запросе (роль из стора актуальна);
+2. fallback — повторная верификация Basic из headers (identity_from_headers,
+   TTL-кэш горячий) — «Basic бит-в-бит»: curl/браузер с кэшированными
+   Basic-кредами получают полноценную роль, а не fail-closed;
+3. ни то ни другое → fail-closed ('contributor' при непустом сторе).
 
 Семантика ролей для UI-гейтов и MCP-ключей:
-- legacy (пустой users-стор): effective_role='admin', ключ=MCP_API_KEY —
-  поведение 002 бит-ин-бит (ничего не скрыто);
+- legacy (пустой users-стор): эффективная роль 'admin', ключ=MCP_API_KEY —
+  поведение 002 бит-ин-бит (current_identity → None, ранний возврат);
 - identity есть: роль из users.jsonl, ключ по api_key_for_role (Ф3.1);
 - непустой стор БЕЗ identity (не должно случаться — middleware режет):
   fail-closed → 'contributor'.
@@ -39,6 +42,43 @@ def identity_from_headers(headers: dict[str, str], users: Any) -> dict[str, Any]
     if record is None:
         return None
     return {"id": record.id, "username": record.username, "role": record.role}
+
+
+def identity_from_session(session: Any) -> dict[str, Any] | None:
+    """Identity из cookie-сессии (payload, записанный /api/login; 035).
+
+    Ревалидация против стора — зона gate-middleware (каждый запрос); здесь
+    формальная проверка payload. Legacy-payload → None (legacy-режим не
+    имеет per-user identity — эффективная роль admin через effective_role,
+    бит-в-бит с 002).
+    """
+    if not isinstance(session, dict):
+        return None
+    ident = session.get("identity")
+    if not isinstance(ident, dict) or ident.get("legacy"):
+        return None
+    username = ident.get("username")
+    role = ident.get("role")
+    if not username or not role:
+        return None
+    return {"id": str(ident.get("user_id") or ""), "username": username, "role": role}
+
+
+def identity_from_request(request: Any, users: Any) -> dict[str, Any] | None:
+    """Порядок P1-1: session → Basic-fallback (None при отсутствии обоих)."""
+    try:
+        session = request.session
+    except (AssertionError, AttributeError, KeyError):
+        session = None
+    if session is not None:
+        from_session = identity_from_session(session)
+        if from_session is not None:
+            return from_session
+    try:
+        headers = dict(request.headers)
+    except (AttributeError, KeyError, TypeError):
+        return None
+    return identity_from_headers(headers, users)
 
 
 def effective_role(identity: dict[str, Any] | None, *, has_users: bool) -> str:
@@ -77,8 +117,10 @@ def _users_store() -> Any:
 
 
 def current_identity() -> dict[str, Any] | None:
-    """Identity из nicegui page-context (Basic → UserStore, кэш горячий).
+    """Identity из nicegui page-context (035: session → Basic → None).
 
+    Legacy-режим (пустой стор) — ранний возврат None, бит-в-бит с 002:
+    эффективная роль admin через effective_role(has_users=False).
     Вне page-context/запроса (unit-тесты, CLI) → None. Ошибки подавляем:
     identity-хелпер НИКОГДА не ломает рендер страницы.
     """
@@ -88,12 +130,12 @@ def current_identity() -> dict[str, Any] | None:
     try:
         from nicegui import context
 
-        headers = dict(context.client.request.headers)
+        request = context.client.request
     except (ImportError, AttributeError, RuntimeError, ValueError, KeyError):
         # KeyError: вне HTTP-запроса (screen-test/фоновые задачи) request
         # требует NICEGUI_SCREEN_TEST_PORT — identity недоступна, это норма.
         return None
-    return identity_from_headers(headers, users)
+    return identity_from_request(request, users)
 
 
 def current_role() -> str:

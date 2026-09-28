@@ -12,17 +12,22 @@ from __future__ import annotations
 from nicegui import core, ui
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from . import login_page
 from .auth import ConsoleAuthMiddleware, resolve_auth_mode
 from .components.header import render_header
 from .config import (
+    CONSOLE_ADMIN_CONTACT,
     CONSOLE_ADMIN_PASSWORD,
     CONSOLE_ADMIN_USER,
     CONSOLE_AUTH,
     CONSOLE_HOST,
     CONSOLE_PASSWORD,
     CONSOLE_PORT,
+    CONSOLE_STORAGE_SECRET,
+    CONSOLE_TRUST_XFF,
     CONSOLE_USERS_FILE,
 )
+from .core.storage_secret import resolve_storage_secret
 from .core.users import UserStore
 
 
@@ -124,11 +129,33 @@ AUTH_MODE = resolve_auth_mode(
     CONSOLE_PASSWORD, CONSOLE_AUTH, CONSOLE_HOST, users_present=_USERS_PRESENT
 )
 
+# Ф3.2 + 035: стор и режим auth в runtime-модуле (identity-хелперы, header).
+_runtime.USERS_STORE = USERS_STORE
+_runtime.AUTH_MODE = AUTH_MODE
+
+# 035: роуты страницы входа (GET /login, POST /api/login, POST /api/logout).
+login_page.register_routes(
+    auth_mode=AUTH_MODE,
+    users=USERS_STORE,
+    password=CONSOLE_PASSWORD,
+    admin_contact=CONSOLE_ADMIN_CONTACT,
+    trust_xff=CONSOLE_TRUST_XFF,
+)
+
+# 035 §3б: секрет подписи cookie-сессий (env → файл в volume → ephemeral)
+# и ЯВНЫЕ параметры cookie: абсолютные 12ч (дефолт Starlette 14 суток
+# отклонён), SameSite=Lax, https_only=False — двойной контур доступа
+# (TLS-фасад :8443 и loopback HTTP :8085; cookie всегда подписан+httponly).
+STORAGE_SECRET = resolve_storage_secret(CONSOLE_STORAGE_SECRET, base_path=CONSOLE_USERS_FILE)
+_SESSION_KWARGS = {"max_age": 12 * 3600, "same_site": "lax", "https_only": False}
+
 # Порядок middleware: Starlette add_middleware = insert(0) → последний
 # добавленный = самый внешний. ConsoleAuth регистрируем ПЕРВОЙ (внутренняя),
 # RequestLog — ПОСЛЕДНЕЙ (внешняя) → RequestLog логирует и 401-отказы
 # (brute-force-видимость в [REQ]-логах). Безусловная регистрация:
-# режим off = чистый транзит (нулевой оверхед).
+# режим off = чистый транзит (нулевой оверхед). SessionMiddleware будет
+# добавлена ПОЗЖЕ всех через ui.run(storage_secret=…) — самая внешняя:
+# ConsoleAuth уже видит распакованный scope["session"] (http и websocket).
 core.app.add_middleware(
     ConsoleAuthMiddleware,
     password=CONSOLE_PASSWORD,
@@ -145,4 +172,6 @@ ui.run(
     title="MCP Knowledge Console",
     reload=False,
     show=False,
+    storage_secret=STORAGE_SECRET,
+    session_middleware_kwargs=_SESSION_KWARGS,
 )

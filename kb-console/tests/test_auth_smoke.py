@@ -84,6 +84,24 @@ def _wait_for_server(port: int, timeout: float = 15.0) -> None:
 _proc: subprocess.Popen | None = None
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _teardown_console():
+    """Модульный teardown: убить smoke-сервер (утечка = stale-порт →
+    false-green/false-red в следующем прогоне)."""
+    yield
+    global _proc
+    if _proc is not None:
+        try:
+            os.killpg(os.getpgid(_proc.pid), signal.SIGTERM)
+            _proc.wait(timeout=5)
+        except (ProcessLookupError, OSError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(os.getpgid(_proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+        _proc = None
+
+
 def _get_or_start_console() -> subprocess.Popen:
     global _proc
     if _proc is None or _proc.poll() is not None:
