@@ -10,6 +10,7 @@ import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -870,7 +871,7 @@ class TestCronMarkerOnly033F4:
     «Собственные ошибки — в stderr (НЕ в sink — анти-рекурсия)».
     """
 
-    REPORT_LINES = [
+    REPORT_LINES: ClassVar[list[str]] = [
         "- [P0] 7d=1 actors=- — Traceback (most recent call last):   File \"/usr/local/lib/python3.11/site-packages/httpx/_transports/default.py\"",
         "- [P1] 7d=3 actors=2ebf — signature growth: +2 за сутки (cap=5)",
         "P2 summary: 14 сигнатур, топ: docker_logs|503|…",
