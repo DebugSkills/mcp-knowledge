@@ -235,7 +235,12 @@ class TestAnsibleNoProxy:
 
     def test_firewall_opens_facade_port(self) -> None:
         """ufw с DEFAULT_INPUT_POLICY=DROP даёт таймаут снаружи — порт обязан быть открыт,
-        а подсеть правила совпадать с allow-list фасада."""
+        а подсети правила совпадать с allow-list фасада.
+
+        033-F2: allow-list — СПИСОК CIDR (LAN + VPN через пробел в env-значении);
+        ufw-переменная — ansible-список; множества подсетей обязаны совпадать,
+        иначе фаервол режет VPN-клиентов раньше Caddy.
+        """
         text = GROUP_VARS.read_text(encoding="utf-8")
         assert re.search(r"^mcp_kb_host_prepare__lan_ports:", text, re.MULTILINE)
         ports_line = next(
@@ -243,16 +248,25 @@ class TestAnsibleNoProxy:
             if line.startswith("mcp_kb_host_prepare__lan_ports")
         )
         assert "8443" in ports_line, f"порт фасада не открыт в фаерволе: {ports_line}"
+        env_match = re.search(
+            r"^CONSOLE_LAN_CIDR=(.+)$", ENV_EXAMPLE.read_text(encoding="utf-8"), re.MULTILINE
+        )
+        assert env_match, "CONSOLE_LAN_CIDR отсутствует в .env.example"
+        env_cidrs = env_match.group(1).split()
+        assert "10.8.2.0/24" in env_cidrs, (
+            "033-F2: VPN-подсеть операторов (10.8.2.0/24) обязана быть в allow-list"
+        )
         cidr_line = next(
             line for line in text.splitlines()
             if line.startswith("mcp_kb_host_prepare__lan_cidr")
         )
-        env_cidr = re.search(
-            r"^CONSOLE_LAN_CIDR=(.+)$", ENV_EXAMPLE.read_text(encoding="utf-8"), re.MULTILINE
+        ansible_cidrs = re.findall(r'"([^"]+)"', cidr_line)
+        assert ansible_cidrs, (
+            f"mcp_kb_host_prepare__lan_cidr должен быть списком CIDR: {cidr_line}"
         )
-        assert env_cidr, "CONSOLE_LAN_CIDR отсутствует в .env.example"
-        assert env_cidr.group(1).strip() in cidr_line, (
-            "подсеть ufw-правила должна совпадать с allow-list фасада (CONSOLE_LAN_CIDR)"
+        assert set(ansible_cidrs) == set(env_cidrs), (
+            f"подсети ufw-правил ({sorted(ansible_cidrs)}) должны совпадать "
+            f"с allow-list фасада ({sorted(env_cidrs)})"
         )
 
     def test_host_prepare_has_ufw_task(self) -> None:
@@ -273,6 +287,22 @@ class TestEnvExample:
         assert re.search(r"^CONSOLE_LAN_IP=", text, re.MULTILINE)
         assert re.search(r"^CONSOLE_LAN_CIDR=", text, re.MULTILINE)
         assert "0.0.0.0 НЕДОПУСТИМ" in text
+
+    def test_no_open_world_cidr_in_configs(self) -> None:
+        """033-F2: нигде в значимых строках фасадных конфигов — открытого мира.
+
+        `0.0.0.0/0` в allow-list превращает fail-closed 403-ветку в дыру для
+        всего интернета (диагноз 032: живой .env именно так и был настроен).
+        """
+        texts = [CADDYFILE.read_text(encoding="utf-8")]
+        texts += [p.read_text(encoding="utf-8") for p in COMPOSE_FILES]
+        for path, text in zip([CADDYFILE, *COMPOSE_FILES], texts):
+            offenders = [
+                line for line in _effective_lines(text) if "0.0.0.0/0" in line
+            ]
+            assert not offenders, (
+                f"{path.name}: открытый мир в allow-list запрещён: {offenders}"
+            )
 
 
 # ── функциональная валидация Caddyfile (docker, без сети) ────────────────────
@@ -296,11 +326,19 @@ def _docker_ready() -> bool:
 class TestCaddyValidate:
     @pytest.mark.parametrize(
         ("lan_ip", "cidr"),
-        [("192.168.2.3", "192.168.2.0/24"), ("10.1.2.3", "10.1.0.0/16")],
-        ids=["home-lan", "office-lan"],
+        [
+            ("192.168.2.3", "192.168.2.0/24"),
+            ("10.1.2.3", "10.1.0.0/16"),
+            ("192.168.2.3", "192.168.2.0/24 10.8.2.0/24"),
+        ],
+        ids=["home-lan", "office-lan", "lan+vpn"],
     )
     def test_config_is_valid(self, lan_ip: str, cidr: str) -> None:
-        """Конфиг валиден для разных LAN-адресов (переносимость в офис)."""
+        """Конфиг валиден для разных LAN-адресов (переносимость в офис).
+
+        ``lan+vpn`` (033-F2): пробел-разделённые несколько CIDR — Caddy раскрывает
+        ``{$CONSOLE_LAN_CIDR}`` в несколько токенов матчера remote_ip ДО парсинга.
+        """
         if not _docker_ready():
             pytest.skip(f"нет docker или локального образа {CADDY_IMAGE}")
         res = subprocess.run(

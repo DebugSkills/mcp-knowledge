@@ -365,10 +365,12 @@
         - name: Разрешить доступ из LAN к портам сервисов (ufw)
           community.general.ufw:
             rule: allow
-            port: "{{ item }}"
+            port: "{{ item.1 }}"
             proto: tcp
-            from_ip: "{{ mcp_kb_host_prepare__lan_cidr }}"
-          loop: "{{ mcp_kb_host_prepare__lan_ports }}"
+            from_ip: "{{ item.0 }}"
+          # 033-F2: lan_cidr — СПИСОК подсетей (LAN + VPN); декартово произведение
+          # подсети × порт даёт правило для каждой пары (product → [cidr, port]).
+          loop: "{{ mcp_kb_host_prepare__lan_cidr | product(mcp_kb_host_prepare__lan_ports) | list }}"
           when:
             - mcp_kb_host_prepare__ufw_bin.stat.exists
             - "'Status: active' in (mcp_kb_host_prepare__ufw_status.stdout | default(''))"

@@ -79,9 +79,10 @@ mcp_kb_host_prepare__no_proxy: "{{ docker_no_proxy | default('localhost,127.0.0.
 # LAN-доступ и фаервол (трасса code-2026-09-26-030). На хостах с ufw и политикой
 # DEFAULT_INPUT_POLICY=DROP без правила снаружи ТАЙМАУТ, а изнутри всё работает
 # (диагностировано 2026-09-26: kb-console-tls:8443 и MCP:8000 недоступны с других машин).
-# Подсеть обязана совпадать с CONSOLE_LAN_CIDR в .env (allow-list фасада).
-# Для доступа к самому MCP-серверу с других машин добавьте "8000" в список портов.
-mcp_kb_host_prepare__lan_cidr: "192.168.2.0/24"
+# Список подсетей должен включать ВСЕ подсети CONSOLE_LAN_CIDR из .env (allow-list
+# фасада, 033-F2: офисная LAN + VPN-подсеть операторов), иначе ufw режет VPN раньше
+# Caddy. Для доступа к самому MCP-серверу с других машин добавьте "8000" в список портов.
+mcp_kb_host_prepare__lan_cidr: ["192.168.2.0/24", "10.8.2.0/24"]
 mcp_kb_host_prepare__lan_ports: ["8443"]
 
 # — Параметры клонирования репозиториев (бывшая роль mcp_kb_repos, инлайн в playbooks/deploy.yml) —
