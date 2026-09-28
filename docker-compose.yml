@@ -198,11 +198,12 @@ services:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      # curl в python:3.11-slim отсутствует → проверка через urllib.
-      # Auth-aware (code-2026-09-20-002 + roles Ф4): legacy-режим —
-      # (':'+CONSOLE_PASSWORD); per-user — bootstrap-админ из
-      # CONSOLE_ADMIN_USER/PASSWORD (в непустом сторе legacy-пароль отклонён).
-      test: ["CMD", "python", "-c", "import base64,os,urllib.request;u=os.environ.get('CONSOLE_ADMIN_USER','');p=os.environ.get('CONSOLE_ADMIN_PASSWORD','') or os.environ.get('CONSOLE_PASSWORD','');req=urllib.request.Request('http://localhost:8085/',headers={'Authorization':'Basic '+base64.b64encode((u+':'+p).encode()).decode()});urllib.request.urlopen(req,timeout=3)"]
+      # 033-F3: liveness ≠ auth-валидность — безусловный /healthz (inline-ответ
+      # middleware ДО аутентификации). Креды из healthcheck убраны: Basic-строка
+      # в `docker inspect` + login_ok в users_audit каждые 30s (5523 записи,
+      # диагноз 032) + permanently unhealthy при ротации пароля админа.
+      # Деградация users-стора больше НЕ роняет healthcheck — и не должна.
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8085/healthz',timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3

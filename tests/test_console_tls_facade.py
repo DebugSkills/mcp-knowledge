@@ -94,6 +94,30 @@ class TestCaddyfile:
         lines = _effective_lines(CADDYFILE.read_text(encoding="utf-8"))
         assert any(re.search(r"respond .*403", line) for line in lines), "нет deny-ветки 403"
 
+    def test_healthz_blocked_at_facade_403(self) -> None:
+        """033-F3: /healthz (liveness, без auth) закрыт на фасаде — 403 ПЕРВЫМ
+        handle-блоком сайта 8443 (Caddy «only the first matching block is
+        evaluated»: path-матчер конкретнее @lan). Наружу эндпоинт не выходит,
+        доступен только loopback контейнера."""
+        text = CADDYFILE.read_text(encoding="utf-8")
+        site = text.split("https://{$CONSOLE_LAN_IP}:8443 {", 1)[1]
+        handle_blocks = re.findall(r"^\t(handle[^\n]*)$", site, re.MULTILINE)
+        assert any(b.strip().startswith("handle /healthz") for b in handle_blocks), (
+            f"нет handle /healthz в сайте 8443: {handle_blocks}"
+        )
+        healthz_pos = next(
+            i for i, b in enumerate(handle_blocks) if b.strip().startswith("handle /healthz")
+        )
+        lan_pos = next(
+            i for i, b in enumerate(handle_blocks) if b.strip().startswith("handle @lan")
+        )
+        assert healthz_pos < lan_pos, "handle /healthz обязан идти РАНЬШЕ handle @lan"
+        # в блоке /healthz — 403
+        block_match = re.search(
+            r"handle /healthz \{[^}]*respond[^\n]*403", text, re.DOTALL
+        )
+        assert block_match, "handle /healthz должен отвечать 403"
+
     def test_no_http_redirect_listener(self) -> None:
         """Авто-redirect Caddy открыл бы :80 на всех интерфейсах (host-сеть)."""
         lines = _effective_lines(CADDYFILE.read_text(encoding="utf-8"))
@@ -180,6 +204,24 @@ class TestCompose:
         effective = "\n".join(_effective_lines(block))
         assert "nc -z" in effective
         assert "wget" not in effective, "wget как healthcheck даёт ложный unhealthy на 401"
+
+    def test_console_healthcheck_no_credentials_inline(self, compose: Path) -> None:
+        """033-F3: healthcheck kb-console — /healthz БЕЗ кредов.
+
+        Креды админа в healthcheck-строке = Basic-пароль в `docker inspect`
+        + login_ok в auth-audit каждые 30s (5523 записи, диагноз 032) +
+        unhealthy при ротации пароля. Liveness ≠ auth-валидность.
+        Проверяется ИМЕННО healthcheck-подблок (CONSOLE_ADMIN_* в
+        environment сервиса легитимны — bootstrap-админ users-стора).
+        """
+        block = _service_block(compose.read_text(encoding="utf-8"), "kb-console")
+        assert "healthcheck:" in block, f"{compose.name}: у kb-console нет healthcheck"
+        hc = block.split("healthcheck:", 1)[1]
+        for forbidden in ("CONSOLE_ADMIN_USER", "CONSOLE_ADMIN_PASSWORD", "Authorization"):
+            assert forbidden not in hc, (
+                f"{compose.name}: healthcheck kb-console не должен содержать {forbidden}"
+            )
+        assert "/healthz" in hc, "healthcheck обязан пробовать /healthz"
 
 
 # ── verify-deploy ────────────────────────────────────────────────────────────

@@ -184,9 +184,10 @@ services:
     healthcheck:
       # curl в образе kb-console (python:3.11-slim) ОТСУТСТВУЕТ — старый curl-test
       # был латентным дефектом; унифицировано с dev- compose на python/urllib.
-      # Auth-aware (code-2026-09-20-002 + roles Ф4): legacy — (':'+CONSOLE_PASSWORD);
-      # per-user — bootstrap-админ (CONSOLE_ADMIN_USER/PASSWORD).
-      test: ["CMD", "python", "-c", "import base64,os,urllib.request;u=os.environ.get('CONSOLE_ADMIN_USER','');p=os.environ.get('CONSOLE_ADMIN_PASSWORD','') or os.environ.get('CONSOLE_PASSWORD','');req=urllib.request.Request('http://localhost:8085/',headers={'Authorization':'Basic '+base64.b64encode((u+':'+p).encode()).decode()});urllib.request.urlopen(req,timeout=3)"]
+      # 033-F3: liveness ≠ auth-валидность — безусловный /healthz; креды из
+      # healthcheck убраны (Basic в `docker inspect` + login_ok каждые 30s в
+      # users_audit + unhealthy при ротации пароля админа).
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8085/healthz',timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3

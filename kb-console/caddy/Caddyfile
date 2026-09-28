@@ -65,6 +65,13 @@ https://{$CONSOLE_LAN_IP}:8443 {
 	# Второй контур после TLS: доступ только из разрешённой подсети.
 	@lan remote_ip {$CONSOLE_LAN_CIDR}
 
+	# 033-F3: liveness-эндпоинт консоли (/healthz, без auth) наружу НЕ выходит —
+	# 403 первым handle-блоком (Caddy: only the first matching block is evaluated;
+	# path-матчер конкретнее @lan). Доступен только loopback контейнера.
+	handle /healthz {
+		respond "denied" 403
+	}
+
 	handle @lan {
 		# Консоль — NiceGUI (websocket): reverse_proxy сам обрабатывает upgrade.
 		reverse_proxy 127.0.0.1:8085 {

@@ -277,6 +277,76 @@ def test_mode_off_transits_everything():
     assert len(stub_ws.calls) == 1
 
 
+# ── 033-F3: /healthz — неаутентифицированный liveness-эндпоинт ──
+
+
+class TestHealthzEndpoint:
+    """033-F3: healthcheck не должен писать login_ok в auth-audit.
+
+    Docker HEALTHCHECK каждые 30s логинился в `/` → 5523 login_ok/640 КБ
+    шума в users_audit.jsonl + испорченный last_login_at. Решение: pure-ASGI
+    guard в middleware ПЕРВЫМ действием (до enabled-ветки) — inline-ответ
+    200 "ok" без вызова app и UserStore. Фасад (Caddy) режет /healthz 403.
+    """
+
+    def test_healthz_no_credentials_200_ok(self):
+        """RED-1: http /healthz БЕЗ Authorization → 200 + body ok; app НЕ вызван."""
+        mw, stub = _make_mw()
+        sent = _run(mw, _make_scope("http", "/healthz"))
+        assert stub.calls == [], "healthz не должен доходить до NiceGUI-app"
+        assert sent[0]["type"] == "http.response.start"
+        assert sent[0]["status"] == 200
+        body = b"".join(
+            msg.get("body", b"") for msg in sent if msg["type"] == "http.response.body"
+        )
+        assert body == b"ok"
+
+    def test_healthz_works_in_mode_off(self):
+        """RED-2: mode=off → /healthz всё равно 200 inline (guard до enabled-ветки),
+        иначе auth-off-режим ловил бы 404 от NiceGUI-app."""
+        mw, stub = _make_mw(mode="off")
+        sent = _run(mw, _make_scope("http", "/healthz"))
+        assert stub.calls == [], "healthz отдаётся middleware, не app (равенство семантики on/off)"
+        assert sent[0]["status"] == 200
+
+    def test_healthz_matcher_is_strict(self):
+        """RED-3 (изоляция): skip ТОЛЬКО точный /healthz — инвариант «skip-путей
+        нет» сохранён для всего остального; ws /healthz НЕ скипается."""
+        # / без кредов → по-прежнему 401-челлендж
+        mw, stub = _make_mw()
+        sent = _run(mw, _make_scope("http", "/"))
+        assert stub.calls == []
+        assert sent[0]["status"] == 401
+        # /healthz/ (trailing slash) без кредов → 401, НЕ 200 (строгий матчер;
+        # на фасаде путь проксируется, но middleware отдаёт челлендж)
+        mw2, stub2 = _make_mw()
+        sent2 = _run(mw2, _make_scope("http", "/healthz/"))
+        assert stub2.calls == []
+        assert sent2[0]["status"] == 401, "/healthz/ не должен матчиться как /healthz"
+        # ws-scope /healthz → НЕ skip (guard только http): без кредов — close
+        mw3, stub3 = _make_mw()
+        sent3 = _run(mw3, _make_scope("websocket", "/healthz"))
+        assert stub3.calls == []
+        assert sent3 and sent3[0]["type"] == "websocket.close"
+
+    def test_healthz_no_audit_records(self):
+        """RED-4 (audit-молчание): N запросов /healthz со включённым users-стором
+        → verify/log_login НЕ вызываются (users_audit.jsonl не растёт)."""
+        from unittest.mock import MagicMock
+
+        users = MagicMock()
+        users.has_users.return_value = True
+        stub = _StubApp()
+        mw = ConsoleAuthMiddleware(
+            app=stub, password="secret", mode="on", failure_delay=0.0, users=users
+        )
+        for _ in range(3):
+            _run(mw, _make_scope("http", "/healthz"))
+        assert users.verify.call_count == 0, "healthz не должен вызывать pbkdf2-verify"
+        assert users.log_login.call_count == 0, "healthz не должен писать login_ok в аудит"
+        assert stub.calls == []
+
+
 if __name__ == "__main__":
     import pytest
 

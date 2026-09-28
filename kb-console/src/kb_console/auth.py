@@ -26,7 +26,14 @@ kb-console-roles Ф2 (B2), middleware v2 — per-user Basic поверх 002:
     ПОЛНОСТЬЮ + warning в interlock (P2-5b: скрытый неаудитируемый
     админ-вход запрещён).
 
-Skip-путей НЕТ by design: статика /_nicegui/* обязана быть за auth.
+Skip-путей НЕТ by design (статика /_nicegui/* обязана быть за auth).
+Единственное исключение — /healthz (033-F3): ТОЧНОЕ сравнение пути, отдаётся
+inline pure-ASGI-ответом ДО ветки enabled и до app (liveness Docker HEALTHCHECK
+без кредов — иначе каждые 30s login_ok в users_audit.jsonl + испорченный
+last_login_at; 5523 записи/640 КБ шума, диагноз 032). Снаружи /healthz закрыт
+403 на TLS-фасаде (Caddy, handle-блок до @lan) — доступен только loopback
+контейнера; /healthz/ (trailing slash) матчится строгим сравнением и идёт
+в обычный 401-путь.
 Сессий/cookie/storage_secret НЕТ — stateless. Инвариант: Basic без TLS =
 креды base64 → сетевой доступ только ssh -L или TLS-фасад (доки, не код).
 """
@@ -222,6 +229,13 @@ class ConsoleAuthMiddleware:
     async def __call__(self, scope: _Scope, receive: _Receive, send: _Send) -> None:
         scope_type = scope["type"]
 
+        # 033-F3: liveness-эндпоинт — ДО enabled-ветки (одинаковая семантика в
+        # режимах on/off: auth-off не должен ловить 404 от NiceGUI-app) и до
+        # парсинга заголовков. Строгое равенство: "/healthz/" идёт в 401-путь.
+        if scope_type == "http" and scope.get("path") == "/healthz":
+            await self._respond_healthz(send)
+            return
+
         # Guard: не-http и не-websocket (lifespan и прочие) — транзит.
         if scope_type not in ("http", "websocket") or not self._enabled:
             await self.app(scope, receive, send)
@@ -243,6 +257,25 @@ class ConsoleAuthMiddleware:
             return
 
         await self._reject(scope, scope_type, authorization, send)
+
+    async def _respond_healthz(self, send: _Send) -> None:
+        """Inline pure-ASGI 200 "ok" для /healthz (033-F3).
+
+        Приложение (NiceGUI) и UserStore не вызываются — ноль side-effects
+        для аудита и last_login_at. no-store: ответ неизменяем, кешировать
+        нечего.
+        """
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"text/plain; charset=utf-8"),
+                    (b"cache-control", b"no-store"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"ok"})
 
     async def _authenticate_user(self, scope: _Scope, authorization: str) -> bool:
         """Per-user verify: pbkdf2 в executor + identity в scope-state.
