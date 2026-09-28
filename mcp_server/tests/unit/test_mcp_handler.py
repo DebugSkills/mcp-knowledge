@@ -352,3 +352,84 @@ class TestNotificationsHandler:
         assert resp.status_code == 204
         raw = resp.body if hasattr(resp, "body") else b""
         assert raw == b"", f"204 тело должно быть пустым, got {raw!r}"
+
+
+# ── 033-F1: классификация Qdrant-таймаутов (−32006 retryable) ────
+
+
+class TestToolsCallBackendUnavailable:
+    """033-F1: транзиентные сбои векторного хранилища → -32006 retryable.
+
+    Носитель (проверено критиком на venv qdrant-client 1.14.3 = прод):
+    qdrant-client REST заворачивает ЛЮБОЙ транспортный сбой в
+    ``ResponseHandlingException`` (api_client.py send_inner:127-130),
+    исходное исключение доступно как ``.source`` (exceptions.py:44-46).
+    На проде QDRANT_PREFER_GRPC=false → REST/httpx-путь.
+    """
+
+    def _patch_search_handler(self, monkeypatch, exc: Exception) -> None:
+        """Подменить search_knowledge на handler, поднимающий exc."""
+        import mcp_server.mcp_handler as mh
+        monkeypatch.setitem(mh.TOOL_HANDLERS, "search_knowledge", AsyncMock(side_effect=exc))
+
+    async def test_qdrant_read_timeout_is_retryable_32006(self, monkeypatch):
+        """RED-1 (главный, носитель): ResponseHandlingException(httpx.ReadTimeout)
+        → -32006 + data.retryable=True + retry-hint, без traceback в message."""
+        import httpx
+        from qdrant_client.http.exceptions import ResponseHandlingException
+
+        self._patch_search_handler(
+            monkeypatch,
+            ResponseHandlingException(httpx.ReadTimeout("The read operation timed out")),
+        )
+        req = _make_mock_request_for_dispatch()
+        result = await _handle_tools_call(
+            {"name": "search_knowledge", "arguments": {"query": "x"}}, request_id=1, request=req,
+        )
+        assert result["error"]["code"] == -32006, \
+            f"Qdrant read-timeout должен давать -32006, got {result['error']['code']}"
+        assert result["error"]["data"]["retryable"] is True
+        assert "Retry" in result["error"]["message"], f"Нет retry-hint: {result['error']['message']}"
+        assert "Traceback" not in result["error"]["message"]
+
+    async def test_qdrant_non_transient_stays_32603(self, monkeypatch):
+        """RED-2 (носитель, негатив): ResponseHandlingException(ValueError) —
+        НЕ транзиент (ValidationError-ветка send_inner) → прежний -32603 без retry-hint."""
+        from qdrant_client.http.exceptions import ResponseHandlingException
+
+        self._patch_search_handler(
+            monkeypatch,
+            ResponseHandlingException(ValueError("bad json")),
+        )
+        req = _make_mock_request_for_dispatch()
+        result = await _handle_tools_call(
+            {"name": "search_knowledge", "arguments": {"query": "x"}}, request_id=1, request=req,
+        )
+        assert result["error"]["code"] == -32603
+        assert "Retry" not in result["error"]["message"]
+        data = result["error"].get("data")
+        assert not (isinstance(data, dict) and data.get("retryable")), \
+            f"Нетранзиентная ошибка не должна быть retryable: {data}"
+
+    async def test_raw_httpx_connect_error_is_retryable_32006(self, monkeypatch):
+        """RED-3 (raw httpx): httpx.ConnectError без qdrant-обёртки → -32006 retryable."""
+        import httpx
+
+        self._patch_search_handler(monkeypatch, httpx.ConnectError("refused"))
+        req = _make_mock_request_for_dispatch()
+        result = await _handle_tools_call(
+            {"name": "search_knowledge", "arguments": {"query": "x"}}, request_id=1, request=req,
+        )
+        assert result["error"]["code"] == -32006
+        assert result["error"]["data"]["retryable"] is True
+        assert "Retry" in result["error"]["message"]
+
+    async def test_generic_value_error_stays_32603(self, monkeypatch):
+        """RED-4 (preservation): ValueError → прежний -32603 (generic-ветка жива)."""
+        self._patch_search_handler(monkeypatch, ValueError("boom"))
+        req = _make_mock_request_for_dispatch()
+        result = await _handle_tools_call(
+            {"name": "search_knowledge", "arguments": {"query": "x"}}, request_id=1, request=req,
+        )
+        assert result["error"]["code"] == -32603
+        assert "Tool execution failed" in result["error"]["message"]

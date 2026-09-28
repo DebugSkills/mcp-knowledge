@@ -18,8 +18,10 @@ import logging
 import time
 from typing import Any
 
+import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
+from qdrant_client.http.exceptions import ResponseHandlingException
 
 from .auth import SUBSCRIBER_TOOLS, check_tool_permission, get_auth
 from .config import settings
@@ -51,6 +53,7 @@ MCP_AUTH_FAILED = -32002
 MCP_RATE_LIMITED = -32003
 MCP_REQUEST_TOO_LARGE = -32004
 MCP_CONFLICT = -32005  # F2: optimistic locking version conflict (HTTP 409)
+MCP_BACKEND_UNAVAILABLE = -32006  # 033-F1: транзиентный сбой векторного хранилища (timeout/transport), retryable
 
 # ── Helpers ────────────────────────────────────────────────
 
@@ -234,6 +237,52 @@ async def _handle_tools_call(params: dict, request_id: Any, request: Request) ->
         from .metrics import tool_requests
         tool_requests.labels(tool=tool_name, status="success").inc()
         return _jsonrpc_result({"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}, request_id)
+    except ResponseHandlingException as exc:
+        # 033-F1: Qdrant REST (прод-путь, QDRANT_PREFER_GRPC=false) заворачивает любой
+        # сбой send_inner в ResponseHandlingException(source=...) — api_client.py:127-130.
+        # Транзиентные транспортные (.source ⊆ httpx.TransportError: ReadTimeout,
+        # ConnectError, …) → -32006 retryable; прочее (ValidationError/JSON-декод) —
+        # прежняя семантика -32603 без retry-hint. gRPC-путь (PREFER_GRPC=true) даёт
+        # grpc.RpcError → уходит в generic-ветку (задокументированная деградация).
+        src = getattr(exc, "source", None)
+        if isinstance(src, httpx.TransportError):
+            from .metrics import tool_requests
+            tool_requests.labels(tool=tool_name, status="backend_unavailable").inc()
+            # Без exc_info: ERROR-строка без traceback не порождает P0-сигнатуру
+            # в errors-sink; детали исключения сохранены через %r/%r.
+            logger.error(
+                "[MCP] tool=%s backend unavailable (qdrant transport): %r source=%r",
+                tool_name, exc, src,
+            )
+            return _jsonrpc_error(
+                MCP_BACKEND_UNAVAILABLE,
+                "Vector storage temporarily unavailable (timeout/transport). Retry the request in a few seconds.",
+                request_id,
+                data={"backend": "qdrant", "retryable": True},
+            )
+        from .metrics import tool_requests
+        tool_requests.labels(tool=tool_name, status="error").inc()
+        logger.exception("[MCP] tool=%s ERROR", tool_name)
+        return _jsonrpc_error(
+            JSONRPC_INTERNAL_ERROR,
+            f"Tool execution failed: {exc}",
+            request_id,
+        )
+    except httpx.TransportError as exc:
+        # 033-F1: raw httpx (транспортный сбой без qdrant-обёртки — прочие тулы/пути).
+        # Нейтральный текст: источник неизвестен (критик iter2-P3).
+        from .metrics import tool_requests
+        tool_requests.labels(tool=tool_name, status="backend_unavailable").inc()
+        logger.error(
+            "[MCP] tool=%s backend unavailable (transport): %r",
+            tool_name, exc,
+        )
+        return _jsonrpc_error(
+            MCP_BACKEND_UNAVAILABLE,
+            "Upstream service temporarily unavailable (timeout/transport). Retry the request in a few seconds.",
+            request_id,
+            data={"retryable": True},
+        )
     except Exception as exc:
         # Фаза 12: tool_requests — error
         from .metrics import tool_requests
