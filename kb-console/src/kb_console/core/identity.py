@@ -81,6 +81,27 @@ def identity_from_request(request: Any, users: Any) -> dict[str, Any] | None:
     return identity_from_headers(headers, users)
 
 
+def session_identity() -> dict[str, Any] | None:
+    """Сырой identity ИЗ СЕССИИ в nicegui page-context (035 Ф2, «Выйти»).
+
+    Отличия от current_identity(): БЕЗ Basic-фолбэка (Basic-клиент не может
+    «выйти» — браузер шлёт креды на каждом запросе) и БЕЗ требования
+    per-user стора (legacy-payload тоже показываем — выход доступен всем
+    входившим через форму). Ревалидацию уже сделал gate-middleware.
+    Вне page-context → None, никогда не бросает.
+    """
+    try:
+        from nicegui import context
+
+        session = context.client.request.scope.get("session")
+    except (ImportError, AttributeError, RuntimeError, ValueError, KeyError):
+        return None
+    ident = session.get("identity") if isinstance(session, dict) else None
+    if isinstance(ident, dict) and ident.get("username"):
+        return {"username": str(ident["username"]), "legacy": bool(ident.get("legacy"))}
+    return None
+
+
 def effective_role(identity: dict[str, Any] | None, *, has_users: bool) -> str:
     """Роль для UI-гейтов: legacy → admin (бит-ин-бит 002), fail-closed → contributor."""
     if identity is not None:

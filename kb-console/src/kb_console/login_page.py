@@ -126,7 +126,7 @@ class LoginContext:
     limiter: LoginRateLimiter = field(default_factory=LoginRateLimiter)
 
 
-# ── HTML (минимальная рабочая страница; полный сплит-UI — Ф2) ──
+# ── HTML: сплит-лейаут + табы «Вход»/«Заявка» (Svyazi-канон, Ф2) ──
 
 
 def render_login_html(
@@ -138,10 +138,15 @@ def render_login_html(
 ) -> str:
     """HTML /login: inline-CSS/JS, 0 внешних запросов (air-gap, план §4).
 
-    Полный сплит-лейаут с табами «Вход»/«Заявка на доступ» — Ф2; контракт
-    функции (аргументы) финален: каналы заявки строятся из SSOT-констант.
+    Сплит-лейаут: слева бренд-панель, справа карточка с CSS-only табами
+    «Вход»/«Заявка на доступ» (работают даже без JS). Каналы заявки
+    (textarea + mailto + t.me) строятся из одних SSOT-констант — контент-
+    контракт тестируется на согласованность с ACCESS_REQUEST_FIELDS.
+    favicon — data:-URI; шрифты системные; единственный fetch —
+    same-origin /api/login.
     """
     import json
+    from html import escape as _esc
 
     from .config import (
         ACCESS_REQUEST_EMAIL,
@@ -150,48 +155,131 @@ def render_login_html(
     )
 
     template = template or access_request_template()
-    mailto = f"mailto:{ACCESS_REQUEST_EMAIL}?subject={quote(ACCESS_REQUEST_SUBJECT)}&body={quote(template)}"
-    tme = f"https://t.me/{admin_contact}?text={quote(template)}" if admin_contact else ""
-    next_js = json.dumps(sanitize_next(next_path))
-    user_field = "" if legacy else '<input id="f-user" name="username" autocomplete="username" placeholder="Логин" required>'
-    hint = "Пароль выдаёт администратор" if legacy else "Логин и пароль выдаёт администратор"
+    tpl_esc = _esc(template)
+    tpl_js = json.dumps(template)
+    mailto = (
+        f"mailto:{ACCESS_REQUEST_EMAIL}"
+        f"?subject={quote(ACCESS_REQUEST_SUBJECT)}&body={quote(template)}"
+    )
     tme_html = (
-        f'<p><a id="tme-link" href="{tme}">Написать администратору в чате</a> (Telegram)</p>'
-        if tme
+        f"<a id='tme-link' class='btn ghost' href=\"https://t.me/{_esc(admin_contact)}"
+        f"?text={quote(template)}\">Написать администратору в чате</a>"
+        if admin_contact
         else ""
     )
+    next_js = json.dumps(sanitize_next(next_path))
+    user_field = (
+        ""
+        if legacy
+        else (
+            "<input id='f-user' name='username' autocomplete='username' "
+            "placeholder='Логин' required autocapitalize='none'>"
+        )
+    )
+    hint = "🔑 Пароль выдаёт администратор" if legacy else "🔑 Логин и пароль выдаёт администратор"
+
+    css = (
+        "*{box-sizing:border-box;margin:0}body{font-family:system-ui,-apple-system,"
+        "'Segoe UI',Roboto,sans-serif;min-height:100vh;display:flex;"
+        "background:#f0f2f5;color:#1f2937}"
+        ".split{display:flex;width:100%;min-height:100vh}"
+        ".brand{flex:1 1 46%;background:linear-gradient(160deg,#0d1b2a 0%,"
+        "#1b3a5c 60%,#2563eb 140%);color:#e5edf6;display:flex;flex-direction:"
+        "column;justify-content:center;padding:64px;gap:14px}"
+        ".brand h1{font-size:42px;letter-spacing:-.5px}.brand .logo{font-size:52px}"
+        ".brand p{color:#b8c7d9;line-height:1.55;max-width:44ch}"
+        ".brand ul{list-style:none;margin-top:18px;display:flex;"
+        "flex-direction:column;gap:10px;color:#cdd9e5;font-size:15px}"
+        ".brand li:before{content:'✓  ';color:#60a5fa;font-weight:700}"
+        ".pane{flex:1 1 54%;display:flex;align-items:center;justify-content:center;padding:36px}"
+        ".card{width:100%;max-width:460px;background:#fff;border-radius:18px;"
+        "box-shadow:0 12px 40px rgba(13,27,42,.14);padding:34px 34px 28px}"
+        ".tabs input[type=radio]{position:absolute;opacity:0;pointer-events:none}"
+        ".tablabels{display:flex;gap:6px;margin-bottom:22px;border-bottom:1px solid #e5e7eb}"
+        ".tablabels label{flex:1;text-align:center;padding:10px 6px;cursor:pointer;"
+        "font-weight:600;color:#6b7280;border-bottom:2px solid transparent;"
+        "transition:color .15s,border-color .15s}"
+        "#tab-login:checked~.tablabels label[for=tab-login],"
+        "#tab-req:checked~.tablabels label[for=tab-req]{color:#1d4ed8;"
+        "border-bottom-color:#1d4ed8}"
+        ".panels section{display:none}#tab-login:checked~.panels #p-login,"
+        "#tab-req:checked~.panels #p-req{display:block;animation:fade .18s ease-in}"
+        "@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1}}"
+        "input[type=text],input[type=password]{width:100%;padding:12px 14px;"
+        "margin:8px 0;border:1px solid #cbd5e1;border-radius:10px;font-size:15px}"
+        "input:focus{outline:2px solid #93c5fd;border-color:#3b82f6}"
+        ".toggle{display:flex;align-items:center;gap:8px;font-size:14px;"
+        "color:#546e7a;margin:6px 0 4px;cursor:pointer}"
+        ".btn{display:inline-flex;align-items:center;justify-content:center;"
+        "width:100%;padding:12px 18px;margin-top:14px;border:0;border-radius:10px;"
+        "background:#1d4ed8;color:#fff;font-size:15px;font-weight:600;"
+        "cursor:pointer;transition:background .15s;text-decoration:none}"
+        ".btn:hover{background:#1e40af}.btn.ghost{background:#eef2ff;color:#1e40af}"
+        ".err{color:#c62828;min-height:22px;font-size:14px;margin-top:10px}"
+        ".hint{font-size:13.5px;color:#6b7280;margin:10px 0 2px}"
+        "textarea{width:100%;min-height:190px;padding:12px;border:1px solid #cbd5e1;"
+        "border-radius:10px;font-family:ui-monospace,Consolas,monospace;"
+        "font-size:13px;resize:vertical;color:#374151}"
+        ".channels{display:flex;flex-direction:column;gap:8px;margin-top:6px}"
+        ".req-note{font-size:13.5px;color:#6b7280;margin:12px 0 8px;line-height:1.5}"
+        "a.mailto{color:#1d4ed8;font-weight:600;text-decoration:none}"
+        "a.mailto:hover{text-decoration:underline}"
+        "@media(max-width:860px){.split{flex-direction:column}.brand{padding:34px;"
+        "flex-basis:auto}.brand h1{font-size:30px}.brand ul{display:none}}"
+    )
+
     return (
         "<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>Вход — kb-console</title>"
         "<link rel='icon' href='data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww"
         ".w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20100%20100%22%3E%3Ctext%20y%3D%22"
         ".9em%22%20font-size%3D%2290%22%3E%F0%9F%97%82%3C%2Ftext%3E%3C%2Fsvg%3E'>"
-        "<style>body{font-family:system-ui,sans-serif;display:flex;justify-content:center;"
-        "padding-top:8vh;background:#f4f6f8}.card{background:#fff;border-radius:16px;"
-        "padding:32px;max-width:420px;box-shadow:0 4px 24px rgba(0,0,0,.08)}input{display:"
-        "block;width:100%;margin:8px 0;padding:10px;border:1px solid #cbd5e1;border-radius:"
-        "8px;box-sizing:border-box}button{margin-top:12px;padding:10px 18px;border:0;"
-        "border-radius:8px;background:#1976d2;color:#fff;cursor:pointer}.err{color:#c62828;"
-        "min-height:20px}label{font-size:14px;color:#546e7a}</style></head><body>"
-        "<div class='card'><h1>kb-console</h1>"
-        f"<p>🔐 {hint}</p>"
+        f"<style>{css}</style></head><body><div class='split'>"
+        "<aside class='brand'><div class='logo'>🗂</div><h1>kb-console</h1>"
+        "<p>Консоль управления базой знаний MCP: книги, импорт, поиск, "
+        "качество и токены — в одном интерфейсе.</p>"
+        "<ul><li>Вход по личному логину</li><li>Роли: admin / editor / contributor"
+        "</li><li>Сессия действует 12 часов</li></ul></aside>"
+        "<main class='pane'><div class='card'>"
+        "<div class='tabs'>"
+        "<input type='radio' name='tab' id='tab-login' checked>"
+        "<input type='radio' name='tab' id='tab-req'>"
+        "<div class='tablabels'><label for='tab-login'>Вход</label>"
+        "<label for='tab-req'>Заявка на доступ</label></div>"
+        "<div class='panels'>"
+        "<section id='p-login'>"
         f"<form id='lf'>{user_field}"
-        "<input id='f-pass' type='password' name='password' autocomplete='current-password' "
-        "placeholder='Пароль' required>"
-        "<label><input type='checkbox' onclick=\"document.getElementById('f-pass').type="
-        "this.checked?'text':'password'\"> показать пароль</label>"
-        "<button type='submit'>Войти</button><div class='err' id='err'></div></form>"
-        f"<p>Заявка на доступ: скопируйте шаблон и отправьте на {mailto}.</p>{tme_html}"
-        "<textarea readonly rows='7' style='width:100%' onclick='this.select()'>"
-        f"{template}</textarea>"
-        "</div><script>const N=" + next_js + ";"
+        "<input id='f-pass' type='password' name='password' "
+        "autocomplete='current-password' placeholder='Пароль' required>"
+        "<label class='toggle'><input type='checkbox' onclick="
+        "\"document.getElementById('f-pass').type=this.checked?'text':'password'\">"
+        "показать пароль</label>"
+        "<button class='btn' type='submit'>Войти</button>"
+        "<div class='err' id='err'></div>"
+        f"<p class='hint'>{hint}</p>"
+        "</form></section>"
+        "<section id='p-req'>"
+        "<p class='req-note'>Скопируйте шаблон, заполните обязательные поля "
+        "и отправьте заявителю доступа по любому каналу ниже.</p>"
+        f"<textarea id='req-tpl' readonly rows='9' onclick='this.select()'>{tpl_esc}</textarea>"
+        "<div class='channels'>"
+        "<button class='btn ghost' type='button' id='copy-btn'>Скопировать заявку</button>"
+        f"<a class='mailto' href=\"{mailto}\">Отправить по почте</a>{tme_html}"
+        "</div></section>"
+        "</div></div></div></main></div>"
+        "<script>const N=" + next_js + ",T=" + tpl_js + ";"
         "document.getElementById('lf').addEventListener('submit',async(e)=>{e.preventDefault();"
         "const u=document.getElementById('f-user');"
         "const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':"
         "'application/json'},body:JSON.stringify({username:u?u.value:'',password:"
         "document.getElementById('f-pass').value})});"
         "if(r.ok){window.location=N}else{document.getElementById('err').textContent="
-        "'Неверный логин или пароль'}});</script></body></html>"
+        "'Неверный логин или пароль'}});"
+        "document.getElementById('copy-btn').addEventListener('click',function(){"
+        "navigator.clipboard.writeText(T).then(()=>{this.textContent='Скопировано ✓'},"
+        "()=>{const t=document.getElementById('req-tpl');t.focus();t.select()})});"
+        "</script></body></html>"
     )
 
 
