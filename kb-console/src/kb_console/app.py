@@ -101,11 +101,23 @@ def page_tokens() -> None:
 
 
 @ui.page("/users")
-def page_users() -> None:
-    """Страница «Пользователи» — учётные записи консоли (admin-only, Ф3.2)."""
+def page_users(from_request: str = "") -> None:
+    """Страница «Пользователи» — учётные записи консоли (admin-only, Ф3.2).
+
+    036 Ф2 (Q2): `?from_request=<id>` — предзаполнение формы создания
+    из одобренной заявки (передаётся в build_users).
+    """
     render_header("users")
     from .pages.users_page import build_users
-    build_users()
+    build_users(prefill_request_id=from_request)
+
+
+@ui.page("/requests")
+def page_requests() -> None:
+    """Страница «Заявки на доступ» — окно админа (036 Ф2)."""
+    render_header("requests")
+    from .pages.requests_page import build_requests
+    build_requests()
 
 
 # ── Start ───────────────────────────────────────────────────
@@ -150,6 +162,9 @@ REQUESTS_STORE = AccessRequestStore(
 )
 REQUESTS_STORE.migrate()
 
+# 036 Ф2: стор в runtime для страниц /requests, /users (prefill), печати.
+_runtime.REQUESTS_STORE = REQUESTS_STORE
+
 login_page.register_routes(
     auth_mode=AUTH_MODE,
     users=USERS_STORE,
@@ -158,6 +173,12 @@ login_page.register_routes(
     trust_xff=CONSOLE_TRUST_XFF,
     requests_store=REQUESTS_STORE,
 )
+
+# 036 Ф2: API статусов + печатная карточка (admin-гейты в хендлерах).
+from .pages import requests_page, requests_print
+
+requests_page.register_api(core.app)
+requests_print.register_print_route(core.app)
 
 # 035 §3б: секрет подписи cookie-сессий (env → файл в volume → ephemeral)
 # и ЯВНЫЕ параметры cookie: абсолютные 12ч (дефолт Starlette 14 суток

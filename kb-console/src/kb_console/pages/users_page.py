@@ -78,8 +78,13 @@ def _show_one_time_password(username: str, password: str, what: str) -> None:
     dlg.open()
 
 
-def build_users() -> None:
-    """Построить страницу «Пользователи» (admin-only)."""
+def build_users(prefill_request_id: str = "") -> None:
+    """Построить страницу «Пользователи» (admin-only).
+
+    036 Ф2 (Q2): `prefill_request_id` (из `?from_request=<id>`) — карточка
+    данных одобренной заявки + открытый диалог создания с предзаполненной
+    заметкой (ФИО → подсказка username; роль выбирает админ; автосоздания НЕТ).
+    """
     if not is_admin():
         ui.label("⛔ 403: управление пользователями доступно только администраторам.").classes(
             "text-h6 text-negative"
@@ -103,14 +108,20 @@ def build_users() -> None:
 
     # ── Создание ─────────────────────────────────────────────
     with ui.row().classes("q-mb-md"):
-        def _open_create() -> None:
+        def _open_create(username_hint: str = "", note: str = "") -> None:
             with ui.dialog() as dlg, ui.card().classes("q-pa-md"):
                 ui.label("Создать пользователя").classes("text-h6")
                 username_in = ui.input("Username").classes("w-full")
+                if username_hint:
+                    ui.label(f"Подсказка из заявки: {username_hint}").classes(
+                        "text-caption text-grey-7"
+                    )
                 role_sel = ui.select(
                     list(ROLES), value="contributor", label="Роль",
                 ).classes("w-full")
-                note_in = ui.input("Заметка (опционально)").classes("w-full")
+                note_in = ui.input(
+                    "Заметка (опционально)", value=note,
+                ).classes("w-full")
 
                 def _do_create() -> None:
                     username = username_in.value.strip()
@@ -136,6 +147,44 @@ def build_users() -> None:
             dlg.open()
 
         ui.button("➕ Создать пользователя", on_click=_open_create).props("color=primary")
+
+    # ── Предзаполнение из заявки (036 Ф2, Q2) ────────────────
+    def _prefill_from_request(rid: str) -> None:
+        from ..core import runtime
+        from ..core.access_requests import AccessRequestError
+
+        rstore = runtime.REQUESTS_STORE
+        if rstore is None:
+            ui.notify("Хранилище заявок недоступно", type="warning")
+            return
+        try:
+            rec = rstore.get(rid)
+        except AccessRequestError:
+            ui.notify("Заявка не найдена (возможно, удалена по retention)",
+                      type="warning")
+            return
+        with ui.card().classes("w-full q-mb-md bg-green-1"):
+            ui.label(f"👤 Заявка {rec.id} — одобрена, создайте пользователя").classes(
+                "text-subtitle1 font-bold"
+            )
+            for label, value in (
+                ("ФИО", rec.fio), ("Отдел", rec.department),
+                ("Телефон", rec.phone), ("Почта", rec.email),
+                ("Перечень работ", rec.work_summary),
+            ):
+                ui.label(f"{label}: {value}").classes("text-body2")
+            ui.label(
+                "Роль выберите по перечню работ; пароль будет сгенерирован "
+                "и показан один раз. Автосоздания нет (Q2)."
+            ).classes("text-caption text-grey-7")
+        _open_create(
+            username_hint=f"{rec.fio} (или email: {rec.email})",
+            note=f"Заявка {rec.id}: {rec.fio} ({rec.department}); "
+                 f"{rec.email}; {rec.phone}",
+        )
+
+    if prefill_request_id:
+        _prefill_from_request(prefill_request_id)
 
     # ── Таблица ──────────────────────────────────────────────
     users = store.list_users()

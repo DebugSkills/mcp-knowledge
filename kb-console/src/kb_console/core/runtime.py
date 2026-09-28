@@ -16,3 +16,6 @@ USERS_STORE: Any = None
 
 AUTH_MODE: str = ""
 """Режим gate-middleware ('on'/'off'), кладёт app.py (035: кнопка «Выйти»)."""
+
+REQUESTS_STORE: Any = None
+"""AccessRequestStore (036), кладёт app.py при старте (страница /requests)."""

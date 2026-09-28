@@ -13,7 +13,16 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from . import books, import_page, quality, search, status, tokens, users_page
+from . import (
+    books,
+    import_page,
+    quality,
+    requests_page,
+    search,
+    status,
+    tokens,
+    users_page,
+)
 
 # ROUTES: (путь, метка, функция-построитель, min_role)
 # Используется header.py и app.py для регистрации @ui.page.
@@ -25,6 +34,7 @@ ROUTES: list[tuple[str, str, Callable[[], None], str]] = [
     ("/quality", "Качество", quality.build_quality, "contributor"),  # Фаза 13.14
     ("/tokens", "Токены", tokens.build_tokens, "admin"),  # W5; admin-only — У-3/Ф3.2
     ("/users", "Пользователи", users_page.build_users, "admin"),  # Ф3.2
+    ("/requests", "Заявки", requests_page.build_requests, "admin"),  # 036 Ф2
 ]
 
 # PAGES оставлен для обратной совместимости (если где-то ещё используется).
