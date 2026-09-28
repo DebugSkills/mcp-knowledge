@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote
 
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -124,50 +125,53 @@ class LoginContext:
     trust_xff: bool = True
     failure_delay: float = _AUTH_FAILURE_DELAY
     limiter: LoginRateLimiter = field(default_factory=LoginRateLimiter)
+    requests_store: Any = None  # AccessRequestStore | None (036)
+    request_limiter: LoginRateLimiter = field(
+        default_factory=lambda: LoginRateLimiter(max_attempts=5, window_sec=300.0)
+    )
+    """5 POST/5мин на ключ (036 §3): fail() на КАЖДЫЙ запрос, без reset."""
 
 
-# ── HTML: сплит-лейаут + табы «Вход»/«Заявка» (Svyazi-канон, Ф2) ──
+# ── HTML: сплит-лейаут + табы «Вход»/«Заявка» (Svyazi-канон, Ф2; 036 — форма) ──
+
+
+def _request_form_fields() -> str:
+    """Инпуты формы заявки из SSOT ACCESS_REQUEST_FIELDS (036 §3).
+
+    Лимиты — зеркало серверной валидации; textarea — только для перечня работ.
+    """
+    from .config import ACCESS_REQUEST_FIELDS
+
+    fio, dept, phone, email, works = ACCESS_REQUEST_FIELDS  # ровно 5 (контракт)
+    return (
+        f"<label class='fld'>{fio}<input id='r-fio' type='text' maxlength='120' required></label>"
+        f"<label class='fld'>{dept}<input id='r-dept' type='text' maxlength='120' required></label>"
+        f"<label class='fld'>{phone}<input id='r-phone' type='tel' maxlength='32' "
+        "pattern='[+0-9 ()\\-]*' required></label>"
+        f"<label class='fld'>{email}<input id='r-email' type='email' maxlength='120' required></label>"
+        f"<label class='fld'>{works}<textarea id='r-works' maxlength='2000' "
+        "required></textarea></label>"
+    )
 
 
 def render_login_html(
     *,
     legacy: bool,
     next_path: str,
-    admin_contact: str = "",
-    template: str = "",
 ) -> str:
-    """HTML /login: inline-CSS/JS, 0 внешних запросов (air-gap, план §4).
+    """HTML /login: inline-CSS/JS, 0 внешних запросов (air-gap, 035 §4).
 
     Сплит-лейаут: слева бренд-панель, справа карточка с CSS-only табами
-    «Вход»/«Заявка на доступ» (работают даже без JS). Каналы заявки
-    (textarea + mailto + t.me) строятся из одних SSOT-констант — контент-
-    контракт тестируется на согласованность с ACCESS_REQUEST_FIELDS.
-    favicon — data:-URI; шрифты системные; единственный fetch —
-    same-origin /api/login.
+    «Вход»/«Заявка на доступ» (работают даже без JS). Таб заявки (036) —
+    РЕДАКТИРУЕМАЯ форма: 5 полей из SSOT ACCESS_REQUEST_FIELDS + обязательный
+    чекбокс согласия (152-ФЗ) + POST /api/access-request (same-origin).
+    favicon — data:-URI; шрифты системные; fetch только same-origin.
     """
     import json
     from html import escape as _esc
 
-    from .config import (
-        ACCESS_REQUEST_EMAIL,
-        ACCESS_REQUEST_SUBJECT,
-        APP_COPYRIGHT,
-        access_request_template,
-    )
+    from .config import ACCESS_REQUEST_CONSENT_TEXT, APP_COPYRIGHT
 
-    template = template or access_request_template()
-    tpl_esc = _esc(template)
-    tpl_js = json.dumps(template)
-    mailto = (
-        f"mailto:{ACCESS_REQUEST_EMAIL}"
-        f"?subject={quote(ACCESS_REQUEST_SUBJECT)}&body={quote(template)}"
-    )
-    tme_html = (
-        f"<a id='tme-link' class='btn ghost' href=\"https://t.me/{_esc(admin_contact)}"
-        f"?text={quote(template)}\">Написать администратору в чате</a>"
-        if admin_contact
-        else ""
-    )
     next_js = json.dumps(sanitize_next(next_path))
     user_field = (
         ""
@@ -178,6 +182,8 @@ def render_login_html(
         )
     )
     hint = "🔑 Пароль выдаёт администратор" if legacy else "🔑 Логин и пароль выдаёт администратор"
+    fields_html = _request_form_fields()
+    _consent_text = _esc(ACCESS_REQUEST_CONSENT_TEXT)
 
     css = (
         "*{box-sizing:border-box;margin:0}body{font-family:system-ui,-apple-system,"
@@ -224,8 +230,17 @@ def render_login_html(
         "font-size:13px;resize:vertical;color:#374151}"
         ".channels{display:flex;flex-direction:column;gap:8px;margin-top:6px}"
         ".req-note{font-size:13.5px;color:#6b7280;margin:12px 0 8px;line-height:1.5}"
-        "a.mailto{color:#1d4ed8;font-weight:600;text-decoration:none}"
-        "a.mailto:hover{text-decoration:underline}"
+        ".fld{display:block;font-size:13.5px;color:#374151;margin:10px 0 2px}"
+        ".fld input,.fld textarea{width:100%;padding:12px 14px;margin-top:4px;"
+        "border:1px solid #cbd5e1;border-radius:10px;font-size:15px;"
+        "font-family:inherit;resize:vertical}"
+        ".fld input:focus,.fld textarea:focus{outline:2px solid #93c5fd;"
+        "border-color:#3b82f6}"
+        ".consent-text{font-size:13px;color:#6b7280;line-height:1.45}"
+        ".ok{color:#15803d;min-height:20px;font-size:14px;margin-top:10px;"
+        "line-height:1.5}"
+        ""
+        ""
         ".copy{margin:12px 0 18px;text-align:center;white-space:nowrap;"
         "font-size:12.5px;color:#9ca3af}"
         "@media(max-width:860px){.split{flex-direction:column}.brand{padding:34px;"
@@ -264,16 +279,17 @@ def render_login_html(
         f"<p class='hint'>{hint}</p>"
         "</form></section>"
         "<section id='p-req'>"
-        "<p class='req-note'>Скопируйте шаблон, заполните обязательные поля "
-        "и отправьте заявителю доступа по любому каналу ниже.</p>"
-        f"<textarea id='req-tpl' readonly rows='9' onclick='this.select()'>{tpl_esc}</textarea>"
-        "<div class='channels'>"
-        "<button class='btn ghost' type='button' id='copy-btn'>Скопировать заявку</button>"
-        f"<a class='mailto' href=\"{mailto}\">Отправить по почте</a>{tme_html}"
-        "</div></section>"
+        "<p class='req-note'>Заполните все поля — заявка уйдёт "
+        "администратору напрямую (без почты и мессенджеров).</p>"
+        f"<form id='rf'>{fields_html}"
+        f"<label class='toggle'><input type='checkbox' id='r-consent' required>"
+        f"<span class='consent-text'>{_consent_text}</span></label>"
+        "<button class='btn' type='submit' id='r-send' disabled>Отправить заявку</button>"
+        "<div class='err' id='r-err'></div><div class='ok' id='r-ok'></div>"
+        "</form></section>"
         "</div></div></div></main></div>"
         f"<footer class='copy'>{APP_COPYRIGHT}</footer>"
-        "<script>const N=" + next_js + ",T=" + tpl_js + ";"
+        "<script>const N=" + next_js + ";"
         "document.getElementById('lf').addEventListener('submit',async(e)=>{e.preventDefault();"
         "const u=document.getElementById('f-user');"
         "const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':"
@@ -281,9 +297,24 @@ def render_login_html(
         "document.getElementById('f-pass').value})});"
         "if(r.ok){window.location=N}else{document.getElementById('err').textContent="
         "'Неверный логин или пароль'}});"
-        "document.getElementById('copy-btn').addEventListener('click',function(){"
-        "navigator.clipboard.writeText(T).then(()=>{this.textContent='Скопировано ✓'},"
-        "()=>{const t=document.getElementById('req-tpl');t.focus();t.select()})});"
+        "const rc=document.getElementById('r-consent'),rs=document.getElementById('r-send');"
+        "rc.addEventListener('change',()=>{rs.disabled=!rc.checked});"
+        "document.getElementById('rf').addEventListener('submit',async(e)=>{e.preventDefault();"
+        "rs.disabled=true;rs.textContent='Отправляем…';"
+        "const r=await fetch('/api/access-request',{method:'POST',headers:{'Content-Type':"
+        "'application/json'},body:JSON.stringify({fio:document.getElementById('r-fio').value,"
+        "department:document.getElementById('r-dept').value,"
+        "phone:document.getElementById('r-phone').value,"
+        "email:document.getElementById('r-email').value,"
+        "work_summary:document.getElementById('r-works').value,consent:rc.checked})});"
+        "if(r.status===201){const d=await r.json();document.getElementById('rf').style.display='none';"
+        "document.getElementById('r-ok').textContent='Заявка отправлена, номер '+d.id"
+        "+'. Администратор свяжется с вами.'}"
+        "else{let m='Не удалось отправить заявку';try{const d=await r.json();"
+        "if(r.status===409)m='Такая заявка уже отправлена недавно';"
+        "if(r.status===429)m='Слишком много попыток, попробуйте позже';}catch(e){}"
+        "document.getElementById('r-err').textContent=m;rs.disabled=false;"
+        "rs.textContent='Отправить заявку'}});"
         "</script></body></html>"
     )
 
@@ -295,9 +326,7 @@ async def _login_get_impl(ctx: LoginContext, next_raw: str | None) -> Response:
     if ctx.auth_mode != "on":
         return RedirectResponse("/status", status_code=302)
     legacy = not (ctx.users is not None and ctx.users.has_users())
-    html = render_login_html(
-        legacy=legacy, next_path=next_raw or "", admin_contact=ctx.admin_contact
-    )
+    html = render_login_html(legacy=legacy, next_path=next_raw or "")
     return HTMLResponse(html)
 
 
@@ -379,6 +408,120 @@ async def _logout_post_impl(request: Request) -> Response:
     return JSONResponse({"ok": True})
 
 
+# ── 036: публичная заявка на доступ (3-слойный guard, план §3) ──
+
+_BODY_CAP = 8192
+"""Потолок тела заявки; +1 байт = превышение (413)."""
+
+_FIELD_LIMITS = {
+    "fio": 120,
+    "department": 120,
+    "phone": 32,
+    "email": 120,
+    "work_summary": 2000,
+}
+_PHONE_RE = re.compile(r"^[+0-9 ()\-]+$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _validate_access_request(payload: dict) -> dict[str, str] | None:
+    """Серверная валидация (план §3): strip, непустота, длины, паттерны,
+    consent is True. Возвращает нормализованные поля или None (→400).
+    Ошибки НЕ детализируются наружу (P2-5)."""
+    cleaned: dict[str, str] = {}
+    for name, limit in _FIELD_LIMITS.items():
+        raw = payload.get(name)
+        if not isinstance(raw, str):
+            return None
+        value = raw.strip()
+        if not value or len(value) > limit:
+            return None
+        cleaned[name] = value
+    if not _PHONE_RE.fullmatch(cleaned["phone"]):
+        return None
+    if not _EMAIL_RE.fullmatch(cleaned["email"]):
+        return None
+    if payload.get("consent") is not True:
+        return None
+    return cleaned
+
+
+async def _access_request_post_impl(ctx: LoginContext, request: Request) -> Response:
+    """POST /api/access-request: лимитер → кап тела → JSON → валидация → стор.
+
+    Порядок P1-2 строго: (1) rate-limit ДО чтения тела; (2) Content-Length
+    > 8 КБ → 413 без чтения; потоковое чтение с капом 8192+1 → 413;
+    (3) JSON ≤ известных полей; (4) валидация; (5) dupe → 409; cap → 503.
+    """
+    from .core.access_requests import AccessRequestError
+
+    if ctx.auth_mode != "on":
+        return JSONResponse({"error": "auth выключен"}, status_code=403)
+
+    key = client_key(request, ctx.trust_xff)
+    if ctx.request_limiter.blocked(key):
+        return JSONResponse(
+            {"error": "Слишком много попыток, попробуйте позже"},
+            status_code=429,
+            headers={"Retry-After": str(ctx.request_limiter.retry_after(key))},
+        )
+    ctx.request_limiter.fail(key)  # P2-4: каждый POST, включая валидные
+
+    length_header = request.headers.get("content-length")
+    if length_header and length_header.isdigit() and int(length_header) > _BODY_CAP:
+        return _payload_too_large()
+
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > _BODY_CAP:
+            return _payload_too_large()
+    try:
+        payload = json.loads(bytes(body).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return _bad_request()
+    if not isinstance(payload, dict):
+        return _bad_request()
+
+    cleaned = _validate_access_request(payload)
+    if cleaned is None:
+        return _bad_request()
+
+    store = ctx.requests_store
+    if store is None:  # консоль без стора заявок (не должна случаться)
+        return JSONResponse({"error": "internal"}, status_code=500)
+    try:
+        req = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: store.append(**cleaned),
+        )
+    except AccessRequestError as exc:
+        if exc.code == "duplicate":
+            return JSONResponse(
+                {"error": "Такая заявка уже отправлена недавно"}, status_code=409
+            )
+        if exc.code == "cap_exceeded":
+            return JSONResponse(
+                {"error": "Очередь заявок переполнена, попробуйте позже"},
+                status_code=503,
+            )
+        # storage_error и прочее: без деталей (P2-5), в лог — только тип
+        print(f"[ACCESS-REQUEST] storage failure: {type(exc).__name__}")
+        return JSONResponse({"error": "internal"}, status_code=500)
+    return JSONResponse({"id": req.id}, status_code=201)
+
+
+def _bad_request() -> JSONResponse:
+    return JSONResponse(
+        {"error": "Проверьте обязательные поля и согласие на обработку данных"},
+        status_code=400,
+    )
+
+
+def _payload_too_large() -> JSONResponse:
+    return JSONResponse({"error": "Тело запроса слишком большое"}, status_code=413)
+
+
 # ── Регистрация на nicegui-приложении (FastAPI add_api_route) ──
 
 _registered = False
@@ -391,8 +534,9 @@ def register_routes(
     password: str,
     admin_contact: str = "",
     trust_xff: bool = True,
+    requests_store: Any = None,
 ) -> None:
-    """Зарегистрировать /login, /api/login, /api/logout (идемпотентно)."""
+    """Зарегистрировать /login, /api/login, /api/logout, /api/access-request."""
     global _registered
     if _registered:
         return
@@ -402,6 +546,7 @@ def register_routes(
         password=password,
         admin_contact=admin_contact,
         trust_xff=trust_xff,
+        requests_store=requests_store,
     )
 
     async def login_get(next: str = "") -> Response:
@@ -413,9 +558,15 @@ def register_routes(
     async def logout_post(request: Request) -> Response:
         return await _logout_post_impl(request)
 
+    async def access_request_post(request: Request) -> Response:
+        return await _access_request_post_impl(ctx, request)
+
     from nicegui import app as nicegui_app
 
     nicegui_app.add_api_route("/login", login_get, methods=["GET"])
     nicegui_app.add_api_route("/api/login", login_post, methods=["POST"])
     nicegui_app.add_api_route("/api/logout", logout_post, methods=["POST"])
+    nicegui_app.add_api_route(
+        "/api/access-request", access_request_post, methods=["POST"]
+    )
     _registered = True

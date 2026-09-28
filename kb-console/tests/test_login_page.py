@@ -15,11 +15,10 @@ from __future__ import annotations
 
 import html as html_mod
 import re
-from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 
-from kb_console.config import ACCESS_REQUEST_EMAIL, ACCESS_REQUEST_FIELDS
+from kb_console.config import ACCESS_REQUEST_FIELDS
 from kb_console.login_page import render_login_html
 
 # ── air-gap детектор (N4: полный список векторов) ─────────────
@@ -68,57 +67,11 @@ def find_external_urls(page_html: str, *, allow_tme: str = "") -> list[str]:
 # ── контент-контракт каналов заявки (§4.5) ────────────────────
 
 
-class TestAccessRequestChannels:
-    @pytest.fixture()
-    def page(self) -> str:
-        return render_login_html(legacy=False, next_path="/books", admin_contact="admin_officer")
-
-    def test_fields_in_textarea(self, page):
-        for field in ACCESS_REQUEST_FIELDS:
-            assert field in page, f"поле отсутствует в textarea: {field}"
-
-    def test_fields_in_mailto_body(self, page):
-        href = _first(page, r"href=['\"](mailto:[^'\"]+)['\"]")
-        body = parse_qs(urlparse(href).query).get("body", [""])[0]
-        for field in ACCESS_REQUEST_FIELDS:
-            assert field in unquote(body), f"поле отсутствует в mailto-body: {field}"
-
-    def test_fields_in_tme_text(self, page):
-        href = _first(page, r"href=['\"](https://t\.me/[^'\"]+)['\"]")
-        text = parse_qs(urlparse(href).query).get("text", [""])[0]
-        for field in ACCESS_REQUEST_FIELDS:
-            assert field in unquote(text), f"поле отсутствует в t.me-канале: {field}"
-
-    def test_mailto_uses_ssot_email_and_subject(self, page):
-        from kb_console.config import ACCESS_REQUEST_SUBJECT
-
-        href = unquote(_first(page, r"href=['\"](mailto:[^'\"]+)['\"]"))
-        assert href.startswith(f"mailto:{ACCESS_REQUEST_EMAIL}?")
-        assert f"subject={ACCESS_REQUEST_SUBJECT}" in href or ACCESS_REQUEST_SUBJECT in unquote(href)
-
-
-def _first(text: str, pattern: str) -> str:
-    match = re.search(pattern, text)
-    assert match, f"не найдено: {pattern}"
-    return match.group(1)
-
-
-# ── air-gap-контракт (P1-5, N4) ───────────────────────────────
-
-
 class TestAirGap:
     def test_no_external_urls_when_no_contact(self):
-        page = render_login_html(legacy=False, next_path="/x", admin_contact="")
+        page = render_login_html(legacy=False, next_path="/x")
         assert find_external_urls(page) == []
         assert "https://" not in page
-
-    def test_exactly_one_tme_when_contact_set(self):
-        page = render_login_html(legacy=False, next_path="/x", admin_contact="admin_officer")
-        tme = re.findall(r"https://t\.me/admin_officer", page)
-        assert len(tme) == 1
-        # все прочие абсолютные URL запрещены
-        rest = find_external_urls(page, allow_tme="admin_officer")
-        assert rest == []
 
     @pytest.mark.parametrize(
         "mutation",
@@ -136,7 +89,7 @@ class TestAirGap:
     )
     def test_detector_catches_mutations(self, mutation):
         """Позитивный контроль: детектор НЕвакуумный — каждая мутация ловится."""
-        page = render_login_html(legacy=False, next_path="/x", admin_contact="") + mutation
+        page = render_login_html(legacy=False, next_path="/x") + mutation
         caught = find_external_urls(page)
         assert any("cdn.example" in u for u in caught), f"мутация не поймана: {mutation}"
 
@@ -150,10 +103,37 @@ class TestLoginUiContract:
         assert "Вход" in page
         assert "Заявка на доступ" in page
 
-    def test_copy_button_present(self):
+    def test_request_form_5_fields_editable(self):
+        """036: 5 полей из SSOT как РЕДАКТИРУЕМЫЕ инпуты (не readonly)."""
+
         page = render_login_html(legacy=False, next_path="/x")
-        assert "Скопировать" in page
-        assert "clipboard" in page
+        for field in ACCESS_REQUEST_FIELDS:
+            assert field in page
+        for inp in ("r-fio", "r-dept", "r-phone", "r-email", "r-works"):
+            assert f"id='{inp}'" in page
+        assert "readonly" not in page  # редактируемая форма, не шаблон
+
+    def test_request_form_consent_required(self):
+        """Обязательный чекбокс согласия (текст из SSOT) + кнопка disabled."""
+        from kb_console.config import ACCESS_REQUEST_CONSENT_TEXT
+
+        page = render_login_html(legacy=False, next_path="/x")
+        assert "id='r-consent'" in page
+        assert ACCESS_REQUEST_CONSENT_TEXT[:40] in page
+        assert "id='r-send'" in page
+        assert "rs.disabled=!rc.checked" in page  # кнопка ждёт согласия
+
+    def test_request_form_no_mailto_no_tme(self):
+        """036: каналы mailto/t.me/copy удалены — заявка уходит на сервер."""
+        page = render_login_html(legacy=False, next_path="/x")
+        assert "mailto:" not in page
+        assert "t.me" not in page
+        assert "clipboard" not in page
+
+    def test_request_form_posts_same_origin(self):
+        page = render_login_html(legacy=False, next_path="/x")
+        assert "fetch('/api/access-request'" in page
+        assert "disabled=true" in page  # disabled-on-submit
 
     def test_password_toggle_and_error_inline(self):
         page = render_login_html(legacy=False, next_path="/x")

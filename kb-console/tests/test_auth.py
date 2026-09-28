@@ -404,6 +404,21 @@ class TestAllowlistV3:
         _run(mw, _make_scope("http", "/api/login"))
         assert stub.calls == []
 
+    def test_api_access_request_post_allowed_without_auth(self):
+        """036 §3: POST /api/access-request — публичен (4-й путь allowlist)."""
+        mw, stub = _make_mw()
+        scope = _make_scope("http", "/api/access-request")
+        scope["method"] = "POST"
+        _run(mw, scope)
+        assert len(stub.calls) == 1
+
+    def test_api_access_request_get_anon_401_json(self):
+        """GET того же пути — метод-специфичный allowlist: XHR-ветка 401 JSON."""
+        mw, stub = _make_mw()
+        sent = _run(mw, _make_scope("http", "/api/access-request"))
+        assert stub.calls == []
+        assert sent[0]["status"] == 401
+
     def test_nicegui_ws_polling_get_without_session_401(self):
         """engine.io HTTP-polling — API-класс: 401 JSON (не 302)."""
         mw, stub = _make_mw()

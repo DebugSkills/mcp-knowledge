@@ -169,6 +169,159 @@ def _ctx(tmp_path, password: str = "", auth_mode: str = "on", limiter: LoginRate
     )
 
 
+def _req_ctx(tmp_path, cap: int = 500):  # -> (LoginContext, AccessRequestStore)
+    from kb_console.core.access_requests import AccessRequestStore
+
+    req_store = AccessRequestStore(str(tmp_path / "req" / "a.db"), cap=cap)
+    lim = LoginRateLimiter(max_attempts=5, window_sec=300.0, clock=lambda: 0.0)
+    users = UserStore(users_file=str(tmp_path / "users.jsonl"))
+    return (
+        LoginContext(
+            auth_mode="on",
+            users=users,
+            failure_delay=0.0,
+            limiter=LoginRateLimiter(clock=lambda: 0.0),
+            requests_store=req_store,
+            request_limiter=lim,
+        ),
+        req_store,
+    )
+
+
+def _ar_scope(body_bytes: bytes, headers: list[tuple[str, str]] | None = None) -> Request:
+    """Scope POST /api/access-request с сырым телом (потоковый кап-тест)."""
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or [])]
+    raw.append((b"content-type", b"application/json"))
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/access-request",
+        "headers": raw,
+        "client": ("127.0.0.1", 12345),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": body_bytes, "more_body": False}
+
+    return Request(scope, receive)
+
+
+def _ar_payload(**over) -> dict:
+    base = {
+        "fio": "Иван Иванович Иванов",
+        "department": "Отдел разработки",
+        "phone": "+7 900 000-00-00",
+        "email": "ivan@example.com",
+        "work_summary": "Нужен доступ для ревью документации",
+        "consent": True,
+    }
+    base.update(over)
+    return base
+
+
+class TestAccessRequestPostImpl:
+    def test_success_201(self, tmp_path):
+        from kb_console.login_page import _access_request_post_impl as impl
+
+        ctx, store = _req_ctx(tmp_path)
+        resp = asyncio.run(impl(ctx, _ar_scope(json.dumps(_ar_payload()).encode())))
+        assert resp.status_code == 201
+        rid = json.loads(resp.body)["id"]
+        assert store.get(rid).fio == "Иван Иванович Иванов"
+
+    def test_validation_missing_field_400(self, tmp_path):
+        from kb_console.login_page import _access_request_post_impl as impl
+
+        ctx, store = _req_ctx(tmp_path)
+        bad = _ar_payload(fio="   ")  # пустое после strip
+        resp = asyncio.run(impl(ctx, _ar_scope(json.dumps(bad).encode())))
+        assert resp.status_code == 400
+        assert store.count() == 0
+
+    def test_validation_bad_phone_400(self, tmp_path):
+        from kb_console.login_page import _access_request_post_impl as impl
+
+        ctx, _ = _req_ctx(tmp_path)
+        resp = asyncio.run(
+            impl(ctx, _ar_scope(json.dumps(_ar_payload(phone="tel:+7();DROP")).encode()))
+        )
+        assert resp.status_code == 400
+
+    def test_consent_false_400(self, tmp_path):
+        from kb_console.login_page import _access_request_post_impl as impl
+
+        ctx, store = _req_ctx(tmp_path)
+        resp = asyncio.run(
+            impl(ctx, _ar_scope(json.dumps(_ar_payload(consent=False)).encode()))
+        )
+        assert resp.status_code == 400
+        assert store.count() == 0
+
+    def test_duplicate_409(self, tmp_path):
+        from kb_console.login_page import _access_request_post_impl as impl
+
+        ctx, _ = _req_ctx(tmp_path)
+        body = json.dumps(_ar_payload()).encode()
+        assert asyncio.run(impl(ctx, _ar_scope(body))).status_code == 201
+        assert asyncio.run(impl(ctx, _ar_scope(body))).status_code == 409
+
+    def test_rate_limit_5_then_429_no_reset_on_success(self, tmp_path):
+        """P2-4: fail() на каждый POST; 5 попыток → 6-я 429; успех НЕ reset."""
+        from kb_console.login_page import _access_request_post_impl as impl
+
+        ctx, _ = _req_ctx(tmp_path)
+        codes = []
+        for i in range(5):
+            body = json.dumps(_ar_payload(fio=f"Фамилия {i}", phone=f"+7900000000{i}")).encode()
+            codes.append(asyncio.run(impl(ctx, _ar_scope(body))).status_code)
+        assert codes == [201] * 5
+        sixth = json.dumps(_ar_payload(fio="Шестой", phone="+79000")).encode()
+        assert asyncio.run(impl(ctx, _ar_scope(sixth))).status_code == 429
+
+    def test_cap_503(self, tmp_path):
+        from kb_console.login_page import _access_request_post_impl as impl
+
+        ctx, _ = _req_ctx(tmp_path, cap=1)
+        first = json.dumps(_ar_payload()).encode()
+        assert asyncio.run(impl(ctx, _ar_scope(first))).status_code == 201
+        second = json.dumps(_ar_payload(fio="Другой", phone="+79999")).encode()
+        assert asyncio.run(impl(ctx, _ar_scope(second))).status_code == 503
+
+    def test_content_length_over_cap_413_without_read(self, tmp_path):
+        from kb_console.login_page import _access_request_post_impl as impl
+
+        ctx, store = _req_ctx(tmp_path)
+        scope = _ar_scope(b"{}")
+        scope.scope["headers"].append((b"content-length", b"1048576"))
+        resp = asyncio.run(impl(ctx, scope))
+        assert resp.status_code == 413
+        assert store.count() == 0
+
+    def test_chunked_1mb_413_or_disconnect_not_saved(self, tmp_path):
+        """iter3: chunked без CL, 1 МБ → 413 ИЛИ обрыв; заявка НЕ сохранена."""
+        from kb_console.login_page import _access_request_post_impl as impl
+
+        ctx, store = _req_ctx(tmp_path)
+        big = b"x" * (1024 * 1024)
+        scope = _ar_scope(big)  # без content-length
+        outcome = "disconnected"  # обрыв тоже валиден (P1-2)
+        try:
+            resp = asyncio.run(impl(ctx, scope))
+        except (ConnectionError, OSError, RuntimeError):
+            resp = None
+        if resp is not None:
+            assert resp.status_code == 413
+        assert outcome == "disconnected"
+        assert store.count() == 0
+
+    def test_bad_json_400(self, tmp_path):
+        from kb_console.login_page import _access_request_post_impl as impl
+
+        ctx, _ = _req_ctx(tmp_path)
+        resp = asyncio.run(impl(ctx, _ar_scope(b"not-json")))
+        assert resp.status_code == 400
+
+
 class TestLoginPostImpl:
     def test_per_user_success_session_payload(self, tmp_path):
         ctx = _ctx(tmp_path)
@@ -309,6 +462,7 @@ def _start_console(port: int) -> subprocess.Popen:
     env["CONSOLE_HOST"] = "127.0.0.1"
     env["CONSOLE_PASSWORD"] = _PASSWORD  # legacy-режим (пустой стор)
     env["CONSOLE_USERS_FILE"] = "/tmp/kilo/035-users-smoke/users.jsonl"  # несуществующий → пусто
+    env["CONSOLE_ACCESS_REQUESTS_DB"] = "/tmp/kilo/035-users-smoke/access_requests.db"  # 036: /app-дефолт не существует вне docker
     env["CONSOLE_STORAGE_SECRET_FILE_DIR_FALLBACK"] = ""  # не используется, просто маркер
     env["MCP_SERVER_URL"] = "http://localhost:8000"
     env["NICEGUI_SCREEN_TEST_PORT"] = str(port)
@@ -398,6 +552,24 @@ class TestLoginIntegration:
         )
         assert r.status_code == 401
         assert r.headers.get("content-type", "").startswith("application/json")
+
+    def test_access_request_anon_get_401_json(self):
+        """036 §3: GET /api/access-request анонимно → XHR-ветка 401 JSON."""
+        r = httpx.get(
+            f"http://localhost:{_SMOKE_PORT}/api/access-request",
+            trust_env=False,
+            timeout=5.0,
+        )
+        assert r.status_code == 401
+        assert r.headers.get("content-type", "").startswith("application/json")
+        assert "www-authenticate" not in {k.lower() for k in r.headers}
+
+    def test_access_request_authed_get_405(self):
+        """Аутентифицированный GET → 405 от роута (метод-специфичный allowlist)."""
+        with httpx.Client(trust_env=False, base_url=f"http://localhost:{_SMOKE_PORT}") as c:
+            c.post("/api/login", json={"password": _PASSWORD}, timeout=5.0)
+            r = c.get("/api/access-request", timeout=5.0)
+        assert r.status_code == 405
 
     def test_logout_cycle(self):
         """logout → Set-Cookie session=null; следующий запрос (с null-cookie

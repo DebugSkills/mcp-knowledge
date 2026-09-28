@@ -85,6 +85,10 @@ _LOGIN_PATH = "/login"
 _API_LOGIN_PATH = "/api/login"
 """REST-логин (035): POST — в анонимном allowlist (rate-limit в login_page)."""
 
+_API_ACCESS_REQUEST_PATH = "/api/access-request"
+"""Публичная заявка на доступ (036 §3): только POST в allowlist —
+метод-специфично; GET этого пути остаётся в XHR-ветке → 401 JSON."""
+
 _API_PREFIXES = ("/api/", "/_nicegui_ws/")
 """Пути, всегда классифицируемые как XHR/API (401 JSON, не 302)."""
 
@@ -264,12 +268,16 @@ class ConsoleAuthMiddleware:
         path = scope.get("path", "") or "/"
         method = scope.get("method", "GET").upper()
 
-        # 035 §3а-1: анонимный allowlist — РОВНО 3 пути (счётность).
+        # 035 §3а-1 + 036 §3: анонимный allowlist — РОВНО 4 пути (счётность;
+        # последний метод-специфичен: только POST /api/access-request).
         if scope_type == "http":
             if path == _LOGIN_PATH and method == "GET":
                 await self.app(scope, receive, send)
                 return
             if path == _API_LOGIN_PATH and method == "POST":
+                await self.app(scope, receive, send)
+                return
+            if path == _API_ACCESS_REQUEST_PATH and method == "POST":
                 await self.app(scope, receive, send)
                 return
 

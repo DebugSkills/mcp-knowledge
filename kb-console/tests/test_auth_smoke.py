@@ -42,6 +42,8 @@ def _start_console(port: int) -> subprocess.Popen:
     env.pop("MCP_API_KEY_ADMIN", None)
     env.pop("MCP_API_KEY_EDITOR", None)
     env.pop("MCP_API_KEY_CONTRIBUTOR", None)
+    # 036: /app-дефолт БД заявок не существует вне docker → локальный tmp
+    env["CONSOLE_ACCESS_REQUESTS_DB"] = "/tmp/kilo/035-users-smoke/access_requests.db"
     env["CONSOLE_PORT"] = str(port)
     env["CONSOLE_HOST"] = "127.0.0.1"
     env["MCP_SERVER_URL"] = "http://localhost:8000"

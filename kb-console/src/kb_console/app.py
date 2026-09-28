@@ -133,13 +133,30 @@ AUTH_MODE = resolve_auth_mode(
 _runtime.USERS_STORE = USERS_STORE
 _runtime.AUTH_MODE = AUTH_MODE
 
-# 035: роуты страницы входа (GET /login, POST /api/login, POST /api/logout).
+# 035: роуты страницы входа (GET /login, POST /api/login, POST /api/logout)
+# + 036: публичная заявка (POST /api/access-request, 3-слойный guard).
+# Стор заявок: SQLite volume, миграции на старте (fail-fast user_version).
+from .config import (
+    CONSOLE_ACCESS_REQUESTS_DB,
+    CONSOLE_ACCESS_REQUESTS_MAX,
+    CONSOLE_ACCESS_REQUESTS_RETENTION_DAYS,
+)
+from .core.access_requests import AccessRequestStore
+
+REQUESTS_STORE = AccessRequestStore(
+    CONSOLE_ACCESS_REQUESTS_DB,
+    cap=CONSOLE_ACCESS_REQUESTS_MAX,
+    retention_days=CONSOLE_ACCESS_REQUESTS_RETENTION_DAYS,
+)
+REQUESTS_STORE.migrate()
+
 login_page.register_routes(
     auth_mode=AUTH_MODE,
     users=USERS_STORE,
     password=CONSOLE_PASSWORD,
     admin_contact=CONSOLE_ADMIN_CONTACT,
     trust_xff=CONSOLE_TRUST_XFF,
+    requests_store=REQUESTS_STORE,
 )
 
 # 035 §3б: секрет подписи cookie-сессий (env → файл в volume → ephemeral)

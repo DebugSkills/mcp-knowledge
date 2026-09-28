@@ -39,6 +39,8 @@ def _start_console(port: int) -> subprocess.Popen:
     env.pop("CONSOLE_USERS_FILE", None)
     env.pop("CONSOLE_ADMIN_USER", None)
     env.pop("CONSOLE_ADMIN_PASSWORD", None)
+    # 036: /app-дефолт БД заявок не существует вне docker → локальный tmp
+    env["CONSOLE_ACCESS_REQUESTS_DB"] = "/tmp/kilo/035-users-smoke/access_requests.db"
     # kb-console-roles Ф3.1: per-role ключи не должны утекать в smoke.
     env.pop("MCP_API_KEY_ADMIN", None)
     env.pop("MCP_API_KEY_EDITOR", None)
