@@ -151,6 +151,7 @@ def render_login_html(
     from .config import (
         ACCESS_REQUEST_EMAIL,
         ACCESS_REQUEST_SUBJECT,
+        APP_COPYRIGHT,
         access_request_template,
     )
 
@@ -224,6 +225,7 @@ def render_login_html(
         ".req-note{font-size:13.5px;color:#6b7280;margin:12px 0 8px;line-height:1.5}"
         "a.mailto{color:#1d4ed8;font-weight:600;text-decoration:none}"
         "a.mailto:hover{text-decoration:underline}"
+        ".copy{margin-top:18px;text-align:center;font-size:12.5px;color:#9ca3af}"
         "@media(max-width:860px){.split{flex-direction:column}.brand{padding:34px;"
         "flex-basis:auto}.brand h1{font-size:30px}.brand ul{display:none}}"
     )
@@ -268,6 +270,7 @@ def render_login_html(
         f"<a class='mailto' href=\"{mailto}\">Отправить по почте</a>{tme_html}"
         "</div></section>"
         "</div></div></div></main></div>"
+        f"<footer class='copy'>{APP_COPYRIGHT}</footer>"
         "<script>const N=" + next_js + ",T=" + tpl_js + ";"
         "document.getElementById('lf').addEventListener('submit',async(e)=>{e.preventDefault();"
         "const u=document.getElementById('f-user');"

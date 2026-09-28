@@ -191,6 +191,14 @@ class TestLoginUiContract:
         page = render_login_html(legacy=False, next_path="/x")
         assert "fetch('/api/login'" in page or 'fetch("/api/login"' in page
 
+    def test_copyright_present_and_ssot(self):
+        """Подпись разработчика на /login из SSOT APP_COPYRIGHT (035)."""
+        from kb_console.config import APP_COPYRIGHT
+
+        page = render_login_html(legacy=False, next_path="/x")
+        assert APP_COPYRIGHT in page
+        assert "footer" in page  # подпись — в подвале, не в контенте формы
+
     def test_next_sanitized_into_js(self):
         page = render_login_html(legacy=False, next_path="https://evil.example")
         assert "evil.example" not in html_mod.unescape(page)

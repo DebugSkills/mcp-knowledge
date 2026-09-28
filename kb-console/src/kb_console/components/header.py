@@ -41,6 +41,7 @@ def render_header(active: str) -> None:
     035 Ф2: справа — username из сессии + кнопка «Выйти» (только для
     session-identity; Basic-клиенты её не видят).
     """
+    from ..config import APP_COPYRIGHT
     from ..core import runtime as _runtime
     from ..core.identity import ROLE_LEVEL, current_role, session_identity
     from ..pages import ROUTES  # lazy import: ломает circular chain pages↔components
@@ -61,6 +62,7 @@ def render_header(active: str) -> None:
             else:
                 btn.props("flat")
         ui.element("div").classes("grow")
+        ui.label(APP_COPYRIGHT).classes("text-grey-5 self-center text-caption")
         ident = session_identity()
         if should_show_logout(ident, _runtime.AUTH_MODE):
             ui.label(ident["username"]).classes("text-grey-7 self-center")
