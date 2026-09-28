@@ -176,6 +176,11 @@ services:
       - CONSOLE_USERS_FILE=/app/data/console/users.jsonl
       - CONSOLE_ADMIN_USER=${CONSOLE_ADMIN_USER:-}
       - CONSOLE_ADMIN_PASSWORD=${CONSOLE_ADMIN_PASSWORD:-}
+      # 035: секрет cookie-сессий — файл-режим по умолчанию
+      # (data/console/storage_secret, 0600); env-override при необходимости:
+      # - CONSOLE_STORAGE_SECRET=${CONSOLE_STORAGE_SECRET:-}
+      # Ротация секрета (удаление файла/env) = logout-all.
+      # CONSOLE_ADMIN_CONTACT (t.me-контакт) — опционально, кнопка на /login.
     volumes:
       - ./data/console:/app/data/console   # users.jsonl + users_audit.jsonl (Ф3.3)
     depends_on:

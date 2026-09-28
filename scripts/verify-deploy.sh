@@ -13,9 +13,9 @@
 #                   лога, не подстрока (INFO errors=1 — НЕ FAIL; нет docker → SKIP)
 #   V3  MCP tools   POST /mcp tools/list с read-ключом из .env → ≥30
 #                   (нет ключа → SKIP с сообщением; ключ НЕ печатается)
-#   V4  console     :8085, auth-aware: CONSOLE_AUTH=required+пароль →
-#                   без кредов 401 + WWW-Authenticate, с паролем 200;
-#                   auth off/пусто без пароля → 200. Пароль НЕ печатается.
+#   V4  console     :8085, auth-aware: CONSOLE_AUTH=required(+пароль) →
+#                   без кредов 302 + Location */login* (035 gate v3),
+#                   с Basic-кредами 200 (back-compat); auth off → 200.
 #
 # Env: VERIFY_WAIT (сек ожидания health, дефолт 120) · VERIFY_LOG_TAIL
 #      (строк логов, дефолт 300) · VERIFY_MIN_TOOLS (дефолт 30) ·
@@ -239,7 +239,7 @@ v4_console() {
     fi
 
     if [ "$auth_on" = "1" ]; then
-        local code_auth www legacy
+        local code_auth loc legacy
         code_auth="$(curl -s -o /dev/null -w '%{http_code}' -m 10 \
             -u "${user}:${passwd}" "$CONSOLE_URL" 2>/dev/null || true)"
         # Переходный режим: если per-user креды не сработали, пробуем legacy-пароль.
@@ -251,15 +251,17 @@ v4_console() {
                 [ "$code_auth" = "200" ] && user="verify"
             fi
         fi
-        www="$(printf '%s' "$headers" | grep -i '^www-authenticate:' || true)"
-        if [ "$code" = "401" ] && [ -n "$www" ] && [ "$code_auth" = "200" ]; then
+        # 035 (gate v3): навигация без кредов → 302 + Location */login*
+        # (WWW-Authenticate больше не выдаётся); Basic back-compat: -u → 200.
+        loc="$(printf '%s' "$headers" | grep -i '^location:' | grep -i '/login' || true)"
+        if [ "$code" = "302" ] && [ -n "$loc" ] && [ "$code_auth" = "200" ]; then
             PASSED=$((PASSED + 1))
             say_pass 4 "console (auth=on, mode=${mode:-auto}, user=$user)" \
-                "без кредов 401+WWW-Authenticate, с кредами 200"
+                "без кредов 302→/login, с Basic-кредами 200"
         else
             FAILED=$((FAILED + 1)); FAILED_IDS+=("V4")
             say_fail 4 "console (auth=on, mode=${mode:-auto})" \
-                "без кредов=$code (WWW-Authenticate: $([ -n "$www" ] && echo yes || echo no)), с кредами=$code_auth — ожидалось 401+hdr / 200"
+                "без кредов=$code (Location /login: $([ -n "$loc" ] && echo yes || echo no)), с кредами=$code_auth — ожидалось 302+/login / 200"
         fi
     else
         # auth off/пусто без пароля → консоль открыта: без кредов 200
@@ -276,11 +278,11 @@ v4_console() {
 }
 
 # ── V5 console-tls: TLS-фасад kb-console для доступа из локальной сети (трасса 030) ──
-# Проверяем: с LAN-адреса фасад отвечает TLS-ом, без кредов 401 + WWW-Authenticate,
-# с кредами 200. Всё через --noproxy (иначе корпоративный Squid отвечает 403).
-# Нет CONSOLE_LAN_IP → SKIP (фасад не сконфигурирован — это валидная конфигурация).
+# Проверяем: с LAN-адреса фасад отвечает TLS-ом, без кредов 302 + Location */login*
+# (035 gate v3), с Basic-кредами 200. Всё через --noproxy (иначе корпоративный
+# Squid отвечает 403). Нет CONSOLE_LAN_IP → SKIP (фасад не сконфигурирован).
 v5_console_tls() {
-    local lan_ip cidr url code code_auth www user passwd
+    local lan_ip cidr url code code_auth loc user passwd
     lan_ip="$(env_val CONSOLE_LAN_IP)"
     cidr="$(env_val CONSOLE_LAN_CIDR)"
     if [ -z "$lan_ip" ]; then
@@ -301,7 +303,7 @@ v5_console_tls() {
         say_fail 5 "console-tls $url" "нет ответа (фасад не поднят? docker logs kb-console-tls)"
         return 0
     fi
-    www="$(curl -s --noproxy '*' -k -D - -o /dev/null -m 10 "$url" 2>/dev/null | grep -i '^www-authenticate:' || true)"
+    loc="$(curl -s --noproxy '*' -k -D - -o /dev/null -m 10 "$url" 2>/dev/null | grep -i '^location:' | grep -i '/login' || true)"
 
     if [ -z "$passwd" ]; then
         SKIPPED=$((SKIPPED + 1))
@@ -310,14 +312,15 @@ v5_console_tls() {
     fi
     code_auth="$(curl -s --noproxy '*' -k -o /dev/null -w '%{http_code}' -m 12 \
         -u "${user}:${passwd}" "$url" 2>/dev/null || true)"
-    if [ "$code" = "401" ] && [ -n "$www" ] && [ "$code_auth" = "200" ]; then
+    # 035 (gate v3): без кредов 302 + Location */login*; Basic back-compat → 200.
+    if [ "$code" = "302" ] && [ -n "$loc" ] && [ "$code_auth" = "200" ]; then
         PASSED=$((PASSED + 1))
-        say_pass 5 "console-tls (lan=$lan_ip cidr=${cidr:-—})" \
-            "TLS ок, без кредов 401+WWW-Authenticate, с кредами 200"
+        say_pass 5 "console-tls (lan=$lan_ip)" \
+            "TLS ок, без кредов 302→/login, с Basic-кредами 200"
     else
         FAILED=$((FAILED + 1)); FAILED_IDS+=("V5")
         say_fail 5 "console-tls (lan=$lan_ip)" \
-            "без кредов=$code (WWW-Authenticate: $([ -n "$www" ] && echo yes || echo no)), с кредами=$code_auth — ожидалось 401+hdr / 200"
+            "без кредов=$code (Location /login: $([ -n "$loc" ] && echo yes || echo no)), с кредами=$code_auth — ожидалось 302+/login / 200"
     fi
     return 0
 }
