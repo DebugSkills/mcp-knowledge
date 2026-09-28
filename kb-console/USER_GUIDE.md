@@ -40,7 +40,7 @@ docker run -d --name kb-console \
 | `CONSOLE_AUTH` | `auto` | `auto`: пароль/юзеры есть → auth включён; пусто + non-loopback bind → предупреждение. `off`: выключить (консоль открыта, `/login` → редирект на `/status`). `required`: ничего не задано → контейнер не стартует (прод). |
 | `CONSOLE_STORAGE_SECRET` | пусто | Секрет подписи cookie-сессий. Лестница: env → файл `<dir users.jsonl>/storage_secret` (0600, атомарная запись) → ephemeral + WARNING (сессии живут до рестарта). **Ротация/удаление секрета = logout-all** (все cookie становятся невалидными). |
 | `CONSOLE_TRUST_XFF` | `1` | Rate-limit логина по первому IP из `X-Forwarded-For`. Безопасно за TLS-фасадом (наш Caddy ставит XFF и отбрасывает входящие значения); при прямой публикации порта в сеть — поставьте `0` (иначе IP-ключ можно спуфить). |
-| `CONSOLE_ADMIN_CONTACT` | пусто | Telegram-контакт админа: на `/login` появляется кнопка «Написать администратору» (t.me с готовым шаблоном заявки). Пусто (air-gap) — кнопки нет. |
+| `CONSOLE_ADMIN_CONTACT` | пусто | Резервный контакт админа (хранится в config; кнопки t.me на `/login` больше нет — с 036 заявка отправляется формой на самой странице). |
 
 - **Вход:** откройте консоль → редирект на `/login` → форма (логин+пароль или
   только пароль в legacy-режиме) → редирект на исходную страницу. Лимит:
@@ -78,14 +78,62 @@ docker run -d --name kb-console \
   - Полный runbook (деплой, раздача CA, добавление оператора, troubleshooting):
     `docs/operations/console-lan-access.md`.
 
-### 📝 Заявка на доступ (air-gap, 035)
+### 📝 Заявка на доступ (036)
 
-Нет учётки — на странице `/login` откройте таб **«Заявка на доступ»**:
-шаблон с 5 обязательными полями (**ФИО / Отдел / Телефон для связи /
-Почта (email) / Перечень проводимых работ**), кнопка «Скопировать заявку»,
-отправка по почте (`oksigen_07@bk.ru`, mailto с готовым текстом) или
-администратору в чате (при заданном `CONSOLE_ADMIN_CONTACT`). Страница
-не делает ни одного внешнего запроса (inline CSS/JS, favicon data-URI).
+Нет учётки — на странице `/login` откройте таб **«Заявка на доступ»**: форма
+с 5 обязательными полями (**ФИО / Отдел / Телефон для связи / Почта (email) /
+Перечень проводимых работ**) и **обязательным чекбоксом согласия** на
+обработку персональных данных (без него кнопка «Отправить» неактивна).
+Отправка — кнопкой на этой же странице: заявка сохраняется на сервере
+(`POST /api/access-request`) и попадает в окно администратора `/requests`.
+Защита от залива: не более 5 отправок за 5 минут с одного IP, дубль
+(то же ФИО+телефон в течение 10 минут) отклоняется. Страница не делает
+ни одного внешнего запроса (inline CSS/JS, favicon data-URI).
+
+**Обработка (админ):** вкладка **«Заявки»** (только admin) — таблица с
+фильтрами и счётчиками, клик по строке → деталь с историей; статусный
+workflow `новая → в работе → доступ выдан | отклонена` (без отката);
+на «доступ выдан» — кнопка **«Создать пользователя по заявке»** (форма
+`/users` с предзаполненными данными; автосоздания учётки нет — роль
+выбирает администратор) и **«Печать»** — чистая карточка заявки
+(`/requests/print?id=…`, 0 внешних ресурсов).
+
+### 🛡️ Заявки и персональные данные (152-ФЗ)
+
+- **Хранение локальное** (air-gap): SQLite `data/console/access_requests.db`
+  на сервере сообщества; форма и окно админа не делают внешних запросов,
+  каналов передачи ПДн наружу нет.
+- **Доступ:** только администраторы консоли (страница `/requests`, печать и
+  статусный API закрыты admin-гейтом на сервере).
+- **Срок хранения — 180 дней** (`CONSOLE_ACCESS_REQUESTS_RETENTION_DAYS`):
+  рассмотренные заявки (доступ выдан / отклонена) и их история событий
+  удаляются автоматически; нерассмотранные не удаляются.
+- **Согласие:** обязательный чекбокс перед отправкой; момент согласия
+  фиксируется в заявке (`consent_at`).
+- **Логирование:** поля заявок (ФИО/телефон/почта) в логи и error-sink
+  не пишутся — в диагностику попадают только id/IP/статусы.
+- **Удаление по требованию:** запросите администратора в чате/лично
+  (внешних каналов нет); состав/цель/срок — в тексте согласия на форме.
+
+### 🔎 Диагностика заявок (админ)
+
+БД: `${DATA_ROOT}/console/access_requests.db` (в контейнере —
+`/app/data/console/access_requests.db`; внутри — `access_requests` и
+`access_request_events`). Быстрые запросы (sqlite3 CLI; отсутствует —
+`python3 -c "import sqlite3,sys; [print(r) for r in sqlite3.connect(sys.argv[1]).execute(sys.argv[2])]" <db> "<sql>"`):
+
+```bash
+DB=data/console/access_requests.db
+sqlite3 "$DB" "SELECT id, created_at, fio, status FROM access_requests WHERE status='new' ORDER BY created_at;"   # нерассмотренные
+sqlite3 "$DB" "SELECT status, count(*) FROM access_requests GROUP BY status;"                                      # счётчики по статусам
+sqlite3 "$DB" "SELECT id, fio, status FROM access_requests WHERE created_at BETWEEN '2026-09-01' AND '2026-10-01';" # за период
+sqlite3 "$DB" "SELECT id, fio FROM access_requests WHERE fio LIKE '%Иванов%';"                                      # поиск по ФИО
+sqlite3 "$DB" "SELECT ts, actor, event, old_status, new_status FROM access_request_events WHERE request_id='req_XXXXXXXX' ORDER BY ts;"  # история заявки
+```
+
+Пользовательские тесты протокола: `kb-console/tests/test_access_requests.py`,
+`test_login_endpoints.py` (endpoint-контракты), `test_requests_page.py`
+(окно админа/печать).
 
 - 📎 **Safari:** не прикладывает сохранённые Basic-креды к websocket-upgrade →
   консоль работает через HTTP-polling (тоже за auth, дыры нет), но отклик чуть
@@ -225,4 +273,7 @@ pbkdf2-хэши — секретов нет) и входит в `scripts/backup.
 | `CONSOLE_HOST` | `127.0.0.1` | Адрес привязки (loopback; `0.0.0.0` — только bridge docker run + `-p 127.0.0.1:8085:8085`) |
 | `CONSOLE_PASSWORD` | пусто | Пароль HTTP Basic auth (пусто = auth off) |
 | `CONSOLE_AUTH` | `auto` | Режим auth: `auto` / `off` / `required` (см. «Доступ и авторизация») |
+| `CONSOLE_ACCESS_REQUESTS_DB` | `/app/data/console/access_requests.db` | Путь SQLite-БД заявок на доступ (036; volume `data/console`) |
+| `CONSOLE_ACCESS_REQUESTS_MAX` | `500` | Cap заявок (501-я → 503; защита от залива) |
+| `CONSOLE_ACCESS_REQUESTS_RETENTION_DAYS` | `180` | Срок хранения рассмотренных заявок и их истории (авто-prune) |
 | `REFRESH_SECONDS` | `10` | Интервал автообновления страницы «Статус» |

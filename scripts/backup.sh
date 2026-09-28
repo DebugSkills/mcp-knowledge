@@ -211,32 +211,99 @@ backup_ssot_tar() {
     echo "[$(date -Iseconds)] SSOT tar: $BACKUP_DIR/knowledge-${TIMESTAMP}.tar.gz"
 }
 
-# --- Console state backup (kb-console-roles Ф4.4, P2-5a) ---
-# users.jsonl (pbkdf2-хэши — секретов нет) + users_audit.jsonl + tokens.jsonl
-# (тот же класс данных; дыра в бэкап-контуре отмечена ещё в 001).
-# Восстановление = копия файлов + рестарт контейнеров.
-# P0-1 (code-2026-09-22-002): АБСОЛЮТНЫЕ пути от $DATA_ROOT — прежние относительные
-# data/console ломались после cd "$KNOWLEDGE_DIR" в backup_ssot_git → тихий скип.
+# --- Console state backup (036 §2.2: staging-протокол ПОЛНОГО стейта) ---
+# Состав staging (зеркалит layout DATA_ROOT → в таре console/, tokens/):
+#   users.jsonl (pbkdf2 невосстановимы) + users_audit.jsonl + storage_secret
+#   + access_requests.db (снапшот VACUUM INTO под КАНОНИЧЕСКИМ именем)
+#   + tokens/ целиком (если есть).
+# Tar собирает STAGING, живой console/ НЕ тарим: живая БД и её -journal/-wal/-shm
+# в архив не попадают по построению.
+# Guard «каталог только с .db» (бывш. дыра :227): jsonl ИЛИ .db ИЛИ secret.
+# Guard пустой БД: файла нет → INFO-скип; 0 байт / 0 таблиц → ERROR + rc=1.
 backup_console_state() {
-    echo "[$(date -Iseconds)] Backing up console state (users/tokens)..."
+    echo "[$(date -Iseconds)] Backing up console state (staging-протокол, 036 §2.2)..."
     mkdir -p "$BACKUP_DIR"
     chmod 700 "$BACKUP_DIR"
-    local items=()
-    local dir
-    for dir in "$DATA_ROOT/console" "$DATA_ROOT/tokens"; do
-        if [ -d "$dir" ] && ls "$dir"/*.jsonl >/dev/null 2>&1; then
-            items+=("$dir")
+    local console_dir="$DATA_ROOT/console" tokens_dir="$DATA_ROOT/tokens"
+    local rc=0
+
+    local has_state=false dir
+    for dir in "$console_dir" "$tokens_dir"; do
+        [ -d "$dir" ] || continue
+        if ls "$dir"/*.jsonl >/dev/null 2>&1 || ls "$dir"/*.db >/dev/null 2>&1 \
+           || [ -f "$dir/storage_secret" ]; then
+            has_state=true
         fi
     done
-    if [ ${#items[@]} -eq 0 ]; then
-        echo "[$(date -Iseconds)] Console state: нет users/tokens файлов — пропуск."
+    if [ "$has_state" = false ]; then
+        echo "[$(date -Iseconds)] Console state: файлов стейта нет — пропуск (не ошибка)."
         return 0
     fi
-    # -C "$DATA_ROOT": в таре относительные имена (console/, tokens/) —
-    # распаковка restore-скриптом в любой каталог без разворока абсолютных путей
-    tar -czf "$BACKUP_DIR/console-state-${TIMESTAMP}.tar.gz" -C "$DATA_ROOT" \
-        $(for dir in "${items[@]}"; do basename "$dir"; done) 2>&1
+
+    # Свежий staging на каждый прогон: VACUUM INTO не падает на существующий
+    # target («already exists») — staging всегда чистый.
+    local staging
+    staging="$(mktemp -d)"
+    chmod 700 "$staging"
+    mkdir -p "$staging/console"
+
+    local f
+    for f in users.jsonl users_audit.jsonl storage_secret; do
+        if [ -f "$console_dir/$f" ]; then
+            cp -p "$console_dir/$f" "$staging/console/$f"
+            echo "    + console/$f"
+        fi
+    done
+
+    local db="$console_dir/access_requests.db"
+    if [ ! -f "$db" ]; then
+        echo "    · access_requests.db нет — скип (свежая установка, INFO)"
+    elif [ ! -s "$db" ]; then
+        echo "    ✖ ERROR: access_requests.db существует, но 0 байт (битая?) — снапшота нет"
+        rc=1
+    elif ! python3 -c "import sqlite3,sys; conn=sqlite3.connect(sys.argv[1]); sys.exit(0 if conn.execute('SELECT count(*) FROM sqlite_master').fetchone()[0] > 0 else 3)" "$db"; then
+        echo "    ✖ ERROR: access_requests.db без таблиц/битая — снапшот НЕ сделан"
+        rc=1
+    elif python3 - "$db" "$staging/console/access_requests.db" <<'PY'
+import sqlite3, sys
+
+src, dst = sys.argv[1], sys.argv[2]
+conn = sqlite3.connect(src, timeout=5.0)
+conn.execute("PRAGMA busy_timeout=5000")  # параллельная запись не роняет бэкап
+conn.execute("VACUUM INTO ?", (dst,))
+conn.close()
+PY
+    then
+        echo "    + console/access_requests.db (VACUUM INTO, каноническое имя)"
+    else
+        echo "    ✖ ERROR: VACUUM INTO не удался — снапшота нет"
+        rc=1
+    fi
+
+    if [ -d "$tokens_dir" ]; then
+        mkdir -p "$staging/tokens"
+        cp -Rp "$tokens_dir/." "$staging/tokens/"
+        # страховка: sqlite-спутники в архив не едут (в токенах их быть не должно)
+        find "$staging/tokens" \( -name '*.db-journal' -o -name '*.db-wal' \
+            -o -name '*.db-shm' \) -delete 2>/dev/null || true
+        echo "    + tokens/"
+    fi
+
+    local tar_items=()
+    [ -n "$(ls -A "$staging/console" 2>/dev/null)" ] && tar_items+=(console)
+    [ -d "$staging/tokens" ] && tar_items+=(tokens)
+    if [ ${#tar_items[@]} -eq 0 ]; then
+        echo "[$(date -Iseconds)] Console state: staging пуст — тар не создан (rc=$rc)."
+        rm -rf "$staging"
+        return "$rc"
+    fi
+    # -C staging: относительные имена (console/, tokens/) — как прежде;
+    # распаковка restore-скриптом в любой каталог без разворока путей.
+    tar -czf "$BACKUP_DIR/console-state-${TIMESTAMP}.tar.gz" \
+        -C "$staging" "${tar_items[@]}" 2>&1
+    rm -rf "$staging"
     echo "[$(date -Iseconds)] Console state tar: $BACKUP_DIR/console-state-${TIMESTAMP}.tar.gz"
+    return "$rc"
 }
 
 # --- Secrets backup (.env; P1-4/P2-9, code-2026-09-22-002) ---
@@ -336,12 +403,19 @@ backup_weekly_snapshots() {
     echo "[$(date -Iseconds)] Weekly-4: готово ($(ls "$week_dir" | wc -l) файлов)."
 }
 
-# --- Console-state untar-drill (P2-6, code-2026-09-22-002 Ф3) ---
-# Последний console-state-тар: tar -tzf (целостность) → untar во временный каталог
-# → каждая строка users.jsonl/users_audit.jsonl/tokens.jsonl парсится json.loads
-# → cleanup. Возвращает 0/1; отсутствие тара — skip (return 0 с сообщением).
+# --- Console-state untar-drill (036 §2.2: presence + канонический путь + integrity) ---
+# Последний console-state-тар: tar -tzf (целостность) → untar во временный каталог →
+#   1) ПУСТОЙ архив (нет console/ и tokens/) → FAIL — закрыт ложный rc=0 «ok»
+#      от пустого find|while;
+#   2) presence-ассерты ДО цикла: файл, существующий на источнике, обязан быть
+#      в архиве и непустым — иначе FAIL ПОИМЁННО;
+#   3) БД заявок: канонический путь console/access_requests.db (имя снапшота =
+#      каноническое → «рядом лежащий неиспользованный» исключён по построению);
+#      PRAGMA integrity_check + count; живая БД без снапшота в архиве → FAIL;
+#   4) каждая строка *.jsonl парсится json.loads.
+# Возвращает 0/1; отсутствие тара — skip (return 0 с сообщением).
 verify_console_drill() {
-    echo "[$(date -Iseconds)] Console untar-drill (P2-6)..."
+    echo "[$(date -Iseconds)] Console untar-drill (036 §2.2)..."
     local tar_file
     tar_file="$(ls -t "$BACKUP_DIR"/console-state-*.tar.gz 2>/dev/null | head -1 || true)"
     if [ -z "$tar_file" ]; then
@@ -356,7 +430,68 @@ verify_console_drill() {
     local tmp
     tmp="$(mktemp -d)"
     tar -xzf "$tar_file" -C "$tmp" || { rm -rf "$tmp"; return 1; }
-    local jsonl rc=0
+    local rc=0
+
+    # Пустой архив ≠ «ok»
+    if [ ! -d "$tmp/console" ] && [ ! -d "$tmp/tokens" ]; then
+        echo "    ✖ FAIL: архив пуст — нет ни console/, ни tokens/"
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    # Presence-ассерты обязательных файлов (ожидание = наличие на источнике)
+    local f
+    for f in users.jsonl users_audit.jsonl storage_secret; do
+        if [ -s "$DATA_ROOT/console/$f" ]; then
+            if [ -s "$tmp/console/$f" ]; then
+                echo "    ✔ console/$f: presence ok"
+            else
+                echo "    ✖ FAIL: console/$f есть на источнике, но ОТСУТСТВУЕТ/пуст в архиве"
+                rc=1
+            fi
+        fi
+    done
+    if [ -d "$DATA_ROOT/tokens" ] && [ -n "$(ls -A "$DATA_ROOT/tokens" 2>/dev/null)" ]; then
+        if [ -d "$tmp/tokens" ] && [ -n "$(ls -A "$tmp/tokens" 2>/dev/null)" ]; then
+            echo "    ✔ tokens/: presence ok"
+        else
+            echo "    ✖ FAIL: tokens/ есть на источнике, но ОТСУТСТВУЕТ/пуст в архиве"
+            rc=1
+        fi
+    fi
+
+    # БД заявок: канонический путь + integrity + count
+    if [ -f "$tmp/console/access_requests.db" ]; then
+        local dbcheck
+        dbcheck="$(python3 - "$tmp/console/access_requests.db" <<'PY'
+import sqlite3, sys
+
+conn = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True)
+integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+try:
+    count = conn.execute("SELECT count(*) FROM access_requests").fetchone()[0]
+except sqlite3.Error:
+    count = -1
+print(f"{integrity} {count}")
+PY
+)" || dbcheck="error -1"
+        local integrity="${dbcheck% *}" dbcount="${dbcheck#* }"
+        if [ "$integrity" = "ok" ] && [ "$dbcount" -ge 0 ] 2>/dev/null; then
+            echo "    ✔ console/access_requests.db: integrity=ok, заявок: $dbcount"
+            [ "$dbcount" -eq 0 ] && echo "      (warning: заявок в снапшоте не было)"
+        else
+            echo "    ✖ FAIL: access_requests.db integrity=$integrity count=$dbcount"
+            rc=1
+        fi
+    elif [ -s "$DATA_ROOT/console/access_requests.db" ]; then
+        echo "    ✖ FAIL: живая БД заявок есть, снапшота в архиве НЕТ"
+        rc=1
+    else
+        echo "    · access_requests.db в архиве нет (легальный скип свежей установки)"
+    fi
+
+    # JSONL-валидация (каждая строка — валидный JSON)
+    local jsonl jrc
     while IFS= read -r jsonl; do
         local n
         n="$(python3 -c "
@@ -374,11 +509,12 @@ with open(sys.argv[1], encoding='utf-8') as f:
             print(f'BAD line {i}: {e}', file=sys.stderr)
             sys.exit(1)
 print(ok)
-" "$jsonl")" || rc=1
-        if [ "$rc" -eq 0 ]; then
+" "$jsonl")" || jrc=1
+        if [ "${jrc:-0}" -eq 0 ]; then
             echo "    ✔ $(basename "$jsonl"): ${n} строк, все валидный JSON"
         else
             echo "    ✖ $(basename "$jsonl"): битые строки JSON"
+            rc=1
             break
         fi
     done < <(find "$tmp" -name '*.jsonl' -type f | sort)
@@ -490,9 +626,16 @@ fi
 [ "$NO_QDRANT" = false ] && create_qdrant_snapshot
 [ "$NO_QDRANT" = false ] && backup_weekly_snapshots   # P2-7: вс-копии (no-op в остальные дни)
 [ "$NO_SSOT" = false ] && backup_ssot_git
-backup_console_state   # kb-console-roles Ф4.4: users.jsonl + users_audit + tokens
+# 036 §2.2: ошибка console-state (битая БД и т.п.) НЕ прерывает остальные
+# бэкапы — rc фиксируется и отдаётся в exit ПОСЛЕ полного прогона.
+CONSOLE_RC=0
+backup_console_state || CONSOLE_RC=1
 backup_secrets         # code-2026-09-22-002 P1-4: .env (guard P2-9 — skip без файла)
 backup_errors_state    # Error→Rule Ф4: config/aggregates/alert_state (без notify.json)
 rotate_backups
 
+if [ "$CONSOLE_RC" -ne 0 ]; then
+    echo "=== Backup completed WITH ERRORS (console state — см. ✖ выше): ${TIMESTAMP} ==="
+    exit 1
+fi
 echo "=== Backup completed: ${TIMESTAMP} ==="

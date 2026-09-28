@@ -181,8 +181,12 @@ services:
       # - CONSOLE_STORAGE_SECRET=${CONSOLE_STORAGE_SECRET:-}
       # Ротация секрета (удаление файла/env) = logout-all.
       # CONSOLE_ADMIN_CONTACT (t.me-контакт) — опционально, кнопка на /login.
+      # 036: заявки на доступ — SQLite в том же volume data/console.
+      - CONSOLE_ACCESS_REQUESTS_DB=/app/data/console/access_requests.db
+      - CONSOLE_ACCESS_REQUESTS_MAX=${CONSOLE_ACCESS_REQUESTS_MAX:-500}
+      - CONSOLE_ACCESS_REQUESTS_RETENTION_DAYS=${CONSOLE_ACCESS_REQUESTS_RETENTION_DAYS:-180}
     volumes:
-      - ./data/console:/app/data/console   # users.jsonl + users_audit.jsonl (Ф3.3)
+      - ./data/console:/app/data/console   # users.jsonl + users_audit.jsonl (Ф3.3) + access_requests.db (036)
     depends_on:
       mcp-server:
         condition: service_healthy
