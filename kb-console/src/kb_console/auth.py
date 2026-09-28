@@ -26,16 +26,33 @@ kb-console-roles Ф2 (B2), middleware v2 — per-user Basic поверх 002:
     ПОЛНОСТЬЮ + warning в interlock (P2-5b: скрытый неаудитируемый
     админ-вход запрещён).
 
-Skip-путей НЕТ by design (статика /_nicegui/* обязана быть за auth).
-Единственное исключение — /healthz (033-F3): ТОЧНОЕ сравнение пути, отдаётся
-inline pure-ASGI-ответом ДО ветки enabled и до app (liveness Docker HEALTHCHECK
-без кредов — иначе каждые 30s login_ok в users_audit.jsonl + испорченный
-last_login_at; 5523 записи/640 КБ шума, диагноз 032). Снаружи /healthz закрыт
-403 на TLS-фасаде (Caddy, handle-блок до @lan) — доступен только loopback
-контейнера; /healthz/ (trailing slash) матчится строгим сравнением и идёт
-в обычный 401-путь.
-Сессий/cookie/storage_secret НЕТ — stateless. Инвариант: Basic без TLS =
-креды base64 → сетевой доступ только ssh -L или TLS-фасад (доки, не код).
+035, middleware v3 — cookie-сессия + allowlist + ревалидация (план §3):
+  - без аутентификации доступны РОВНО 3 пути: /healthz (033-F3), /login
+    (GET, статический HTML), /api/login (POST, rate-limit в login_page);
+    /_nicegui/ и /_nicegui_ws/ — ВСЕГДА за аутентификацией (least
+    privilege, P2-1; favicon = data-URI);
+  - приоритет источников: cookie-сессия → Basic → отказ. Cookie-identity
+    ревалидируется на КАЖДОМ запросе (HTTP и WS-handshake, §3д):
+    * legacy-сессия валидна пока стор ПУСТ и store_version совпадает
+      (P1-6: create_user → bump → отказ на первом же запросе);
+    * обычная — UserStore.get(): active + роль из стора (мгновенный
+      отзыв), плюс равенство session.store_version == store.store_version
+      (N3: set_password/create_user/set_role/set_active = logout-all);
+  - неаутентифицированный HTTP: навигация → 302 /login?next=<path>;
+    XHR/API (пути /api/*, /_nicegui_ws/*, Accept: application/json или
+    X-Requested-With) → 401 JSON БЕЗ WWW-Authenticate (P2-2 — иначе
+    браузер поднимет Basic-диалог). Basic-челлендж не выдаётся вовсе:
+    Basic-креды по-прежнему ПРИНИМАЮТСЯ (verify-deploy/curl back-compat);
+  - провал ревалидации чистит сессию (scope['session'].clear() →
+    Starlette шлёт Set-Cookie session=null на 302) — петли 302 нет;
+  - websocket без аутентификации (в т.ч. сессия невалидна) → close 1008
+    ДО accept (класс 002: WS/polling-транзит = обход auth);
+  - scope['session'] читается только через .get() — отсутствие ключа =
+    fail-closed отказ, не 500 (P2-4).
+
+Сессии/stateless: Basic-ветка 002 сохранена бит-в-бит (legacy-пароль при
+пустом сторе). Инвариант: Basic без TLS = креды base64 → сетевой доступ
+только ssh -L или TLS-фасад (доки, не код).
 """
 
 from __future__ import annotations
@@ -46,6 +63,7 @@ import hmac
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import quote
 
 logger = logging.getLogger("kb_console.auth")
 
@@ -55,14 +73,20 @@ _VALID_AUTH_MODES = ("auto", "off", "required")
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 """Адреса, публикация на которых безопасна без пароля (loopback)."""
 
-_REALM_CHALLENGE = b'Basic realm="kb-console"'
-"""Значение заголовка WWW-Authenticate при 401 (HTTP Basic челлендж)."""
-
 _AUTH_FAILURE_DELAY = 0.5
 """Фиксированная задержка (сек) на неверный пароль — brute-force замедление."""
 
 _WS_POLICY_CODE = 1008
 """Code закрытия websocket-соединения при отказе (policy violation)."""
+
+_LOGIN_PATH = "/login"
+"""Статическая страница входа (035): GET — в анонимном allowlist."""
+
+_API_LOGIN_PATH = "/api/login"
+"""REST-логин (035): POST — в анонимном allowlist (rate-limit в login_page)."""
+
+_API_PREFIXES = ("/api/", "/_nicegui_ws/")
+"""Пути, всегда классифицируемые как XHR/API (401 JSON, не 302)."""
 
 # ASGI-типы (scope/receive/send — Any: ASGI-контракт без protocol-классов).
 _Scope = dict[str, Any]
@@ -190,25 +214,21 @@ def _parse_scope_headers(scope: _Scope) -> dict[str, str]:
 
 
 class ConsoleAuthMiddleware:
-    """Pure-ASGI HTTP Basic auth: http + websocket + транзит lifespan.
+    """Pure-ASGI gate v3: cookie-сессия + Basic + allowlist (http+ws+lifespan).
 
     Ветвление по scope["type"] (guard первым, до парсинга заголовков):
-      - http: без кредов → 401 + WWW-Authenticate; с кредами → app вниз;
-      - websocket: без кредов → websocket.close ДО accept (app вниз НЕ
-        вызывается); с кредами → app вниз;
-      - lifespan и любые прочие → транзит (uvicorn шлёт lifespan-scope на
-        старте — наивный else-reject сломал бы запуск; паттерн
-        mcp_server/auth.py:376-378).
+      - http: allowlist (3 пути) → сессия → Basic → 302/401;
+      - websocket: сессия → Basic → websocket.close ДО accept;
+      - lifespan и любые прочие → транзит.
 
-    Режим mode="off" — полный транзит (нулевой оверхед).
+    Порядок источников аутентификации: cookie-сессия (ревалидация §3д —
+    legacy-ветка P1-6, поля active/role, version-equality N3) → per-user
+    Basic (executor, identity в scope["state"]["user"]) → legacy-Basic
+    (пароль CONSOLE_PASSWORD при пустом сторе) → отказ.
 
-    Ф2 v2: users (UserStore | None) — непустой стор включает per-user
-    verify (pbkdf2 через run_in_executor — P2-4: CPU-bound pbkdf2 НЕ
-    блокирует event loop NiceGUI; прецедент Фазы 13.15); identity кладётся
-    в scope["state"]["user"] (dict: id/username/role) для role-гейтов Ф3.
-    Пустой стор / users=None → legacy-режим 002 бит-в-бит.
+    Режим mode="off" — полный транзит (нулевой оверхед), кроме /healthz.
 
-    Неверный пароль: logger.warning (без пароля в сообщении) +
+    Неверный пароль/невалидная сессия: logger.warning (без секретов) +
     фиксированная задержка failure_delay (anti-brute-force).
     """
 
@@ -231,7 +251,7 @@ class ConsoleAuthMiddleware:
 
         # 033-F3: liveness-эндпоинт — ДО enabled-ветки (одинаковая семантика в
         # режимах on/off: auth-off не должен ловить 404 от NiceGUI-app) и до
-        # парсинга заголовков. Строгое равенство: "/healthz/" идёт в 401-путь.
+        # парсинга заголовков. Строгое равенство: "/healthz/" идёт в отказ.
         if scope_type == "http" and scope.get("path") == "/healthz":
             await self._respond_healthz(send)
             return
@@ -241,22 +261,91 @@ class ConsoleAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
+        path = scope.get("path", "") or "/"
+        method = scope.get("method", "GET").upper()
+
+        # 035 §3а-1: анонимный allowlist — РОВНО 3 пути (счётность).
+        if scope_type == "http":
+            if path == _LOGIN_PATH and method == "GET":
+                await self.app(scope, receive, send)
+                return
+            if path == _API_LOGIN_PATH and method == "POST":
+                await self.app(scope, receive, send)
+                return
+
         headers = _parse_scope_headers(scope)
         authorization = headers.get("authorization", "")
 
-        # Ф2 v2: непустой users-стор → per-user ветка (legacy-пароль отклонён)
+        # 1) Cookie-сессия (035 §3д): ревалидация на каждом запросе.
+        ok, had_identity = self._validate_session_identity(scope)
+        if ok:
+            await self.app(scope, receive, send)
+            return
+
+        # 2) Basic (back-compat: verify-deploy, curl, API-скрипты).
         if self._users is not None and self._users.has_users():
             if await self._authenticate_user(scope, authorization):
                 await self.app(scope, receive, send)
                 return
-            await self._reject(scope, scope_type, authorization, send)
-            return
-
-        if verify_basic_auth(authorization, self._password):
+        elif verify_basic_auth(authorization, self._password):
             await self.app(scope, receive, send)
             return
 
-        await self._reject(scope, scope_type, authorization, send)
+        await self._reject(scope, scope_type, authorization, send, had_identity)
+
+    # ── session branch (035) ────────────────────────────────
+
+    def _validate_session_identity(self, scope: _Scope) -> tuple[bool, bool]:
+        """Ревалидация cookie-identity §3д. Возвращает (ok, had_identity).
+
+        had_identity — была ли в сессии заявленная identity: нужно для
+        очистки cookie при провале (анонимную сессию с session-id NiceGUI
+        не трогаем). Синхронно: UserStore.get() — TTL-кэш под RLock, без
+        await внутри (single-loop, WORKERS=1 — гонок нет).
+        """
+        session = scope.get("session")
+        if not isinstance(session, dict):
+            return False, False  # P2-4: fail-closed, не 500
+        ident = session.get("identity")
+        if not isinstance(ident, dict):
+            return False, False
+        had_identity = True
+
+        if ident.get("legacy"):
+            # P1-6: legacy-сессия валидна только пока стор ПУСТ (плюс
+            # version-equality: create_user бампает версию).
+            users = self._users
+            store_empty = users is None or not users.has_users()
+            version_ok = users is None or ident.get("store_version") == users.store_version
+            if store_empty and version_ok:
+                scope.setdefault("state", {})["user"] = {
+                    "id": "",
+                    "username": "admin",
+                    "role": "admin",
+                    "legacy": True,
+                }
+                return True, had_identity
+            return False, had_identity
+
+        username = ident.get("username")
+        users = self._users
+        if users is None or not username:
+            return False, had_identity
+        record = users.get(username)
+        if record is None or not record.active:
+            return False, had_identity
+        # N3: любая мутация стора = logout-all сессий (версия глобальная).
+        if ident.get("store_version") != users.store_version:
+            return False, had_identity
+        # Полевая ревалидация роли: смена роли действует мгновенно.
+        if record.role != ident.get("role"):
+            ident["role"] = record.role  # Session пометит modified → Set-Cookie
+        scope.setdefault("state", {})["user"] = {
+            "id": record.id,
+            "username": record.username,
+            "role": record.role,
+        }
+        return True, had_identity
 
     async def _respond_healthz(self, send: _Send) -> None:
         """Inline pure-ASGI 200 "ok" для /healthz (033-F3).
@@ -302,23 +391,47 @@ class ConsoleAuthMiddleware:
         }
         return True
 
+    # ── reject (035: 302/401-JSON/close вместо Basic-челленджа) ──
+
+    def _is_api_request(self, scope: _Scope, headers: dict[str, str]) -> bool:
+        """XHR/API-класс: 401 JSON; всё прочее — навигация → 302.
+
+        Классификация: путь под /api/ или /_nicegui_ws/ (engine.io-polling),
+        Accept: application/json, заголовок X-Requested-With.
+        """
+        path = scope.get("path", "") or "/"
+        if path.startswith(_API_PREFIXES):
+            return True
+        if "application/json" in headers.get("accept", ""):
+            return True
+        return bool(headers.get("x-requested-with"))
+
     async def _reject(
         self,
         scope: _Scope,
         scope_type: str,
         authorization: str,
         send: _Send,
+        session_identity_failed: bool = False,
     ) -> None:
-        """Общий отказ: warning + задержка при неверных кредах, 401/close."""
-        if authorization:
-            # Неверные креды — brute-force-сигнатура: warning + задержка.
+        """Отказ: warning + задержка при признаках подбора; 302/401/close.
+
+        session_identity_failed — в сессии БЫЛА identity, не прошедшая
+        ревалидацию → чистим cookie (scope['session'].clear(); Starlette
+        на выходе шлёт Set-Cookie session=null) — петли 302 нет.
+        """
+        if authorization or session_identity_failed:
             logger.warning(
-                "Auth failed (401): неверные учётные данные, %s %s",
+                "Auth failed: неверные учётные данные или просроченная сессия, %s %s",
                 scope_type,
                 scope.get("path", ""),
             )
             await asyncio.sleep(self._failure_delay)
-        # Отсутствующий заголовок — первичный челлендж браузера: тихий 401.
+
+        if session_identity_failed:
+            session = scope.get("session")
+            if isinstance(session, dict):
+                session.clear()
 
         if scope_type == "websocket":
             await send(
@@ -326,14 +439,34 @@ class ConsoleAuthMiddleware:
             )
             return
 
+        headers = _parse_scope_headers(scope)
+        if self._is_api_request(scope, headers):
+            # P2-2: 401 JSON БЕЗ WWW-Authenticate (иначе браузер поднимет
+            # Basic-диалог — регрессия UX-цели страницы входа).
+            body = b'{"ok": false, "error": "unauthorized"}'
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json; charset=utf-8"),
+                        (b"cache-control", b"no-store"),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+
+        next_path = quote(scope.get("path", "/") or "/", safe="")
         await send(
             {
                 "type": "http.response.start",
-                "status": 401,
+                "status": 302,
                 "headers": [
                     (b"content-type", b"text/plain; charset=utf-8"),
-                    (b"www-authenticate", _REALM_CHALLENGE),
+                    (b"location", f"/login?next={next_path}".encode("ascii")),
+                    (b"cache-control", b"no-store"),
                 ],
             }
         )
-        await send({"type": "http.response.body", "body": b"401 Unauthorized: kb-console\n"})
+        await send({"type": "http.response.body", "body": b"302 -> /login\n"})

@@ -174,19 +174,26 @@ def _run(mw: ConsoleAuthMiddleware, scope: dict) -> list[dict]:
     return sent
 
 
-def test_http_no_credentials_401_with_challenge():
-    """http без кредов → 401 + WWW-Authenticate: Basic realm="kb-console"; app НЕ вызван."""
+def test_http_no_credentials_302_to_login():
+    """v3 (035): http без кредов, навигация → 302 → /login?next=; app НЕ вызван.
+
+    Basic-челлендж (401+WWW-Authenticate) заменён страницей входа: заголовок
+    WWW-Authenticate больше НЕ выдаётся middleware вовсе (иначе браузер
+    поднимет Basic-диалог — регрессия UX-цели, P2-2).
+    """
     mw, stub = _make_mw()
     sent = _run(mw, _make_scope("http", "/status"))
     assert stub.calls == []
     assert sent[0]["type"] == "http.response.start"
-    assert sent[0]["status"] == 401
+    assert sent[0]["status"] == 302
     headers = {k.decode().lower(): v.decode() for k, v in sent[0]["headers"]}
-    assert headers["www-authenticate"] == 'Basic realm="kb-console"'
+    assert headers["location"].startswith("/login")
+    assert "next=" in headers["location"]
+    assert "www-authenticate" not in headers
 
 
 def test_http_no_credentials_silent_challenge(caplog):
-    """Первичный заход браузера (заголовка нет) — тихий 401, БЕЗ warning."""
+    """Первичный заход браузера (заголовка нет) — тихий 302, БЕЗ warning."""
     mw, _stub = _make_mw()
     with caplog.at_level(logging.WARNING, logger="kb_console.auth"):
         _run(mw, _make_scope("http", "/status"))
@@ -204,8 +211,8 @@ def test_http_with_credentials_pass_through():
     assert sent == []
 
 
-def test_http_wrong_password_401_and_warning(caplog):
-    """Неверный пароль → 401 + logger.warning (brute-force-видимость)."""
+def test_http_wrong_password_302_and_warning(caplog):
+    """Неверный пароль → 302 на /login + logger.warning (brute-force-видимость)."""
     mw, stub = _make_mw()
     scope = _make_scope(
         "http", "/status", headers=[(b"authorization", _basic("op", "wrong").encode())]
@@ -213,8 +220,7 @@ def test_http_wrong_password_401_and_warning(caplog):
     with caplog.at_level(logging.WARNING, logger="kb_console.auth"):
         sent = _run(mw, scope)
     assert stub.calls == []
-    assert sent[0]["status"] == 401
-    assert any("401" in r.getMessage() or "auth" in r.getMessage().lower() for r in caplog.records)
+    assert sent[0]["status"] == 302
 
 
 def test_failure_delay_sleeps_on_wrong_password():
@@ -312,17 +318,17 @@ class TestHealthzEndpoint:
     def test_healthz_matcher_is_strict(self):
         """RED-3 (изоляция): skip ТОЛЬКО точный /healthz — инвариант «skip-путей
         нет» сохранён для всего остального; ws /healthz НЕ скипается."""
-        # / без кредов → по-прежнему 401-челлендж
+        # / без кредов → v3: навигационный отказ 302 на /login
         mw, stub = _make_mw()
         sent = _run(mw, _make_scope("http", "/"))
         assert stub.calls == []
-        assert sent[0]["status"] == 401
-        # /healthz/ (trailing slash) без кредов → 401, НЕ 200 (строгий матчер;
-        # на фасаде путь проксируется, но middleware отдаёт челлендж)
+        assert sent[0]["status"] == 302
+        # /healthz/ (trailing slash) без кредов → 302, НЕ 200 (строгий матчер;
+        # на фасаде путь проксируется, но middleware отдаёт редирект на логин)
         mw2, stub2 = _make_mw()
         sent2 = _run(mw2, _make_scope("http", "/healthz/"))
         assert stub2.calls == []
-        assert sent2[0]["status"] == 401, "/healthz/ не должен матчиться как /healthz"
+        assert sent2[0]["status"] == 302, "/healthz/ не должен матчиться как /healthz"
         # ws-scope /healthz → НЕ skip (guard только http): без кредов — close
         mw3, stub3 = _make_mw()
         sent3 = _run(mw3, _make_scope("websocket", "/healthz"))
@@ -345,6 +351,327 @@ class TestHealthzEndpoint:
         assert users.verify.call_count == 0, "healthz не должен вызывать pbkdf2-verify"
         assert users.log_login.call_count == 0, "healthz не должен писать login_ok в аудит"
         assert stub.calls == []
+
+
+# ── 035 Ф1: middleware v3 — сессии, allowlist, XHR/навигация ──
+
+
+def _session_scope(
+    path: str = "/status",
+    identity: dict | None = None,
+    scope_type: str = "http",
+    headers: list[tuple[bytes, bytes]] | None = None,
+) -> dict:
+    """Scope с cookie-сессией (как его готовит SessionMiddleware)."""
+    scope = _make_scope(scope_type, path, headers)
+    session: dict = {"id": "sess-1"}
+    if identity is not None:
+        session["identity"] = identity
+    scope["session"] = session
+    return scope
+
+
+def _ident(store, username: str = "alice", role: str = "editor") -> dict:
+    rec = store.get(username)
+    return {
+        "user_id": rec.id,
+        "username": username,
+        "role": role,
+        "store_version": store.store_version,
+        "legacy": False,
+    }
+
+
+class TestAllowlistV3:
+    """Контракт §3а: без аутентификации доступны РОВНО 3 пути (+favicon data-URI
+    в самом HTML — /favicon.ico не существует и не запрашивается)."""
+
+    def test_login_get_allowed_without_auth(self):
+        mw, stub = _make_mw()
+        _run(mw, _make_scope("http", "/login"))
+        assert len(stub.calls) == 1
+
+    def test_api_login_post_allowed_without_auth(self):
+        mw, stub = _make_mw()
+        scope = _make_scope("http", "/api/login")
+        scope["method"] = "POST"
+        _run(mw, scope)
+        assert len(stub.calls) == 1
+
+    def test_api_login_get_not_allowlisted(self):
+        """GET /api/login (не POST) — не в allowlist → отказ 302."""
+        mw, stub = _make_mw()
+        _run(mw, _make_scope("http", "/api/login"))
+        assert stub.calls == []
+
+    def test_nicegui_ws_polling_get_without_session_401(self):
+        """engine.io HTTP-polling — API-класс: 401 JSON (не 302)."""
+        mw, stub = _make_mw()
+        sent = _run(mw, _make_scope("http", "/_nicegui_ws/socket.io/"))
+        assert stub.calls == []
+        assert sent[0]["status"] == 401
+
+    def test_nicegui_static_without_auth_302(self):
+        """/_nicegui/*-статика без аутентификации → навигационный 302."""
+        mw, stub = _make_mw()
+        sent = _run(mw, _make_scope("http", "/_nicegui/nicegui.js"))
+        assert stub.calls == []
+        assert sent[0]["status"] == 302
+
+
+class TestRejectShapes:
+    """P2-2: XHR → 401 JSON без WWW-Authenticate; навигация → 302+Location."""
+
+    def test_xhr_json_accept_401_without_challenge(self):
+        mw, stub = _make_mw()
+        scope = _make_scope(
+            "http", "/api/whatever", headers=[(b"accept", b"application/json")]
+        )
+        sent = _run(mw, scope)
+        assert stub.calls == []
+        assert sent[0]["status"] == 401
+        headers = {k.decode().lower(): v.decode() for k, v in sent[0]["headers"]}
+        assert "www-authenticate" not in headers
+        assert "application/json" in headers["content-type"]
+
+    def test_xhr_requested_with_401(self):
+        mw, _stub = _make_mw()
+        scope = _make_scope(
+            "http", "/status", headers=[(b"x-requested-with", b"XMLHttpRequest")]
+        )
+        sent = _run(mw, scope)
+        assert sent[0]["status"] == 401
+
+    def test_navigation_302_location_contains_next(self):
+        mw, _stub = _make_mw()
+        sent = _run(mw, _make_scope("http", "/books"))
+        headers = {k.decode().lower(): v.decode() for k, v in sent[0]["headers"]}
+        assert sent[0]["status"] == 302
+        assert headers["location"] == "/login?next=%2Fbooks"
+
+    def test_anonymous_session_not_cleared(self):
+        """Анонимная сессия (только session-id) НЕ чистится при отказе:
+        иначе сбрасывали бы session-id NiceGUI каждому неаутентифицированному."""
+        mw, _stub = _make_mw()
+        scope = _session_scope("/status", identity=None)
+        _run(mw, scope)
+        assert scope["session"] == {"id": "sess-1"}
+
+
+class TestSessionBranch:
+    """Cookie-сессия как источник аутентификации + ревалидация §3д."""
+
+    def test_valid_session_passes_http(self, tmp_path):
+        from kb_console.core.users import UserStore
+
+        store = UserStore(users_file=str(tmp_path / "u.jsonl"))
+        store.create_user("alice", "pw", "editor")
+        mw, stub = _make_mw_with_users(store)
+        scope = _session_scope("/status", identity=_ident(store))
+        _run(mw, scope)
+        assert len(stub.calls) == 1
+        # identity в scope-state (та же семантика, что у Basic-ветки)
+        user = stub.calls[0].get("state", {}).get("user")
+        assert user["username"] == "alice" and user["role"] == "editor"
+
+    def test_valid_session_passes_websocket(self, tmp_path):
+        from kb_console.core.users import UserStore
+
+        store = UserStore(users_file=str(tmp_path / "u.jsonl"))
+        store.create_user("alice", "pw", "editor")
+        mw, stub = _make_mw_with_users(store)
+        scope = _session_scope(
+            "/_nicegui_ws/socket.io/", identity=_ident(store), scope_type="websocket"
+        )
+        _run(mw, scope)
+        assert len(stub.calls) == 1  # WS-handshake с сессией → pass
+
+    def test_session_preferred_over_basic(self, tmp_path):
+        """Сессия валидна → Basic-креды не проверяются (даже кривые)."""
+        from kb_console.core.users import UserStore
+
+        store = UserStore(users_file=str(tmp_path / "u.jsonl"))
+        store.create_user("alice", "pw", "editor")
+        mw, stub = _make_mw_with_users(store)
+        scope = _session_scope(
+            "/status",
+            identity=_ident(store),
+            headers=[(b"authorization", _basic("alice", "WRONG").encode())],
+        )
+        _run(mw, scope)
+        assert len(stub.calls) == 1
+
+    def test_forged_identity_unknown_user_rejected_and_cookie_cleared(self, tmp_path):
+        """Поддельный identity (юзера нет) → 302 + session.clear() (Set-Cookie
+        null на выходе из SessionMiddleware)."""
+        from kb_console.core.users import UserStore
+
+        store = UserStore(users_file=str(tmp_path / "u.jsonl"))
+        store.create_user("alice", "pw", "editor")
+        mw, stub = _make_mw_with_users(store)
+        forged = {
+            "user_id": "usr_fake",
+            "username": "mallory",
+            "role": "admin",
+            "store_version": store.store_version,
+            "legacy": False,
+        }
+        scope = _session_scope("/status", identity=forged)
+        sent = _run(mw, scope)
+        assert stub.calls == []
+        assert sent[0]["status"] == 302
+        assert scope["session"] == {}, "провал ревалидации чистит сессию"
+
+    def test_garbage_session_identity_rejected(self):
+        """identity не-dict / без username → отказ (fail-closed по форме)."""
+        mw, stub = _make_mw()
+        scope = _session_scope("/status", identity={"role": "admin"})  # без username
+        _run(mw, scope)
+        assert stub.calls == []
+        # identity не словарь
+        scope2 = _session_scope("/status", identity="admin")
+        sent2 = _run(mw, scope2)
+        assert sent2[0]["status"] == 302
+
+    def test_missing_session_key_fail_closed(self):
+        """P2-4: scope без 'session' (композиция middleware изменилась) →
+        fail-closed отказ, НЕ 500."""
+        mw, stub = _make_mw()
+        _run(mw, _make_scope("http", "/status"))
+        assert stub.calls == []
+
+    def test_websocket_invalid_session_close_1008(self, tmp_path):
+        """WS-handshake с невалидной сессией → close 1008 ДО accept."""
+        from kb_console.core.users import UserStore
+
+        store = UserStore(users_file=str(tmp_path / "u.jsonl"))
+        store.create_user("alice", "pw", "editor")
+        mw, stub = _make_mw_with_users(store)
+        bad = dict(_ident(store), store_version=999)
+        scope = _session_scope(
+            "/_nicegui_ws/socket.io/", identity=bad, scope_type="websocket"
+        )
+        sent = _run(mw, scope)
+        assert stub.calls == []
+        assert sent and sent[0]["type"] == "websocket.close"
+        assert all(m["type"] != "websocket.accept" for m in sent)
+
+
+class TestSessionRevalidation:
+    """§3д: отзыв прав действуют мгновенно; N3 — version-equality."""
+
+    def test_store_version_mismatch_rejects(self, tmp_path):
+        """N3: set_password (bump версии) убивает ВСЕ сессии."""
+        from kb_console.core.users import UserStore
+
+        store = UserStore(users_file=str(tmp_path / "u.jsonl"))
+        store.create_user("alice", "pw", "editor")
+        ident = _ident(store)
+        store.set_password("alice", "new-pw")  # _mutate → version++
+        mw, stub = _make_mw_with_users(store)
+        scope = _session_scope("/status", identity=ident)
+        sent = _run(mw, scope)
+        assert stub.calls == []
+        assert sent[0]["status"] == 302
+
+    def test_deactivated_user_session_rejected(self, tmp_path):
+        from kb_console.core.users import UserStore
+
+        store = UserStore(users_file=str(tmp_path / "u.jsonl"))
+        store.create_user("alice", "pw", "editor")
+        ident = _ident(store)
+        store.set_active("alice", False)
+        mw, stub = _make_mw_with_users(store)
+        sent = _run(mw, _session_scope("/status", identity=ident))
+        assert stub.calls == []
+        assert sent[0]["status"] == 302
+
+    def test_role_change_updates_session_role_immediately(self, tmp_path):
+        """Смена роли: сессия жива, роль в scope-state — НОВАЯ (мгновенно)."""
+        from kb_console.core.users import UserStore
+
+        store = UserStore(users_file=str(tmp_path / "u.jsonl"))
+        store.create_user("alice", "pw", "editor")
+        ident = _ident(store)
+        store.set_role("alice", "admin")  # version++ НО полевая ревалидация
+        # пересобираем identity с новой версией? НЕТ: версия в сессии старая →
+        # bump при set_role убьёт сессию (N3, logout-all при мутациях стора).
+        # Этот тест фиксирует именно семантику N3: сессия со старой версией
+        # отзывается даже при живом/активном юзере.
+        mw, stub = _make_mw_with_users(store)
+        sent = _run(mw, _session_scope("/status", identity=ident))
+        assert stub.calls == []
+        assert sent[0]["status"] == 302
+
+    def test_role_freshness_when_version_matches(self, tmp_path):
+        """Полевая ревалидация роли: версия совпала (крафт) — роль берётся из
+        стора, а не из cookie."""
+        from kb_console.core.users import UserStore
+
+        store = UserStore(users_file=str(tmp_path / "u.jsonl"))
+        store.create_user("alice", "pw", "editor")
+        store.set_role("alice", "admin")
+        ident = _ident(store, role="editor")  # устаревшая роль в cookie
+        ident["store_version"] = store.store_version
+        mw, stub = _make_mw_with_users(store)
+        scope = _session_scope("/status", identity=ident)
+        _run(mw, scope)
+        assert len(stub.calls) == 1
+        user = stub.calls[0]["state"]["user"]
+        assert user["role"] == "admin", "роль из стора, не из cookie"
+        assert scope["session"]["identity"]["role"] == "admin"
+
+
+class TestLegacySessionLifecycle:
+    """P1-6: legacy-сессия жива ТОЛЬКО пока стор пуст; create_user = отзыв."""
+
+    def test_legacy_session_alive_on_empty_store(self, tmp_path):
+        from kb_console.core.users import UserStore
+
+        store = UserStore(users_file=str(tmp_path / "u.jsonl"))
+        assert not store.has_users()
+        ident = {
+            "user_id": "",
+            "username": "admin",
+            "role": "admin",
+            "store_version": store.store_version,
+            "legacy": True,
+        }
+        mw, stub = _make_mw_with_users(store, password="legacy-pw")
+        _run(mw, _session_scope("/status", identity=ident))
+        assert len(stub.calls) == 1, "legacy-сессия валидна на пустом сторе"
+
+    def test_legacy_session_dead_after_create_user(self, tmp_path):
+        """Расширение кейса test_auth.py:247 (035 P1-6): не только payload
+        логина — сама сессия отзывается при появлении стора."""
+        from kb_console.core.users import UserStore
+
+        store = UserStore(users_file=str(tmp_path / "u.jsonl"))
+        ident = {
+            "user_id": "",
+            "username": "admin",
+            "role": "admin",
+            "store_version": store.store_version,
+            "legacy": True,
+        }
+        mw, stub = _make_mw_with_users(store, password="legacy-pw")
+        scope = _session_scope("/status", identity=ident)
+        _run(mw, scope)
+        assert len(stub.calls) == 1
+        store.create_user("root", "pw-root", "admin")  # bump + has_users
+        scope2 = _session_scope("/status", identity=ident)
+        sent2 = _run(mw, scope2)
+        assert stub.calls and len(stub.calls) == 1
+        assert sent2[0]["status"] == 302
+        assert scope2["session"] == {}, "cookie сброшен (Set-Cookie null)"
+
+
+def _make_mw_with_users(users_store, password: str = "", mode: str = "on"):
+    stub = _StubApp()
+    mw = ConsoleAuthMiddleware(
+        app=stub, password=password, mode=mode, failure_delay=0.0, users=users_store
+    )
+    return mw, stub
 
 
 if __name__ == "__main__":

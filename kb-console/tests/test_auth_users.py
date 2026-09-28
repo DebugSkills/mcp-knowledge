@@ -150,31 +150,35 @@ class TestMiddlewarePerUser:
         user = stub.calls[0].get("state", {}).get("user")
         assert user is not None and user["username"] == "alice" and user["role"] == "editor"
 
-    def test_wrong_password_401(self, users):
+    def test_wrong_password_302(self, users):
+        """v3 (035): навигация с неверным паролем → 302 /login (не 401-челлендж)."""
         mw, stub = _mw(users)
         sent = _run(mw, _make_scope("http", "/status", headers=_hdr(_basic("alice", "wrong"))))
         assert stub.calls == []
-        assert sent[0]["status"] == 401
+        assert sent[0]["status"] == 302
 
-    def test_unknown_user_401(self, users):
+    def test_unknown_user_302(self, users):
         mw, stub = _mw(users)
         sent = _run(mw, _make_scope("http", "/status", headers=_hdr(_basic("ghost", "pw"))))
         assert stub.calls == []
-        assert sent[0]["status"] == 401
+        assert sent[0]["status"] == 302
 
     def test_legacy_password_rejected_when_users_present(self, users):
-        """P2-5b: вход по CONSOLE_PASSWORD при непустом сторе → 401."""
+        """P2-5b: вход по CONSOLE_PASSWORD при непустом сторе → отказ (v3: 302)."""
         mw, stub = _mw(users, password="legacy-pw")
         sent = _run(mw, _make_scope("http", "/status", headers=_hdr(_basic("admin", "legacy-pw"))))
         assert stub.calls == []
-        assert sent[0]["status"] == 401
+        assert sent[0]["status"] == 302
 
-    def test_no_credentials_401_challenge(self, users):
+    def test_no_credentials_302_login_no_challenge(self, users):
+        """v3 (035): без кредов → 302 /login; WWW-Authenticate НЕ выдаётся."""
         mw, stub = _mw(users)
         sent = _run(mw, _make_scope("http", "/status"))
         assert stub.calls == []
         headers = {k.decode().lower(): v.decode() for k, v in sent[0]["headers"]}
-        assert headers["www-authenticate"] == 'Basic realm="kb-console"'
+        assert sent[0]["status"] == 302
+        assert headers["location"].startswith("/login")
+        assert "www-authenticate" not in headers
 
     def test_websocket_reject_close_before_accept(self, users):
         mw, stub = _mw(users)
@@ -197,12 +201,12 @@ class TestMiddlewarePerUser:
         _run(mw, _make_scope("http", "/status"))
         assert len(stub.calls) == 1
 
-    def test_inactive_user_401(self, users):
+    def test_inactive_user_302(self, users):
         users.set_active("alice", False)
         mw, stub = _mw(users)
         sent = _run(mw, _make_scope("http", "/status", headers=_hdr(_basic("alice", "pw-alice"))))
         assert stub.calls == []
-        assert sent[0]["status"] == 401
+        assert sent[0]["status"] == 302
 
 
 # ── middleware: пустой стор → legacy 002 бит-в-бит ──────────
@@ -223,12 +227,12 @@ class TestMiddlewareLegacyFallback:
         _run(mw, _make_scope("http", "/status", headers=_hdr(_basic("zzz", "legacy-pw"))))
         assert len(stub.calls) == 1
 
-    def test_empty_store_wrong_password_401(self, tmp_path):
+    def test_empty_store_wrong_password_302(self, tmp_path):
         store = UserStore(users_file=str(tmp_path / "users.jsonl"))
         mw, stub = _mw(store, password="legacy-pw")
         sent = _run(mw, _make_scope("http", "/status", headers=_hdr(_basic("op", "wrong"))))
         assert stub.calls == []
-        assert sent[0]["status"] == 401
+        assert sent[0]["status"] == 302
 
     def test_users_none_fully_legacy(self):
         """users=None (старый конструктор 002) — поведение не меняется."""
