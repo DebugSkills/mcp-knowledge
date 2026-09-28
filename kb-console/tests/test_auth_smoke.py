@@ -87,6 +87,15 @@ _proc: subprocess.Popen | None = None
 def _get_or_start_console() -> subprocess.Popen:
     global _proc
     if _proc is None or _proc.poll() is not None:
+        # Stale-сервер на порту (false-green: отвечает СТАРЫЙ код) — fail fast.
+        try:
+            local_get(f"http://localhost:{_SMOKE_PORT}/status", timeout=1.0)
+            raise RuntimeError(
+                f"порт {_SMOKE_PORT} занят stale-сервером — прибейте его "
+                "(pkill -f kb_console.app) перед прогоном smoke"
+            )
+        except httpx.HTTPError:
+            pass  # порт свободен — штатно поднимаем свой сервер
         _proc = _start_console(_SMOKE_PORT)
         _wait_for_server(_SMOKE_PORT)
     return _proc
@@ -95,16 +104,17 @@ def _get_or_start_console() -> subprocess.Popen:
 # ── Tests ───────────────────────────────────────────────────
 
 
-def test_status_without_credentials_401():
-    """GET /status без кредов → 401 + Basic-челлендж."""
+def test_status_without_credentials_302_to_login():
+    """GET /status без кредов → v3 (035): 302 + Location /login (Basic-челленджа нет)."""
     _get_or_start_console()
     r = local_get(f"http://localhost:{_SMOKE_PORT}/status", timeout=5.0)
-    assert r.status_code == 401
-    assert r.headers.get("www-authenticate") == 'Basic realm="kb-console"'
+    assert r.status_code == 302
+    assert r.headers.get("location", "").startswith("/login")
+    assert r.headers.get("www-authenticate") is None
 
 
 def test_status_with_credentials_200():
-    """GET /status с верными кредами → 200 HTML."""
+    """GET /status с верными Basic-кредами → 200 HTML (back-compat v3)."""
     _get_or_start_console()
     r = local_get(
         f"http://localhost:{_SMOKE_PORT}/status",
@@ -115,15 +125,17 @@ def test_status_with_credentials_200():
     assert "<html" in r.text.lower()
 
 
-def test_nicegui_static_without_credentials_401():
-    """Статика /_nicegui/* без кредов → 401 (JS-каркас за auth)."""
+def test_nicegui_static_without_credentials_302():
+    """Статика /_nicegui/* без кредов → 302 (JS-каркас за auth)."""
     _get_or_start_console()
     r = local_get(f"http://localhost:{_SMOKE_PORT}/_nicegui/nicegui.js", timeout=5.0)
-    assert r.status_code == 401
+    assert r.status_code == 302
+    assert r.headers.get("location", "").startswith("/login")
 
 
 def test_socketio_polling_without_credentials_401():
-    """socket.io-polling /_nicegui_ws/* без кредов → 401 (обход через polling закрыт)."""
+    """socket.io-polling /_nicegui_ws/* без кредов → 401 JSON (обход через
+    polling закрыт; API-класс — не 302, P2-2)."""
     _get_or_start_console()
     r = local_get(
         f"http://localhost:{_SMOKE_PORT}/_nicegui_ws/socket.io/"
@@ -131,6 +143,7 @@ def test_socketio_polling_without_credentials_401():
         timeout=5.0,
     )
     assert r.status_code == 401
+    assert r.headers.get("www-authenticate") is None
 
 
 if __name__ == "__main__":
