@@ -482,6 +482,10 @@ def collect_docker_logs(sink: Path, state: dict, cfg: dict):
 def collect_cron_logs(sink: Path, state: dict, cfg: dict):
     events = []
     cl_state = state.setdefault("cron_log", {})
+    # 033-F4: marker-only set — для перечисленных логов текст вне [CRON]-строк
+    # игнорируется (анти-рекурсия: строки отчётов weekly/alerts не создают
+    # сигнатур; [CRON]-ветка выше продолжает работать для них).
+    marker_only = set(cfg.get("cron_marker_only", []))
     for logfile in cfg.get("cron_logs", []):
         path = Path(logfile)
         try:
@@ -530,6 +534,11 @@ def collect_cron_logs(sink: Path, state: dict, cfg: dict):
                     priority_hint=None if heartbeat else "cron_nonzero",
                     actor_id=f"cron:{job}", expected=heartbeat,
                 ))
+            elif str(path) in marker_only:
+                # 033-F4: собственные логи — только [CRON]-маркеры; текст отчётов
+                # НЕ переигрывается коллектором (петля report→collect, 1662 события;
+                # соответствие докстрингу :28-29 «Собственные ошибки — НЕ в sink»).
+                continue
             elif re.search(r"\b(WARN|ERROR|CRITICAL|FAILED|Traceback)\b", line):
                 level = "CRITICAL" if "CRITICAL" in line else ("ERROR" if "ERROR" in line else "WARNING")
                 events.append(make_event(
@@ -1000,6 +1009,10 @@ DEFAULT_CONFIG = {
     "containers": ["mcp-knowledge-server", "kb-console", "mcp-qdrant-dev", "mcp-knowledge-ollama",
                    "kb-console-tls"],
     "cron_logs": ["/var/log/mcp-backup.log", "/var/log/mcp-quality.log"],
+    # 033-F4: логи собственных джоб (collector/alerts/weekly/prune) — собирать
+    # ТОЛЬКО [CRON]-маркеры; текст отчётов не переигрывается (анти-рекурсия,
+    # докстринг :28-29). Пути кладёт overlay errors_cron.sh / ansible-шаблон.
+    "cron_marker_only": [],
     "thresholds": {"df_warn_pct": 85, "df_crit_pct": 95, "ram_avail_min_pct": 10,
                    "load15_factor": 2, "vram_warn_pct": 95},
     "retention_days": 90, "hold_days": 14, "e4_window_days": 7,

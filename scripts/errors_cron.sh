@@ -108,8 +108,16 @@ for p in ours:
     if p not in cl:
         cl.append(p)
 cfg["cron_logs"] = cl
+# 033-F4: marker-only — собственные логи собираются ТОЛЬКО по [CRON]-маркерам
+# (текст отчётов weekly/alerts не переигрывается — анти-рекурсия, петля 032).
+# Union, как с cron_logs: чужие пути (если есть) сохраняются.
+mo = list(cfg.get("cron_marker_only", []))
+for p in ours:
+    if p not in mo:
+        mo.append(p)
+cfg["cron_marker_only"] = mo
 cfgp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-print(f"[errors_cron] config overlay: cron_logs={len(cl)} (наших +3) → {cfgp}")
+print(f"[errors_cron] config overlay: cron_logs={len(cl)} (наших +3), cron_marker_only={len(mo)} → {cfgp}")
 PYEOF
 }
 
@@ -227,7 +235,7 @@ case "$ACTION" in
     fi
     CFG="$DATA_ROOT/logs/errors/config.json"
     if [ -f "$CFG" ]; then
-      python3 -c "import json,sys; cl=json.load(open('$CFG')).get('cron_logs',[]); ours=[p for p in cl if 'logs/cron/' in p]; print(f'config overlay: {len(ours)}/4 наших логов в cron_logs')" 2>/dev/null || echo "config overlay: config.json не читается"
+      python3 -c "import json,sys; c=json.load(open('$CFG')); cl=c.get('cron_logs',[]); ours=[p for p in cl if 'logs/cron/' in p]; mo=c.get('cron_marker_only',[]); print(f'config overlay: {len(ours)}/4 наших логов в cron_logs, marker-only: {len(mo)}')" 2>/dev/null || echo "config overlay: config.json не читается"
     else
       echo "config overlay: нет config.json"
     fi

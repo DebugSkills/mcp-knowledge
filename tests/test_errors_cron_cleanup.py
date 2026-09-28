@@ -167,5 +167,41 @@ class TestCronLegacyCleanupT8:
             json.dumps(alert_before).encode()  # бэкап до правки
 
 
+# ── 033-F4: ключ cron_marker_only в ansible-шаблоне (защита от затирания) ──
+
+
+class TestErrorsConfigTemplateMarkerOnly033F4:
+    """033-F4 (critic-P1): ansible/playbooks/errors.yml:40-45 рендерит
+    config.json из ansible/templates/errors-config.json.j2 ПОЛНОЙ заменой.
+    Без ключа cron_marker_only в шаблоне очередной `make -C ansible errors`
+    молча сбрасывает фикс → петля report→collect возвращается. Статический
+    ассерт: ключ присутствует + 4 собственных пути logs/cron/*.log.
+    """
+
+    TEMPLATE = ROOT / "ansible" / "templates" / "errors-config.json.j2"
+
+    def test_template_has_marker_only_key(self):
+        text = self.TEMPLATE.read_text(encoding="utf-8")
+        assert '"cron_marker_only"' in text, (
+            f"{self.TEMPLATE.name}: нет ключа cron_marker_only — ansible-рендер "
+            "сбросит фикс 033-F4 (петля report→collect вернётся)"
+        )
+
+    def test_template_lists_all_four_own_logs(self):
+        text = self.TEMPLATE.read_text(encoding="utf-8")
+        # ключ-блок до следующего верхнеуровневого ключа
+        block = text.split('"cron_marker_only"', 1)[1]
+        block = block.split("]", 1)[0]
+        for name in ("collector", "alerts", "weekly", "prune"):
+            assert f"logs/cron/{name}.log" in block, (
+                f"{self.TEMPLATE.name}: нет logs/cron/{name}.log в cron_marker_only"
+            )
+        # пути — ansible-managed через {{ data_root }}, чтобы совпадать с
+        # DATA_ROOT оверлея errors_cron.sh на целевом хосте (critic iter2-P3)
+        assert "{{ data_root }}" in block or "{{ data_root " in block, (
+            "пути cron_marker_only должны идти через {{ data_root }} (сверка с overlay)"
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

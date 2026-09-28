@@ -855,5 +855,94 @@ class TestE2FrozenOnAccessCorpus:
         assert ev["signature"] == expected
 
 
+# ── 033-F4: marker-only сбор собственных cron-логов (анти-рекурсия) ──
+
+
+class TestCronMarkerOnly033F4:
+    """033-F4: логи собственных джоб (collector/alerts/weekly/prune) — только
+    [CRON]-маркеры; текст отчётов не переигрывается коллектором.
+
+    Петля (диагноз 032): weekly-отчёт цитирует P0-сигнатуры → попадает в
+    weekly.log → эвристика WARN/ERROR/Traceback создаёт НОВЫЕ события
+    (hint=traceback → P0) — 1662 переигранных события. Ключ конфига
+    ``cron_marker_only`` рвёт плечо report→collect, сохраняя [CRON]-сигнал
+    (exit≠0 → P0 cron_nonzero). Соответствует докстрингу :28-29 модуля:
+    «Собственные ошибки — в stderr (НЕ в sink — анти-рекурсия)».
+    """
+
+    REPORT_LINES = [
+        "- [P0] 7d=1 actors=- — Traceback (most recent call last):   File \"/usr/local/lib/python3.11/site-packages/httpx/_transports/default.py\"",
+        "- [P1] 7d=3 actors=2ebf — signature growth: +2 за сутки (cap=5)",
+        "P2 summary: 14 сигнатур, топ: docker_logs|503|…",
+    ]
+
+    def _log(self, tmp_path, lines):
+        logf = tmp_path / "weekly.log"
+        logf.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return logf
+
+    def test_marker_only_suppresses_report_lines(self, tmp_path):
+        """RED-1 (главный): [CRON]-heartbeat + строки отчёта; marker_only=[log]
+        → ровно 1 событие (маркер, expected); строки отчёта НЕ стали событиями."""
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        logf = self._log(tmp_path, [
+            f"[CRON] job=weekly exit=0 dur=3s ts={now}",
+            *self.REPORT_LINES,
+        ])
+        events = ec.collect_cron_logs(
+            tmp_path / "sink", {},
+            {"cron_logs": [str(logf)], "cron_marker_only": [str(logf)]},
+        )
+        assert len(events) == 1, (
+            f"marker-only: только [CRON]-событие, строки отчёта не переигрываются; "
+            f"got {len(events)}: {[e['message'][:60] for e in events]}"
+        )
+        assert events[0]["expected"] is True
+        assert "job=weekly" in events[0]["message"]
+
+    def test_marker_only_preserves_cron_nonzero_p0(self, tmp_path):
+        """RED-2: [CRON] exit=1 в marker-only логе → событие cron_nonzero,
+        expected=False (легитимный P0-сигнал падения джобы сохранён)."""
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        logf = self._log(tmp_path, [
+            *self.REPORT_LINES,
+            f"[CRON] job=weekly exit=1 dur=5s ts={now}",
+        ])
+        events = ec.collect_cron_logs(
+            tmp_path / "sink", {},
+            {"cron_logs": [str(logf)], "cron_marker_only": [str(logf)]},
+        )
+        assert len(events) == 1
+        ev = events[0]
+        assert ev["priority_hint"] == "cron_nonzero", f"ожидался cron_nonzero, got {ev}"
+        assert ev["expected"] is False
+
+    def test_foreign_logs_untouched_without_key(self, tmp_path):
+        """RED-3: чужой лог с легитимным ERROR БЕЗ marker_only → событие
+        создаётся (эвристика жива для чужих логов); и контроль прежнего
+        поведения собственных логов без ключа — строки отчёта ловятся."""
+        foreign = tmp_path / "mcp-backup.log"
+        foreign.write_text(
+            "2026-09-28T03:00:00Z ERROR: backup failed: exit 2\n", encoding="utf-8"
+        )
+        events = ec.collect_cron_logs(
+            tmp_path / "sink", {}, {"cron_logs": [str(foreign)]},
+        )
+        assert len(events) == 1 and "backup failed" in events[0]["message"]
+        # контроль: тот же weekly-лог БЕЗ marker_only — строки отчёта создают
+        # события (прежнее поведение, доказывает что ключ — единственный фильтр)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        logf = self._log(tmp_path, [
+            f"[CRON] job=weekly exit=0 dur=3s ts={now}",
+            *self.REPORT_LINES,
+        ])
+        events2 = ec.collect_cron_logs(
+            tmp_path / "sink2", {}, {"cron_logs": [str(logf)]},
+        )
+        assert len(events2) > 1, (
+            "без cron_marker_only строки отчёта обязаны ловиться (прежнее поведение)"
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -2,6 +2,12 @@
   "_doc": "Error→Rule config (Ф4/Ф5, code-2026-09-22-003; ansible-managed). Рендер errors.yml → config.json; секретов НЕТ (токены — notify.json из vault). Дефолты: scripts/errors_collect.py DEFAULT_CONFIG",
   "containers": ["mcp-knowledge-server", "kb-console", "mcp-qdrant-dev", "mcp-knowledge-ollama"],
   "cron_logs": ["/var/log/mcp-backup.log", "/var/log/mcp-quality.log", "/var/log/mcp-errors-collect.log"],
+  "cron_marker_only": [
+    "{{ data_root }}/logs/cron/collector.log",
+    "{{ data_root }}/logs/cron/alerts.log",
+    "{{ data_root }}/logs/cron/weekly.log",
+    "{{ data_root }}/logs/cron/prune.log"
+  ],
   "health_urls": [
     "http://localhost:8000/health",
     "http://localhost:6333/healthz",

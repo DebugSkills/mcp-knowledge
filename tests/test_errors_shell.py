@@ -361,6 +361,26 @@ class TestCronInstall:
         assert len([p for p in cl if "collector" in p]) == 1  # без дублей
         assert "errors_collect.py" in state.read_text()  # crontab записан
 
+    def test_config_overlay_marker_only_033f4(self, tmp_path):
+        """033-F4: реальный --install кладёт в config.json ключ
+        cron_marker_only с 4 собственными логами (union) — иначе текст
+        weekly/alerts-отчётов переигрывается коллектором (петля, 1662 события).
+        """
+        env, _state = fake_crontab_env(tmp_path)
+        dr = tmp_path / "data"
+        cfgp = dr / "logs" / "errors" / "config.json"
+        cfgp.parent.mkdir(parents=True)
+        cfgp.write_text(json.dumps({"cron_logs": []}), encoding="utf-8")
+        r = sh(CRON_SH, "--install", "--data-root", str(dr), env_over=env)
+        assert r.returncode == 0, r.stderr
+        merged = json.loads(cfgp.read_text())
+        mo = merged.get("cron_marker_only")
+        assert isinstance(mo, list), f"нет cron_marker_only в config.json: {merged.keys()}"
+        cron_dir = str(dr / "logs" / "cron")
+        for name in ("collector", "alerts", "weekly", "prune"):
+            assert f"{cron_dir}/{name}.log" in mo, f"нет {name}.log в cron_marker_only: {mo}"
+        assert len(mo) == 4, f"ровно 4 собственных лога, без дублей: {mo}"
+
     def test_config_overlay_backup(self, tmp_path):
         """R9 (Д3): старый config.json бэкапится до мерджа (реальный режим)."""
         env, _state = fake_crontab_env(tmp_path)
