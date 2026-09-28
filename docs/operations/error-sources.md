@@ -123,6 +123,7 @@
 | marker:ERRORS_QUERY | mcp-server, 1 сайт (errors_query, audit обращений) | sink: docker logs mcp-knowledge-server → errors_collect.py (source=docker_logs) | covered |
 | class:errors_query_audit | [ERRORS_QUERY]-строки тула | sink: classify_routine → expected=True (P3-baseline) | covered |
 | class:queue_overflow_backpressure | WARNING «Очередь переполнена — blocking put» (pipeline.py:122) | sink: classify_routine → expected=True (P3-baseline, durable-правило 015) | covered |
+| class:rate_limit_backpressure | anonymous-429: access `"POST /mcp" 429` + WARNING «Rate limit exceeded: key=anonymous» (rate_limit.py:96) | sink: classify_routine → expected=True (P3-baseline; burst-окно → P2/routine без TG, keyed key=<hex> — сигнал, durable-правило 034) | covered |
 | backlog:queue_capacity | вариант В (ёмкость): max_queue/batch_size из settings, producer-батчинг импорта (015, отклонён — нет данных о повторяемости) | sink: — | gap: бэклог; триггер запуска: ≥2 массовых импортов/мес ИЛИ 503-readiness > 15 мин |
 
 ## Шторм-гард write-side (code-2026-09-23-008, спека §7 .boardData.md)

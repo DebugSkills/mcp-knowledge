@@ -281,8 +281,9 @@ def classify_routine(rest: str, level, marker, status, slow_ms: float):
     routine: '[MCP] tool=… ok <ms>' при ms<slow_ms; '[MCP] tool=… start';
     access '[REQ] …' 2xx/без явного 4xx-5xx.
     НЕ routine (expected=False): ERROR/CRITICAL/traceback, любой 5xx, '[MCP]'
-    с error, WARNING — КРОМЕ ожидаемого backpressure-паттерна индексации
-    (015: «Очередь переполнена — blocking put», логгер mcp_knowledge.pipeline).
+    с error, WARNING — КРОМЕ ожидаемого backpressure (015: «Очередь
+    переполнена — blocking put», логгер mcp_knowledge.pipeline; 034: anonymous
+    rate-limit, см. ниже).
     slow: '[MCP] … ok <ms≥slow_ms>' → hint='slow' (P1).
     """
     low = rest.lower()
@@ -296,6 +297,23 @@ def classify_routine(rest: str, level, marker, status, slow_ms: float):
     # по low, как в ветке ERRORS_QUERY ниже (сбойную семантику не глотаем).
     if (level == "WARNING" and "mcp_knowledge.pipeline" in rest
             and "Очередь переполнена — blocking put" in rest
+            and not AUDIT_FAIL_RE.search(low)):
+        return True, None
+    # 034: ожидаемый rate-limit backpressure — СТРОГО anonymous (F1):
+    # (1) access-429 uvicorn: status==429 при marker is None (GIN-строки имеют
+    #     marker='GIN' и исключены; гейт ERROR/5xx выше). В access-формате
+    #     ключа конструктивно нет ⇒ сигнатура общая для anonymous/keyed —
+    #     принято и задокументировано (план 034 §5.1): user-impact keyed-клиента
+    #     виден в его warning-сигнатуре с актором (P1-способен), не в access.
+    # (2) WARNING mcp_knowledge.rate_limit ТОЛЬКО при key=anonymous
+    #     (key=<hex> — сигнал: ≥2 акторов / burst ⇒ P1).
+    # Fail-word-гард — по low на ОБЕИХ ветках (прецедент 015-t3; критик 034 N1):
+    # сбойную семантику в 429-строке не глотаем; path /errors с 429 остаётся
+    # non-routine («errors» матчится гардом) — fail-safe, осознанное решение.
+    if status == 429 and marker is None and not AUDIT_FAIL_RE.search(low):
+        return True, None
+    if (level == "WARNING" and "mcp_knowledge.rate_limit" in rest
+            and "Rate limit exceeded" in rest and "key=anonymous" in rest
             and not AUDIT_FAIL_RE.search(low)):
         return True, None
     if level == "WARNING":
