@@ -182,8 +182,9 @@ def render_login_html(
     css = (
         "*{box-sizing:border-box;margin:0}body{font-family:system-ui,-apple-system,"
         "'Segoe UI',Roboto,sans-serif;min-height:100vh;display:flex;"
+        "flex-direction:column;"
         "background:#f0f2f5;color:#1f2937}"
-        ".split{display:flex;width:100%;min-height:100vh}"
+        ".split{display:flex;width:100%;flex:1}"
         ".brand{flex:1 1 46%;background:linear-gradient(160deg,#0d1b2a 0%,"
         "#1b3a5c 60%,#2563eb 140%);color:#e5edf6;display:flex;flex-direction:"
         "column;justify-content:center;padding:64px;gap:14px}"
@@ -225,7 +226,8 @@ def render_login_html(
         ".req-note{font-size:13.5px;color:#6b7280;margin:12px 0 8px;line-height:1.5}"
         "a.mailto{color:#1d4ed8;font-weight:600;text-decoration:none}"
         "a.mailto:hover{text-decoration:underline}"
-        ".copy{margin-top:18px;text-align:center;font-size:12.5px;color:#9ca3af}"
+        ".copy{margin:12px 0 18px;text-align:center;white-space:nowrap;"
+        "font-size:12.5px;color:#9ca3af}"
         "@media(max-width:860px){.split{flex-direction:column}.brand{padding:34px;"
         "flex-basis:auto}.brand h1{font-size:30px}.brand ul{display:none}}"
     )

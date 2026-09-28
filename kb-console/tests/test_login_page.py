@@ -199,6 +199,18 @@ class TestLoginUiContract:
         assert APP_COPYRIGHT in page
         assert "footer" in page  # подпись — в подвале, не в контенте формы
 
+    def test_copyright_footer_layout(self):
+        """Регресс прод-нита: body flex-column + .split flex:1 + .copy nowrap,
+        footer ПОСЛЕ .split — иначе подпись уезжает вправо и рвётся на 2 строки."""
+        page = render_login_html(legacy=False, next_path="/x")
+        assert "flex-direction:column" in page
+        assert ".split{display:flex;width:100%;flex:1}" in page
+        assert "white-space:nowrap" in page
+        assert ".copy" in page
+        # footer вне .split: закрывающий </footer> стоит после закрытия </main>
+        # и после конца .split (</main></div>), т.е. позиция footer > позиция split-close
+        assert page.rfind("</footer>") > page.rfind("</main></div>")
+
     def test_next_sanitized_into_js(self):
         page = render_login_html(legacy=False, next_path="https://evil.example")
         assert "evil.example" not in html_mod.unescape(page)
