@@ -9,7 +9,7 @@ VAULT_ARGS := --vault-password-file $(VAULT_PASS_FILE)
 endif
 APB := ansible-playbook -i $(INVENTORY)
 .PHONY: deps test lint check run run-tag vault-create vault-edit \
-        update update-check logs events health metrics stats \
+        update update-check update-local update-local-check logs events health metrics stats \
         backup backup-verify restore \
         errors errors-report errors-prune errors-cron-cleanup errors-sources
 deps:
@@ -43,6 +43,16 @@ update:
 # Dry-run апдейта: показать, что изменилось бы (--check --diff).
 update-check:
 	$(APB) playbooks/update.yml --check --diff $(VAULT_ARGS)
+
+# ─── 038 Ф3: air-gap апдейт из локального пакета (update_source=local) ───
+# Пакет собирает scripts/offline-update.sh pack (make update-bundle). В начале
+# прогона плейбук печатает дрейф образов (локальный .Id ↔ manifest, P2-5).
+# Перед применением ВСЕГДА смотреть update-local-check (dry-run печатает план).
+update-local:
+	$(APB) playbooks/update.yml -e update_source=local -e update_bundle_path=$(BUNDLE) $(VAULT_ARGS)
+
+update-local-check:
+	$(APB) playbooks/update.yml --check --diff -e update_source=local -e update_bundle_path=$(BUNDLE) $(VAULT_ARGS)
 
 # Read-only операции (ops.yml, БЕЗ vault-промпта — плейбук не использует секретов).
 # Примеры:

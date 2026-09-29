@@ -37,6 +37,7 @@ transfer_images:
   - kb-console:prod
   - qdrant/qdrant:v1.13.4
   - ollama/ollama:0.20.2
+  - caddy:2-alpine   # 038 P1-4: TLS-фасад kb-console-tls в compose — без образа пересоздание фасада = pull-fail
 
 # — Параметры подготовки хоста (бывшая роль mcp_kb_host_prepare, инлайн в playbooks/host-prepare.yml) —
 # Приоритет: extra vars > host_vars/*.yml > group_vars — host_vars переопределяет эти дефолты.

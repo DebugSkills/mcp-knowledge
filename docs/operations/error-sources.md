@@ -101,6 +101,7 @@
 | script:verify-deploy.sh | post-deploy гейт (make push / make verify-deploy, 2026-09-24) | sink: — | gap: ручной; FAIL → exit≠0 и явное сообщение оператору из make push; при автоматизации через cron_wrap.sh |
 | script:reindex.sh | ручной запуск | sink: — | gap: ручной; запускать через cron_wrap.sh (RUNBOOK §Error-наблюдаемость) |
 | script:offline-deploy.sh | air-gap-утилита, ручной запуск | sink: — | gap: ручной (bundle-контур вне прода) |
+| script:offline-update.sh | 038: air-gap ОБНОВЛЕНИЕ (pack/inspect/verify/apply-stage), ручной запуск | sink: — | gap: ручной (offline-update-контур вне прода; FAIL → exit≠0 + явное STOP-сообщение) |
 | script:seed_knowledge.py | разовый сид, ручной | sink: — | gap: разовый; через cron_wrap.sh при использовании |
 | script:backfill_sequence_payload.py | миграция payload, ручной | sink: — | gap: ручной; через cron_wrap.sh (конвенция update-флоу) |
 | script:errors_collect.py | сам коллектор (cron */5) | sink: — | gap: self — анти-рекурсия (P2-2); stderr → mcp-errors-collect.log с ротацией |

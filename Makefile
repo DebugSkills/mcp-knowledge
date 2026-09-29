@@ -98,8 +98,29 @@ e2e-slow:  ## E2E + медленные сценарии (blue-green, GPU)
 bundle:  ## Собрать air-gap bundle для изолированного контура (машина с интернетом)
 	./scripts/offline-deploy.sh prepare
 
-prod-verify:  ## Высокоуровневая проверка прода: smoke + E2E S1-S19 (из docker-compose.prod.yml)
+airgap-verify:  ## Air-gap: проверка изолированного контура — smoke + E2E S1-S19 (offline-deploy.sh)
 	./scripts/offline-deploy.sh verify
+
+# Deprecated-alias (038 Ф3): оставить 1 релиз, чтобы не ломать привычку.
+prod-verify:
+	@echo "⚠️  prod-verify переименован в airgap-verify (038) — путаница с verify-deploy (post-deploy)."
+	@$(MAKE) airgap-verify
+
+# ─── Offline-update (038 Ф3): полный пакет + идемпотентное применение ───
+# Поток: (интернет-машина) make update-bundle [ARGS="--with-ollama-image --with-models"]
+#        → (носитель)  make update-bundle-verify DIR=/media/…/mcp-kb-update-….tar.gz
+#        → (aikb)      make prod-update-local BUNDLE=/media/…/mcp-kb-update-….tar.gz
+
+.PHONY: update-bundle update-bundle-verify prod-update-local
+
+update-bundle:  ## 038: собрать пакет offline-обновления (интернет-машина; ARGS="--with-ollama-image --with-models")
+	./scripts/offline-update.sh pack $(ARGS)
+
+update-bundle-verify:  ## 038: проверка пакета на носителе (sha256 + bundle + manifest)
+	./scripts/offline-update.sh inspect --check $(DIR)
+
+prod-update-local:  ## 038: air-gap апдейт прода из пакета (BUNDLE=…; перед применением — update-local-check)
+	$(MAKE) -C ansible update-local BUNDLE=$(BUNDLE)
 
 # ═══════════════════════════════════════════════════════════════
 # kb-console (Фаза 13.7) — NiceGUI-клиент (диагностика + импорт + поиск)
