@@ -70,6 +70,7 @@ docker run -d --name kb-console \
 4. [Phase 3: Verify (Isolated Host)](#4-phase-3-verify-isolated-host)
 5. [Troubleshooting](#5-troubleshooting)
 6. [Air-gap Architecture Notes](#6-air-gap-architecture-notes)
+7. [Offline update (обновление, не первичная установка)](#7-offline-update-обновление-не-первичная-установка)
 
 ---
 
@@ -595,6 +596,77 @@ TOOLS=$(curl -sf -X POST http://localhost:8000/mcp \
 
 echo "=== Done ==="
 ```
+
+---
+
+## 7. Offline update (обновление, не первичная установка)
+
+> Эта глава — про **обновление уже установленного** изолированного контура (code-2026-09-29-038). Первичная установка не меняется — см. §0–§4.
+
+### 7.1 Why the build cannot happen on the isolated host
+
+Обновление кода обычно = `git pull` → `docker compose build` → `up`. В изолированном контуре это невозможно: `docker build` для `mcp-server` и `kb-console` тянет `apt`/`pip` **из сети** (базовые образы и зависимости), а `git pull` требует доступ к origin. Поэтому **образы собираются заранее** на машине с интернетом и доставляются готовыми.
+
+### 7.2 What the package contains
+
+Полный пакет `mcp-kb-update-<ISO>.tar.gz`:
+
+```
+mcp-kb-update-<ISO>/
+├── repo.git                 # git bundle --all (вся история репо кода)
+├── images/                  # per-image docker save | gzip
+│   ├── mcp-knowledge-mcp-server_latest.tar.gz
+│   ├── kb-console_prod.tar.gz
+│   ├── qdrant_qdrant_v1.13.4.tar.gz
+│   └── caddy_2-alpine.tar.gz
+├── models/                  # опционально (--with-models): манифесты + blobs
+├── manifest.json            # target_commit, images[].Id/sha256/bytes, models[].digest
+└── CHECKSUMS.sha256         # целостность всего пакета
+```
+
+Опции: `--with-ollama-image` — добавить образ `ollama/ollama`; `--with-models` — добавить Ollama-модели (манифесты и blobs). Секреты (`.env`, keys) в пакет **не входят**.
+
+### 7.3 How it differs from `make bundle`
+
+| | `make bundle` (первичная установка, трасса 003) | `make update-bundle` (обновление, 038) |
+|---|---|---|
+| Назначение | поднять стек «с нуля» на пустом хосте | обновить **существующую** установку |
+| Внутри | `images.tar` + **wheelhouse (`pip`)** + модели + compose + `offline-deploy.sh` | `repo.git` + **per-image** tarballs + `manifest.json` + `CHECKSUMS.sha256` |
+| Код | не нужен (образы уже собраны) | привозится git-история → рабочее дерево обновляется |
+| Применение | `docker load` всего + запуск | **идемпотентно**: `docker load` только расходящихся образов + `merge --ff-only` |
+| Скрипт | `scripts/offline-deploy.sh prepare` | `scripts/offline-update.sh pack` |
+
+Первичная установка везёт всё, что нужно для запуска; обновление несёт **дифф** между «что уже стоит» и целевым коммитом и применяет только недостающее.
+
+### 7.4 Idempotent apply («only what is needed»)
+
+Применение идемпотентно — повторный прогон того же пакета = **0 мутаций**:
+
+- `HEAD == manifest.target_commit` → `git fetch/merge` **пропускается**;
+- образ с локальным `.Id`, равным manifest → `docker load` **пропускается** (`.Id` совпал);
+- Ollama-модель с совпавшим digest манифеста → копирование **пропускается**;
+- контейнеры при этом **не перезапускаются** (`up -d --wait` рекреатит только при смене digest/конфигурации).
+
+Изменённые образы перед загрузкой сохраняются под тегом `:prev` — это точка отката.
+
+### 7.5 Поток (команды)
+
+```bash
+# 1) Машина с интернетом: собрать полный пакет
+make update-bundle                                  # + ARGS="--with-ollama-image --with-models"
+# → artifacts/mcp-kb-update-<ISO>.tar.gz
+
+# 2) Носитель (флешка): после копирования — verify
+make update-bundle-verify DIR=/media/.../mcp-kb-update-<ISO>.tar.gz
+
+# 3) Изолированный хост: dry-run (план, 0 мутаций), затем применение
+make -C ansible update-local-check BUNDLE=/media/.../mcp-kb-update-<ISO>.tar.gz
+make prod-update-local            BUNDLE=/media/.../mcp-kb-update-<ISO>.tar.gz
+```
+
+Все проверки целостности (`sha256sum -c`, `git bundle verify`, сверка головы bundle ↔ `target_commit`) выполняются **до** любых мутаций: битый пакет = STOP, установка не тронута. Standalone-вариант без ansible: `./scripts/offline-update.sh {pack|inspect --check|verify|apply-stage}`.
+
+Критерии приёмки (идемпотентность) и процедура отката: приватный операционный runbook (§11); публичная процедура восстановления — `docs/restore-runbook.md` §11.
 
 ---
 
