@@ -47,7 +47,9 @@ def render_header(active: str) -> None:
     from ..pages import ROUTES  # lazy import: ломает circular chain pages↔components
 
     role = ROLE_LEVEL.get(current_role(), 0)
-    with ui.row().classes("items-center gap-2 q-mb-md w-full") as _header:
+    # 037 Ф2 (P2-2): класс .kb-header — акцентная полоса из console_css()
+    # (тема), вместо хрупкого структурного селектора «первый .row».
+    with ui.row().classes("items-center gap-2 q-mb-md w-full kb-header") as _header:
         for path, label, _builder, min_role in ROUTES:
             if role < ROLE_LEVEL.get(min_role, 0):
                 continue
