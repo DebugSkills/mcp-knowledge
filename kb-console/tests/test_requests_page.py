@@ -231,3 +231,72 @@ class TestUserPrefillLink:
         sig = inspect.signature(build_users)
         assert "prefill_request_id" in sig.parameters
         assert sig.parameters["prefill_request_id"].default == ""
+
+
+# ── Регресс визуальной проверки 036 (дефект 1, P0): первая отрисовка ──────
+
+
+@pytest.mark.filterwarnings(
+    # nicegui.testing-харнесс: teardown-артефакт библиотеки (Outbox.loop),
+    # не наш код — подавляем точечно, глобальный фильтр не ставим
+    "ignore:coroutine 'Outbox.loop' was never awaited:RuntimeWarning",
+)
+class TestFirstPaint:
+    """`/requests` рендерил ТОЛЬКО шапку: @ui.refreshable render() не был
+    вызван ни разу — render.refresh() на никогда не рисованной функции
+    оставляет страницу пустой. Харнесс nicegui.testing.User ловит класс
+    «страница/refreshable не отрисованы» на уровне реального DOM-дерева.
+    """
+
+    async def test_admin_sees_counters_and_table_on_first_paint(self, tmp_path, ui_user):
+        from nicegui import ui
+
+        user = ui_user
+        from kb_console.core import runtime
+        from kb_console.pages.requests_page import build_requests
+
+        store = _store(tmp_path)
+        rid = _seed(store)
+        _change_status(store, rid, "in_progress", actor="admin")
+
+        runtime.REQUESTS_STORE = store
+        try:
+            ui.page("/t-036-requests")(build_requests)
+            await user.open("/t-036-requests")
+            # счётчики (render_counters) + фильтры (render)
+            await user.should_see("Всего: 1")
+            await user.should_see("В работе: 1")
+            await user.should_see("Поиск по ФИО")
+            # таблица отрисована И содержит заявку (ячейки Quasar живут
+            # клиентски — проверяем rows отрисанного ui.table)
+            from nicegui import ui as _ui
+
+            tables = [
+                el for el in user.client.layout.descendants()
+                if isinstance(el, _ui.table)
+            ]
+            assert tables, "ui.table не отрисован"
+            all_rows = [r for t in tables for r in t._props.get("rows", [])]
+            assert any(
+                r.get("fio") == "Иван Иванов" and r.get("status") == "in_progress"
+                for r in all_rows
+            ), f"строка заявки не в таблице: {all_rows}"
+        finally:
+            runtime.REQUESTS_STORE = None
+
+    async def test_empty_store_still_renders_placeholder(self, tmp_path, ui_user):
+        """Пустой стор: страница не пустая — рисуется заглушка (не шапка-одна)."""
+        from nicegui import ui
+
+        user = ui_user
+        from kb_console.core import runtime
+        from kb_console.pages.requests_page import build_requests
+
+        runtime.REQUESTS_STORE = _store(tmp_path)
+        try:
+            ui.page("/t-036-requests-empty")(build_requests)
+            await user.open("/t-036-requests-empty")
+            await user.should_see("Всего: 0")
+            await user.should_see("Заявок нет.")  # заглушка, не пустая страница
+        finally:
+            runtime.REQUESTS_STORE = None

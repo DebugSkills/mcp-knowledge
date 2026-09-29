@@ -338,4 +338,9 @@ def build_requests() -> None:
         _by_id.update({r.id: r for r in _rows})
         render.refresh()
 
-    _refresh_all()
+    # Первичная отрисовка. ВАЖНО: `@ui.refreshable`-функцию нужно вызвать
+    # ХОТЯ БЫ РАЗ самому — иначе `render.refresh()` ничего не рисует и
+    # страница остаётся пустой (дефект, пойман визуальной проверкой 036).
+    load()
+    _by_id.update({r.id: r for r in _rows})
+    render()

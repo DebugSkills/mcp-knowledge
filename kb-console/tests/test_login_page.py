@@ -113,6 +113,37 @@ class TestLoginUiContract:
             assert f"id='{inp}'" in page
         assert "readonly" not in page  # редактируемая форма, не шаблон
 
+    def test_phone_pattern_v_flag_safe(self):
+        """Регресс visual-check 036 (дефект 2, P1): pattern у r-phone обязан
+        быть валидным regex в `v`-режиме браузера — неэкранированные `(`/`)`
+        в классе символов дают console.error и ломают клиентскую валидацию.
+        """
+        import re
+
+        page = render_login_html(legacy=False, next_path="/x")
+        m = re.search(r"pattern='([^']*)' required", page)
+        assert m, "pattern-атрибут у r-phone не найден"
+        pat = m.group(1)
+        # каждые ( и ) внутри класса экранированы — v-флаг это требует
+        class_body = pat[pat.index("[") + 1:pat.rindex("]")]
+        for ch in "()":
+            for occurrence in re.finditer(re.escape(ch), class_body):
+                pos = occurrence.start()
+                backslashes = 0
+                while pos - 1 - backslashes >= 0 and class_body[pos - 1 - backslashes] == "\\":
+                    backslashes += 1
+                assert backslashes % 2 == 1, (
+                    f"неэкранированный {ch!r} в классе {pat!r} — невалидный "
+                    "regex под v-флагом (console.error в браузере)"
+                )
+        # семантика сохранена: телефон с +, цифрами, пробелами, скобками,
+        # дефисами проходит; буквы — нет; серверную валидацию не ослабляли
+        compiled = re.compile(f"\\A{pat}\\Z")
+        assert compiled.match("+7 (900) 123-45-67")
+        assert compiled.match("+79001234567")
+        assert not compiled.match("abc")
+        assert not compiled.match("tel:+7")
+
     def test_request_form_consent_required(self):
         """Обязательный чекбокс согласия (текст из SSOT) + кнопка disabled."""
         from kb_console.config import ACCESS_REQUEST_CONSENT_TEXT

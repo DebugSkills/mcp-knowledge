@@ -147,7 +147,7 @@ def _request_form_fields() -> str:
         f"<label class='fld'>{fio}<input id='r-fio' type='text' maxlength='120' required></label>"
         f"<label class='fld'>{dept}<input id='r-dept' type='text' maxlength='120' required></label>"
         f"<label class='fld'>{phone}<input id='r-phone' type='tel' maxlength='32' "
-        "pattern='[+0-9 ()\\-]*' required></label>"
+        "pattern='[+0-9 \\(\\)\\-]*' required></label>"
         f"<label class='fld'>{email}<input id='r-email' type='email' maxlength='120' required></label>"
         f"<label class='fld'>{works}<textarea id='r-works' maxlength='2000' "
         "required></textarea></label>"
