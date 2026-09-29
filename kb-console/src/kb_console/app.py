@@ -14,6 +14,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from . import login_page
 from .auth import ConsoleAuthMiddleware, resolve_auth_mode
+from .components import theme
 from .components.header import render_header
 from .config import (
     CONSOLE_ADMIN_CONTACT,
@@ -203,6 +204,10 @@ core.app.add_middleware(
 
 # Глобальный request logger для отладки upload.
 core.app.add_middleware(RequestLogMiddleware)
+
+# 037 Ф0: тёмно-зелёная тема консоли (SSOT components/theme.py) —
+# Quasar-brand всех @ui.page + глобальный CSS (shared=True) до ui.run.
+theme.apply(core.app)
 
 ui.run(
     host=CONSOLE_HOST,
