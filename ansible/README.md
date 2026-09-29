@@ -15,8 +15,10 @@ Ansible-обвязка стека mcp-knowledge: подготовка хоста
 | Таргет | Плейбук | Что делает |
 |---|---|---|
 | `run` / `run-tag` | deploy / host-prepare / transfer | деплой по сценарию (transfer — DEPRECATED, см. выше); `run-tag PLAYBOOK=… ROLE=<тег> HOST=<хост>` — один тег |
-| `update` | `update.yml` | идемпотентный апдейт КОДА: preflight (диск/dirty-гейт/**mount-гейт** DATA_ROOT/лёгкий бэкап) → `git pull --ff-only` только `mcp-knowledge` → build → `up -d --wait` → health ×4 → **миграции релиза** (`scripts/(backfill\|migrate)_*.py` через `docker run --env-file`, с pause-подтверждением) → rollback-hint. `update_source=bundle` — заглушка (air-gap → `scripts/offline-deploy.sh`) |
+| `update` | `update.yml` | идемпотентный апдейт КОДА: preflight (диск/dirty-гейт/**mount-гейт** DATA_ROOT/лёгкий бэкап) → `git pull --ff-only` только `mcp-knowledge` → build → `up -d --wait` → health ×4 → **миграции релиза** (`scripts/(backfill\|migrate)_*.py` через `docker run --env-file`, с pause-подтверждением) → rollback-hint. `update_source=bundle` — **устаревший алиас `local`** (038 Q4); air-gap-путь — `update-local` (приватный `RUNBOOK §11`) |
 | `update-check` | `update.yml` | dry-run апдейта (`--check --diff`) — смотреть ПЕРЕД `update` |
+| `update-local` | `update.yml` | **air-gap апдейт из локального пакета** (038): `BUNDLE=<пакет.tar.gz\|каталог>` (`-e update_source=local -e update_bundle_path=…`). preflight (stat+распаковка в `update-staging`+`sha256sum -c`+`bundle verify`+сверка head↔`target_commit`+df+mount+**полный бэкап**) → `merge --ff-only` из bundle (skip при `HEAD==target`) → `docker load` **только расходящихся** образов (по `.Id`, ретег `:prev`) → `up --wait` → health ×4 → миграции. Сборка (`build`) пропускается — образы везут готовыми. Все проверки — ДО мутаций |
+| `update-local-check` | `update.yml` | dry-run offline-апдейта (`--check --diff`): печатает план (manifest, расходящиеся по `.Id` образы), 0 мутаций. **Смотреть ПЕРЕД `update-local`** |
 | `logs` / `events` | `ops.yml` | read-only, **БЕЗ vault-промпта**: `logs [S=<сервис>] [N=<строк>]`; `events [M=<строк>]` — маркеры `[START\|RECONCILE\|REINDEX\|EMBED\|MCP\|IMPORT\|ANALYZE]` за 24ч (без `[AUTH]`) |
 | `health` / `metrics` / `stats` | `ops.yml` | health-пробы ×4 (8000/6333/11435/8085); Prometheus `:8000/metrics`; `docker stats` |
 | `backup` | `backup.yml` | полный бэкап: qdrant-snapshots + weekly-4 (вс) + SSOT (bare/tar) + console-state + secrets-tar (0600) |
@@ -26,7 +28,11 @@ Ansible-обвязка стека mcp-knowledge: подготовка хоста
 
 Из корня клона те же операции — passthrough: `make prod-update`, `prod-update-check`, `prod-logs [S=…] [N=…]`, `prod-events [M=…]`, `prod-health`, `prod-metrics`, `prod-stats`, `prod-backup`, `prod-backup-verify`, `prod-restore [SCOPE=…] [RESTORE_CONFIRM=yes] [RESTORE_SNAPSHOT=…]`.
 
+**Air-gap / offline-update (038, root `Makefile`):** `make airgap-verify` (проверка изолированного контура — smoke + E2E S1-S19; **переименование** `prod-verify` → `airgap-verify`, старый таргет оставлен deprecation-алиасом на 1 релиз) · `make update-bundle [ARGS="--with-ollama-image --with-models"]` (собрать offline-пакет на интернет-машине) · `make update-bundle-verify DIR=<пакет.tar.gz>` (проверка пакета на носителе) · `make prod-update-local BUNDLE=<пакет.tar.gz>` (применение на изолированном хосте → `make -C ansible update-local`).
+
 ## Структура каталога `ansible/`
+
+> **Почему `ansible/roles/` пуст:** каталог оставлен пустым **намеренно** — роли инлайн в `playbooks/` (см. `ansible.cfg`: `# roles_path не нужен: роли инлайн в playbooks/`). Никаких внешних/локальных ролей не подключается; конфигурация и задачи живут в single-file плейбуках.
 
 ```
 ansible/
