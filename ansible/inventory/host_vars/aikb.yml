@@ -46,6 +46,19 @@ mcp_kb_host_prepare__lan_ports: ["8443"]   # дефолт group_vars; дубли
 # console_lan_ip обязан быть исключён из прокси (если прокси есть): берётся автоматически
 # в mcp_kb_host_prepare__no_proxy через docker_no_proxy | default(... ~ console_lan_ip).
 
+# ─── Docker: зеркало apt (проверено с aikb 2026-09-29) ───
+# `download.docker.com` из сети aikb НЕДОСТУПЕН (curl timeout, 000) — дефолт group_vars не годится.
+# mirrors.aliyun.com → 200: gpg-ключ (3817 B) + все пакеты списка (docker-ce, docker-ce-cli,
+# containerd.io, docker-buildx-plugin, docker-compose-plugin 2.16 → compose v2, нужен для
+# `docker compose up -d --build --wait`). Альтернативы проверены и НЕ работают: yandex-mirror (404),
+# tencent/tuna/mirror.docker.ru (000). Debian-пакеты (docker.io 20.10 + docker-compose 1.29) не годятся — нет v2.
+mcp_kb_host_prepare__docker_gpg_url: "https://mirrors.aliyun.com/docker-ce/linux/debian/gpg"
+mcp_kb_host_prepare__docker_repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/debian bookworm stable"
+
+# ─── Прод-защита консоли (RUNBOOK §M2) ───
+# fail-fast: без vault_console_password контейнер консоли не поднимется «молча без пароля».
+console_auth_mode: required
+
 # ─── ollama / embedding ───
 ollama_url: http://localhost:11435
 ollama_model: mxbai-embed-large
