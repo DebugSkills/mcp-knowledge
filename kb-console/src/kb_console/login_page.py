@@ -28,6 +28,8 @@ from typing import Any
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+from .components.theme import login_css
+
 _AUTH_FAILURE_DELAY = 0.5
 """Та же фиксированная задержка отказа, что в auth.py (anti-brute-force)."""
 
@@ -185,67 +187,9 @@ def render_login_html(
     fields_html = _request_form_fields()
     _consent_text = _esc(ACCESS_REQUEST_CONSENT_TEXT)
 
-    css = (
-        "*{box-sizing:border-box;margin:0}body{font-family:system-ui,-apple-system,"
-        "'Segoe UI',Roboto,sans-serif;min-height:100vh;display:flex;"
-        "flex-direction:column;"
-        "background:#f0f2f5;color:#1f2937}"
-        ".split{display:flex;width:100%;flex:1}"
-        ".brand{flex:1 1 46%;background:linear-gradient(160deg,#0d1b2a 0%,"
-        "#1b3a5c 60%,#2563eb 140%);color:#e5edf6;display:flex;flex-direction:"
-        "column;justify-content:center;padding:64px;gap:14px}"
-        ".brand h1{font-size:42px;letter-spacing:-.5px}.brand .logo{font-size:52px}"
-        ".brand p{color:#b8c7d9;line-height:1.55;max-width:44ch}"
-        ".brand ul{list-style:none;margin-top:18px;display:flex;"
-        "flex-direction:column;gap:10px;color:#cdd9e5;font-size:15px}"
-        ".brand li:before{content:'✓  ';color:#60a5fa;font-weight:700}"
-        ".pane{flex:1 1 54%;display:flex;align-items:center;justify-content:center;padding:36px}"
-        ".card{width:100%;max-width:460px;background:#fff;border-radius:18px;"
-        "box-shadow:0 12px 40px rgba(13,27,42,.14);padding:34px 34px 28px}"
-        ".tabs input[type=radio]{position:absolute;opacity:0;pointer-events:none}"
-        ".tablabels{display:flex;gap:6px;margin-bottom:22px;border-bottom:1px solid #e5e7eb}"
-        ".tablabels label{flex:1;text-align:center;padding:10px 6px;cursor:pointer;"
-        "font-weight:600;color:#6b7280;border-bottom:2px solid transparent;"
-        "transition:color .15s,border-color .15s}"
-        "#tab-login:checked~.tablabels label[for=tab-login],"
-        "#tab-req:checked~.tablabels label[for=tab-req]{color:#1d4ed8;"
-        "border-bottom-color:#1d4ed8}"
-        ".panels section{display:none}#tab-login:checked~.panels #p-login,"
-        "#tab-req:checked~.panels #p-req{display:block;animation:fade .18s ease-in}"
-        "@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1}}"
-        "input[type=text],input[type=password]{width:100%;padding:12px 14px;"
-        "margin:8px 0;border:1px solid #cbd5e1;border-radius:10px;font-size:15px}"
-        "input:focus{outline:2px solid #93c5fd;border-color:#3b82f6}"
-        ".toggle{display:flex;align-items:center;gap:8px;font-size:14px;"
-        "color:#546e7a;margin:6px 0 4px;cursor:pointer}"
-        ".btn{display:inline-flex;align-items:center;justify-content:center;"
-        "width:100%;padding:12px 18px;margin-top:14px;border:0;border-radius:10px;"
-        "background:#1d4ed8;color:#fff;font-size:15px;font-weight:600;"
-        "cursor:pointer;transition:background .15s;text-decoration:none}"
-        ".btn:hover{background:#1e40af}.btn.ghost{background:#eef2ff;color:#1e40af}"
-        ".err{color:#c62828;min-height:22px;font-size:14px;margin-top:10px}"
-        ".hint{font-size:13.5px;color:#6b7280;margin:10px 0 2px}"
-        "textarea{width:100%;min-height:190px;padding:12px;border:1px solid #cbd5e1;"
-        "border-radius:10px;font-family:ui-monospace,Consolas,monospace;"
-        "font-size:13px;resize:vertical;color:#374151}"
-        ".channels{display:flex;flex-direction:column;gap:8px;margin-top:6px}"
-        ".req-note{font-size:13.5px;color:#6b7280;margin:12px 0 8px;line-height:1.5}"
-        ".fld{display:block;font-size:13.5px;color:#374151;margin:10px 0 2px}"
-        ".fld input,.fld textarea{width:100%;padding:12px 14px;margin-top:4px;"
-        "border:1px solid #cbd5e1;border-radius:10px;font-size:15px;"
-        "font-family:inherit;resize:vertical}"
-        ".fld input:focus,.fld textarea:focus{outline:2px solid #93c5fd;"
-        "border-color:#3b82f6}"
-        ".consent-text{font-size:13px;color:#6b7280;line-height:1.45}"
-        ".ok{color:#15803d;min-height:20px;font-size:14px;margin-top:10px;"
-        "line-height:1.5}"
-        ""
-        ""
-        ".copy{margin:12px 0 18px;text-align:center;white-space:nowrap;"
-        "font-size:12.5px;color:#9ca3af}"
-        "@media(max-width:860px){.split{flex-direction:column}.brand{padding:34px;"
-        "flex-basis:auto}.brand h1{font-size:30px}.brand ul{display:none}}"
-    )
+    # 037 Ф1: вся палитра /login — из SSOT темы (components/theme.py);
+    # структурные CSS-подстроки сохранены побайтово (контракт test_login_page).
+    css = login_css()
 
     return (
         "<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'>"
