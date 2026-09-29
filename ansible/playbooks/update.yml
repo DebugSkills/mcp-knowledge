@@ -1,10 +1,12 @@
 ---
-# update.yml — идемпотентный апдейт КОДА mcp-knowledge на проде (code-2026-09-22-002 Ф2).
+# update.yml — идемпотентный апдейт КОДА mcp-knowledge на проде (code-2026-09-22-002 Ф2;
+# 038 Ф2: update_source=local — air-gap обновление из пакета offline-update.sh).
 #
 # Обновляет ТОЛЬКО код в git-клоне {{ deploy_root }}/{{ repo_name }}/:
-#   preflight (диск/health-снапшот/mount-гейт/prev-HEAD/лёгкий бэкап)
-#   → pull --ff-only → build mcp-server+kb-console → up -d --wait
-#   → health (4 пробы) → migrations (backfill_/migrate_ из scripts/).
+#   preflight (диск/health-снапшот/mount-гейт/prev-HEAD/бэкап; local: пакет+staging+sha256+bundle)
+#   → [git] pull --ff-only / [local] fetch+merge --ff-only из bundle (skip при prev==target)
+#   → [git] build / [local] docker load ТОЛЬКО расходящихся образов (по .Id из manifest)
+#   → up -d --wait → health (4 пробы) → migrations (backfill_/migrate_ из scripts/).
 #
 # ⚠️ ДАННЫЕ НЕ ТРОГАЕМ: Qdrant/Ollama/console-жизнь в {{ data_root }} ВНЕ клона
 #    (Ф1, DATA_ROOT). Поэтому здесь НИКАКИХ `git clean` / `git reset` /
@@ -12,14 +14,23 @@
 #    рядом с клоном могут лежать файлы оператора и артефакты, а локальные правки
 #    в клоне — сигнал STOP (dirty-гейт), а не повод затирать.
 #
-# Откат: rollback-hint в конце + сам плейбук идемпотентен (повтор prod-update
-# после git reset на prev HEAD в клоне восстанавливает предыдущую версию).
+# --check-режим (038 §5.5): read-only интроспекции помечены check_mode: false
+# (safe in check: read-only fact) — dry-run печатает ПЛАН (manifest, расходящиеся
+# образы), мутации честно скипаются; пост-assert-ы — when: not ansible_check_mode.
+# Dry-run НЕ проверяет ff-совместимость клона (merge скипнут) — расхождение
+# вскроется на apply безопасным STOP.
 #
-# Теги: preflight | pull | build | up | health | migrations
-#   make -C ansible update                       # полный прогон
-#   make -C ansible run-tag PLAYBOOK=playbooks/update.yml ROLE=health HOST=aikb
+# Откат: rollback-hint в конце. ⚠️ После ручного отката (reset --hard) НЕ
+# повторять этот плейбук с тем же источником: pull/fetch вернёт HEAD вперёд —
+# откат отменится сам собой (038 §5.4, P1-N1).
+#
+# Теги: preflight | pull | load | build | up | health | migrations
+#   make -C ansible update                                        # git-режим
+#   make -C ansible update-local BUNDLE=/media/…/mcp-kb-update-….tar.gz
+#   make -C ansible update-local-check BUNDLE=…                    # dry-run
+#   make -C ansible run-tag PLAYBOOK=playbooks/update.yml ROLE=up HOST=aikb
 
-- name: Идемпотентный апдейт кода mcp-knowledge (Ф2 update)
+- name: Идемпотентный апдейт кода mcp-knowledge (Ф2 update; 038 — +local)
   hosts: mcp_kb_new
   gather_facts: true
   become: true
@@ -27,8 +38,11 @@
   vars:
     # repo_name, compose_file, deploy_root, data_root, min_free_gb — из inventory
     # (group_vars/all.yml + host_vars/aikb.yml). Здесь только run-параметры:
-    update_source: git          # git | bundle (bundle — заглушка, см. preflight)
+    update_source: git          # git | local | bundle (deprecated-алиас local, см. preflight)
     update_branch: main
+    update_bundle_path: ""      # local: tar.gz или каталог пакета на этом хосте (флешка/диск)
+    update_full_backup: false   # true → полный backup.sh; local — принудительно true (038 Q2)
+    update_staging_dir: "{{ deploy_root }}/update-staging"   # распаковка пакета (НЕ в клон)
     health_retries: 10          # попыток каждой health-пробы (delay 5с ⇒ до ~50с)
     clone_dir: "{{ deploy_root }}/{{ repo_name }}"
     # P1-3в: в scripts/ считаются миграциями только backfill_*.py / migrate_*.py
@@ -36,14 +50,23 @@
 
   tasks:
     # ════════════════════ preflight ════════════════════
-    - name: "Preflight: bundle-заглушка — оффлайн-режим не реализован"
+    - name: "Preflight: bundle deprecated — используйте update_source=local (038 Q4)"
       tags: [preflight]
       when: update_source == 'bundle'
       ansible.builtin.fail:
         msg: >-
-          update_source=bundle не реализован: положите bundle рядом с клоном и
-          используйте scripts/offline-deploy.sh (см. RUNBOOK §11, Ф3).
-          Для обычного апдейта не задавайте update_source.
+          update_source=bundle переименован в local (038): запускайте
+          make -C ansible update-local BUNDLE=<путь к пакету offline-update.sh pack>
+          (эквивалент: -e update_source=local -e update_bundle_path=<путь>).
+
+    - name: "Preflight: local — путь к пакету обязателен (update_bundle_path)"
+      tags: [preflight]
+      when: update_source == 'local'
+      ansible.builtin.assert:
+        that: update_bundle_path | length > 0
+        fail_msg: >-
+          update_source=local требует update_bundle_path (tar.gz или каталог
+          пакета): make -C ansible update-local BUNDLE=/media/…/mcp-kb-update-….tar.gz
 
     - name: "Preflight: свободное место на разделе deploy_root"
       tags: [preflight]
@@ -51,6 +74,7 @@
         cmd: df -BG --output=avail {{ deploy_root }}
       register: df_avail
       changed_when: false
+      check_mode: false   # safe in check: read-only fact (038 §5.5)
 
     - name: "Preflight: гейт свободного места (порог min_free_gb из inventory)"
       tags: [preflight]
@@ -69,6 +93,7 @@
         cmd: git -C {{ clone_dir }} rev-parse HEAD
       register: prev_head
       changed_when: false
+      check_mode: false   # safe in check: read-only fact (038 §5.5)
 
     - name: Preflight — dirty-гейт, в клоне не должно быть локальных правок  # noqa: command-instead-of-module
       tags: [preflight]
@@ -77,6 +102,7 @@
       register: git_status
       changed_when: false
       failed_when: git_status.stdout | length > 0
+      check_mode: false   # safe in check: read-only fact (038 §5.5)
       # STOP вместо затирания: reset/clean запрещены (см. шапку). Локальные правки —
       # сигнал разобраться (git -C {{ clone_dir }} stash list / diff), а не повод чистить.
 
@@ -87,6 +113,7 @@
         chdir: "{{ clone_dir }}"
       register: compose_cfg
       changed_when: false
+      check_mode: false   # safe in check: read-only fact (038 §5.5)
 
     - name: "Preflight: извлечь фактический qdrant-маунт из рендера"
       tags: [preflight]
@@ -108,7 +135,7 @@
           (рендерится deploy.yml из inventory data_root); (2) data_root в
           ansible/inventory/group_vars/all.yml и host_vars/aikb.yml;
           (3) после правки .env — перезапустить через deploy.yml (up применит маунты).
-          Остановлено ДО pull/build/up — данные не тронуты.
+          Остановлено ДО pull/load/up — данные не тронуты.
 
     - name: "Preflight: health-снапшот mcp-server ДО обновления"
       tags: [preflight]
@@ -118,23 +145,173 @@
       register: pre_health
       ignore_errors: true   # снапшот для сверки «до/после», не блокируем
       failed_when: false
+      check_mode: false   # safe in check: GET read-only (038 §5.5)
 
-    - name: "Preflight: лёгкий бэкап перед обновлением (без qdrant/SSOT)"
+    # ════════════════════ preflight: local-пакет ════════════════════
+    - name: "Local-preflight: stat пакета (tar.gz или каталог)"
+      tags: [preflight]
+      when: update_source == 'local'
+      ansible.builtin.stat:
+        path: "{{ update_bundle_path }}"
+      register: update_bundle_stat
+
+    - name: "Local-preflight: пакет существует"
+      tags: [preflight]
+      when: update_source == 'local'
+      ansible.builtin.assert:
+        that: update_bundle_stat.stat.exists
+        fail_msg: "Пакет не найден: {{ update_bundle_path }} (update_bundle_path)"
+
+    - name: "Local-preflight: факт «пакет = архив»"
+      tags: [preflight]
+      when: update_source == 'local'
+      ansible.builtin.set_fact:
+        update_bundle_is_archive: "{{ update_bundle_stat.stat.exists and not update_bundle_stat.stat.isdir }}"
+
+    - name: "Local-preflight: распаковка пакета в staging (вне клона)"  # noqa: command-instead-of-module
+      tags: [preflight]
+      when: update_source == 'local' and update_bundle_is_archive | bool
+      ansible.builtin.shell: |     # safe in check: пишет ТОЛЬКО в update_staging_dir (038 P2-1)
+        set -euo pipefail
+        mkdir -p {{ update_staging_dir }}
+        tar -xzf {{ update_bundle_path }} -C {{ update_staging_dir }} --strip-components=1
+      args:
+        executable: /bin/bash
+      check_mode: false   # 038 P2-1: без этого зависимые sha256/manifest в dry-run падают (staging пуст)
+      changed_when: false   # staging — расходный каталог, не продукт
+
+    - name: "Local-preflight: каталог пакета используется как staging напрямую"
+      tags: [preflight]
+      when: update_source == 'local' and not (update_bundle_is_archive | bool)
+      ansible.builtin.set_fact:
+        update_staging_dir: "{{ update_bundle_path }}"
+
+    - name: "Local-preflight: целостность пакета sha256sum -c (ДО любых мутаций)"  # noqa: command-instead-of-module
+      tags: [preflight]
+      when: update_source == 'local'
+      ansible.builtin.command:
+        cmd: sha256sum -c CHECKSUMS.sha256 --quiet
+        chdir: "{{ update_staging_dir }}"
+      changed_when: false
+      check_mode: false   # safe in check: read-only проверка (STOP до мутаций при битом пакете)
+
+    - name: "Local-preflight: прочитать manifest.json (slurp, read-only)"
+      tags: [preflight]
+      when: update_source == 'local'
+      ansible.builtin.slurp:
+        src: "{{ update_staging_dir }}/manifest.json"
+      register: update_manifest_raw
+
+    - name: "Local-preflight: факты пакета из manifest (target_commit/images/models)"
+      tags: [preflight]
+      when: update_source == 'local'
+      ansible.builtin.set_fact:
+        update_manifest: "{{ update_manifest_raw.content | b64decode | from_json }}"
+        update_target_commit: "{{ (update_manifest_raw.content | b64decode | from_json).target_commit }}"
+
+    - name: "Local-preflight: git bundle verify (целостность+prerequisites, в клоне)"  # noqa: command-instead-of-module
+      tags: [preflight]
+      when: update_source == 'local'
+      ansible.builtin.command:
+        cmd: git -C {{ clone_dir }} bundle verify {{ update_staging_dir }}/repo.git
+      changed_when: false
+      check_mode: false   # safe in check: read-only проверка
+
+    - name: "Local-preflight: голова bundle (list-heads, read-only)"  # noqa: command-instead-of-module
+      tags: [preflight]
+      when: update_source == 'local'
+      ansible.builtin.command:
+        cmd: git bundle list-heads {{ update_staging_dir }}/repo.git
+      register: bundle_heads
+      changed_when: false
+      check_mode: false   # safe in check: read-only факт
+
+    - name: "Local-preflight: голова bundle == manifest.target_commit (ВСЕГДА, P0-1)"
+      tags: [preflight]
+      when: update_source == 'local'
+      vars:
+        bundle_head_sha: "{{ bundle_heads.stdout | regex_findall('([0-9a-f]{40})\\s+refs/heads/' ~ update_branch) | first | default('') }}"
+      ansible.builtin.assert:
+        that: bundle_head_sha == update_target_commit
+        fail_msg: >-
+          Голова bundle ({{ bundle_head_sha }}) != manifest.target_commit
+          ({{ update_target_commit }}) — пакет рассинхронизирован. STOP до мутаций:
+          пересоберите пакет (scripts/offline-update.sh pack).
+
+    - name: "Local-preflight: локальные .Id образов из manifest (P2-5 — видимость дрейфа)"  # noqa: command-instead-of-module
+      tags: [preflight]
+      when: update_source == 'local'
+      ansible.builtin.command:
+        cmd: docker image inspect -f '{% raw %}{{.Id}}{% endraw %}' {{ item.name }}
+      loop: "{{ update_manifest.images | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: image_ids_local
+      changed_when: false
+      failed_when: false   # образ может отсутствовать — это и есть «будет загружен»
+      check_mode: false   # safe in check: read-only факт (dry-run покажет план загрузки)
+
+    - name: "Local-preflight: сводка дрейфа образов (локальный .Id ↔ пакет)"
+      tags: [preflight]
+      when: update_source == 'local'
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.name }}: локально {{ item.stdout | default('ОТСУТСТВУЕТ') }} ↔
+          пакет {{ item.item.id }} → {{ 'SKIP (совпал)' if (item.stdout | default('')) == item.item.id else 'БУДЕТ ЗАГРУЖЕН' }}
+      loop: "{{ image_ids_local.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: "Preflight: фуллбек-флаг (local → принудительно полный backup.sh, 038 Q2)"
+      tags: [preflight]
+      ansible.builtin.set_fact:
+        update_full_backup_effective: "{{ update_full_backup | bool or update_source == 'local' }}"
+
+    - name: "Preflight: бэкап перед обновлением (local: полный; git: лёгкий)"
       tags: [preflight]
       ansible.builtin.command:
-        cmd: bash scripts/backup.sh --no-qdrant --no-ssot
+        cmd: >-
+          bash scripts/backup.sh
+          {{ '' if (update_full_backup_effective | bool) else '--no-qdrant --no-ssot' }}
         chdir: "{{ clone_dir }}"
       changed_when: false
 
-    # ════════════════════ pull ════════════════════
+    # ════════════════════ pull (git) / merge (local) ════════════════════
     - name: Pull — git pull --ff-only из origin, ветка update_branch, только репо кода  # noqa: command-instead-of-module
       tags: [pull]
+      when: update_source == 'git'
       ansible.builtin.command:
         cmd: git -C {{ clone_dir }} pull --ff-only origin {{ update_branch }}
       register: pull_result
-      changed_when: "'Already up to date' not in pull_result.stdout"
+      changed_when: pull_result is not skipped and ('Already up to date' not in (pull_result.stdout | default('')))
       # ТОЛЬКО репо кода; knowledge-SSOT бэкапится отдельно (backup.sh --ssot).
       # Никаких clean/reset/checkout -f — см. шапку плейбука.
+
+    - name: "Local-merge: применение кода (fetch из bundle + merge --ff-only)"
+      tags: [pull]
+      when: update_source == 'local' and prev_head.stdout != update_target_commit
+      ansible.builtin.shell: |     # noqa: command-instead-of-module
+        set -euo pipefail
+        cur_branch="$(git -C {{ clone_dir }} symbolic-ref --short HEAD)"
+        if [ "$cur_branch" != "{{ update_branch }}" ]; then
+          echo "ОШИБКА: клон на ветке '$cur_branch' (или detached), пакет для '{{ update_branch }}'."
+          echo "ff-only пишет в ТЕКУЩУЮ ветку — переключите клон на {{ update_branch }} и повторите."
+          exit 1
+        fi
+        git -C {{ clone_dir }} fetch {{ update_staging_dir }}/repo.git {{ update_branch }}
+        git -C {{ clone_dir }} merge --ff-only FETCH_HEAD
+      args:
+        executable: /bin/bash
+      register: merge_result
+      # changed честно: задача выполняется только при prev != target (skip-ветка —
+      # когда prev == target, changed=false самой задачей выше); guard от скипа в --check.
+      changed_when: merge_result is not skipped and (merge_result.stdout | default('')) is search('Updating|Fast-forward|fast-forward')
+
+    - name: "Local-merge: skip — HEAD уже == target_commit (критерий (б))"
+      tags: [pull]
+      when: update_source == 'local' and prev_head.stdout == update_target_commit
+      ansible.builtin.debug:
+        msg: "SKIP merge: HEAD ({{ prev_head.stdout[:7] }}) уже == manifest.target_commit — fetch/merge не нужны."
 
     - name: Pull — новый HEAD после обновления  # noqa: command-instead-of-module
       tags: [pull]
@@ -142,14 +319,98 @@
         cmd: git -C {{ clone_dir }} rev-parse HEAD
       register: new_head
       changed_when: false
+      check_mode: false   # safe in check: read-only факт (в check == prev_head — честно)
 
-    # ════════════════════ build ════════════════════
-    - name: "Build: пересобрать образы mcp-server + kb-console"
+    - name: "Local-merge: пост-проверка HEAD == manifest.target_commit (P0-1, ВСЕГДА)"  # noqa: command-instead-of-module
+      tags: [pull]
+      when: update_source == 'local' and not ansible_check_mode
+      ansible.builtin.assert:
+        that: new_head.stdout == update_target_commit
+        fail_msg: >-
+          ЛОЖНЫЙ ЗЕЛЁНЫЙ (host-ahead): HEAD ({{ new_head.stdout }}) !=
+          manifest.target_commit ({{ update_target_commit }}) — merge дал rc=0
+          «Уже актуально» при локальных коммитах поверх target. Диагностика:
+          git -C {{ clone_dir }} log {{ update_target_commit }}..HEAD
+      # В --check merge скипнут и HEAD != target — это ПЛАН применения, не ошибка (038 §5.5).
+
+    # ════════════════════ build (только git) ════════════════════
+    - name: "Build: пересобрать образы mcp-server + kb-console (git-режим; local везёт готовые)"
       tags: [build]
+      when: update_source == 'git'
       ansible.builtin.command:
         cmd: docker compose -f {{ compose_file }} build mcp-server kb-console
         chdir: "{{ clone_dir }}"
       changed_when: false   # docker build кешируется сам; changed-статус неинформативен
+
+    # ════════════════════ load (только local) ════════════════════
+    - name: "Load: повторный df перед загрузкой образов (P2-3 — после staging+фуллбека)"  # noqa: command-instead-of-module
+      tags: [load]
+      when: update_source == 'local'
+      ansible.builtin.command:
+        cmd: df -BG --output=avail {{ deploy_root }}
+      register: df_avail2
+      changed_when: false
+      check_mode: false   # safe in check: read-only факт
+
+    - name: "Load: гейт свободного места перед docker load (P2-3)"
+      tags: [load]
+      when: update_source == 'local'
+      vars:
+        avail_gb2: "{{ (df_avail2.stdout_lines[-1] | regex_findall('\\d+')) | first | int }}"
+      ansible.builtin.assert:
+        that: avail_gb2 | int >= min_free_gb | int
+        fail_msg: >-
+          После staging/бэкапа свободно {{ avail_gb2 }} GB < {{ min_free_gb }} GB —
+          docker load (uncompressed ~1.3 ГБ + :prev-дубликаты) может заполнить диск.
+          Освободите место и повторите (прогон идемпотентен).
+
+    - name: "Load: ретег :prev + docker load ТОЛЬКО расходящихся образов (по .Id)"  # noqa: command-instead-of-module
+      tags: [load]
+      when: update_source == 'local'
+      ansible.builtin.shell: |
+        set -euo pipefail
+        changed=0
+        {% for img in (update_manifest.images | default([])) %}
+        local_id="{{ image_ids_local.results[loop.index0].stdout | default('') }}"
+        if [ "$local_id" = "{{ img.id }}" ]; then
+          echo "SKIP {{ img.name }} (.Id совпал)"
+        else
+          if [ -n "$local_id" ]; then
+            case "{{ img.name }}" in
+              mcp-knowledge-mcp-server:latest|kb-console:prod)
+                docker tag "{{ img.name }}" "$(echo '{{ img.name }}' | cut -d: -f1):prev"
+                echo "retag {{ img.name }} → :prev (rollback-образ)" ;;
+            esac
+          fi
+          echo "docker load {{ img.name }} ← {{ img.file }}"
+          docker load -i "{{ update_staging_dir }}/{{ img.file }}"
+          new_id="$(docker image inspect -f '{% raw %}{{.Id}}{% endraw %}' '{{ img.name }}')"
+          [ "$new_id" = "{{ img.id }}" ] || { echo "ОШИБКА: после load .Id != manifest ({{ img.name }})"; exit 1; }
+          changed=1
+        fi
+        {% endfor %}
+        [ "$changed" = 1 ] || echo "__ALL_SKIPPED__"
+      args:
+        executable: /bin/bash
+      register: load_result
+      changed_when: load_result is not skipped and '__ALL_SKIPPED__' not in (load_result.stdout | default(''))
+      # В --check скипается (мутация docker) — план загрузки уже напечатан в preflight-сводке.
+
+    - name: "Load: пост-проверка — все образы пакета == manifest .Id (P1-4, до up)"  # noqa: command-instead-of-module
+      tags: [load]
+      when: update_source == 'local' and not ansible_check_mode
+      ansible.builtin.shell: |
+        set -euo pipefail
+        fail=0
+        {% for img in (update_manifest.images | default([])) %}
+        local_id="$(docker image inspect -f '{% raw %}{{.Id}}{% endraw %}' '{{ img.name }}' 2>/dev/null || true)"
+        [ "$local_id" = "{{ img.id }}" ] || { echo "ОБРАЗ НЕ СООТВЕТСТВУЕТ МАНИФЕСТУ: {{ img.name }} ($local_id != {{ img.id }})"; fail=1; }
+        {% endfor %}
+        exit "$fail"
+      args:
+        executable: /bin/bash
+      changed_when: false
+      # В --check load скипнут — проверять нечего (образы старые/отсутствуют = план).
 
     # ════════════════════ up ════════════════════
     - name: "Up: перезапустить стек (up -d --wait)"
@@ -159,8 +420,9 @@
         chdir: "{{ clone_dir }}"
       register: up_result
       changed_when: >-
-        up_result.stdout is search('Created|Recreated|Started|Built')
-        or up_result.stderr is search('Created|Recreated|Started|Built')
+        up_result.stdout is defined
+        and (up_result.stdout is search('Created|Recreated|Started|Built')
+             or up_result.stderr is search('Created|Recreated|Started|Built'))
 
     # ════════════════════ health ════════════════════
     - name: "Health: mcp-server /health (retries: health_retries)"
@@ -171,6 +433,7 @@
       retries: "{{ health_retries }}"
       delay: 5
       until: h_mcp.status == 200
+      check_mode: false   # safe in check: GET read-only (038 §5.5)
 
     - name: "Health: qdrant /healthz"
       tags: [health]
@@ -180,6 +443,7 @@
       retries: "{{ health_retries }}"
       delay: 5
       until: h_qdrant.status == 200
+      check_mode: false   # safe in check: GET read-only
 
     - name: "Health: ollama /api/tags"
       tags: [health]
@@ -189,6 +453,7 @@
       retries: "{{ health_retries }}"
       delay: 5
       until: h_ollama.status == 200
+      check_mode: false   # safe in check: GET read-only
 
     - name: "Health: kb-console :8085 (200 или 401 = жив, auth-aware)"
       tags: [health]
@@ -199,6 +464,7 @@
       retries: "{{ health_retries }}"
       delay: 5
       until: h_console.status in [200, 401]
+      check_mode: false   # safe in check: GET read-only
 
     - name: "Health: сводка (до → после)"
       tags: [health]
@@ -209,6 +475,46 @@
           ollama: "{{ h_ollama.status }}"
           kb-console: "{{ h_console.status }} (200/401 — жив)"
 
+    # ════════════════════ модели (local, если в пакете; 038 §5.2.6) ════════════════════
+    - name: "Models: локальный digest манифеста модели (read-only)"  # noqa: command-instead-of-module
+      tags: [preflight]
+      when: update_source == 'local' and (update_manifest.models | default([]) | length) > 0
+      ansible.builtin.command:
+        cmd: sha256sum {{ data_root }}/ollama/models/manifests/registry.ollama.ai/library/{{ item.name }}/latest
+      loop: "{{ update_manifest.models }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: model_digest_local
+      changed_when: false
+      failed_when: false   # модели может ещё не быть — это «будет установлена»
+      check_mode: false   # safe in check: read-only факт
+
+    - name: "Models: манифест модели — copy только при расхождении digest (идемпотентен сам)"
+      tags: [load]
+      when: update_source == 'local' and (update_manifest.models | default([]) | length) > 0
+      ansible.builtin.copy:
+        src: "{{ update_staging_dir }}/models/manifests/registry.ollama.ai/library/{{ item.name }}/latest"
+        dest: "{{ data_root }}/ollama/models/manifests/registry.ollama.ai/library/{{ item.name }}/latest"
+        mode: '0644'
+      loop: "{{ update_manifest.models }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: model_manifest_copy
+
+    - name: "Models: blobs — только если манифест обновился (cp -an не перезаписывает)"  # noqa: command-instead-of-module
+      tags: [load]
+      when:
+        - update_source == 'local'
+        - (update_manifest.models | default([]) | length) > 0
+        - model_manifest_copy.results[midx] is changed
+      ansible.builtin.command:
+        cmd: cp -an {{ update_staging_dir }}/models/blobs/. {{ data_root }}/ollama/models/blobs/
+      loop: "{{ update_manifest.models }}"
+      loop_control:
+        index_var: midx
+        label: "{{ item.name }}"
+      changed_when: true   # выполняется только когда манифест реально сменился
+
     # ════════════════════ migrations (P1-3 / P1-3в) ════════════════════
     - name: Migrations — diff scripts/ между HEADами  # noqa: command-instead-of-module
       tags: [migrations]
@@ -216,6 +522,7 @@
         cmd: git -C {{ clone_dir }} diff --name-only {{ prev_head.stdout }}..HEAD -- scripts/
       register: mig_diff
       changed_when: false
+      check_mode: false   # safe in check: read-only (в check prev==HEAD — «миграций нет» = формат dry-run)
 
     - name: "Migrations: отфильтровать backfill_/migrate_ скрипты"
       tags: [migrations]
@@ -226,7 +533,9 @@
       tags: [migrations]
       when: pending_migrations | length == 0
       ansible.builtin.debug:
-        msg: "Миграций между {{ prev_head.stdout[:7] }} и HEAD нет (scripts/ без backfill_/migrate_) — пропуск."
+        msg: >-
+          Миграций между {{ prev_head.stdout[:7] }} и HEAD нет (scripts/ без backfill_/migrate_) —
+          пропуск.{{ ' [dry-run: prev==HEAD — реальные миграции определятся после merge]' if ansible_check_mode else '' }}
 
     - name: "Migrations: список к запуску + команды ручного повтора"
       tags: [migrations]
@@ -236,7 +545,7 @@
 
     - name: "Migrations: подтверждение оператора (User Gate)"
       tags: [migrations]
-      when: pending_migrations | length > 0
+      when: pending_migrations | length > 0 and not ansible_check_mode   # 038 §5.5: pause подвешивает dry-run
       ansible.builtin.pause:
         prompt: >-
           Будут запущены миграции (host-сеть, --env-file, образ mcp-knowledge-mcp-server:latest):
@@ -271,13 +580,38 @@
       # (label), exit code и stdout/stderr; команда ручного повтора — debug выше.
 
     # ════════════════════ rollback-hint ════════════════════
-    - name: "Rollback-hint: как откатиться"
+    - name: "Rollback-hint (git): как откатиться"
       tags: [always]
-      when: prev_head is defined
+      when: update_source == 'git' and prev_head is defined
       ansible.builtin.debug:
         msg:
           - "Обновление завершено: {{ prev_head.stdout[:7] }} → {{ (new_head.stdout | default(''))[:7] or 'HEAD' }}"
-          - "Откат при проблемах:"
+          - "Откат при проблемах (038 §5.4 — БЕЗ повторного pull):"
           - "  ssh: git -C {{ clone_dir }} reset --hard {{ prev_head.stdout }}"
-          - "  затем повторить: make prod-update  (плейбук идемпотентен — пересоберёт образы и перезапустит стек)"
+          - "  затем пересобрать и поднять ПРЕДЫДУЩИЙ код:"
+          - "    make -C ansible run-tag PLAYBOOK=playbooks/update.yml ROLE=build HOST=aikb"
+          - "    make -C ansible run-tag PLAYBOOK=playbooks/update.yml ROLE=up HOST=aikb"
+          - "  ⚠️ НЕ повторяйте make prod-update после reset --hard: pull --ff-only вернёт"
+          - "     HEAD вперёд к origin/main — откат отменится сам собой (038 §5.4.6)."
           - "Крайняя мера — восстановление из бэкапа: RUNBOOK §10 (backup.sh restore)."
+
+    - name: "Rollback-hint (local): как откатиться"
+      tags: [always]
+      when: update_source == 'local' and prev_head is defined
+      ansible.builtin.debug:
+        msg:
+          - "Обновление завершено: {{ prev_head.stdout[:7] }} → {{ update_target_commit[:7] }} (local, target_commit)"
+          - "Откат при проблемах (038 §5.4, БЕЗ повторного apply):"
+          - "  1) вернуть образы: docker tag mcp-knowledge-mcp-server:prev mcp-knowledge-mcp-server:latest"
+          - "     и docker tag kb-console:prev kb-console:prod"
+          - "  2) вернуть код: git -C {{ clone_dir }} reset --hard {{ prev_head.stdout }}  (деструктивная ручная операция)"
+          - "  3) поднять стек на откате: make -C ansible run-tag PLAYBOOK=playbooks/update.yml ROLE=up HOST=aikb"
+          - "     (эквивалент на aikb: docker compose -f docker-compose.yml up -d --wait в клоне)"
+          - "  ⚠️ НЕ повторяйте make prod-update-local с тем же пакетом после ручного отката:"
+          - "     плейбук увидит HEAD(prev) != target → merge вернёт target → load накатит новые"
+          - "     образы — откат отменится сам собой (038 §5.4, P1-N1)."
+          - "  ⚠️ Если плейбук остановился ПОСЛЕ load (до up) — не запускайте up вручную:"
+          - "     выполните шаги 1-3 выше (новый образ без миграций = риск)."
+          - "Проверка после отката: make prod-health + git -C {{ clone_dir }} rev-parse HEAD == {{ prev_head.stdout }}"
+          - "  + docker image inspect -f '{% raw %}{{.Id}}{% endraw %}' mcp-knowledge-mcp-server:latest == Id тега :prev"
+          - "Крайняя мера — restore из фуллбека: RUNBOOK §10 / docs/restore-runbook.md (Сценарий 3)."
