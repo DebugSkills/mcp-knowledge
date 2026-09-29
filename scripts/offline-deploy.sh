@@ -153,7 +153,9 @@ prepare() {
     cp "$GIT_ROOT/kb-console/USER_GUIDE.md" "$STAGING_DIR/USER_GUIDE.md" 2>/dev/null || true
 
     echo "[6/6] Checksums + pack..."
-    ( cd "$STAGING_DIR" && find . -type f ! -name CHECKSUMS.sha256 -exec sha256sum {} \; > CHECKSUMS.sha256 )
+    ( cd "$STAGING_DIR" \
+      && find . -type f ! -name CHECKSUMS.sha256 -exec sha256sum {} \; > CHECKSUMS.sha256.tmp \
+      && mv CHECKSUMS.sha256.tmp CHECKSUMS.sha256 )
     tar -C "$GIT_ROOT/artifacts" -czf "$BUNDLE" "$(basename "$STAGING_DIR")"
 
     echo ""
@@ -197,13 +199,15 @@ deploy() {
 
     echo "[6/6] Starting services (qdrant + mcp-server)..."
     docker compose -f "$PROJECT_DIR/$COMPOSE_PROD" up -d
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
         curl -sf http://localhost:8000/health/live >/dev/null 2>&1 && break
         sleep 5
     done
-    curl -sf http://localhost:8000/health/live >/dev/null \
-        && echo "  mcp-server: LIVE ✅" \
-        || { echo "ERROR: mcp-server не поднялся. Логи: docker compose -f $COMPOSE_PROD logs mcp-server"; exit 1; }
+    if curl -sf http://localhost:8000/health/live >/dev/null; then
+        echo "  mcp-server: LIVE ✅"
+    else
+        echo "ERROR: mcp-server не поднялся. Логи: docker compose -f $COMPOSE_PROD logs mcp-server"; exit 1
+    fi
 
     echo ""
     echo "✅ Deployment complete."
@@ -212,23 +216,35 @@ deploy() {
 }
 
 # ─── verify: smoke + высокоуровневые тесты всей системы ────────
+# probe_ok URL ALLOWED — HTTP-код в allow-списке (kb-console за auth даёт 401 —
+# это «жив», паттерн update.yml:196-197; ollama контейнера публикуется :11435).
+probe_ok() {
+    local url="$1" allowed="$2" code
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url" || echo 000)"
+    case ",$allowed," in
+        *",$code,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 verify() {
     echo "=== [verify] Проверка системы (корень: $PROJECT_DIR) ==="
     local ok=0 fail=0
 
     echo "--- Smoke tests ---"
     local -a probes=(
-        "mcp-server /health/live|http://localhost:8000/health/live"
-        "mcp-server /health     |http://localhost:8000/health"
-        "qdrant /healthz        |http://localhost:6333/healthz"
-        "Ollama /api/tags       |http://localhost:11434/api/tags"
-        "kb-console /           |http://localhost:8085/"
+        "mcp-server /health/live|http://localhost:8000/health/live|200"
+        "mcp-server /health     |http://localhost:8000/health|200"
+        "qdrant /healthz        |http://localhost:6333/healthz|200"
+        "Ollama /api/tags       |http://localhost:11435/api/tags|200"
+        "kb-console /           |http://localhost:8085/|200,401"
     )
+    local p
     for p in "${probes[@]}"; do
-        local label url
-        label="${p%%|*}"; url="${p##*|}"
+        local label url allowed
+        label="$(cut -d'|' -f1 <<<"$p")"; url="$(cut -d'|' -f2 <<<"$p")"; allowed="$(cut -d'|' -f3 <<<"$p")"
         echo -n "  $label: "
-        if curl -sf "$url" >/dev/null; then echo "✅"; ok=$((ok+1)); else echo "❌"; fail=$((fail+1)); fi
+        if probe_ok "$url" "$allowed"; then echo "✅"; ok=$((ok+1)); else echo "❌"; fail=$((fail+1)); fi
     done
 
     echo ""
