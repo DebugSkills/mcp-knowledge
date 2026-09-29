@@ -297,10 +297,11 @@ with open(f"{staging}/manifest.json", "w") as f:
 PY
     rm -f "$tsv" "$mtsv"
 
-    # CHECKSUMS + итоговый tar (временный файл, чтобы не читать/писать один файл)
+    # CHECKSUMS + итоговый tar (tmp ВНЕ staging: иначе find видит файл-вывод — гонка)
+    local tmpsum="$staging.CHECKSUMS.tmp"
     ( cd "$staging" \
-      && find . -type f ! -name CHECKSUMS.sha256 -exec sha256sum {} + > CHECKSUMS.sha256.tmp \
-      && mv CHECKSUMS.sha256.tmp CHECKSUMS.sha256 )
+      && find . -type f ! -name CHECKSUMS.sha256 -exec sha256sum {} + > "$tmpsum" \
+      && mv "$tmpsum" "$staging/CHECKSUMS.sha256" )
     tar -C "$out_dir" -czf "$out_dir/mcp-kb-update-$iso.tar.gz" "mcp-kb-update-$iso"
 
     echo ""
