@@ -22,6 +22,14 @@ make push    # preflight → git push --no-verify → deploy → verify-deploy
 
 `--no-verify` здесь безопасен: preflight уже прогнан первым шагом цели `push`, а повторный запуск в pre-push хуке — это лишние ~4–5 мин. `verify-deploy` (`scripts/verify-deploy.sh`, выход = число упавших) проверяет: `/health` :8000 (status=healthy + reconcile без error) · логи `mcp-knowledge-server` (0 строк error/traceback/critical) · MCP `tools/list` (≥30, read-ключ из `.env`, не печатается) · консоль :8085 auth-aware (`CONSOLE_AUTH=required` → 401+WWW-Authenticate без кредов и 200 с паролем; auth off → 200). Если verify-deploy падает, `make push` явно сообщает: **код уже запушен, стек требует внимания**.
 
+**Быстрый режим для config/docs-правок** (без изменения кода):
+
+```bash
+make push-fast  # classify-changes → preflight --config-only → git push --no-verify → deploy → verify-deploy
+```
+
+Допустим ТОЛЬКО для путей `ansible/**`, `docs/**`, `*.md`, `.knowledge/**`, `plans/**`, `README`, `AGENTS.md`, `.gitignore`. `push-fast` **fail-safe**: `scripts/classify-changes.sh` при ЛЮБОМ код-пути (`scripts/`, `mcp_server/`, `kb-console/`, `tests/`, `Makefile`, `docker-compose*`, `pyproject.toml`, `requirements*`) отказывает (`exit 1` → «используйте make push»). Для код-правок полный preflight обязателен. Частичный прогон помечается `mode=config-only` в заголовке и в сводке `═══ Preflight: … ═══` — принимать его за полный preflight нельзя.
+
 Ручной путь (альтернатива, когда нужен пошаговый контроль):
 
 1. **`make deploy`** (= `docker compose up -d --build --force-recreate`; bind-mount'ы qdrant/ollama/console/данных сохраняются).

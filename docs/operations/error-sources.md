@@ -99,6 +99,7 @@
 | script:cron_wrap.sh | обёртка ручных/cron запусков | sink: [CRON]-строки → collect_cron_logs | covered |
 | script:preflight.sh | pre-push гейт (004); запускать через cron_wrap.sh при желании | sink: — | gap: self — сам гейт НЕ собирает ошибки (P2-2); unit-гейты G4/G5 покрывают E5 |
 | script:verify-deploy.sh | post-deploy гейт (make push / make verify-deploy, 2026-09-24) | sink: — | gap: ручной; FAIL → exit≠0 и явное сообщение оператору из make push; при автоматизации через cron_wrap.sh |
+| script:classify-changes.sh | fail-safe классификатор изменений make push-fast (config-only/code/none) | sink: — | gap: self — read-only, ошибок не собирает; git-сбой → fail-safe токен `code` (лишний полный preflight безопаснее пропущенного код-гейта) |
 | script:reindex.sh | ручной запуск | sink: — | gap: ручной; запускать через cron_wrap.sh (RUNBOOK §Error-наблюдаемость) |
 | script:offline-deploy.sh | air-gap-утилита, ручной запуск | sink: — | gap: ручной (bundle-контур вне прода) |
 | script:offline-update.sh | 038: air-gap ОБНОВЛЕНИЕ (pack/inspect/verify/apply-stage), ручной запуск | sink: — | gap: ручной (offline-update-контур вне прода; FAIL → exit≠0 + явное STOP-сообщение) |

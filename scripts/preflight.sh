@@ -19,8 +19,9 @@
 #   G9  smoke E→R   errors_collect/report/prune на свежем temp-sink (нет docker → SKIP)
 #   G10 make         make -n prod-errors* (проброс не сломан)
 #
-# Флаги: --quick (G1+G4+G5+G10) · --full (то же + e2e-slow) · --no-smoke
-#        (без G9) · --fail-fast · --help. G2 герметичен (без e2e), G2b — live e2e.
+# Флаги: --quick (G1+G4+G5+G10) · --full (то же + e2e-slow) · --config-only
+#        (только G6+G7+G8+G10, НЕ полный preflight; несовместим с --full/--quick)
+#        · --no-smoke (без G9) · --fail-fast · --help. G2 герметичен, G2b — live e2e.
 # Выход: exit = число упавших гейтов (0 = зелёно). Никаких rm в репо:
 # temp-sink живёт в mktemp -d (системный /tmp, вне репозитория).
 
@@ -28,7 +29,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="$ROOT/.venv/bin/python"
-QUICK=0; FULL=0; NO_SMOKE=0; FAIL_FAST=0
+QUICK=0; FULL=0; NO_SMOKE=0; FAIL_FAST=0; CONFIG_ONLY=0
 PASSED=0; FAILED=0; SKIPPED=0; FAILED_IDS=()
 
 # Цвет — только при TTY (в CI/пайпе вывод чистый)
@@ -72,7 +73,7 @@ run_gate() {
 
 finish() {
     echo ""
-    echo "${C_B}═══ Preflight: ${C_G}${PASSED} passed${C_0} / ${C_R}${FAILED} failed${C_0} (${FAILED_IDS[*]:-}) / ${C_Y}${SKIPPED} skipped${C_0} ═══${C_0}"
+    echo "${C_B}═══ Preflight: ${C_G}${PASSED} passed${C_0} / ${C_R}${FAILED} failed${C_0} (${FAILED_IDS[*]:-}) / ${C_Y}${SKIPPED} skipped${C_0} · mode=${MODE} ═══${C_0}"
     exit "$FAILED"
 }
 
@@ -85,6 +86,7 @@ for arg in "$@"; do
     case "$arg" in
         --quick)     QUICK=1 ;;
         --full)      FULL=1 ;;
+        --config-only) CONFIG_ONLY=1 ;;
         --no-smoke)  NO_SMOKE=1 ;;
         --fail-fast) FAIL_FAST=1 ;;
         --help|-h)   help ;;
@@ -92,9 +94,31 @@ for arg in "$@"; do
     esac
 done
 
+# Взаимоисключение режимов: config-only не сочетается с full/quick — иначе
+# неясно, какой набор гейтов должен прогнаться (двусмысленность запрещена).
+if [ "$CONFIG_ONLY" = 1 ]; then
+    if [ "$FULL" = 1 ]; then
+        echo "Ошибка: --config-only несовместим с --full (см. --help)" >&2; exit 64
+    fi
+    if [ "$QUICK" = 1 ]; then
+        echo "Ошибка: --config-only несовместим с --quick (см. --help)" >&2; exit 64
+    fi
+fi
+
+MODE=default
+if [ "$CONFIG_ONLY" = 1 ]; then MODE=config-only
+elif [ "$FULL" = 1 ]; then MODE=full
+elif [ "$QUICK" = 1 ]; then MODE=quick
+fi
+
 cd "$ROOT"
-echo "${C_B}═══ mcp-knowledge preflight · $(date -Iseconds) · mode=$( \
-    [ "$FULL" = 1 ] && echo full || { [ "$QUICK" = 1 ] && echo quick || echo default; }) ═══${C_0}"
+echo "${C_B}═══ mcp-knowledge preflight · $(date -Iseconds) · mode=$MODE ═══${C_0}"
+
+if [ "$CONFIG_ONLY" = 1 ]; then
+    echo ""
+    echo "${C_Y}⚠️  mode=config-only: G1/G2/G2b/G3/G4/G5/G9 НЕ гоняются — только статические config-гейты. Это НЕ полный preflight.${C_0}"
+    echo ""
+fi
 
 HAS_PY=1; [ -x "$PY" ] || HAS_PY=0
 HAS_DOCKER=1; command -v docker >/dev/null 2>&1 || HAS_DOCKER=0
@@ -105,12 +129,14 @@ if [ "$HAS_DOCKER" = "1" ] && docker compose ps -q mcp-server >/dev/null 2>&1 \
 fi
 
 # ── G1 lint (quick/full/default) ──
-run_gate 1 "lint ruff" "$([ "$HAS_PY" = 1 ] && echo 0 || echo 1)" \
-    "$PY" -m ruff check mcp_server/src mcp_server/tests kb-console/src kb-console/tests \
-    tests scripts/errors_collect.py scripts/errors_report.py scripts/errors_prune.py scripts/errors_cleanup_cron_legacy.py
+if [ "$CONFIG_ONLY" = 0 ]; then
+    run_gate 1 "lint ruff" "$([ "$HAS_PY" = 1 ] && echo 0 || echo 1)" \
+        "$PY" -m ruff check mcp_server/src mcp_server/tests kb-console/src kb-console/tests \
+        tests scripts/errors_collect.py scripts/errors_report.py scripts/errors_prune.py scripts/errors_cleanup_cron_legacy.py
+fi
 
 # ── G2 unit mcp_server (default/full) ──
-if [ "$QUICK" = 0 ]; then
+if [ "$QUICK" = 0 ] && [ "$CONFIG_ONLY" = 0 ]; then
     run_gate 2 "unit mcp_server" "$([ "$HAS_PY" = 1 ] && echo 0 || echo 1)" \
         "$PY" -m pytest mcp_server/tests -q
 fi
@@ -118,24 +144,28 @@ fi
 # ── G2b e2e live (default/full; нужен поднятый стек Qdrant+Ollama) ──
 # 021 (Block 2): addopts исключает e2e из G2 (герметичность) — покрытие e2e
 # сохраняется здесь; preflight — единственный авто-гейт в `make push`.
-if [ "$QUICK" = 0 ]; then
+if [ "$QUICK" = 0 ] && [ "$CONFIG_ONLY" = 0 ]; then
     run_gate 2b "e2e live (Qdrant+Ollama)" "$([ "$HAS_PY" = 1 ] && [ "$STACK_UP" = 1 ] && echo 0 || echo 1)" \
         "$PY" -m pytest mcp_server/tests/e2e -m "e2e and not e2e_slow" -q
 fi
 
 # ── G3 unit kb-console (default/full) ──
-if [ "$QUICK" = 0 ]; then
+if [ "$QUICK" = 0 ] && [ "$CONFIG_ONLY" = 0 ]; then
     run_gate 3 "unit kb-console" "$([ "$HAS_PY" = 1 ] && echo 0 || echo 1)" \
         "$PY" -m pytest kb-console/tests -q
 fi
 
 # ── G4 root tests (+ E5-скан внутри) ──
-run_gate 4 "root tests (incl E5)" "$([ "$HAS_PY" = 1 ] && echo 0 || echo 1)" \
-    "$PY" -m pytest tests/ -q
+if [ "$CONFIG_ONLY" = 0 ]; then
+    run_gate 4 "root tests (incl E5)" "$([ "$HAS_PY" = 1 ] && echo 0 || echo 1)" \
+        "$PY" -m pytest tests/ -q
+fi
 
 # ── G5 E5-отчёт (наглядный COVERAGE OK / список gap) ──
-run_gate 5 "E5 error-sources" "$([ "$HAS_PY" = 1 ] && echo 0 || echo 1)" \
-    "$PY" tests/test_error_sources.py
+if [ "$CONFIG_ONLY" = 0 ]; then
+    run_gate 5 "E5 error-sources" "$([ "$HAS_PY" = 1 ] && echo 0 || echo 1)" \
+        "$PY" tests/test_error_sources.py
+fi
 
 # ── G6 compose config (default/full; нет docker → SKIP) ──
 if [ "$QUICK" = 0 ]; then
@@ -178,7 +208,7 @@ if [ "$QUICK" = 0 ]; then
 fi
 
 # ── G9 smoke Error→Rule на свежем temp-sink (default/full; --no-smoke/SKIP) ──
-if [ "$QUICK" = 0 ] && [ "$NO_SMOKE" = 0 ]; then
+if [ "$QUICK" = 0 ] && [ "$NO_SMOKE" = 0 ] && [ "$CONFIG_ONLY" = 0 ]; then
     smoke_gate() {
         local tmp; tmp="$(mktemp -d)"   # системный /tmp, вне репо
         # ВАЖНО: без trap RETURN — bash наследует его во вложенные функции

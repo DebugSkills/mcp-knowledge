@@ -293,7 +293,7 @@ hooks-uninstall:  ## Удалить pre-push hook (в .trash/, обратимо)
 # mcp-knowledge-prod-ops, docs/observability/self-improvement-loop.md §13.9
 # ═══════════════════════════════════════════════════════════════
 
-.PHONY: verify-deploy push
+.PHONY: verify-deploy push push-fast
 
 verify-deploy:  ## Post-deploy проверки стека: /health + логи + MCP tools + консоль (auth-aware)
 	bash scripts/verify-deploy.sh
@@ -319,4 +319,40 @@ push: preflight  ## Пуш+деплой стека: preflight → git push --no-
 		echo "⚠️  ВНИМАНИЕ: код УЖЕ запушен, но стек требует разбора — verify-deploy нашёл проблемы."; \
 		echo "    Диагностика: make logs / make dev-latest-log / skill mcp-knowledge-prod-ops."; \
 		exit 1; \
+	fi
+
+# push-fast: fail-safe быстрый режим пуша для config/docs-правок (ansible/**,
+# docs/**, *.md, .knowledge/**, plans/**, README, AGENTS.md, .gitignore).
+# Сначала classify-changes.sh решает, можно ли без код-гейтов: при ЛЮБОМ
+# код-пути (scripts/, mcp_server/, kb-console/, tests/, Makefile, docker-compose*,
+# pyproject, requirements*) он отказывает → используйте make push. Прогоняется
+# ТОЛЬКО preflight --config-only (G6+G7+G8+G10), сводка помечается
+# mode=config-only (это НЕ полный preflight — частичный прогон за полный не выдаётся).
+push-fast:  ## Пуш+деплой config/docs-правок (fail-safe: код-пути → отказ; полный preflight НЕ гоняется)
+	@cls="$$(bash scripts/classify-changes.sh)"; \
+	case "$$cls" in \
+	  config-only) : ;; \
+	  code) echo "❌ push-fast · config-only: изменения затрагивают код → используйте make push (полный preflight обязателен)."; exit 1 ;; \
+	  none) echo "ℹ️  push-fast · config-only: нечего пушить (изменений нет)."; exit 1 ;; \
+	  *) echo "❌ push-fast: неожиданный результат классификации '$$cls' → используйте make push."; exit 1 ;; \
+	esac; \
+	echo ""; \
+	echo "push-fast · config-only ($$cls): прогон preflight --config-only — только G6/G7/G8/G10, это НЕ полный preflight…"; \
+	bash scripts/preflight.sh --config-only || exit 1; \
+	echo ""; \
+	echo "✔ preflight --config-only пройден → git push --no-verify (гейт уже прогнан выше)"; \
+	git push --no-verify || exit 1; \
+	echo ""; \
+	echo "✔ код отправлен → deploy…"; \
+	$(MAKE) deploy || exit 1; \
+	echo ""; \
+	echo "deploy завершён → post-deploy проверки (verify-deploy)…"; \
+	if $(MAKE) verify-deploy; then \
+	  echo ""; \
+	  echo "✅ push-fast complete: config-правки запушены, стек задеплоен и проверен (mode=config-only)."; \
+	else \
+	  echo ""; \
+	  echo "⚠️  ВНИМАНИЕ: код УЖЕ запушен, но стек требует разбора — verify-deploy нашёл проблемы."; \
+	  echo "    Диагностика: make logs / make dev-latest-log / skill mcp-knowledge-prod-ops."; \
+	  exit 1; \
 	fi
