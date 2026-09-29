@@ -22,7 +22,23 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ..core.access_requests import STATUSES, AccessRequestError
-from .requests_print import STATUS_LABELS
+from .requests_print import STATUS_LABELS, event_label, status_label
+
+
+def _format_history_line(e: dict) -> str:
+    """Строка истории для диалога админа: только RU-метки, без сырых кодов
+    (036 nit: единообразие с печатной карточкой; SSOT меток — requests_print).
+
+    Формат: `· <время> — <actor>: <Событие>: <Из> → <В> (<заметка>)`.
+    """
+    ts = (e.get("ts") or "").replace("T", " ")[:16]
+    new = status_label(e.get("new_status")) if e.get("new_status") else ""
+    arrow = ""
+    if new:
+        old = status_label(e.get("old_status")) if e.get("old_status") else ""
+        arrow = f": {old} → {new}" if old else f": {new}"
+    note = f" ({e['note']})" if e.get("note") else ""
+    return f"· {ts} — {e.get('actor', '')}: {event_label(e.get('event', ''))}{arrow}{note}"
 
 STATUS_META: dict[str, dict[str, str]] = {
     "new": {"label": "🆕 Новая", "color": "blue"},
@@ -236,14 +252,7 @@ def build_requests() -> None:
             ui.separator()
             ui.label("История").classes("font-bold")
             for e in _requests_store().events(rec.id):
-                change = e.get("old_status") or ""
-                new = e.get("new_status") or ""
-                arrow = f": {change} → {new}" if new else ""
-                note = f" ({e['note']})" if e.get("note") else ""
-                ui.label(
-                    f"· {e['ts'].replace('T', ' ')[:16]} — {e['actor']}: "
-                    f"{e['event']}{arrow}{note}"
-                ).classes("text-body2 text-grey-8")
+                ui.label(_format_history_line(e)).classes("text-body2 text-grey-8")
             targets = TRANSITIONS.get(rec.status, ())
             if targets:
                 ui.separator()

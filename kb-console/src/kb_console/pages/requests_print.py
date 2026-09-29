@@ -26,12 +26,23 @@ STATUS_LABELS: dict[str, str] = {
     "access_granted": "Доступ выдан",
     "rejected": "Отклонена",
 }
-"""RU-метки статусов (SSOT для печати и окна админа)."""
+"""RU-метки статусов — SSOT для печати И окна админа (диалог истории)."""
 
-_EVENT_LABELS: dict[str, str] = {
+EVENT_LABELS: dict[str, str] = {
     "created": "Создана",
     "status_change": "Смена статуса",
 }
+"""RU-метки событий истории — SSOT для печати И диалога админа (036 nit)."""
+
+
+def status_label(code: str | None) -> str:
+    """RU-метка статуса; неизвестный код — как есть (не теряем данные)."""
+    return STATUS_LABELS.get(code or "", code or "")
+
+
+def event_label(code: str | None) -> str:
+    """RU-метка события; неизвестный код — как есть."""
+    return EVENT_LABELS.get(code or "", code or "")
 
 _CARD_CSS = """body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
 color:#1a1a1a;margin:0;padding:16px;background:#fff}
@@ -79,10 +90,10 @@ def render_request_card_html(req: Any, events: list[dict[str, Any]]) -> str:
 
     Pure-функция: контент-контракт печатается в тестах без сервера.
     """
-    status_label = STATUS_LABELS.get(req.status, req.status)
+    status_text = status_label(req.status)  # RU-метка статуса заявки
     rows = [
         ("Дата заявки", _fmt_ts(req.created_at)),
-        ("Статус", f"{status_label} ({req.status})"),
+        ("Статус", f"{status_text} ({req.status})"),
         ("ФИО", req.fio),
         ("Отдел", req.department),
         ("Телефон", req.phone),
@@ -103,9 +114,9 @@ def render_request_card_html(req: Any, events: list[dict[str, Any]]) -> str:
         "<tr>"
         f"<td>{_esc(_fmt_ts(e.get('ts', '')))}</td>"
         f"<td>{_esc(e.get('actor', ''))}</td>"
-        f"<td>{_esc(_EVENT_LABELS.get(e.get('event', ''), e.get('event', '')))}</td>"
-        f"<td>{_esc(e.get('old_status') or '—')} → "
-        f"{_esc(e.get('new_status') or '—')}</td>"
+        f"<td>{_esc(event_label(e.get('event', '')))}</td>"
+        f"<td>{_esc(status_label(e.get('old_status')) or '—')} → "
+        f"{_esc(status_label(e.get('new_status')) or '—')}</td>"
         f"<td>{_esc(e.get('note', ''))}</td>"
         "</tr>"
         for e in events
@@ -116,7 +127,7 @@ def render_request_card_html(req: Any, events: list[dict[str, Any]]) -> str:
         "<body><div class='card'>"
         "<h1>Заявка на доступ к базе знаний</h1>"
         f"<p class='sub'>ID: {_esc(req.id)} · "
-        f"<span class='badge'>{_esc(status_label)}</span></p>"
+        f"<span class='badge'>{_esc(status_text)}</span></p>"
         f"<table class='fields'>{fields}</table>"
         "<h2>История</h2>"
         "<table class='hist'><tr><th>Время</th><th>Кто</th><th>Событие</th>"

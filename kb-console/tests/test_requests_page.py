@@ -157,6 +157,7 @@ class TestPrint:
             rid, "Иван Иванов", "Отдел тестирования", "+7 900 000-00-01",
             "ivan@example.com", "Чтение базы знаний", "В работе",
             "История", "Смена статуса",
+            "Новая → В работе",  # 036 nit: стрелка истории RU-метками
         ):
             assert needle in html, f"нет «{needle}» в печатной карточке"
         assert "<script" not in html  # чистый HTML без SPA-скриптов
@@ -300,3 +301,43 @@ class TestFirstPaint:
             await user.should_see("Заявок нет.")  # заглушка, не пустая страница
         finally:
             runtime.REQUESTS_STORE = None
+
+
+# ── Регресс 036-nit: RU-метки в истории (диалог = печать, SSOT requests_print) ──
+
+
+class TestHistoryLabels:
+    def test_created_line_ru_no_raw_codes(self):
+        from kb_console.pages.requests_page import _format_history_line
+
+        line = _format_history_line({
+            "ts": "2026-09-28T10:00:00.123Z", "actor": "public",
+            "event": "created", "old_status": None, "new_status": "new", "note": "",
+        })
+        assert "Создана" in line
+        assert "Новая" in line
+        for raw in ("created", "new", "status_change"):
+            assert raw not in line, f"сырой код {raw!r} в истории диалога: {line}"
+
+    def test_status_change_line_ru_with_note(self):
+        from kb_console.pages.requests_page import _format_history_line
+
+        line = _format_history_line({
+            "ts": "2026-09-28T11:30:00.000Z", "actor": "admin",
+            "event": "status_change", "old_status": "new",
+            "new_status": "in_progress", "note": "взял в работу",
+        })
+        assert "Смена статуса" in line
+        assert "Новая → В работе" in line  # RU-стрелка, единообразно с печатью
+        assert "(взял в работу)" in line  # заметка сохранена
+        for raw in ("status_change", "new →", "in_progress", "created"):
+            assert raw not in line, f"сырой код {raw!r} в истории диалога: {line}"
+
+    def test_labels_ssot_single_source(self):
+        """Метки не дублируются: page берёт STATUS/EVENT_LABELS из print."""
+        import kb_console.pages.requests_page as rp
+        import kb_console.pages.requests_print as rpr
+
+        assert rp.STATUS_LABELS is rpr.STATUS_LABELS
+        assert rp.event_label is rpr.event_label
+        assert rp.status_label is rpr.status_label
