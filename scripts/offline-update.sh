@@ -44,7 +44,9 @@ ROLLBACK_IMAGES=(
 )
 
 die() { echo "ОШИБКА: $*" >&2; exit 1; }
-info() { echo "[offline-update] $*"; }
+# info → stderr: stdout занят данными (verify_pkg возвращает target_commit через
+# command substitution — диагностика не должна загрязнять захват, 038 Ф5)
+info() { echo "[offline-update] $*" >&2; }
 
 # ─── manifest_field FILE KEY [SUBKEY IDX] — значение из manifest.json ───
 manifest_field() {
@@ -98,8 +100,13 @@ bundle_head() {
 }
 
 # ─── verify_pkg PKG_DIR [CLONE_DIR] — все проверки ДО любых мутаций ───
+# Все git-вызовы: LC_ALL=C + решение ТОЛЬКО по коду возврата (никакого парсинга
+# локализуемого stdout). Пути абсолютизируются: git -C меняет CWD, относительный
+# путь к bundle резолвился бы от клона (038 Ф5, false-red).
 verify_pkg() {
     local pkg="$1" clone="${2:-}" target bundle_sha tmprepo
+    pkg="$(cd "$(dirname "$pkg")" && pwd)/$(basename "$pkg")"
+    if [ -n "$clone" ]; then clone="$(cd "$clone" && pwd)"; fi
     [ -f "$pkg/manifest.json" ] || die "нет manifest.json в $pkg"
     [ -f "$pkg/CHECKSUMS.sha256" ] || die "нет CHECKSUMS.sha256 в $pkg"
     [ -f "$pkg/repo.git" ] || die "нет repo.git (git bundle) в $pkg"
@@ -113,12 +120,13 @@ verify_pkg() {
 
     info "git bundle verify (целостность + prerequisites) …"
     if [ -n "$clone" ]; then
-        git -C "$clone" bundle verify "$pkg/repo.git" >/dev/null 2>&1 \
-            || die "git bundle verify FAILED (битый bundle или нет prerequisites в $clone). STOP до мутаций."
+        if ! LC_ALL=C git -C "$clone" bundle verify "$pkg/repo.git" >/dev/null 2>&1; then
+            die "git bundle verify FAILED (битый bundle или нет prerequisites в $clone). STOP до мутаций."
+        fi
     else
         tmprepo="$(mktemp -d /tmp/kilo/offline-update-verify.XXXXXX)"
-        git -C "$tmprepo" -q init 2>/dev/null || true
-        if ! git -C "$tmprepo" bundle verify "$pkg/repo.git" >/dev/null 2>&1; then
+        git -C "$tmprepo" init --quiet
+        if ! LC_ALL=C git -C "$tmprepo" bundle verify "$pkg/repo.git" >/dev/null 2>&1; then
             die "git bundle verify FAILED. Полный bundle(--all) проходит в пустом репо; \
 инкрементальный требует клона — передайте --clone <каталог>. STOP до мутаций."
         fi
@@ -393,6 +401,7 @@ cmd_apply_stage() {
     [ "${#args[@]}" -ge 1 ] || die "apply-stage <пакет> --clone <каталог-клона> [--stage DIR] [--models-dir DIR]"
     [ -n "$clone" ] || die "apply-stage: обязателен --clone <каталог git-клона>"
     [ -d "$clone/.git" ] || die "--clone ($clone) не git-репозиторий"
+    clone="$(cd "$clone" && pwd)"   # abs: далее git -C "$clone" меняет CWD вызова
 
     local src="${args[0]}" pkg
     if [ -d "$src" ]; then
@@ -400,6 +409,7 @@ cmd_apply_stage() {
     else
         [ -n "$stage" ] || stage="$(dirname "$src")/update-staging"
         mkdir -p "$stage"
+        stage="$(cd "$stage" && pwd)"   # abs: пути к bundle от клона не сломаются
         pkg="$stage/$(basename "${src%.tar.gz}")"
         if [ ! -f "$pkg/manifest.json" ]; then
             info "Распаковка $src → $stage …"
