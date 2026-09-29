@@ -455,15 +455,15 @@
       until: h_ollama.status == 200
       check_mode: false   # safe in check: GET read-only
 
-    - name: "Health: kb-console :8085 (200 или 401 = жив, auth-aware)"
+    - name: "Health: kb-console :8085 (200/401/3xx = жив, auth-aware; 302 — редирект на /login)"
       tags: [health]
       ansible.builtin.uri:
         url: http://localhost:8085/
-        status_code: [200, 401]
+        status_code: [200, 301, 302, 401]
       register: h_console
       retries: "{{ health_retries }}"
       delay: 5
-      until: h_console.status in [200, 401]
+      until: h_console.status in [200, 301, 302, 401]
       check_mode: false   # safe in check: GET read-only
 
     - name: "Health: сводка (до → после)"
