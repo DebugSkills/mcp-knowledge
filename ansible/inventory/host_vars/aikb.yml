@@ -36,6 +36,16 @@ min_free_gb: 30
 # data_root — дубль group_vars/all.yml (файл самодостаточен, см. шапку)
 data_root: /opt/mcp-knowledge/data
 
+# ─── LAN / TLS-фасад kb-console (трасса 030/033-F2; aikb — своя локальная сеть) ───
+# Проверено 2026-09-29: enp13s0 UP 192.168.10.253/24, шлюз 192.168.10.1, DNS 192.168.10.254.
+# console_lan_ip → адрес листенера Caddy (https://<ip>:8443) и CONSOLE_LAN_IP в .env;
+# lan_cidr → и ufw-правила (host-prepare), и CONSOLE_LAN_CIDR (allow-list фасада) одним значением.
+console_lan_ip: "192.168.10.253"
+mcp_kb_host_prepare__lan_cidr: ["192.168.10.0/24"]
+mcp_kb_host_prepare__lan_ports: ["8443"]   # дефолт group_vars; дублируем для самодостаточности
+# console_lan_ip обязан быть исключён из прокси (если прокси есть): берётся автоматически
+# в mcp_kb_host_prepare__no_proxy через docker_no_proxy | default(... ~ console_lan_ip).
+
 # ─── ollama / embedding ───
 ollama_url: http://localhost:11435
 ollama_model: mxbai-embed-large
