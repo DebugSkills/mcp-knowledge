@@ -1,7 +1,7 @@
 # Restore Runbook — MCP Knowledge Server
 
-> **Версия:** 1.0 | **Дата:** 2026-08-03 | **Область:** Production Recovery
-> **Связанные документы:** [`scripts/backup.sh`](../scripts/backup.sh), [`docker-compose.yml`](../docker-compose.yml)
+> **Версия:** 1.1 | **Дата:** 2026-09-29 | **Область:** Production Recovery
+> **Связанные документы:** [`scripts/backup.sh`](../scripts/backup.sh), [`docker-compose.yml`](../docker-compose.yml), [`docs/air-gap-validation.md`](air-gap-validation.md) §7 (offline update)
 
 ---
 
@@ -372,3 +372,48 @@ git remote add backup ssh://backup-host/path/to/repo.git
 - [ ] Запустить mcp-server
 - [ ] Проверить `/health` и `search_knowledge`
 - [ ] Задокументировать инцидент (дата, причина, сценарий, время восстановления)
+
+---
+
+## §11. Offline update и откат
+
+**Применимость:** обновление **уже работающей** установки в изолированном контуре из offline-пакета (air-gap), а также быстрый откат, если обновление прошло неудачно. Это не замена Сценариям 1-3: §11 возвращает **код и образы**, **данные не трогает** (Qdrant/SSOT/console живут в `{{ data_root }}` вне git-клона). Если откат невозможен/недостаточен — Сценарий 3 (полное восстановление).
+
+### Процедура (кратко)
+
+```bash
+# 1) Машина с интернетом — собрать полный пакет
+make update-bundle [ARGS="--with-ollama-image --with-models"]
+# 2) Носитель — проверка целостности пакета
+make update-bundle-verify DIR=/media/.../mcp-kb-update-<ISO>.tar.gz
+# 3) Изолированный хост — dry-run (план, 0 мутаций), затем применение
+make -C ansible update-local-check BUNDLE=/media/.../mcp-kb-update-<ISO>.tar.gz
+make prod-update-local            BUNDLE=/media/.../mcp-kb-update-<ISO>.tar.gz
+```
+
+Применение **идемпотентно**: неизменённый коммит → `merge` пропускается, образы с совпавшим `.Id` → `load` пропускается, модели с совпавшим digest → копирование пропускается; контейнеры не перезапускаются. Перед загрузкой изменённых образов сохраняются теги `:prev` (точка отката).
+
+### Критерии успеха
+
+- health ×4 зелёный: `:8000/health`, `:6333/healthz`, `:11435/api/tags`, `:8085/` (200/301/302/401);
+- `git -C <clone_dir> rev-parse HEAD` == `manifest.target_commit`;
+- `docker image inspect -f '{{.Id}}'` двух своих образов == Id из `manifest.json`;
+- логи без `error`/`traceback`; повторный `update-local` того же пакета → 0 `changed`.
+
+### Откат
+
+```bash
+# 1) вернуть образы из rollback-тегов
+docker tag mcp-knowledge-mcp-server:prev mcp-knowledge-mcp-server:latest
+docker tag kb-console:prev kb-console:prod
+# 2) вернуть код на prev-HEAD (деструктивная ручная операция отката)
+git -C <clone_dir> reset --hard <prev-HEAD>
+# 3) поднять стек на откате — ТОЛЬКО up
+make -C ansible run-tag PLAYBOOK=playbooks/update.yml ROLE=up HOST=<host>
+```
+
+Проверка после отката: health ×4 + `rev-parse HEAD` == prev-HEAD + `docker image inspect -f '{{.Id}}'` == Id тега `:prev`.
+
+> ⚠️ **После отката НЕ повторяйте apply** (`make prod-update-local` с тем же пакетом): плейбук увидит `HEAD(prev) != target` → `merge` вернёт target → `load` снова накатит новые образы — **откат отменится сам собой**. Идемпотентность apply — про «повтор без изменений», а не про «повтор после ручного отката». Если плейбук остановился **после `load`, до `up`** — не запускайте `up` вручную: сначала шаги 1-3 отката (новый образ без миграций = риск).
+
+**Крайняя мера:** `make prod-restore SCOPE=all RESTORE_CONFIRM=yes` — Сценарий 3.
