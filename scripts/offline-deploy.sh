@@ -153,10 +153,10 @@ prepare() {
     cp "$GIT_ROOT/kb-console/USER_GUIDE.md" "$STAGING_DIR/USER_GUIDE.md" 2>/dev/null || true
 
     echo "[6/6] Checksums + pack..."
-    # tmp ВНЕ staging: иначе find видит файл-вывод и включает его в CHECKSUMS (гонка)
+    # tmp ВНЕ staging (гонка find↔вывод) и АБСОЛЮТНЫЙ (внутри subshell cd в staging)
     ( cd "$STAGING_DIR" \
-      && find . -type f ! -name CHECKSUMS.sha256 -exec sha256sum {} \; > "$STAGING_DIR.tmp-sum" \
-      && mv "$STAGING_DIR.tmp-sum" "$STAGING_DIR/CHECKSUMS.sha256" )
+      && find . -type f ! -name CHECKSUMS.sha256 -exec sha256sum {} \; > "$(pwd).tmp-sum" \
+      && mv "$(pwd).tmp-sum" CHECKSUMS.sha256 )
     tar -C "$GIT_ROOT/artifacts" -czf "$BUNDLE" "$(basename "$STAGING_DIR")"
 
     echo ""

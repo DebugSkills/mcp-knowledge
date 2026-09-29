@@ -297,8 +297,10 @@ with open(f"{staging}/manifest.json", "w") as f:
 PY
     rm -f "$tsv" "$mtsv"
 
-    # CHECKSUMS + итоговый tar (tmp ВНЕ staging: иначе find видит файл-вывод — гонка)
-    local tmpsum="$staging.CHECKSUMS.tmp"
+    # CHECKSUMS + итоговый tar (tmp ВНЕ staging: иначе find видит файл-вывод — гонка;
+    # abs-путь: внутри subshell делается cd в staging, относительный out_dir сломал бы >)
+    local tmpsum
+    tmpsum="$(cd "$staging" && pwd).CHECKSUMS.tmp"
     ( cd "$staging" \
       && find . -type f ! -name CHECKSUMS.sha256 -exec sha256sum {} + > "$tmpsum" \
       && mv "$tmpsum" "$staging/CHECKSUMS.sha256" )
