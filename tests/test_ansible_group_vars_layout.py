@@ -80,6 +80,7 @@ def test_group_only_vars_are_resolved():
         text=True,
         cwd=ROOT / "ansible",
         timeout=120,
+        check=False,  # returncode обрабатываем сами (skip при сбое инвентаря)
     )
     if proc.returncode != 0:
         pytest.skip(f"ansible-inventory вернул {proc.returncode}: {proc.stderr.strip()[:200]}")
