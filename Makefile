@@ -209,7 +209,7 @@ prod-errors-sources:  ## Прод: E5-проверка реестра охват
 	$(MAKE) -C ansible errors-sources
 
 test-errors:  ## Error→Rule: юнит-тесты коллектора + гварда + sender/алертов + shell + E5-реестр (P2-9 008; P3-e 016; T1-T8 018)
-	.venv/bin/python -m pytest tests/test_error_sources.py tests/test_errors_lib.py tests/test_errors_guard.py tests/test_errors_notify.py tests/test_errors_alert.py tests/test_errors_shell.py tests/test_errors_cron_cleanup.py -v
+	.venv/bin/python -m pytest tests/test_error_sources.py tests/test_errors_lib.py tests/test_errors_svyazi_pull.py tests/test_errors_guard.py tests/test_errors_notify.py tests/test_errors_alert.py tests/test_errors_shell.py tests/test_errors_cron_cleanup.py -v
 
 # ─── TG-оповещения Error→Rule (code-2026-09-24-016) ───
 # Каналы: weekly-отчёт (Пн 10:02) + немедленные алерты new-P0/burst (*/5).

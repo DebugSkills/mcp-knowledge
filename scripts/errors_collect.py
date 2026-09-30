@@ -764,6 +764,112 @@ def collect_health(sink: Path, state: dict, cfg: dict):
     return events
 
 
+# ── Источник (i): pull-JSONL Svyazi error_log (Wave 2, трек G; доставку делает
+#    pull-таймер lup→chpd — коллектор ТОЛЬКО читает локальный файл, без
+#    network/subprocess) ──
+
+def _pulled_error_log_row_event(row: dict, kind, source: str):
+    """Строка JSONL-документа ops_events_query → событие; None = пропустить.
+
+    kind=top/impact (агрегаты): ts = last_seen, при отсутствии — first_seen.
+    kind=signature (отдельные события): ts = ts строки. Сигнатура Svyazi —
+    идентичность события (error_code + детерминированный message); message НЕ
+    содержит cnt/persons — иначе сигнатура sink «плывёт» каждый цикл.
+    Отсутствующей signature не подбираем аналог — заглушка "-" (не выдумываем).
+    PostgreSQL-формат ts ("… 17:32:02.965000+03:00" — пробел вместо "T")
+    нормализуем ЗДЕСЬ, не в parse_ts (он общий для docker/cron); в событие
+    кладём уже нормализованный ts — downstream снова зовёт parse_ts(e["ts"]).
+    Битый ts → skip (update_aggregates считает parse_ts(last_seen) — мусорный
+    ts уронил бы цикл; graceful-деградация P2-5).
+    """
+    signature = row.get("signature")
+    if not isinstance(signature, str) or not signature:
+        signature = "-"
+    if kind == "signature":
+        ts = row.get("ts")
+    else:
+        ts = row.get("last_seen") or row.get("first_seen")
+    if not isinstance(ts, str) or not ts:
+        return None
+    ts = ts.strip().replace(" ", "T", 1)  # PostgreSQL " " → RFC3339 "T"
+    try:
+        parse_ts(ts)
+    except ValueError:
+        return None
+    try:
+        persons = int(row.get("persons") or 0)
+    except (TypeError, ValueError):
+        persons = 0
+    return make_event(
+        ts, source, f"[Svyazi error_log] {signature}",
+        level="ERROR", marker="error_log", error_code=signature,
+        priority_hint="P1" if persons >= 3 else "P2",
+    )
+
+
+def collect_pulled_error_log(sink: Path, state: dict, cfg: dict):
+    """JSONL-файлы cfg["pulled_error_log"] — {"path","source","origin"}.
+
+    Один файл = один pull-таймер-документ на строку (kind=top|impact|signature,
+    rows=[…]). Byte-offset дедуп по образцу cron-логов (state
+    "pulled_error_log"[path] = {offset,size}); усечение/ротация (offset >
+    размер) → читать с нуля — повторную дедупликацию даёт сигнатура sink.
+    Битая JSON-строка → skip + stderr (P2-5), коллекцию не роняет.
+    """
+    events = []
+    pl_state = state.setdefault("pulled_error_log", {})
+    for item in cfg.get("pulled_error_log", []):
+        path_s = str(item.get("path", ""))
+        source = str(item.get("source", "svyazi_error_log"))
+        if not path_s:
+            continue
+        try:
+            path = Path(path_s)
+            if not path.exists():
+                continue
+            stat = path.stat()
+        except OSError as exc:
+            print(f"[errors_collect] WARN: pulled error_log {path_s}: {exc} — skip",
+                  file=sys.stderr)
+            continue
+        offset = pl_state.get(path_s, {}).get("offset", 0)
+        if stat.st_size < offset:  # усечение/ротация → с нуля (дедуп — сигнатура)
+            offset = 0
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                if offset:
+                    f.seek(offset)
+                chunk = f.read()
+                new_offset = f.tell()
+        except OSError as exc:
+            print(f"[errors_collect] WARN: pulled error_log {path_s}: {exc} — skip",
+                  file=sys.stderr)
+            continue
+        pl_state[path_s] = {"offset": new_offset, "size": stat.st_size}
+        for line in chunk.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                doc = json.loads(line)
+            except json.JSONDecodeError as exc:
+                print(f"[errors_collect] WARN: pulled error_log {path_s}: "
+                      f"bad json line: {exc} — skip", file=sys.stderr)
+                continue
+            if not isinstance(doc, dict):
+                print(f"[errors_collect] WARN: pulled error_log {path_s}: "
+                      f"non-dict jsonl row — skip", file=sys.stderr)
+                continue
+            kind = doc.get("kind")
+            for row in doc.get("rows") or []:
+                if not isinstance(row, dict):
+                    continue
+                ev = _pulled_error_log_row_event(row, kind, source)
+                if ev is not None:
+                    events.append(ev)
+    return events
+
+
 # ── P2-8: плановые restart рядом с [CRON] job=prod-update/deploy → expected ──
 
 def mark_expected_restarts(events, window_min: int = 15):
@@ -1031,6 +1137,12 @@ DEFAULT_CONFIG = {
     # ТОЛЬКО [CRON]-маркеры; текст отчётов не переигрывается (анти-рекурсия,
     # докстринг :28-29). Пути кладёт overlay errors_cron.sh / ansible-шаблон.
     "cron_marker_only": [],
+    # Wave 2 (трек G): pull-источник Svyazi error_log — JSONL-документы
+    # ops_events_query (--source error_log); файл кладёт pull-таймер lup→chpd
+    # (коллектор ТОЛЬКО читает локальный файл). Пусто = источник выключен
+    # (полная обратная совместимость). Shape элемента:
+    # {"path": "<abs jsonl>", "source": "svyazi_error_log", "origin": "svyazi"}.
+    "pulled_error_log": [],
     "thresholds": {"df_warn_pct": 85, "df_crit_pct": 95, "ram_avail_min_pct": 10,
                    "load15_factor": 2, "vram_warn_pct": 95},
     "retention_days": 90, "hold_days": 14, "e4_window_days": 7,
@@ -1079,7 +1191,8 @@ def main(argv=None) -> int:
     state = load_json(state_path, {})
 
     events = []
-    for collector in (collect_docker_logs, collect_cron_logs, collect_docker_events):
+    for collector in (collect_docker_logs, collect_cron_logs, collect_docker_events,
+                      collect_pulled_error_log):
         try:
             events.extend(collector(sink, state, cfg))
         except Exception as exc:  # noqa: BLE001 — источник упал ⇒ остальные живут (P2-5)

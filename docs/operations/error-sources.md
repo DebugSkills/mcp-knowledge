@@ -116,6 +116,16 @@
 | script:errors_cleanup_cron_legacy.py | 018: one-shot миграция legacy cron-ключей exit=0 (make errors-cron-cleanup / prod-errors-cron-cleanup) | sink: — | gap: self — ручной пост-деплой шаг; backup в .trash/, dry-run по умолчанию |
 | script:errors_guard.py | write-side гвард (cap/burst) + suppression-CLI | sink: — | gap: self — сам не источник; решения оператора → sink/suppression.json + audit.jsonl |
 
+## Pull-источники внешних систем (Wave 2, трек G)
+
+Транспорт — pull-таймер lup→chpd (доставку делает ТАЙМЕР, не коллектор):
+складывает JSONL-документы `ops_events_query --source error_log` в локальный
+файл на lup; коллектор только читает файл (без network/subprocess).
+
+| source_id | источник | sink: путь-механизм | статус |
+|---|---|---|---|
+| source:svyazi_error_log | Svyazi error_log (chpd): структурные JSONL-документы ops_events_query, владелец — трек G (Wave 2) | sink: errors_collect.py collect_pulled_error_log (локальный файл, byte-offset state + детект ротации; сигнатура Svyazi = error_code, message детерминирован без cnt/persons → дедуп/suppression sink совпадают с триажем Svyazi; конфиг `pulled_error_log`=[{path,source,origin}], пусто = выключен) | covered |
+
 ## Известные дыры (честный бэклог, канон §9)
 
 | source_id | источник | sink: путь-механизм | статус |
