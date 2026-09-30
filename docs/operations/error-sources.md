@@ -302,6 +302,62 @@ proxy из vault + host из inventory_hostname, 0600); локально — sud
 (weekly-отчёт 6 секций, stdout) / `TG=1` (отправка), `make errors-alert`
 (dry-run) / `TG=1`, `make errors-cron-status`.
 
+## TG durable-доставка (retry + spool + flush) (code-2026-09-30-039, спека §7 .boardData.md)
+
+Хост `aikb` доставляет TG только через внешний прокси, канал/прокси может
+моргать — раньше `errors_notify.py::send_telegram` при `URLError/OSError`
+просто писал строку в `reports/tg-errors.log` и **терял** чанк. Теперь доставка
+гарантирована «при появлении канала» аддитивными механизмами:
+
+1. **In-run ретраи** на каждый чанк. `notify["retry_attempts"]` (default 3) —
+   число попыток; `notify["retry_backoff_sec"]` (default `"2,5,10"`, список
+   через запятую, лишние элементы игнорируются) — паузы между попытками
+   (дефолт-сумма backoff = 2+5 = 7 с). Ретраятся **только** транспортные/
+   серверные ошибки (`URLError`/`OSError`/timeout/`5xx`/`429`); `4xx` кроме
+   `429` — не ретраятся (сразу в spool).
+
+   ⚠️ **Бюджет времени (честно):** у каждой попытки транспортный таймаут
+   20 с, поэтому худший случай на чанк = 3×20 с timeout + 7 с backoff ≈ **67 с**
+   (не «~15 с»). Один `send_telegram` в худшем случае ≈ flush ≤5 файлов × 67 с
+   + свои чанки ≤3 × 67 с ≈ **~9 мин** — длиннее окна cron `*/5`. Именно поэтому
+   нужен лок (п. 4): при наложении двух прогонов без него возможны дубли
+   доставки.
+
+2. **Durable spool** при финальном фейле чанка: `reports/tg-pending/
+   <UTC-ts>-<pid>-<n>.json`, mode 0600 (атомарная запись tmp+`os.replace`).
+   Содержимое — `created_at`/`host`/`chat_id`/`text`/`attempts`/`last_error`
+   (замаскированный `<token>`/`<proxy>`). **Токен и прокси-креды в файл НИКОГДА
+   не пишутся** (читаются из `notify.json` в момент flush). Лимит
+   `notify["tg_pending_max"]` (default 200): при переполнении удаляются самые
+   старые + строка `tg-pending overflow` в `reports/tg-errors.log`. Битый JSON →
+   карантин `tg-pending/.corrupt/` + строка в лог (не занимает слот).
+
+3. **Auto-flush** в начале каждого `send_telegram`: pending доставляются от
+   старых к новым, ≤ `notify["tg_flush_max"]` (default 5) за вызов; успех →
+   файл удалён, неуспех → файл остаётся с обновлёнными `attempts`/`last_error`
+   (замаскировано). `notify_ready() == false` → `TG: skip`, spool не трогается.
+
+4. **Взаимное исключение (flock):** неблокирующий `fcntl.flock` на
+   `reports/.tg-flush.lock` вокруг ВСЕГО тела отправки (flush + чанки + spool,
+   включая unlink доставленных и write-back упавших). Занят → `TG: skip (flush
+   lock busy)` + rc 0 (никогда rc≠0 — `cron_wrap` дал бы ложный P0). Исключает
+   дубли доставки и «воскрешение» файла write-back'ом после unlink другого
+   процесса (прецедент — `errors_prune.py:168-176`).
+
+**CLI:** `python3 scripts/errors_notify.py --flush [--json] [--sink PATH]` —
+ручной флаш очереди без отправки нового текста. rc=0 при «нет pending / нет
+настроек / доставлено / лок занят», rc≠0 только при внутренней ошибке;
+`--json` — машинные счётчики `sent/spooled/pending/flushed/failed/skipped`
+(`failed` = только реально проваленные попытки, непопытанные сверх `tg_flush_max`
+не считаются).
+
+**Дренаж (честно про тишину):** `send_telegram` вызывается только из
+алерт-прогона **при наличии кандидатов** (`errors_alert.py:190-191`) и из weekly
+(Пн 10:02). При полной тишине (нет P0/burst) pending дожидается следующего
+алерта-с-кандидатами или weekly — в худшем случае до недели. Поэтому при
+длительном простое канала — ручной `python3 scripts/errors_notify.py --flush`
+(отдельный cron не заведён).
+
 ## Durable-правило №1: queue-overflow = ожидаемый backpressure (code-2026-09-24-015, спека §7 .boardData.md)
 
 WARNING `Очередь переполнена — blocking put` (`pipeline.py:122`: `put_nowait` →

@@ -187,7 +187,7 @@ class TestMasking:
         monkeypatch.setattr(en.urllib.request, "urlopen", boom)
 
     def test_token_masked_in_error(self, sink, monkeypatch, capsys):
-        write_notify(sink)
+        write_notify(sink, retry_attempts=1)  # 039: без ретраев — тестируем маскировку, не backoff
         self._failing_net(monkeypatch, f"connect failed for {TOKEN}")
         en.send_telegram(sink, "текст")
         out = capsys.readouterr().out + (sink / "reports" / "tg-errors.log").read_text()
@@ -195,7 +195,7 @@ class TestMasking:
         assert "<token>" in out
 
     def test_proxy_masked_in_error_with_proxy_cfg(self, sink, monkeypatch, capsys):
-        write_notify(sink, proxy=PROXY)
+        write_notify(sink, proxy=PROXY, retry_attempts=1)  # 039: без ретраев — маскировка прокси
         opener = FakeOpener()
         opener.open = lambda req, timeout=None: (_ for _ in ()).throw(
             OSError(f"tunnel {PROXY} refused auth user:pass"))
@@ -231,7 +231,7 @@ class TestDegradation:
 
     def test_chunk_fail_continues(self, sink, monkeypatch, capsys):
         """Сбой чанка 1 → лог + продолжение; чанк 2 доставлен (sent=1)."""
-        write_notify(sink)
+        write_notify(sink, retry_attempts=1)  # 039: ретраи выключены — continue-on-fail детерминирован
         text = "\n".join(f"строка {i} " + "z" * 90 for i in range(120))
         state = {"n": 0}
 
