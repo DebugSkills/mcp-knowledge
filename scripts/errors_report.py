@@ -28,19 +28,30 @@ import shlex
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# REV.3 P1-A: единый SSOT-парсер suppression (второго парсера не заводим).
+# Импорт-прецеденты: errors_alert.py:52 (load_suppression), errors_report.py:40
+# (кросс-импорт errors_notify). Цикла импортов нет: errors_alert/errors_guard
+# не импортируют errors_report (проверено grep).
+from errors_alert import suppression_filters
 from errors_collect import (
     DATA_ROOT,
     atomic_write_json,
+    load_config,
     load_json,
     parse_ts,
 )
+from errors_guard import load_suppression
 from errors_notify import (
     send_telegram,  # 016: shared TG-sender (бит-в-бит + прокси/host-тег)
 )
 
 PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+# P3-5 (REV.3): единый источник титула дайджеста и детектора копии в tick —
+# смену титула невозможно сделать молча (падают и форматтер-тесты, и детектор).
+DIGEST_MARKER = "🛰 Ошибки"
 
 
 def iso_week(now=None):
@@ -110,6 +121,203 @@ def cmd_view(sink, top):
             if rest > 0:
                 ep_part += f"(+{rest})"
         print(f"        sig: {sig[:150]}{ep_part}")
+    return 0
+
+
+# ── --digest: утренняя сводка по хостам (Ф-A1, T1-2) ──
+# Чистая функция. Разрез по source (поля host в событии НЕТ — §2:26), активное
+# окно (count_7d>0 ∧ status!=resolved), цветовая легенда (P0/P1→🔴, P2→⚠️,
+# только-P3→✅), маркер свежести last_seen + сортировка приоритет→свежесть,
+# suppression-фильтр ДО расчёта цвета/счётчиков + прозрачная строка-сводка «⏸».
+# См. plans/2026-09-30-errors-digest-analysis.md §4, R2.3, R3.1, R3.1.1.
+
+HOST_LUP = "lup (knowledge)"
+HOST_SVYAZI = "chpd (Svyazi)"
+HOST_ORDER = (HOST_LUP, HOST_SVYAZI)
+
+
+def _host_of(a):
+    """Разрез по source (host-поля нет — §2:26): svyazi_error_log → chpd, иначе lup."""
+    if "svyazi_error_log" in (a.get("sources") or []):
+        return HOST_SVYAZI
+    return HOST_LUP
+
+
+def _ts_or_epoch(ts):
+    """last_seen → unix-ts для сортировки; битый/пустой → 0 (в хвост)."""
+    try:
+        return parse_ts(ts).timestamp()
+    except (ValueError, TypeError, AttributeError):
+        return 0.0
+
+
+def _rel_age(ts, now_dt):
+    """Маркер свежести «Nс/м/ч/д назад»; битый/пустой ts → '' (без маркера)."""
+    if not ts:
+        return ""
+    try:
+        dt = parse_ts(ts)
+    except (ValueError, TypeError):
+        return ""
+    secs = max(0.0, (now_dt - dt).total_seconds())
+    if secs < 60:
+        return f"{int(secs)}с назад"
+    if secs < 3600:
+        return f"{int(secs // 60)}м назад"
+    if secs < 86400:
+        return f"{int(secs // 3600)}ч назад"
+    return f"{int(secs // 86400)}д назад"
+
+
+def _short_sig(sig):
+    """Короткая форма сигнатуры топ-строки (source-префикс избыточен — он в host)."""
+    if "|" in sig:
+        sig = sig.split("|", 1)[1]
+    return sig[:60]
+
+
+def _suppression_summary(aggs, suppressed, now_dt):
+    """→ (N, M, top_reasons): активные suppression-записи с событиями за 24ч.
+
+    N = записей с M>0 в окне (R3.1.4-3: заглушка без событий N не раздувает);
+    M = Σ suppressed_daily за окно (errors_collect.py:940-945)."""
+    window_cutoff = (now_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    reasons = {}
+    n_sup = m_sup = 0
+    for sig, entry in suppressed.items():
+        a = aggs.get(sig)
+        if not isinstance(a, dict):
+            continue
+        m_sig = sum(n for d, n in (a.get("suppressed_daily") or {}).items()
+                    if isinstance(d, str) and str(d) >= window_cutoff)
+        if m_sig <= 0:
+            continue
+        n_sup += 1
+        m_sup += m_sig
+        reason = entry.get("reason") or "(без причины)"
+        reasons[reason] = reasons.get(reason, 0) + 1
+    top_reasons = [r for r, _ in sorted(reasons.items(), key=lambda kv: -kv[1])][:3]
+    return n_sup, m_sup, top_reasons
+
+
+def render_digest(aggs, suppression, now=None, tz="Europe/Moscow"):
+    """→ str: сводка по хостам. Pure (side effects нет).
+
+    Пайплайн (R3.1.1): фильтр → агрегация хостов (счётчики+цвет) → топы →
+    ⏸-сводка. Инвариант: цвет хоста и его счётчики — функции ОДНОГО
+    отфильтрованного множества (фильтрация top-list'а post-factum запрещена).
+    """
+    now_dt = now or datetime.now(timezone.utc)
+    if isinstance(tz, str):
+        try:
+            tzinfo = ZoneInfo(tz)
+        except Exception:  # noqa: BLE001 — падение TZ не должно ронять форматтер
+            tzinfo = timezone(timedelta(hours=3))
+    else:
+        tzinfo = tz
+    try:
+        now_msk = now_dt.astimezone(tzinfo)
+    except (ValueError, OverflowError):
+        now_msk = now_dt
+    today = now_msk.strftime("%Y-%m-%d")
+
+    # (1) активное множество: count_7d>0 ∧ status!=resolved (§4.1)
+    active = {sig: a for sig, a in aggs.items()
+              if isinstance(a, dict) and a.get("count_7d", 0) > 0
+              and a.get("status") != "resolved"}
+    # (2) ФИЛЬТР — активные suppression-записи исключаются из цветных топов
+    suppressed = {sig: e for sig, e in suppression.items()
+                  if isinstance(e, dict) and suppression_filters(e, today)}
+    visible = {sig: a for sig, a in active.items() if sig not in suppressed}
+
+    # (3) агрегация хостов (счётчики + цвет) — только по visible; P3 не влияет
+    host_errors = {h: [] for h in HOST_ORDER}
+    p3_noise = {h: 0 for h in HOST_ORDER}
+    for sig, a in visible.items():
+        if a.get("priority") in ("P0", "P1", "P2"):
+            host_errors[_host_of(a)].append((sig, a))
+    for sig, a in active.items():
+        if a.get("priority") == "P3":
+            p3_noise[_host_of(a)] += 1
+
+    lines = [f"{DIGEST_MARKER} · {now_msk.strftime('%Y-%m-%d %H:%M %Z')}"]
+    total_active = total_p0 = 0
+    host_colors = []
+    for host in HOST_ORDER:
+        items = host_errors[host]
+        if not items:
+            continue
+        n_p0 = sum(1 for _, a in items if a.get("priority") == "P0")
+        n_p1 = sum(1 for _, a in items if a.get("priority") == "P1")
+        n_p2 = sum(1 for _, a in items if a.get("priority") == "P2")
+        n_err = len(items)
+        if n_p0 or n_p1:
+            color = "🔴"
+        elif n_p2:
+            color = "⚠️"
+        else:
+            color = "✅"
+        host_colors.append(color)
+        total_active += n_err
+        total_p0 += n_p0
+        # (4) топ-3: (priority ASC, last_seen DESC) — R2.3
+        tops = sorted(items, key=lambda kv: (PRIORITY_ORDER.get(kv[1].get("priority"), 9),
+                                             -_ts_or_epoch(kv[1].get("last_seen"))))[:3]
+        top_parts = []
+        for sig, a in tops:
+            part = f"{_short_sig(sig)} ×{a.get('count_7d', 0)}"
+            age = _rel_age(a.get("last_seen"), now_dt)
+            if age:
+                part += f" · {age}"
+            top_parts.append(part)
+        line = f"{color} {host}: {n_err} активных — P0={n_p0} P1={n_p1} P2={n_p2}"
+        if top_parts:
+            line += "\n   топ: " + "; ".join(top_parts)
+        lines.append(line)
+
+    # burst за 24ч — из агрегатов (по образцу weekly-подсекции, окно 24ч, R2.3)
+    burst_cutoff = (now_dt - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    n_burst = sum(1 for a in aggs.values()
+                  if isinstance(a, dict) and a.get("burst_ts")
+                  and a["burst_ts"] >= burst_cutoff)
+
+    # (5) ⏸-сводка — прозрачность suppression (правда не скрывается)
+    n_sup, m_sup, top_reasons = _suppression_summary(aggs, suppressed, now_dt)
+
+    if not total_active and not n_burst and not any(p3_noise.values()) and not n_sup:
+        return "✅ Проблем нет"
+
+    итог_color = "🔴" if "🔴" in host_colors else ("⚠️" if "⚠️" in host_colors else "✅")
+    lines.append(f"{итог_color} Итог: {total_active} активных · P0={total_p0} "
+                 f"· burst-инцидентов за 24ч: {n_burst}")
+
+    for host in HOST_ORDER:
+        if p3_noise[host]:
+            lines.append(f"🔇 шум P3: {p3_noise[host]} сигнатур ({host}) "
+                         f"· подробно: make errors-view")
+
+    if n_sup:
+        reason_part = f" (top-причины: {', '.join(top_reasons)})" if top_reasons else ""
+        lines.append(f"⏸ suppression: {n_sup} сигнатур / {m_sup} событий за 24ч{reason_part}")
+
+    return "\n".join(lines)
+
+
+def build_digest(sink, now=None, tz="Europe/Moscow"):
+    """→ str: читает sink (aggregates + suppression) и рендерит сводку (Ф-A1).
+
+    Переиспользует load_aggregates + load_suppression (единый SSOT-парсер,
+    второго парсера suppression нет). Pure — side effects отсутствуют.
+    """
+    aggs = load_aggregates(sink)
+    suppression = load_suppression(sink)
+    return render_digest(aggs, suppression, now=now, tz=tz)
+
+
+def cmd_digest(sink, now=None):
+    """CLI --digest: read-only печать сводки (TZ из config digest.tz, дефолт MSK)."""
+    tz = (load_config(sink).get("digest") or {}).get("tz", "Europe/Moscow")
+    print(build_digest(sink, now=now, tz=tz))
     return 0
 
 
@@ -467,12 +675,16 @@ def main(argv=None):
     ap.add_argument("--view", action="store_true", help="read-only просмотр топ-сигнатур")
     ap.add_argument("--top", type=int, default=50, help="сколько сигнатур в --view (дефолт 50)")
     ap.add_argument("--weekly", action="store_true", help="weekly-отчёт (8 секций) + alert_state")
+    ap.add_argument("--digest", action="store_true",
+                    help="утренняя сводка по хостам (read-only, Ф-A1/T1-2)")
     ap.add_argument("--send-tg", action="store_true", help="отправить отчёт в TG (best-effort)")
     args = ap.parse_args(argv)
 
     sink = Path(args.sink) if args.sink else DATA_ROOT / "logs" / "errors"
     if args.weekly:
         return cmd_weekly(sink, args.send_tg)
+    if args.digest:
+        return cmd_digest(sink)
     return cmd_view(sink, args.top)  # дефолт = read-only view (E7)
 
 
