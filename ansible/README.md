@@ -8,7 +8,7 @@ Ansible-обвязка стека mcp-knowledge: подготовка хоста
 
 - **Сценарий A — fresh-install из git-клона** — деплой на хост с интернетом, M0–M9 (`playbooks/deploy.yml`).
 - **Сценарий B — подготовка хоста** — docker + драйвер NVIDIA + container toolkit (`playbooks/host-prepare.yml`).
-- **Сценарий C — перенос old→new** — ⚠️ **DEPRECATED** (code-2026-09-22-002): layout данных вынесен в `DATA_ROOT` (`{{ deploy_root }}/data`, см. `deploy.yml` и `group_vars/all.yml`), пути transfer-плейбуков рассчитаны на старый layout (data внутри клона). Не использовать до переработки; файлы сохранены как справка.
+- **Сценарий C — перенос old→new** — ⚠️ **DEPRECATED** (code-2026-09-22-002): layout данных вынесен в `DATA_ROOT` (`{{ deploy_root }}/data`, см. `deploy.yml` и `group_vars/all/main.yml`), пути transfer-плейбуков рассчитаны на старый layout (data внутри клона). Не использовать до переработки; файлы сохранены как справка.
 
 ## Make-таргеты (`ansible/Makefile`)
 

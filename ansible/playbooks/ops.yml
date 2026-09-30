@@ -19,7 +19,7 @@
   become: true
 
   vars:
-    # compose_file, deploy_root, repo_name — из inventory (group_vars/all.yml)
+    # compose_file, deploy_root, repo_name — из inventory (group_vars/all/main.yml)
     clone_dir: "{{ deploy_root }}/{{ repo_name }}"
     # S/N/M (верхний регистр) передаются как extra vars (make logs S=mcp-server N=500);
     # default()-фильтрами в местах использования (самоссылка в vars = recursion).

@@ -37,7 +37,7 @@ per-user (см. §5). Фасад **fail-closed**: без `CONSOLE_LAN_IP` кон
 | `CONSOLE_LAN_CIDR` | `.env` | Подсеть, которой разрешён доступ (здесь `192.168.2.0/24`) |
 | `CONSOLE_ADMIN_USER` / `CONSOLE_ADMIN_PASSWORD` | `.env` | Bootstrap-админ консоли (создаётся в `users.jsonl` при старте) |
 | `MCP_API_KEY_ADMIN` / `_EDITOR` / `_CONTRIBUTOR` | `.env` | Ключи, которыми консоль ходит в MCP от имени роли |
-| `console_lan_ip` | `ansible/inventory/group_vars/all.yml` | Тот же адрес для `NO_PROXY` на хосте (офис — своё значение) |
+| `console_lan_ip` | `ansible/inventory/group_vars/all/main.yml` | Тот же адрес для `NO_PROXY` на хосте (офис — своё значение) |
 
 Соответствие «роль консоли → уровень сервера»: `admin → MCP_WRITE_KEYS`,
 `editor → токен уровня editor (TokenStore)`, `contributor → MCP_IMPORT_KEYS`.
@@ -246,7 +246,7 @@ Invoke-WebRequest 'https://<LAN_IP>:8443/' -UseBasicParsing -Headers @{Authoriza
 ERR_ACCESS_DENIED` — это прокси, а не консоль.
 
 - **Хост:** сделано — `NO_PROXY`/`no_proxy` в `~/.bashrc` содержит `192.168.2.3`;
-  в офисе — `console_lan_ip` в `ansible/inventory/group_vars/all.yml`
+  в офисе — `console_lan_ip` в `ansible/inventory/group_vars/all/main.yml`
   (`mcp_kb_host_prepare__no_proxy` шаблонится в `http-proxy.conf.j2`).
 - **Браузер оператора:** добавить адрес консоли в исключения прокси
   (Chrome/Chromium: `--proxy-bypass-list="192.168.2.3;localhost"` или системные
@@ -307,7 +307,7 @@ ERR_ACCESS_DENIED` — это прокси, а не консоль.
 | `kb-console/caddy/Caddyfile` | конфиг фасада (TLS internal, bind, allow-list, HSTS) |
 | `docker-compose.yml`, `docker-compose.prod.yml` | сервис `kb-console-tls` (+ fail-closed гард) |
 | `scripts/verify-deploy.sh` | V4 — per-user креды, V5 — TLS-фасад в LAN |
-| `ansible/inventory/group_vars/all.yml` | `console_lan_ip` → `NO_PROXY` |
+| `ansible/inventory/group_vars/all/main.yml` | `console_lan_ip` → `NO_PROXY` |
 | `kb-console/USER_GUIDE.md` | раздел доступа из LAN |
 | `docs/operations/console-lan-access.md` | этот runbook |
 | `tests/test_console_tls_facade.py` | инварианты фасада (статика + `caddy validate`) |

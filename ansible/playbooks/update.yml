@@ -37,7 +37,7 @@
 
   vars:
     # repo_name, compose_file, deploy_root, data_root, min_free_gb — из inventory
-    # (group_vars/all.yml + host_vars/aikb.yml). Здесь только run-параметры:
+    # (group_vars/all/main.yml + host_vars/aikb.yml). Здесь только run-параметры:
     update_source: git          # git | local | bundle (deprecated-алиас local, см. preflight)
     update_branch: main
     update_bundle_path: ""      # local: tar.gz или каталог пакета на этом хосте (флешка/диск)
@@ -133,7 +133,7 @@
           запуск up создал бы ПУСТУЮ базу.
           Проверьте: (1) DATA_ROOT в {{ clone_dir }}/.env — должен быть {{ data_root }}
           (рендерится deploy.yml из inventory data_root); (2) data_root в
-          ansible/inventory/group_vars/all.yml и host_vars/aikb.yml;
+          ansible/inventory/group_vars/all/main.yml и host_vars/aikb.yml;
           (3) после правки .env — перезапустить через deploy.yml (up применит маунты).
           Остановлено ДО pull/load/up — данные не тронуты.
 

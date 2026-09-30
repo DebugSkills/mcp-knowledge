@@ -5,8 +5,8 @@
 # ВНИМАНИЕ: гранулярные теги (docker, toolkit, ...) зависят от проб из preflight —
 # запускайте плейбук целиком (тег host_prepare по умолчанию на всех блоках).
 #
-# Параметры mcp_kb_host_prepare__* (бывшие defaults роли) — в inventory/group_vars/all.yml.
-# Приоритет: extra vars > host_vars/*.yml > group_vars/all.yml (host_vars переопределяет дефолты);
+# Параметры mcp_kb_host_prepare__* (бывшие defaults роли) — в inventory/group_vars/all/main.yml.
+# Приоритет: extra vars > host_vars/*.yml > group_vars/all/main.yml (host_vars переопределяет дефолты);
 # точечное переопределение на запуск — extra vars: -e mcp_kb_host_prepare__<имя>=<значение>.
 
 - name: Подготовка нового хоста для mcp-knowledge (docker + GPU)

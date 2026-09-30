@@ -21,7 +21,7 @@
     fail_msg: >-
       deploy_root/data_root не заданы или не абсолютны: deploy_root='{{ deploy_root | default('<undefined>') }}',
       data_root='{{ data_root | default('<undefined>') }}'. Проверьте inventory хоста
-      {{ inventory_hostname }} (group_vars/all.yml: data_root = <deploy_root>/data).
+      {{ inventory_hostname }} (group_vars/all/main.yml: data_root = <deploy_root>/data).
     success_msg: "deploy_root={{ deploy_root }} · data_root={{ data_root }}"
     quiet: true
 

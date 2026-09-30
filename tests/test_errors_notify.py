@@ -13,6 +13,7 @@ NO_PROXY (+lowercase) — реальные прокси окружения не 
 
 import importlib.util
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -306,7 +307,18 @@ class TestSendHostTag:
 
 # ── weekly-интеграция через shared-модуль (AC-weekly-1) ──
 
-def _mk_agg(priority="P1", count=3, first="2026-09-20T10:00:00Z", last="2026-09-23T12:00:00Z"):
+def _mk_agg(priority="P1", count=3, first=None, last=None):
+    """Синтетическая агрегация для weekly-отчёта.
+
+    Даты считаются ОТНОСИТЕЛЬНО now (а не жёстко): `classify_weekly` помечает
+    сигнатуру resolved при `(now - last_seen).days >= 7` (scripts/errors_report.py:155),
+    поэтому захардкоженные даты «протухали» с календарём — отчёт худел и тест
+    «2 чанка» падал на ровном месте (инцидент 2026-09-30: last=2026-09-23T12:00Z,
+    возраст дошёл до 7.05 дня). last — 2 ч назад, first — 3 дня назад: всегда «свежие».
+    """
+    now = datetime.now(timezone.utc)
+    first = first or (now - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    last = last or (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {"priority": priority, "class": "T", "count_total": count, "count_7d": count,
             "count_prev_7d": 0, "daily": {}, "first_seen": first, "last_seen": last,
             "status": "active", "fixed_at": None, "actors": [], "sources": ["docker_logs"],

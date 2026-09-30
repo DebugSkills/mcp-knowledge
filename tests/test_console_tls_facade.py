@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CADDYFILE = ROOT / "kb-console" / "caddy" / "Caddyfile"
 COMPOSE_FILES = (ROOT / "docker-compose.yml", ROOT / "docker-compose.prod.yml")
 VERIFY = ROOT / "scripts" / "verify-deploy.sh"
-GROUP_VARS = ROOT / "ansible" / "inventory" / "group_vars" / "all.yml"
+GROUP_VARS = ROOT / "ansible" / "inventory" / "group_vars" / "all" / "main.yml"
 ENV_EXAMPLE = ROOT / ".env.example"
 CADDY_IMAGE = "caddy:2-alpine"
 

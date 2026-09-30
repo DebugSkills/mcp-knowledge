@@ -18,8 +18,8 @@
 # transfer-pack/-bulk/-cutover.yml, поэтому assert валидности stage и переменная
 # mcp_kb_transfer__stage из tasks/main.yml роли больше не нужны (каждый плейбук = свой этап).
 #
-# Параметры mcp_kb_transfer__* (бывшие defaults роли) — в inventory/group_vars/all.yml.
-# Приоритет: extra vars > host_vars/*.yml > group_vars/all.yml (host_vars переопределяет).
+# Параметры mcp_kb_transfer__* (бывшие defaults роли) — в inventory/group_vars/all/main.yml.
+# Приоритет: extra vars > host_vars/*.yml > group_vars/all/main.yml (host_vars переопределяет).
 
 - name: Перенести bulk-данные на новый хост
   hosts: mcp_kb_new

@@ -2,7 +2,7 @@
 # host_vars/aikb — целевой хост БЗ: fresh-install с запуском ЛОКАЛЬНО на самом aikb.
 # Порядок: склонировать репозиторий mcp-knowledge на aikb (НЕ в /opt/mcp-knowledge/mcp-knowledge!)
 #          → cd <клон>/ansible → make deps → make vault-create → make run PLAYBOOK=...
-# ⚠️ Значения продублированы из group_vars/all.yml для самодостаточности;
+# ⚠️ Значения продублированы из group_vars/all/main.yml для самодостаточности;
 #    при изменении общего дефолта обновите и здесь (host_vars имеет приоритет над group_vars).
 
 # ─── Подключение: Сценарий A/B, локальный bootstrap ───
@@ -33,7 +33,7 @@ deploy_root: /opt/mcp-knowledge
 repo_name: mcp-knowledge
 compose_file: docker-compose.yml
 min_free_gb: 30
-# data_root — дубль group_vars/all.yml (файл самодостаточен, см. шапку)
+# data_root — дубль group_vars/all/main.yml (файл самодостаточен, см. шапку)
 data_root: /opt/mcp-knowledge/data
 
 # ─── LAN / TLS-фасад kb-console (трасса 030/033-F2; aikb — своя локальная сеть) ───

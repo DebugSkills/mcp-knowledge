@@ -5,7 +5,7 @@
 # Порядок: dirs → repos → docker → cron. Теги ролей сохранены как теги секций:
 # --tags dirs|repos|docker|cron.
 #
-# Параметры mcp_kb_repos__* (бывшие defaults роли) — в inventory/group_vars/all.yml.
+# Параметры mcp_kb_repos__* (бывшие defaults роли) — в inventory/group_vars/all/main.yml.
 # Шаблон .env — ansible/templates/.env.j2.
 
 - name: Полный деплой mcp-knowledge (fresh-install)
@@ -22,7 +22,7 @@
       ansible.builtin.import_tasks: tasks/preflight_data_root.yml
 
     # ─── dirs: создание структуры каталогов deploy_root (бывшая роль mcp_kb_dirs) ───
-    # Корень — {{ deploy_root }} из inventory/group_vars/all.yml (по умолчанию /opt/mcp-knowledge).
+    # Корень — {{ deploy_root }} из inventory/group_vars/all/main.yml (по умолчанию /opt/mcp-knowledge).
     #
     # DATA_ROOT-вынос (code-2026-09-22-002): данные живут в ОДНОМ дереве
     # {{ data_root }} (={{ deploy_root }}/data) ВНЕ git-клона. Распределение создания:
@@ -89,8 +89,8 @@
 
     # ─── repos: клонирование git-репозиториев (бывшая роль mcp_kb_repos) ───
     # Клонирование двух git-репозиториев (mcp-knowledge + knowledge).
-    # Корень — {{ deploy_root }} из inventory/group_vars/all.yml (по умолчанию /opt/mcp-knowledge).
-    # Параметры mcp_kb_repos__* — в inventory/group_vars/all.yml.
+    # Корень — {{ deploy_root }} из inventory/group_vars/all/main.yml (по умолчанию /opt/mcp-knowledge).
+    # Параметры mcp_kb_repos__* — в inventory/group_vars/all/main.yml.
     - name: Клонировать репозитории кода и знаний (mcp-knowledge + knowledge)
       tags: [repos]
       block:

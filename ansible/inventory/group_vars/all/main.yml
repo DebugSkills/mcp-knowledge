@@ -69,7 +69,7 @@ mcp_kb_host_prepare__nvidia_repo_url: https://nvidia.github.io/libnvidia-contain
 mcp_kb_host_prepare__docker_gpg_url: https://download.docker.com/linux/debian/gpg
 mcp_kb_host_prepare__docker_repo: deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable
 
-# Прокси наследуется из group_vars/all.yml (docker_proxy/docker_no_proxy)
+# Прокси наследуется из group_vars/all/main.yml (docker_proxy/docker_no_proxy)
 mcp_kb_host_prepare__proxy: "{{ docker_proxy | default('') }}"
 # LAN-адрес kb-console (TLS-фасад, трасса code-2026-09-26-030). Обязательно в NO_PROXY:
 # иначе корпоративный Squid отвечает 403 на внутренний адрес (диагностировано 2026-09-26).
