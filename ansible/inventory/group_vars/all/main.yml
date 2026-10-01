@@ -3,6 +3,9 @@
 deploy_root: /opt/mcp-knowledge        # родительский каталог (basename 'mcp-knowledge' сохраняется!)
 repo_name: mcp-knowledge               # compose project name = basename
 compose_file: docker-compose.yml       # переносим работающий dev-стек
+# ─── docker: сборка/бутстрап (переопределяется в host_vars) ───
+mcp_kb_docker__build: true             # false = air-gap: образы из бандла (docker load)
+mcp_kb_docker__bootstrap_reindex: false  # true = разовый reindex, если коллекций Qdrant нет
 # DATA_ROOT (code-2026-09-22-002): корень данных ВНЕ git-клона (qdrant/ollama/console);
 # рендерится в .env (→ compose ${DATA_ROOT}) + cron-env backup.sh + dirs секция deploy.yml
 data_root: "{{ deploy_root }}/data"

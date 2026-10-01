@@ -66,6 +66,8 @@ ansible/**/RUNBOOK.md
 ansible/**/runbook*.md
 private/
 *.private.md
+# Air-gap runbook: приватные данные (адреса/логины) — шаблон .example трекируемый
+docs/operations/*.private.md
 secrets/
 *.key
 *.pem

@@ -348,14 +348,26 @@ class IndexingPipeline:
         t0 = datetime.now(timezone.utc)
         logger.info("reindex_blue_green: начало blue-green reindex (alias=%s)", alias)
 
-        # 1. Определить активную и целевую коллекции
+        # 1. Определить активную и целевую коллекции.
+        # Инцидент 2026-10-01 (aikb): из-за pydantic-ответа get_aliases() определение
+        # активной коллекции падало, исключение глушилось, active=alias → target=v1,
+        # и force_recreate удалял ЖИВУЮ коллекцию вместе с алиасом. Правила:
+        #   • не угадывать: при неопределённом алиасе целью берём версию БЕЗ данных;
+        #   • никогда не целиться в активную коллекцию;
+        #   • не удалять источник до подтверждённого swap.
         try:
             active = self._qdrant.get_active_collection(alias_name=alias)
-        except Exception:
-            active = v1  # fallback: первая коллекция
-
-        # v1 → v2, v2 → v1
-        target = v2 if active == v1 else v1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("reindex_blue_green: активная коллекция не определена (%s)", exc)
+            active = alias
+        if active == alias:
+            target = v2 if self._qdrant.has_points(v1) else v1
+        else:
+            target = v2 if active == v1 else v1
+        if target == active:
+            raise RuntimeError(
+                f"blue-green: target == active ({target}) — отказ, чтобы не потерять данные"
+            )
         logger.info("reindex_blue_green: active=%s → target=%s", active, target)
 
         # 2. Создать новую коллекцию
@@ -364,8 +376,13 @@ class IndexingPipeline:
         # 3. Заполнить новую коллекцию
         reindex_result = await self._reindex_into(target, zone_filter=zone_filter)
 
-        # 4. Атомарный swap alias
+        # 4. Атомарный swap alias + проверка, что переключение реально произошло
         self._qdrant.swap_alias(alias, target)
+        resolved = self._qdrant.get_active_collection(alias_name=alias)
+        if resolved != target:
+            raise RuntimeError(
+                f"alias '{alias}' не переключился на '{target}' (сейчас '{resolved}')"
+            )
         alias_swapped = True
         logger.info("reindex_blue_green: alias '%s' → '%s' (swap complete)", alias, target)
 

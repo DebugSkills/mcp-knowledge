@@ -201,7 +201,15 @@ class TestReindexZoneIsolation:
         pipeline = IndexingPipeline(
             store=MagicMock(), qdrant=MagicMock(), embedder=MagicMock(),
         )
-        pipeline._qdrant.get_active_collection = MagicMock(return_value=PUBLIC_V1)
+        # Мок честно эмулирует алиас: после swap активная коллекция = target.
+        # (Пайплайн после swap проверяет, что alias реально переключился — инцидент 2026-10-01.)
+        alias_state = {"active": PUBLIC_V1}
+        pipeline._qdrant.get_active_collection = MagicMock(
+            side_effect=lambda alias_name=None: alias_state["active"]
+        )
+        pipeline._qdrant.swap_alias = MagicMock(
+            side_effect=lambda alias, target: alias_state.__setitem__("active", target)
+        )
         pipeline._index_chunks = AsyncMock()
         return pipeline
 

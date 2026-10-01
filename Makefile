@@ -3,7 +3,12 @@ DATA_DIR := ../data
 KNOWLEDGE_DIR := ../knowledge
 MODELS_DIR := ../models_cache
 
-.PHONY: dev deploy down logs test lint clean dlq-replay reindex backup prereq-dirs errors-view errors-report errors-alert errors-notify-import errors-cron-install errors-cron-remove errors-cron-status errors-cron-cleanup prod-errors-cron-cleanup
+.PHONY: dev deploy down logs test lint clean dlq-replay reindex backup prereq-dirs errors-view errors-report errors-alert errors-notify-import errors-cron-install errors-cron-remove errors-cron-status errors-cron-cleanup prod-errors-cron-cleanup help
+
+# help: self-documenting список команд (docstring через `##` попадает сюда)
+help:  ## Список команд (docstring через ##)
+	@grep -hE '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | sort | \
+		awk -F ':.*## ' '{printf "  %-24s %s\n", $$1, $$2}'
 
 # Проверка и создание необходимых директорий перед запуском
 prereq-dirs:
@@ -111,7 +116,7 @@ prod-verify:
 #        → (носитель)  make update-bundle-verify DIR=/media/…/mcp-kb-update-….tar.gz
 #        → (aikb)      make prod-update-local BUNDLE=/media/…/mcp-kb-update-….tar.gz
 
-.PHONY: update-bundle update-bundle-verify prod-update-local
+.PHONY: update-bundle update-bundle-verify prod-update-local bundle-pack bundle-unpack bundle-ship-usb bundle-ship-net airgap-runbook
 
 update-bundle:  ## 038: собрать пакет offline-обновления (интернет-машина; ARGS="--with-ollama-image --with-models")
 	./scripts/offline-update.sh pack $(ARGS)
@@ -121,6 +126,21 @@ update-bundle-verify:  ## 038: проверка пакета на носител
 
 prod-update-local:  ## 038: air-gap апдейт прода из пакета (BUNDLE=…; перед применением — update-local-check)
 	$(MAKE) -C ansible update-local BUNDLE=$(BUNDLE)
+
+bundle-pack:  ## 038: полный офлайн-бандл (образы+код+модели+carrier+python-база) — прогресс и лог (ARGS=…)
+	./scripts/airgap-bundle-pack.sh $(ARGS)
+
+bundle-unpack:  ## 038: распаковка бандла на узле (docker load + установка моделей) — прогресс и лог (BUNDLE=…)
+	./scripts/airgap-bundle-unpack.sh --bundle "$(BUNDLE)" $(ARGS)
+
+bundle-ship-usb:  ## 038: бандл → USB (USB=/media/…) — прогресс, sha256-сверка, чек-лист узла (--checklist-only)
+	./scripts/airgap-bundle-ship.sh --usb "$(USB)" $(ARGS)
+
+bundle-ship-net:  ## 038: бандл → узел по сети (ARGS="--host JUMP" | ARGS="--pipe-via JUMP") — resumable (--checklist-only)
+	./scripts/airgap-bundle-ship.sh $(ARGS)
+
+airgap-runbook:  ## 038: напечатать полный ранбук air-gap (сборка→перенос→установка→приёмка)
+	@cat docs/operations/airgap-first-install.md
 
 # ═══════════════════════════════════════════════════════════════
 # kb-console (Фаза 13.7) — NiceGUI-клиент (диагностика + импорт + поиск)

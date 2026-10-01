@@ -103,6 +103,10 @@
 | script:reindex.sh | ручной запуск | sink: — | gap: ручной; запускать через cron_wrap.sh (RUNBOOK §Error-наблюдаемость) |
 | script:offline-deploy.sh | air-gap-утилита, ручной запуск | sink: — | gap: ручной (bundle-контур вне прода) |
 | script:offline-update.sh | 038: air-gap ОБНОВЛЕНИЕ (pack/inspect/verify/apply-stage), ручной запуск | sink: — | gap: ручной (offline-update-контур вне прода; FAIL → exit≠0 + явное STOP-сообщение) |
+| script:airgap-bundle-pack.sh | 038: обёртка offline-update.sh pack — ПОЛНЫЙ офлайн-бандл на интернет-машине (образы+код+модели+carrier+python-база), ручной | sink: — | gap: ручной (air-gap-контур вне прода; FAIL → exit≠0 + лог bundle-pack-<ts>.log в --out) |
+| script:airgap-bundle-unpack.sh | 038: распаковка бандла на целевом хосте (docker load идемпотентно + модели в DATA_ROOT), ручной | sink: — | gap: ручной (air-gap-контур вне прода; FAIL → exit≠0 + лог bundle-unpack-<ts>.log) |
+| script:airgap-clean-src.sh | 038: чистая локальная копия (git clone --local) для сборки бандла — хелпер airgap-bundle-pack.sh, ручной | sink: — | gap: ручной (air-gap-контур вне прода; FAIL → exit≠0) |
+| script:airgap-bundle-ship.sh | 038: передача бандла на узел (USB / rsync / pipe-via jump), resumable, ручной | sink: — | gap: ручной (air-gap-контур вне прода; FAIL → exit≠0 + лог ship-<ts>.log) |
 | script:seed_knowledge.py | разовый сид, ручной | sink: — | gap: разовый; через cron_wrap.sh при использовании |
 | script:backfill_sequence_payload.py | миграция payload, ручной | sink: — | gap: ручной; через cron_wrap.sh (конвенция update-флоу) |
 | script:errors_collect.py | сам коллектор (cron */5) | sink: — | gap: self — анти-рекурсия (P2-2); stderr → mcp-errors-collect.log с ротацией |

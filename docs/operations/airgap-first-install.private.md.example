@@ -1,0 +1,24 @@
+# Приватные данные air-gap установки — ШАБЛОН
+
+> Скопируйте в `docs/operations/airgap-first-install.private.md` (gitignored)
+> и заполните своими значениями. НЕ коммитьте заполненный файл.
+
+```bash
+# jump-хост (вложенный SSH: ssh -o BatchMode=yes "$JUMP" 'ssh -o BatchMode=yes <remote> <cmd>')
+JUMP=<jump-user>@<jump-host>
+
+# имя/логин целевого хоста за jump'ом
+REMOTE=<remote-user>@<remote-host>
+
+# каталог приёма бандла на узле (переопределяет --dest у airgap-bundle-ship.sh)
+DEST=<remote-dest-dir>
+
+# корень данных mcp-knowledge на узле (DATA_ROOT)
+DATA_ROOT=<data-root>
+
+# корп. прокси (БЕЗ кредов в URL)
+PROXY=<proxy-host:port>
+
+# локальная сеть консоли (LAN-фасад kb-console)
+LAN_CIDR=<lan-cidr>
+```

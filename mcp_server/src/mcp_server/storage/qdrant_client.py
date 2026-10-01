@@ -29,6 +29,25 @@ from .schema import (
 logger = logging.getLogger("mcp_knowledge.qdrant")
 
 
+
+def _alias_pairs(client):
+    """Нормализация get_aliases(): pydantic-ответ -> [(alias, collection)].
+
+    Инцидент 2026-10-01: QdrantSDKClient.get_aliases() возвращает pydantic-модель
+    CollectionsAliasesResponse, итерация которой даёт КОРТЕЖИ ('aliases', [...]) —
+    из-за этого `desc.alias_name` падал, исключение глушилось и blue-green удалял
+    живую коллекцию вместе с её алиасом.
+    """
+    resp = client.get_aliases()
+    items = getattr(resp, "aliases", None)
+    if items is None:
+        items = resp
+    for a in items:
+        if isinstance(a, (tuple, list)):
+            yield a[0], a[1]
+        else:
+            yield getattr(a, "alias_name", None), getattr(a, "collection_name", None)
+
 class QdrantClient:
     """Асинхронная обёртка над Qdrant gRPC SDK."""
 
@@ -133,16 +152,14 @@ class QdrantClient:
         Удаляет все существующие привязки alias и создаёт новую.
         Операция атомарна со стороны Qdrant (<1 сек downtime).
         """
-        self._client.update_collection_aliases(
-            change_aliases_operations=[
-                qmodels.CreateAliasOperation(
-                    create_alias=qmodels.CreateAlias(
-                        collection_name=target,
-                        alias_name=alias,
-                    )
-                )
-            ],
-        )
+        ops = []
+        for name, _coll in _alias_pairs(self._client):
+            if name == alias:
+                ops.append(qmodels.DeleteAliasOperation(
+                    delete_alias=qmodels.DeleteAlias(alias_name=alias)))
+        ops.append(qmodels.CreateAliasOperation(
+            create_alias=qmodels.CreateAlias(collection_name=target, alias_name=alias)))
+        self._client.update_collection_aliases(change_aliases_operations=ops)
         logger.info("Alias '%s' → '%s' (swap complete)", alias, target)
 
     def delete_collection_named(self, name: str) -> None:
@@ -154,9 +171,8 @@ class QdrantClient:
     def has_alias(self, alias_name: str) -> bool:
         """Проверить, существует ли alias."""
         try:
-            aliases = self._client.get_aliases()
-            for desc in aliases:
-                if desc.alias_name == alias_name:
+            for name, _coll in _alias_pairs(self._client):
+                if name == alias_name:
                     return True
         except Exception:
             pass
@@ -227,10 +243,9 @@ class QdrantClient:
         """
         alias = alias_name or COLLECTION_ALIAS
         try:
-            aliases = self._client.get_aliases()
-            for desc in aliases:
-                if desc.alias_name == alias:
-                    return desc.collection_name
+            for name, coll in _alias_pairs(self._client):
+                if name == alias:
+                    return coll
         except Exception:
             pass
         return alias
@@ -562,6 +577,20 @@ class QdrantClient:
             else:
                 result[kid] = upd
         return result
+
+    def has_points(self, collection_name: str) -> bool:
+        """True, если коллекция существует и содержит точки (защита blue-green).
+
+        Инцидент 2026-10-01: без этой проверки blue-green мог выбрать целью
+        коллекцию с данными и пересоздать её (force_recreate) вместе с алиасом.
+        """
+        try:
+            if not self._client.collection_exists(collection_name):
+                return False
+            info = self._client.get_collection(collection_name)
+            return int(getattr(info, "points_count", 0) or 0) > 0
+        except Exception:  # noqa: BLE001
+            return False
 
     def collection_info(self, collection_name: str | None = None) -> dict:
         """Информация о коллекции для /health.

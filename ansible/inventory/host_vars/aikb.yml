@@ -35,6 +35,11 @@ compose_file: docker-compose.yml
 min_free_gb: 30
 # data_root — дубль group_vars/all/main.yml (файл самодостаточен, см. шапку)
 data_root: /opt/mcp-knowledge/data
+# ─── air-gap (aikb): сборка образов невозможна без pypi/DNS ───
+# Образы приходят из офлайн-бандла (docker load) → сборку пропускаем.
+mcp_kb_docker__build: false
+# Свежий узел: startup-reconcile не создаёт коллекции Qdrant → разовый reindex на первом деплое.
+mcp_kb_docker__bootstrap_reindex: true
 
 # ─── LAN / TLS-фасад kb-console (трасса 030/033-F2; aikb — своя локальная сеть) ───
 # Проверено 2026-09-29: enp13s0 UP 192.168.10.253/24, шлюз 192.168.10.1, DNS 192.168.10.254.
