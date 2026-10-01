@@ -37,6 +37,8 @@ ProxyHandler, маскировка. Python ≥3.9, stdlib-only. Выход 0 в�
 """
 
 import argparse
+import contextlib
+import fcntl
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -55,6 +57,35 @@ from errors_notify import log_tg_error, notify_ready, send_telegram
 EPOCH0 = datetime(1970, 1, 1, tzinfo=timezone.utc)
 DEFAULT_ALERTS = {"new_p0_window_min": 10, "cooldown_min": 120,
                   "max_per_run": 2, "max_per_hour": 3}
+# P1-1 (REV.2): additive-фильтр kinds. Дефолт = текущее поведение (46 тестов
+# не меняются); tick вызывает kinds=("new_p0",) — burst физически не может
+# уйти мгновенно (решение оператора №2: burst только в сводку).
+DEFAULT_KINDS = ("new_p0", "burst")
+ALERTS_LOCK_NAME = ".alerts.lock"
+
+
+@contextlib.contextmanager
+def alerts_lock(sink):
+    """Один канонический неблокирующий EX-flock на sink/.alerts.lock (P1-5/R2.6).
+
+    Берут ВСЕ писатели alert_state.json: tick (вся итерация), run_alerts,
+    resolve_sig, cmd_weekly, prune (вокруг своего RMW). Helper переиспользуется
+    импортом (errors_tick/errors_report/errors_prune). Открытие в режиме "w"
+    (truncate-on-open, паттерн errors_prune.py:171) ⇒ mtime файла ≈ момент
+    последнего взятия (лок-проба watchdog T1-3b). busy → yield False, политика
+    skip + видимая строка + rc 0 (никогда rc≠0 — cron_wrap дал бы ложный P0).
+    flock на open-file-description: два open() одного файла конкурируют даже в
+    одном процессе — гонку тестируем без многопроцессности (по образцу 039).
+    """
+    path = Path(sink)
+    path.mkdir(parents=True, exist_ok=True)
+    with open(path / ALERTS_LOCK_NAME, "w") as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
 
 
 def _now():
@@ -165,7 +196,8 @@ def _mark_alerted(alert, cand, now_dt, cooldown_min):
     st["alert_cooldown_until"] = (now_dt + timedelta(minutes=int(cooldown_min))).isoformat()
 
 
-def run_alerts(sink, send_tg=False, chat=None, host=None, dry_run=False, now=None):
+def run_alerts(sink, send_tg=False, chat=None, host=None, dry_run=False, now=None,
+               kinds=DEFAULT_KINDS):
     now_dt = now or _now()
     aggs = load_json(sink / "aggregates" / "signatures.json", {})
     alert_path = sink / "alert_state.json"
@@ -186,6 +218,9 @@ def run_alerts(sink, send_tg=False, chat=None, host=None, dry_run=False, now=Non
     n_inv = sum(1 for st in alert.values()
                 if isinstance(st, dict) and st.get("investigating"))
     cands = detect_candidates(aggs, alert, suppression, acfg, now_dt)
+    # P1-1 (REV.2): additive-фильтр kinds сразу после detect, до печати/бюджета.
+    if kinds:
+        cands = [c for c in cands if c["kind"] in kinds]
     print(f"кандидаты: {len(cands)} (filtered: suppressed={n_supp} investigating={n_inv})")
     if not cands:
         return 0
@@ -298,19 +333,25 @@ def main(argv=None):
                     help="план алертов без отправки и без записи стейта (HITL)")
     args = ap.parse_args(argv)
     sink = Path(args.sink) if args.sink else DATA_ROOT / "logs" / "errors"
-    if args.resolve:  # B-5: ветка resolve — ВЫХОД до run_alerts (алерты не отправляем)
-        return resolve_sig(sink, args.resolve, reason=args.reason, actor=args.actor,
-                           dry_run=args.dry_run)
-    try:
-        return run_alerts(sink, send_tg=args.send_tg, chat=args.chat,
-                          host=args.host, dry_run=args.dry_run)
-    except Exception as exc:  # noqa: BLE001 — best-effort: cron не роняем (§7.8)
-        print(f"[errors_alert] FAIL: {exc}")
+    # P1-5/R2.6: все писатели alert_state.json под каноническим локом.
+    # busy → skip + видимая строка + rc 0 (никогда rc≠0 — cron_wrap дал бы P0).
+    with alerts_lock(sink) as held:
+        if not held:
+            print("alert_state: busy (lock) — skip")
+            return 0
+        if args.resolve:  # B-5: ветка resolve — ВЫХОД до run_alerts (алерты не отправляем)
+            return resolve_sig(sink, args.resolve, reason=args.reason, actor=args.actor,
+                               dry_run=args.dry_run)
         try:
-            log_tg_error(sink, f"errors_alert fail: {exc}")
-        except Exception as log_exc:  # noqa: BLE001 — лог-путь сам не должен ронять exit-0
-            print(f"[errors_alert] лог-путь упал: {log_exc}")
-        return 0
+            return run_alerts(sink, send_tg=args.send_tg, chat=args.chat,
+                              host=args.host, dry_run=args.dry_run)
+        except Exception as exc:  # noqa: BLE001 — best-effort: cron не роняем (§7.8)
+            print(f"[errors_alert] FAIL: {exc}")
+            try:
+                log_tg_error(sink, f"errors_alert fail: {exc}")
+            except Exception as log_exc:  # noqa: BLE001 — лог-путь сам не должен ронять exit-0
+                print(f"[errors_alert] лог-путь упал: {log_exc}")
+            return 0
 
 
 if __name__ == "__main__":

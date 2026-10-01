@@ -36,6 +36,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# P1-5/R2.6: канонический лок писателей alert_state (helper из errors_alert).
+from errors_alert import alerts_lock
 from errors_collect import (
     DATA_ROOT,
     atomic_write_json,
@@ -174,7 +176,14 @@ def main(argv=None) -> int:
         except BlockingIOError:
             print("skip: prune already running (lock busy) — выход 0")
             return 0
-        return _prune(sink, args)
+        # P1-5/R2.6: prune — писатель alert_state.json (stale-RMW) → канонический
+        # .alerts.lock ПОВЕРХ собственного .prune.lock (файловый лок остаётся за
+        # prune для взаимного исключения удалений). busy → skip + rc 0.
+        with alerts_lock(sink) as held:
+            if not held:
+                print("skip: alert_state busy (tick/prune) — выход 0")
+                return 0
+            return _prune(sink, args)
 
 def _prune(sink: Path, args) -> int:
 

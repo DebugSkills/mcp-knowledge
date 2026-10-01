@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # Импорт-прецеденты: errors_alert.py:52 (load_suppression), errors_report.py:40
 # (кросс-импорт errors_notify). Цикла импортов нет: errors_alert/errors_guard
 # не импортируют errors_report (проверено grep).
-from errors_alert import suppression_filters
+from errors_alert import alerts_lock, suppression_filters
 from errors_collect import (
     DATA_ROOT,
     atomic_write_json,
@@ -682,7 +682,12 @@ def main(argv=None):
 
     sink = Path(args.sink) if args.sink else DATA_ROOT / "logs" / "errors"
     if args.weekly:
-        return cmd_weekly(sink, args.send_tg)
+        # P1-5/R2.6: cmd_weekly — писатель alert_state.json → канонический лок.
+        with alerts_lock(sink) as held:
+            if not held:
+                print("alert_state: busy (lock) — skip")
+                return 0
+            return cmd_weekly(sink, args.send_tg)
     if args.digest:
         return cmd_digest(sink)
     return cmd_view(sink, args.top)  # дефолт = read-only view (E7)

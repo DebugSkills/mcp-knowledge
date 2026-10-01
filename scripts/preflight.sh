@@ -132,7 +132,7 @@ fi
 if [ "$CONFIG_ONLY" = 0 ]; then
     run_gate 1 "lint ruff" "$([ "$HAS_PY" = 1 ] && echo 0 || echo 1)" \
         "$PY" -m ruff check mcp_server/src mcp_server/tests kb-console/src kb-console/tests \
-        tests scripts/errors_collect.py scripts/errors_report.py scripts/errors_prune.py scripts/errors_cleanup_cron_legacy.py
+        tests scripts/errors_collect.py scripts/errors_report.py scripts/errors_prune.py scripts/errors_cleanup_cron_legacy.py scripts/errors_tick.py
 fi
 
 # ── G2 unit mcp_server (default/full) ──

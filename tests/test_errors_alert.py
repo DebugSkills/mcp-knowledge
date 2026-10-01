@@ -444,6 +444,27 @@ class TestInjectedClockStamps:
         assert st["_alerts_meta"]["last_run"] == ISO
 
 
+# ── P1-1 (REV.2): additive kinds — дефолт = текущее поведение, kinds=("new_p0",) глушит burst ──
+
+class TestKinds:
+    def test_default_kinds_includes_burst(self, tmp_path, sender, fakenow):
+        sink = mk_sink(tmp_path, {"x|b": agg("P1", burst_ts=ISO)})
+        assert ea.run_alerts(sink, send_tg=True, now=NOW) == 0
+        assert len(sender.sent) == 1
+        assert "BURST" in sender.sent[0]
+
+    def test_new_p0_only_filters_burst(self, tmp_path, sender, fakenow):
+        sink = mk_sink(tmp_path, {"x|b": agg("P1", burst_ts=ISO)})
+        assert ea.run_alerts(sink, send_tg=True, now=NOW, kinds=("new_p0",)) == 0
+        assert sender.sent == []  # burst отфильтрован
+
+    def test_new_p0_only_keeps_new_p0(self, tmp_path, sender, fakenow):
+        sink = mk_sink(tmp_path, {"x|p0": agg("P0"), "x|b": agg("P1", burst_ts=ISO)})
+        assert ea.run_alerts(sink, send_tg=True, now=NOW, kinds=("new_p0",)) == 0
+        assert len(sender.sent) == 1
+        assert "NEW P0" in sender.sent[0]  # только new_p0, burst отфильтрован
+
+
 # ══ 028-B: resolve (немедленная фиксация) + правило ручной фиксации в weekly ══
 
 _RSIG = "docker_logs|TEST|028-resolve"
