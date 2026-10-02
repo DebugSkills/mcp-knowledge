@@ -234,7 +234,64 @@ def test_build_digest_reads_sink(tmp_path):
     (tmp_path / "suppression.json").write_text(json.dumps({
         GIN_SIG: {"reason": "r", "until": None},
     }), encoding="utf-8")
-    text = er.build_digest(tmp_path, now=NOW)
+    text = er.build_digest(tmp_path, now=NOW, full=True)
     assert GIN_SHORT not in text  # suppression прочитан из файла
     assert "✅ Итог: 0 активных" in text
     assert "⏸ suppression: 1 сигнатур / 3 событий за 24ч" in text
+
+
+# ── Короткая форма дайджеста (решение оператора 02.10.2026: счётчик по хостам) ──
+
+def test_short_counts_and_colors_per_host():
+    """Строка на хост: 🔴 при P0/P1 · ⚠️ только P2; ничего лишнего в сообщении."""
+    aggs = {
+        "docker_logs|T|a": _agg(priority="P1", sources=["docker_logs"]),
+        "docker_logs|T|b": _agg(priority="P2", sources=["docker_logs"]),
+        "svyazi_error_log|T|c": _agg(priority="P2", sources=["svyazi_error_log"]),
+    }
+    lines = er.render_digest_short(aggs, {}, now=NOW).splitlines()
+    assert lines[0].startswith(er.DIGEST_MARKER)
+    assert lines[1] == "🔴 lup (knowledge): 2"
+    assert lines[2] == "⚠️ chpd (Svyazi): 1"
+    assert len(lines) == 3
+
+
+def test_short_empty_is_green_with_both_hosts():
+    """Пусто → обе строки нулевые + «✅ Проблем нет» (эталон оператора — отчёт бэкапов)."""
+    text = er.render_digest_short({}, {}, now=NOW)
+    assert "✅ lup (knowledge): 0" in text
+    assert "✅ chpd (Svyazi): 0" in text
+    assert text.rstrip().endswith("✅ Проблем нет")
+
+
+def test_short_excludes_suppressed_and_p3():
+    """Suppression и P3-шум в счётчик короткой формы не входят."""
+    aggs = {
+        "s|A|noise": _agg(priority="P1", sources=["svyazi_error_log"]),
+        "s|A|p3": _agg(priority="P3", sources=["svyazi_error_log"]),
+    }
+    supp = {"s|A|noise": {"reason": "r", "until": None}}
+    text = er.render_digest_short(aggs, supp, now=NOW)
+    assert "chpd (Svyazi): 0" in text
+    assert "🔴" not in text and "⚠️" not in text
+
+
+def test_short_has_no_detail_lines():
+    """В короткой форме нет топов/P3-шума/suppression/итога."""
+    aggs = {"docker_logs|T|a": _agg(priority="P0")}
+    text = er.render_digest_short(aggs, {}, now=NOW)
+    for token in ("топ", "🔇", "⏸", "Итог"):
+        assert token not in text
+    assert "🔴 lup (knowledge): 1" in text
+
+
+def test_build_digest_default_is_short_full_keeps_details(tmp_path):
+    """build_digest: дефолт — короткая форма; full=True — подробная (топы/итог)."""
+    (tmp_path / "aggregates").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "aggregates" / "signatures.json").write_text(json.dumps({
+        "docker_logs|T|err": _agg(priority="P1", last_seen=_ago(NOW, hours=1)),
+    }), encoding="utf-8")
+    short = er.build_digest(tmp_path, now=NOW)
+    full = er.build_digest(tmp_path, now=NOW, full=True)
+    assert "🔴 lup (knowledge): 1" in short and "Итог" not in short
+    assert "Итог" in full and "топ:" in full

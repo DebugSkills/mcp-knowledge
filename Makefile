@@ -245,6 +245,12 @@ errors-view:  ## 016: сводка sink (агрегаты/флаги) — что
 errors-report:  ## 016: weekly-отчёт 6 секций, --weekly обязателен (TG=1 → отправка; по умолчанию stdout)
 	.venv/bin/python scripts/errors_report.py --weekly $(if $(TG),--send-tg)
 
+errors-digest:  ## T1 (A1): короткая утренняя сводка хостов (dry-run, печатает текст; FULL=1 → подробная)
+	.venv/bin/python scripts/errors_report.py --digest $(if $(FULL),--full)
+
+errors-tick:  ## T1 (A2): единый оповещатель tick (dry-run по умолчанию; TG=1 → отправка)
+	.venv/bin/python scripts/errors_tick.py $(if $(TG),--send-tg)
+
 errors-alert:  ## 016: немедленные алерты new-P0/burst (TG=1 → отправка; dry-run по умолчанию)
 	.venv/bin/python scripts/errors_alert.py $(if $(TG),--send-tg)
 

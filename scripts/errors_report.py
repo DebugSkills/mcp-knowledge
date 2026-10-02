@@ -303,21 +303,77 @@ def render_digest(aggs, suppression, now=None, tz="Europe/Moscow"):
     return "\n".join(lines)
 
 
-def build_digest(sink, now=None, tz="Europe/Moscow"):
+def render_digest_short(aggs, suppression, now=None, tz="Europe/Moscow"):
+    """→ str: КОРОТКАЯ утренняя сводка (решение оператора 02.10.2026).
+
+    Формат: заголовок + число ошибок по каждому хосту (P0/P1/P2, активное окно,
+    suppression исключён); при нуле — «✅ Проблем нет». Топы/P3-шум/suppression
+    в сообщение НЕ попадают — они доступны в подробной форме (`build_digest(…,
+    full=True)`, CLI `--digest --full`) и в `make errors-view`/weekly.
+    Pure (side effects нет); цвет хоста: 🔴 есть P0/P1 · ⚠️ только P2 · ✅ ноль.
+    """
+    now_dt = now or datetime.now(timezone.utc)
+    if isinstance(tz, str):
+        try:
+            tzinfo = ZoneInfo(tz)
+        except Exception:  # noqa: BLE001 — падение TZ не должно ронять форматтер
+            tzinfo = timezone(timedelta(hours=3))
+    else:
+        tzinfo = tz
+    try:
+        now_msk = now_dt.astimezone(tzinfo)
+    except (ValueError, OverflowError):
+        now_msk = now_dt
+    today = now_msk.strftime("%Y-%m-%d")
+
+    suppressed = {sig for sig, e in suppression.items()
+                  if isinstance(e, dict) and suppression_filters(e, today)}
+    by_host = {h: 0 for h in HOST_ORDER}
+    severe = {h: False for h in HOST_ORDER}
+    for sig, a in aggs.items():
+        if not isinstance(a, dict):
+            continue
+        if a.get("count_7d", 0) <= 0 or a.get("status") == "resolved":
+            continue
+        if sig in suppressed or a.get("priority") not in ("P0", "P1", "P2"):
+            continue
+        host = _host_of(a)
+        by_host[host] += 1
+        if a.get("priority") in ("P0", "P1"):
+            severe[host] = True
+
+    lines = [f"{DIGEST_MARKER} · {now_msk.strftime('%Y-%m-%d %H:%M %Z')}"]
+    for host in HOST_ORDER:
+        lvl = by_host[host]
+        color = "🔴" if severe[host] else ("⚠️" if lvl else "✅")
+        lines.append(f"{color} {host}: {lvl}")
+    if not any(by_host.values()):
+        lines += ["", "✅ Проблем нет"]
+    return "\n".join(lines)
+
+def build_digest(sink, now=None, tz="Europe/Moscow", full=False):
     """→ str: читает sink (aggregates + suppression) и рендерит сводку (Ф-A1).
 
     Переиспользует load_aggregates + load_suppression (единый SSOT-парсер,
     второго парсера suppression нет). Pure — side effects отсутствуют.
+
+    full=False (дефолт) → короткая форма (оператор 02.10.2026: число ошибок по
+    хостам); full=True → подробная (топы/P3-шум/suppression, для weekly/разбора).
     """
     aggs = load_aggregates(sink)
     suppression = load_suppression(sink)
-    return render_digest(aggs, suppression, now=now, tz=tz)
+    if full:
+        return render_digest(aggs, suppression, now=now, tz=tz)
+    return render_digest_short(aggs, suppression, now=now, tz=tz)
 
 
-def cmd_digest(sink, now=None):
-    """CLI --digest: read-only печать сводки (TZ из config digest.tz, дефолт MSK)."""
+def cmd_digest(sink, now=None, full=False):
+    """CLI --digest: read-only печать сводки (TZ из config digest.tz, дефолт MSK).
+
+    full=False → короткая форма (как в TG); full=True → подробная (--full).
+    """
     tz = (load_config(sink).get("digest") or {}).get("tz", "Europe/Moscow")
-    print(build_digest(sink, now=now, tz=tz))
+    print(build_digest(sink, now=now, tz=tz, full=full))
     return 0
 
 
@@ -676,7 +732,9 @@ def main(argv=None):
     ap.add_argument("--top", type=int, default=50, help="сколько сигнатур в --view (дефолт 50)")
     ap.add_argument("--weekly", action="store_true", help="weekly-отчёт (8 секций) + alert_state")
     ap.add_argument("--digest", action="store_true",
-                    help="утренняя сводка по хостам (read-only, Ф-A1/T1-2)")
+                    help="утренняя сводка по хостам (read-only, короткая; Ф-A1/T1-2)")
+    ap.add_argument("--full", action="store_true",
+                    help="подробная форма дайджеста (топы/P3-шум/suppression; с --digest)")
     ap.add_argument("--send-tg", action="store_true", help="отправить отчёт в TG (best-effort)")
     args = ap.parse_args(argv)
 
@@ -689,7 +747,7 @@ def main(argv=None):
                 return 0
             return cmd_weekly(sink, args.send_tg)
     if args.digest:
-        return cmd_digest(sink)
+        return cmd_digest(sink, full=args.full)
     return cmd_view(sink, args.top)  # дефолт = read-only view (E7)
 
 
