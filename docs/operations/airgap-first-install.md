@@ -285,14 +285,18 @@ aikb (`ansible-compat` требует core ≥2.16); НЕ повторять Э5
 stdout/stderr), не дойдя до проверок. Внесено контрактом путей `40840c7`, найдено
 тестом Н11. Фикс: явный `if is_…; then die …; fi; return 0`.
 
-### Ручной добор (только для узла со СТАРЫМ скриптом)
-
-`docker load` уже прошёл — остаётся довести клон:
+### Одной командой: `make update-airgap` (штатный путь)
 
 ```bash
-git -C /opt/mcp-knowledge/mcp-knowledge fetch /var/tmp/update-bundle/<PAKET>/repo.git main
-git -C /opt/mcp-knowledge/mcp-knowledge merge --ff-only FETCH_HEAD
+make -C ansible update-airgap BUNDLE=/var/tmp/update-bundle/mcp-kb-update-<ISO>.tar.gz \
+     SKIP_BACKUP=1                     # + CHECK=1 — сначала dry-run
 ```
+
+Сама распаковывает пакет, берёт playbook **из пакета** (а не из локального клона, который
+на узле устаревает — O24), играет от `inventory/` своего каталога; `SKIP_BACKUP=1` →
+`-e update_skip_backup=true` (пропуск preflight-бэкапа, Н10). Ручной добор клона (только
+для узла со СТАРЫМ скриптом): `git -C <клон> fetch <пакет>/repo.git main && git -C <клон>
+merge --ff-only FETCH_HEAD`.
 
 ### Н9 — `DATA_ROOT` для `backup.sh` при запуске через ansible
 

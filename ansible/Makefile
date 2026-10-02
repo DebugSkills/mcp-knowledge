@@ -9,7 +9,7 @@ VAULT_ARGS := --vault-password-file $(VAULT_PASS_FILE)
 endif
 APB := ansible-playbook -i $(INVENTORY)
 .PHONY: deps test lint check run run-tag vault-create vault-edit \
-        update update-check update-local update-local-check logs events health metrics stats \
+        update update-check update-local update-local-check update-airgap logs events health metrics stats \
         backup backup-verify restore \
         errors errors-report errors-prune errors-cron-cleanup errors-sources
 deps:
@@ -38,21 +38,56 @@ vault-edit:
 # Идемпотентный апдейт кода прода (preflight→pull→build→up→health→migrations).
 # Операторский гейт: НИКОГДА не запускать без просмотра make update-check.
 update:
-	$(APB) playbooks/update.yml $(VAULT_ARGS)
+	$(APB) playbooks/update.yml $(EXTRA_VARS) $(VAULT_ARGS)
 
 # Dry-run апдейта: показать, что изменилось бы (--check --diff).
 update-check:
-	$(APB) playbooks/update.yml --check --diff $(VAULT_ARGS)
+	$(APB) playbooks/update.yml --check --diff $(EXTRA_VARS) $(VAULT_ARGS)
 
 # ─── 038 Ф3: air-gap апдейт из локального пакета (update_source=local) ───
 # Пакет собирает scripts/offline-update.sh pack (make update-bundle). В начале
 # прогона плейбук печатает дрейф образов (локальный .Id ↔ manifest, P2-5).
 # Перед применением ВСЕГДА смотреть update-local-check (dry-run печатает план).
+# EXTRA_VARS — любые доп. -e, напр. EXTRA_VARS="-e update_skip_backup=true" (Н10-обход).
 update-local:
-	$(APB) playbooks/update.yml -e update_source=local -e update_bundle_path=$(BUNDLE) $(VAULT_ARGS)
+	$(APB) playbooks/update.yml -e update_source=local -e update_bundle_path=$(BUNDLE) $(EXTRA_VARS) $(VAULT_ARGS)
 
 update-local-check:
-	$(APB) playbooks/update.yml --check --diff -e update_source=local -e update_bundle_path=$(BUNDLE) $(VAULT_ARGS)
+	$(APB) playbooks/update.yml --check --diff -e update_source=local -e update_bundle_path=$(BUNDLE) $(EXTRA_VARS) $(VAULT_ARGS)
+
+# ─── 038 Ф3+: air-gap одной командой (O24-proof: playbook берётся ИЗ ПАКЕТА) ───
+#   make update-airgap BUNDLE=/var/tmp/update-bundle/mcp-kb-update-<ISO>.tar.gz [SKIP_BACKUP=1] [CHECK=1]
+# Сам делает всё, что раньше требовало рук:
+#   (1) распаковывает пакет (tar.gz или каталог);
+#   (2) достаёт СВЕЖИЕ ansible/ + playbook ИЗ ПАКЕТА (а не из локального клона,
+#       который на узле может быть устаревшим — O24) в $(AIRGAP_WORK)/tree;
+#   (3) играет playbook, inventory — из ЭТОГО каталога ($(CURDIR)/inventory/);
+#   (4) SKIP_BACKUP=1 → -e update_skip_backup=true (пропуск preflight-бэкапа, Н10);
+#       CHECK=1 → --check --diff (dry-run).
+# Код-клон (deploy_root/repo_name) playbook обновляет САМ (git fetch из пакета + ff-only).
+AIRGAP_WORK ?= /var/tmp/airgap-make
+update-airgap:
+	@test -n "$(BUNDLE)" || { echo 'usage: make update-airgap BUNDLE=<пакет.tar.gz|каталог> [SKIP_BACKUP=1] [CHECK=1]'; exit 1; }
+	@set -e; \
+	rm -rf "$(AIRGAP_WORK)"; mkdir -p "$(AIRGAP_WORK)"; \
+	if [ -f "$(BUNDLE)" ]; then tar -xzf "$(BUNDLE)" -C "$(AIRGAP_WORK)"; \
+	  PKG="$$(find "$(AIRGAP_WORK)" -mindepth 1 -maxdepth 1 -type d -name 'mcp-kb-update-*' | head -1)"; \
+	else PKG="$(BUNDLE)"; fi; \
+	[ -f "$$PKG/manifest.json" ] || { echo "нет manifest.json в пакете: $$PKG"; exit 1; }; \
+	OLD_BRANCH="$$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["branch"])' "$$PKG/manifest.json")"; \
+	echo "~~~ пакет: $$PKG (branch=$$OLD_BRANCH)"; \
+	git -C "$(AIRGAP_WORK)/tree" init -q; \
+	git -C "$(AIRGAP_WORK)/tree" fetch -q "$$PKG/repo.git" "$$OLD_BRANCH"; \
+	git -C "$(AIRGAP_WORK)/tree" checkout -q FETCH_HEAD -- ansible; \
+	PB="$(AIRGAP_WORK)/tree/ansible/playbooks/update.yml"; \
+	[ -f "$$PB" ] || { echo "в пакете нет ansible/playbooks/update.yml — пересоберите пакет"; exit 1; }; \
+	echo "~~~ playbook из пакета: $$PB"; \
+	cd "$(AIRGAP_WORK)/tree/ansible" && \
+	ansible-playbook -i "$(CURDIR)/inventory/" playbooks/update.yml \
+	  -e update_source=local -e update_bundle_path="$(BUNDLE)" \
+	  $(if $(filter 1,$(SKIP_BACKUP)),-e update_skip_backup=true,) \
+	  $(if $(CHECK),--check --diff,) \
+	  $(VAULT_ARGS)
 
 # Read-only операции (ops.yml, БЕЗ vault-промпта — плейбук не использует секретов).
 # Примеры:
