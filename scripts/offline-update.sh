@@ -597,25 +597,45 @@ for l in m["layers"]:
     echo "   Дальше (штатно): make -C ansible run-tag PLAYBOOK=playbooks/update.yml ROLE=up HOST=aikb"
 }
 
+# ─── usage — справка (одна точка правды для main и -h/--help) ───
+usage() {
+    echo "Usage: $0 {pack|inspect|verify|apply-stage} …"
+    echo ""
+    echo "  pack [--with-ollama-image] [--with-models] [--commit <sha>] [--out DIR]"
+    echo "       собрать полный пакет обновления (интернет-машина)"
+    echo "  inspect [--check] [--clone DIR] <пакет.tar.gz|каталог>"
+    echo "       отчёт по manifest (--check = sha256+bundle+сверка)"
+    echo "  verify [--clone DIR] <пакет.tar.gz|каталог>"
+    echo "       полная проверка целостности ДО мутаций (rc≠0 = STOP)"
+    echo "  apply-stage <пакет> --clone DIR [--stage DIR] [--models-dir DIR]"
+    echo "       идемпотентное применение: staging + load расходящихся + ff-only merge"
+    echo ""
+    echo "  Флаги pack: --with-externals — deprecated-алиас --with-ollama-image."
+}
+
+# ─── wants_help ARGS… — 0, если среди аргументов есть -h/--help ───
+wants_help() {
+    local a
+    for a in "$@"; do
+        case "$a" in -h|--help) return 0 ;; esac
+    done
+    return 1
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────
+# -h/--help — всегда справка и rc=0 (раньше `verify --help` давало
+# «пакет не найден: --help»: подкоманды не знали про справку)
+if wants_help "$@"; then
+    usage
+    exit 0
+fi
 case "${1:-}" in
     pack)        shift; cmd_pack "$@" ;;
     inspect)     shift; cmd_inspect "$@" ;;
     verify)      shift; cmd_verify "$@" ;;
     apply-stage) shift; cmd_apply_stage "$@" ;;
     *)
-        echo "Usage: $0 {pack|inspect|verify|apply-stage} …"
-        echo ""
-        echo "  pack [--with-ollama-image] [--with-models] [--commit <sha>] [--out DIR]"
-        echo "       собрать полный пакет обновления (интернет-машина)"
-        echo "  inspect [--check] [--clone DIR] <пакет.tar.gz|каталог>"
-        echo "       отчёт по manifest (--check = sha256+bundle+сверка)"
-        echo "  verify [--clone DIR] <пакет.tar.gz|каталог>"
-        echo "       полная проверка целостности ДО мутаций (rc≠0 = STOP)"
-        echo "  apply-stage <пакет> --clone DIR [--stage DIR] [--models-dir DIR]"
-        echo "       идемпотентное применение: staging + load расходящихся + ff-only merge"
-        echo ""
-        echo "  Флаги pack: --with-externals — deprecated-алиас --with-ollama-image."
+        usage
         exit 1
         ;;
 esac

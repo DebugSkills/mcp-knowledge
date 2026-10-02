@@ -271,3 +271,24 @@ class TestWritePathGuardRegression:
         )
         assert r.returncode != 0
         assert "внутрь корпуса" in r.stderr, r.stderr
+
+
+class TestCliHelp:
+    """-h/--help для любой подкоманды → справка и rc=0 (раньше `verify --help`
+    отвечало «ОШИБКА: пакет не найден: --help» — подкоманды не знали про справку)."""
+
+    def test_no_args_shows_usage_rc1(self):
+        r = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True,
+                           timeout=60, check=False)
+        assert r.returncode == 1
+        assert "Usage:" in r.stdout, r.stdout
+
+    def test_help_flag_rc0_for_all_subcommands(self):
+        cases = (["--help"], ["-h"], ["verify", "--help"], ["apply-stage", "-h"],
+                 ["pack", "--help"], ["inspect", "-h"])
+        for argv in cases:
+            r = subprocess.run(["bash", str(SCRIPT), *argv], capture_output=True,
+                               text=True, timeout=60, check=False)
+            assert r.returncode == 0, (argv, r.stdout, r.stderr)
+            assert "Usage:" in r.stdout, argv
+            assert "пакет не найден" not in (r.stdout + r.stderr), argv
