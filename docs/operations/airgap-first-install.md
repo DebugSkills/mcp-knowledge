@@ -253,3 +253,84 @@ aikb (`ansible-compat` требует core ≥2.16); НЕ повторять Э5
 - Перенос (pipe) resumable по частям, но **нельзя запускать два `ship` одновременно**: оба пишут один `.ship-part/<name>.part-*` → sha части не сходится. Запускать одним persistent-процессом; при обрыве — повторить ту же команду.
 - Идемпотентности у `ship` нет: если файл уже лежит в `--dest` с тем же sha, повтор всё равно передаёт заново (~8 мин на 303 МиБ при ≈0,62 МиБ/с).
 - Переиндексация при обновлении **не нужна**: `apply-stage` делает ff-merge кода + `docker load`; модели копируются только при расхождении digest (в логе `SKIP модель`).
+
+---
+
+## 🔧 Находки обновления 2026-10-02 (aikb): Н9 / Н10 / Н11, O24
+
+> Дополнение по следам пакета `mcp-kb-update-20261002T143909Z` (образ — фикс blue-green
+> `673ccd3`, контракт путей изоляции — `40840c7`, DATA_ROOT-фикс — `ea8ea04`).
+> Узкоспецифичные шимы узла (симлинк DATA_ROOT, exclude клона) — в приватном файле.
+
+### Н11 — сверка образа в `apply-stage`: один образ, два ID в разных image store
+
+После `docker load` `apply-stage` сравнивает `docker image inspect .Id` с
+`manifest.images[].id` и падает («после load .Id образа … != manifest …»). Причина —
+**не другой образ**, а разные идентификаторы одного образа в разных image store:
+
+| Store | IMAGE ID | Что это |
+|-------|----------|---------|
+| overlay2, классический (машина сборки: `docker save`-архив, манифест пакета) | **config-digest** | `blobs/sha256/<config>` = `manifest.json.Config`; пример `sha256:31d74e19…5f341` |
+| containerd image store (узел) | **digest OCI-манифеста** | `index.json.manifests[0].digest`; пример `sha256:539358cc…fbbfb` |
+
+При этом `blobs/sha256/<manifest-digest>` → `config.digest` = тот же config-digest —
+это **один и тот же образ**. Проверка даёт ложный отрицательный результат и обрывает
+поток ПОСЛЕ успешного load и ДО git-merge: клон остаётся на прежнем HEAD.
+Диагностика на пакете (распаковать `images/*.tar.gz`): сверить
+`index.json.manifests[0].digest` (manifest digest) и `blobs/sha256/<этот digest>` →
+`config.digest` (config digest) — оба относятся к одному образу; `manifest.json.Config`
+должен указывать на config digest.
+Рекомендация (открытый пункт): сверку делать store-агностично — принимать любой из
+двух digest'ов (в манифест класть оба); при расхождении не обрывать merge клона.
+
+### Ручной добор обновления (apply-stage оборвался на сверке Н11)
+
+`docker load` уже прошёл — остаётся довести клон:
+
+```bash
+cd /opt/mcp-knowledge/mcp-knowledge
+git fetch /var/tmp/update-bundle/<PAKET>/repo.git main
+git merge --ff-only FETCH_HEAD
+git rev-parse --short HEAD
+docker compose up -d --force-recreate mcp-server   # по желанию: образ уже тот же
+```
+
+### Н9 — `DATA_ROOT` для `backup.sh` при запуске через ansible
+
+Симптом: `ERROR: Snapshot file not found: <клон>/data/qdrant/snapshots/…` в preflight-таске
+бэкапа `update.yml`. Причина: `scripts/backup.sh` берёт `DATA_ROOT="${DATA_ROOT:-$PROJECT_DIR/data}"`
+(`backup.sh:15`), а таска не передавала `environment.DATA_ROOT` — данные живут ВНЕ клона
+(`data_root`, напр. `/opt/mcp-knowledge/data`). Исправлено в `ea8ea04`: в таске появился
+`environment: DATA_ROOT: "{{ data_root }}"`. Тот же контракт — у `deploy.yml` (cron-env)
+и `ansible/playbooks/backup.yml`.
+
+### Н10 — тихий выход полного `backup.sh` (открытый пункт; трасса code-2026-10-02-bibliography)
+
+Симптом: полный `bash scripts/backup.sh` завершается **RC=1 молча** сразу после блока
+Qdrant-снапшотов: stdout обрывается на «OK: Snapshot validated …», stderr пуст, до
+SSOT-шага не доходит. Причина-класс: `set -euo pipefail` + диспетчер вида
+`[ "$NO_QDRANT" = false ] && create_qdrant_snapshot` (`backup.sh:755`) — не-0 из функции
+делает не-0 весь AND-список и убивает скрипт. Проверено: `backup.sh --no-qdrant` → RC=0
+(SSOT уходит в tar-fallback при отсутствии remote `backup` — штатно для air-gap;
+console/secrets/errors-тары создаются в `$DATA_ROOT/backups`). Правильный паттерн — как у
+console-state: фиксировать RC шага и отдавать его в `exit` в конце, а не прерывать прогон.
+Файл правит другая трасса — здесь только фиксация.
+
+### Dirty-гейт `update.yml` — защита, не баг
+
+Preflight обновления требует **чистый код-клон**; локальные правки → падение. Правильная
+реакция — НЕ stash (вернёт ту же «грязь»):
+- mode-only (` M scripts/…` — смена 100644→100755 при распаковке) →
+  `git -C <клон> config core.fileMode false`;
+- локальные артефакты вроде симлинка `data` (паттерн `.gitignore` `data/` игнорирует
+  только каталоги, а симлинк — файл, без exclude гейт видит `?? data`) →
+  `echo data >> <клон>/.git/info/exclude` (метаданные клона, не содержимое репо).
+Конкретные команды шимов узла — в приватном файле.
+
+### O24 — доставка ansible-части на узел (открытый пункт)
+
+Ansible-клон оператора на aikb — ручная копия, **cut off от GitHub**: фиксы плейбуков до
+узла через git НЕ доходят (факты узла — в приватном файле). Варианты (решить):
+- **(а)** класть ansible-часть в офлайн-пакет;
+- **(б)** запускать плейбуки из app-клона, который пакет обновляет:
+  `ansible-playbook /opt/mcp-knowledge/mcp-knowledge/ansible/playbooks/update.yml -i /root/mcp-knowledge/ansible/inventory …`
