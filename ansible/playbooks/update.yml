@@ -259,7 +259,9 @@
       ansible.builtin.debug:
         msg: >-
           {{ item.item.name }}: локально {{ item.stdout | default('ОТСУТСТВУЕТ') }} ↔
-          пакет {{ item.item.id }} → {{ 'SKIP (совпал)' if (item.stdout | default('')) == item.item.id else 'БУДЕТ ЗАГРУЖЕН' }}
+          пакет {{ item.item.id }}{{ (', ' ~ item.item.digest) if item.item.digest | default('') else '' }} →
+          {{ 'SKIP (совпал)' if ((item.stdout | default('')) == item.item.id
+             or (item.item.digest | default('')) == (item.stdout | default(''))) else 'БУДЕТ ЗАГРУЖЕН' }}
       loop: "{{ image_ids_local.results | default([]) }}"
       loop_control:
         label: "{{ item.item.name }}"
@@ -388,11 +390,18 @@
       when: update_source == 'local'
       ansible.builtin.shell: |
         set -euo pipefail
+        # Н11 (2026-10-02): сверка ID store-агностична. Один образ имеет два ID:
+        # overlay2 store → config-digest (img.id, manifest.images[].id);
+        # containerd image store (прод-узел) → digest OCI-манифеста из index.json
+        # (img.digest). Раньше сравнение только с img.id давало ложный STOP после
+        # успешного docker load (и пост-контроль «не соответствует манифесту»).
+        is_ok() { [ "$1" = "$mid" ] || { [ -n "$mdig" ] && [ "$1" = "$mdig" ]; }; }
         changed=0
         {% for img in (update_manifest.images | default([])) %}
+        mid="{{ img.id }}"; mdig="{{ img.digest | default('') }}"
         local_id="{{ image_ids_local.results[loop.index0].stdout | default('') }}"
-        if [ "$local_id" = "{{ img.id }}" ]; then
-          echo "SKIP {{ img.name }} (.Id совпал)"
+        if is_ok "$local_id"; then
+          echo "SKIP {{ img.name }} (ID совпал с manifest)"
         else
           if [ -n "$local_id" ]; then
             case "{{ img.name }}" in
@@ -404,7 +413,7 @@
           echo "docker load {{ img.name }} ← {{ img.file }}"
           docker load -i "{{ update_staging_dir }}/{{ img.file }}"
           new_id="$(docker image inspect -f '{% raw %}{{.Id}}{% endraw %}' '{{ img.name }}')"
-          [ "$new_id" = "{{ img.id }}" ] || { echo "ОШИБКА: после load .Id != manifest ({{ img.name }})"; exit 1; }
+          is_ok "$new_id" || { echo "ОШИБКА: после load ID != manifest ({{ img.name }}): $new_id не равен ни $mid${mdig:+, ни $mdig}"; exit 1; }
           changed=1
         fi
         {% endfor %}
@@ -420,10 +429,13 @@
       when: update_source == 'local' and not ansible_check_mode
       ansible.builtin.shell: |
         set -euo pipefail
+        # Н11: пост-контроль тоже store-агностичен (см. load-цикл выше).
+        is_ok() { [ "$1" = "$mid" ] || { [ -n "$mdig" ] && [ "$1" = "$mdig" ]; }; }
         fail=0
         {% for img in (update_manifest.images | default([])) %}
+        mid="{{ img.id }}"; mdig="{{ img.digest | default('') }}"
         local_id="$(docker image inspect -f '{% raw %}{{.Id}}{% endraw %}' '{{ img.name }}' 2>/dev/null || true)"
-        [ "$local_id" = "{{ img.id }}" ] || { echo "ОБРАЗ НЕ СООТВЕТСТВУЕТ МАНИФЕСТУ: {{ img.name }} ($local_id != {{ img.id }})"; fail=1; }
+        is_ok "$local_id" || { echo "ОБРАЗ НЕ СООТВЕТСТВУЕТ МАНИФЕСТУ: {{ img.name }} ($local_id != $mid${mdig:+ / $mdig})"; fail=1; }
         {% endfor %}
         exit "$fail"
       args:
