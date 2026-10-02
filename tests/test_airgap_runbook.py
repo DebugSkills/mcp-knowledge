@@ -16,6 +16,8 @@ MARKERS = (
     "bundle-pack", "bundle-ship-usb", "bundle-ship-net",
     "airgap-bundle-unpack.sh", "--data-root", "deploy.yml",
     "/health", "update-local", "0.62 MiB/s", "tmux",
+    # аудит контурной изоляции 2026-10-02: инвариант + guard bootstrap
+    "Инвариант контурной изоляции", "bootstrap_reindex", "data/qdrant",
 )
 
 
@@ -33,7 +35,9 @@ class TestRunbookDoc:
 
     def test_reasonable_length(self):
         n = len(RUNBOOK.read_text(encoding="utf-8").splitlines())
-        assert 80 <= n <= 220, f"ранбук подозрительной длины: {n} строк"
+        # Лимит поднят с 220 до 340 (аудит 2026-10-02): добавлен раздел
+        # «Инвариант контурной изоляции» + шаг «после bootstrap выключить флаг».
+        assert 80 <= n <= 340, f"ранбук подозрительной длины: {n} строк"
 
 
 class TestMakeTarget:

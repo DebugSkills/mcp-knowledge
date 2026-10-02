@@ -154,15 +154,60 @@
           changed_when: compose_result.stdout is search('Started|Running|Creating|Created|Built')
 
         # Свежий узел: startup-reconcile коллекции Qdrant НЕ создаёт (ensure_collection живёт
-        # в cli.py) → /health = degraded 404 `Collection knowledge_public doesn't exist` и
-        # health-гейт ниже падает. Делаем разовый bootstrap-reindex, если коллекций нет.
-        - name: Проверить, есть ли коллекции Qdrant (нужен ли bootstrap-reindex)
+        # в cli.py) → на пустом узле /health = degraded 404. Делаем разовый bootstrap-reindex.
+        #
+        # Guard (аудит контурной изоляции 2026-10-02, Н2): решение «нужен ли reindex» принимаем
+        # по ПРЯМОМУ опросу Qdrant (/collections), а не по app-/health. Прежний guard
+        # `not health.qdrant.ok` не различал «коллекций нет» и «health degraded по любой другой
+        # причине» (embedder/временная недоступность/частичный degraded) → незапрошенный полный
+        # reindex на ЖИВОМ узле (blue-green: атомарный своп алиасов = замещение коллекций).
+        # Теперь reindex выполняется ТОЛЬКО если зональные коллекции (knowledge_public*/
+        # knowledge_private*, включая алиасы) реально ОТСУТСТВУЮТ; при недоступном/неясном
+        # ответе Qdrant — НЕ выполняем (fail-safe: данные/индексы не трогаем).
+        - name: "Опросить Qdrant напрямую: есть ли зональные коллекции (guard bootstrap-reindex)"
           ansible.builtin.uri:
-            url: http://localhost:8000/health
+            url: http://localhost:6333/collections
             return_content: true
-          register: health_pre_reindex
+            timeout: 10
+          register: qdrant_collections
           failed_when: false
           changed_when: false
+          retries: 3
+          delay: 5
+          until: qdrant_collections.status | default(-1) == 200
+
+        - name: Guard — доступность Qdrant по ответу /collections
+          ansible.builtin.set_fact:
+            qdrant_probe_ok: "{{ qdrant_collections.status | default(-1) == 200 }}"
+
+        - name: Guard — зональные коллекции (knowledge_public*/knowledge_private*, включая алиасы)
+          ansible.builtin.set_fact:
+            qdrant_zone_collections: >-
+              {{ (qdrant_collections.content | from_json).result.collections | default([])
+                 | map(attribute='name') | select('match', 'knowledge_(public|private)') | list }}
+          when: qdrant_probe_ok | bool
+
+        - name: "Guard — зональные коллекции уже есть: bootstrap-reindex не нужен"
+          ansible.builtin.debug:
+            msg: >-
+              Зональные коллекции Qdrant уже существуют
+              ({{ qdrant_zone_collections | join(', ') }}) — bootstrap-reindex пропущен
+              (индексы не трогаем).
+          when:
+            - mcp_kb_docker__bootstrap_reindex | default(false)
+            - qdrant_probe_ok | bool
+            - (qdrant_zone_collections | default([]) | length) > 0
+
+        - name: "Guard — Qdrant недоступен/ответ неясен: fail-safe (reindex НЕ выполняем)"
+          ansible.builtin.debug:
+            msg: >-
+              Qdrant /collections недоступен или ответ неясен
+              (status={{ qdrant_collections.status | default('n/a') }}). bootstrap-reindex
+              ПРОПУЩЕН — fail-safe: данные/индексы не трогаем. После стабилизации Qdrant
+              запустите reindex вручную (RUNBOOK Шаг 6).
+          when:
+            - mcp_kb_docker__bootstrap_reindex | default(false)
+            - not (qdrant_probe_ok | bool)
 
         - name: Bootstrap-reindex (создать коллекции Qdrant на свежем узле)
           ansible.builtin.command:
@@ -172,7 +217,8 @@
           changed_when: bootstrap_reindex_result.rc == 0
           when:
             - mcp_kb_docker__bootstrap_reindex | default(false)
-            - not (health_pre_reindex.json.checks.qdrant.ok | default(false))
+            - qdrant_probe_ok | bool
+            - (qdrant_zone_collections | default([]) | length) == 0
 
         - name: Проверить health mcp-server
           ansible.builtin.uri:

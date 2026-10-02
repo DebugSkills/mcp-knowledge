@@ -18,6 +18,13 @@
 #
 # Идемпотентность — критерий приёмки: повторный прогон без изменений =
 # 0 мутаций (docker load no-op / skip), контейнеры НЕ рестартят (up здесь нет).
+#
+# ═══ ИНВАРИАНТ КОНТУРНОЙ ИЗОЛЯЦИИ (аудит 2026-10-02) ═══
+# Скрипт пишет ТОЛЬКО в: (1) клон кода (git fetch/merge --ff-only),
+# (2) docker (load образов), (3) models-dir (модели), (4) staging (распаковка пакета).
+# НИКОГДА в corpus (репозиторий `…/knowledge`, структура universal/) и в data/qdrant
+# (индекс) — документы и индексы у dev и prod СВОИ, между контурами едут только код и
+# модели. Runtime-защита путей записи — guard_write_path() в cmd_apply_stage.
 # =============================================================================
 set -euo pipefail
 
@@ -47,6 +54,33 @@ die() { echo "ОШИБКА: $*" >&2; exit 1; }
 # info → stderr: stdout занят данными (verify_pkg возвращает target_commit через
 # command substitution — диагностика не должна загрязнять захват, 038 Ф5)
 info() { echo "[offline-update] $*" >&2; }
+
+# ─── is_corpus_or_index_path PATH — маркер «внутри корпуса/индекса» (НЕ hardcode) ───
+# Корпус знаний — git-репо `…/knowledge` (basename == knowledge) ИЛИ каталог с
+# категорийной структурой корпуса (маркер-подкаталог universal/). Индекс — data/qdrant.
+# Проверка по маркерам, без абсолютных путей. 0 (true) = путь внутри корпуса/индекса.
+is_corpus_or_index_path() {
+    local p="$1" abs base
+    [ -n "$p" ] || return 1
+    abs="$(cd "$p" 2>/dev/null && pwd || true)"
+    [ -n "$abs" ] || abs="$p"
+    base="$(basename "$abs")"
+    [ "$base" = "knowledge" ] && return 0            # корпус-репо …/knowledge
+    [ -d "$abs/universal" ] && return 0              # маркер структуры корпуса
+    case "$abs" in
+        */data/qdrant|*/data/qdrant/*) return 0 ;;   # индекс Qdrant
+    esac
+    return 1
+}
+
+# ─── guard_write_path LABEL PATH — runtime-защита: путь записи НЕ в корпус/индекс ───
+guard_write_path() {
+    local label="$1" p="$2"
+    [ -n "$p" ] || return 0
+    is_corpus_or_index_path "$p" && die "$label '$p' ведёт внутрь корпуса/индекса \
+(knowledge / universal/ / data/qdrant) — offline-update переносит ТОЛЬКО код и модели; \
+документы и индексы НЕ трогает. STOP."
+}
 
 # ─── manifest_field FILE KEY [SUBKEY IDX] — значение из manifest.json ───
 manifest_field() {
@@ -402,6 +436,7 @@ cmd_apply_stage() {
     [ -n "$clone" ] || die "apply-stage: обязателен --clone <каталог git-клона>"
     [ -d "$clone/.git" ] || die "--clone ($clone) не git-репозиторий"
     clone="$(cd "$clone" && pwd)"   # abs: далее git -C "$clone" меняет CWD вызова
+    guard_write_path "--clone" "$clone"
 
     local src="${args[0]}" pkg
     if [ -d "$src" ]; then
@@ -410,6 +445,7 @@ cmd_apply_stage() {
         [ -n "$stage" ] || stage="$(dirname "$src")/update-staging"
         mkdir -p "$stage"
         stage="$(cd "$stage" && pwd)"   # abs: пути к bundle от клона не сломаются
+        guard_write_path "--stage" "$stage"
         pkg="$stage/$(basename "${src%.tar.gz}")"
         if [ ! -f "$pkg/manifest.json" ]; then
             info "Распаковка $src → $stage …"
@@ -474,6 +510,7 @@ cmd_apply_stage() {
     # ── модели (если в пакете): копирование только при расхождении digest ──
     if [ -d "$pkg/models/manifests" ]; then
         [ -n "$models_dir" ] || models_dir="$(ollama_models_dir)"
+        guard_write_path "--models-dir" "$models_dir"
         if [ -z "$models_dir" ]; then
             echo "WARN: в пакете есть модели, но каталог Ollama не найден — передайте --models-dir." >&2
         else

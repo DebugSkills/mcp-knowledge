@@ -38,8 +38,11 @@ data_root: /opt/mcp-knowledge/data
 # ─── air-gap (aikb): сборка образов невозможна без pypi/DNS ───
 # Образы приходят из офлайн-бандла (docker load) → сборку пропускаем.
 mcp_kb_docker__build: false
-# Свежий узел: startup-reconcile не создаёт коллекции Qdrant → разовый reindex на первом деплое.
-mcp_kb_docker__bootstrap_reindex: true
+# bootstrap-reindex выполнен 2026-10-02 (Э6-Э8); для свежего узла включать вручную
+# (true), после первого успешного reindex — выключать (false). Оставленный true на
+# живом узле несёт риск незапрошенного полного reindex при повторном deploy.yml
+# (аудит контурной изоляции 2026-10-02, Н1/Н2).
+mcp_kb_docker__bootstrap_reindex: false
 
 # ─── LAN / TLS-фасад kb-console (трасса 030/033-F2; aikb — своя локальная сеть) ───
 # Проверено 2026-09-29: enp13s0 UP 192.168.10.253/24, шлюз 192.168.10.1, DNS 192.168.10.254.

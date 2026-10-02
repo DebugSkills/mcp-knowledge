@@ -412,6 +412,50 @@
       changed_when: false
       # В --check load скипнут — проверять нечего (образы старые/отсутствуют = план).
 
+    # ════════════════════ модели (local, если в пакете; 038 §5.2.6) ════════════════════
+    # O13 (аудит контурной изоляции 2026-10-02): блок моделей перенесён ВЫШЕ таски `up`,
+    # после load-пост-проверки. Раньше он стоял ПОСЛЕ `up`+`health`: контейнеры поднимались
+    # на старой модели, health давал зелёный → false-green «обновление завершено», а модель
+    # активировалась только при следующем рестарте. Теперь модель активна сразу на `up`.
+    - name: "Models: локальный digest манифеста модели (read-only)"  # noqa: command-instead-of-module
+      tags: [preflight]
+      when: update_source == 'local' and (update_manifest.models | default([]) | length) > 0
+      ansible.builtin.command:
+        cmd: sha256sum {{ data_root }}/ollama/models/manifests/registry.ollama.ai/library/{{ item.name }}/latest
+      loop: "{{ update_manifest.models }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: model_digest_local
+      changed_when: false
+      failed_when: false   # модели может ещё не быть — это «будет установлена»
+      check_mode: false   # safe in check: read-only факт
+
+    - name: "Models: манифест модели — copy только при расхождении digest (идемпотентен сам)"
+      tags: [load]
+      when: update_source == 'local' and (update_manifest.models | default([]) | length) > 0
+      ansible.builtin.copy:
+        src: "{{ update_staging_dir }}/models/manifests/registry.ollama.ai/library/{{ item.name }}/latest"
+        dest: "{{ data_root }}/ollama/models/manifests/registry.ollama.ai/library/{{ item.name }}/latest"
+        mode: '0644'
+      loop: "{{ update_manifest.models }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: model_manifest_copy
+
+    - name: "Models: blobs — только если манифест обновился (cp -an не перезаписывает)"  # noqa: command-instead-of-module
+      tags: [load]
+      when:
+        - update_source == 'local'
+        - (update_manifest.models | default([]) | length) > 0
+        - model_manifest_copy.results[midx] is changed
+      ansible.builtin.command:
+        cmd: cp -an {{ update_staging_dir }}/models/blobs/. {{ data_root }}/ollama/models/blobs/
+      loop: "{{ update_manifest.models }}"
+      loop_control:
+        index_var: midx
+        label: "{{ item.name }}"
+      changed_when: true   # выполняется только когда манифест реально сменился
+
     # ════════════════════ up ════════════════════
     - name: "Up: перезапустить стек (up -d --wait)"
       tags: [up]
@@ -474,46 +518,6 @@
           qdrant: "{{ h_qdrant.status }}"
           ollama: "{{ h_ollama.status }}"
           kb-console: "{{ h_console.status }} (200/401 — жив)"
-
-    # ════════════════════ модели (local, если в пакете; 038 §5.2.6) ════════════════════
-    - name: "Models: локальный digest манифеста модели (read-only)"  # noqa: command-instead-of-module
-      tags: [preflight]
-      when: update_source == 'local' and (update_manifest.models | default([]) | length) > 0
-      ansible.builtin.command:
-        cmd: sha256sum {{ data_root }}/ollama/models/manifests/registry.ollama.ai/library/{{ item.name }}/latest
-      loop: "{{ update_manifest.models }}"
-      loop_control:
-        label: "{{ item.name }}"
-      register: model_digest_local
-      changed_when: false
-      failed_when: false   # модели может ещё не быть — это «будет установлена»
-      check_mode: false   # safe in check: read-only факт
-
-    - name: "Models: манифест модели — copy только при расхождении digest (идемпотентен сам)"
-      tags: [load]
-      when: update_source == 'local' and (update_manifest.models | default([]) | length) > 0
-      ansible.builtin.copy:
-        src: "{{ update_staging_dir }}/models/manifests/registry.ollama.ai/library/{{ item.name }}/latest"
-        dest: "{{ data_root }}/ollama/models/manifests/registry.ollama.ai/library/{{ item.name }}/latest"
-        mode: '0644'
-      loop: "{{ update_manifest.models }}"
-      loop_control:
-        label: "{{ item.name }}"
-      register: model_manifest_copy
-
-    - name: "Models: blobs — только если манифест обновился (cp -an не перезаписывает)"  # noqa: command-instead-of-module
-      tags: [load]
-      when:
-        - update_source == 'local'
-        - (update_manifest.models | default([]) | length) > 0
-        - model_manifest_copy.results[midx] is changed
-      ansible.builtin.command:
-        cmd: cp -an {{ update_staging_dir }}/models/blobs/. {{ data_root }}/ollama/models/blobs/
-      loop: "{{ update_manifest.models }}"
-      loop_control:
-        index_var: midx
-        label: "{{ item.name }}"
-      changed_when: true   # выполняется только когда манифест реально сменился
 
     # ════════════════════ migrations (P1-3 / P1-3в) ════════════════════
     - name: Migrations — diff scripts/ между HEADами  # noqa: command-instead-of-module

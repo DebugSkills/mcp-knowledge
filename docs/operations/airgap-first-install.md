@@ -3,6 +3,30 @@
 > Сборка бандла → перенос → первичная установка на изолированный хост.
 > Единый источник — этот документ: `make airgap-runbook` печатает его целиком.
 
+## Инвариант контурной изоляции (оператор, 2026-10-02)
+
+Деплой/обновление переносят между контурами **ТОЛЬКО код и модели**. Документы (корпус
+знаний) и индексы (данные Qdrant) **НИКОГДА** не переносятся и не затираются — у dev и prod
+**свои документы**.
+
+| Переносится | Никогда не переносится |
+|-------------|------------------------|
+| код (git bundle `repo.git` / ff-merge клона) | корпус (`…/knowledge`, структура `universal/`) |
+| docker-образы (`docker load`) | индекс `data/qdrant` |
+| ollama-модели (`DATA_ROOT/ollama/models`) | документы пользователей |
+
+**Как проверить:**
+- Пакет: `offline-update.sh inspect --check <пакет>` — в `manifest.json` только `images` (образы)
+  и `models` (модели); нет путей с `knowledge/`, `corpus`, `qdrant`.
+- Применение: `offline-update.sh apply-stage` / `ansible update-local` пишут только в клон кода,
+  docker, models-dir, staging — runtime-защита `guard_write_path()` / `is_corpus_or_index_path()`
+  (маркеры `knowledge`, `universal/`, `data/qdrant`) останавливает прогон при указании пути в корпус/индекс.
+- Стражи: `tests/test_airgap_package_content.py` (состав пакета, статика путей),
+  `tests/test_no_infra_leaks.py` (секретность), `tests/test_airgap_runbook.py` (маркеры ранбука).
+- Guard bootstrap-reindex (`ansible/playbooks/deploy.yml`) опрашивает Qdrant напрямую (`GET /collections`)
+  и делает reindex только если зональные коллекции (`knowledge_public*`/`knowledge_private*`, включая
+  алиасы) реально отсутствуют; при недоступном Qdrant — fail-safe (данные не трогаем).
+
 ## Роли и хосты
 
 | Хост | Роль | Заметка |
@@ -129,12 +153,18 @@ cd /root/mcp-knowledge/ansible
 ansible-playbook -i inventory/hosts.yml playbooks/deploy.yml --ask-vault-pass --skip-tags repos
 ```
 
-Флаги air-gap (уже заданы в `host_vars/aikb.yml`, 2026-10-01):
+Флаги air-gap (заданы в `host_vars/aikb.yml`):
 - `mcp_kb_docker__build: false` — образы приходят из бандла (`docker load`); сборка требует pypi/DNS и в контуре падает;
-- `mcp_kb_docker__bootstrap_reindex: true` — плейбук сам делает разовый `python -m mcp_server.cli reindex`, если коллекций
-  Qdrant нет (иначе `/health` = degraded 404 → health-гейт падает).
+- `mcp_kb_docker__bootstrap_reindex: false` — bootstrap уже выполнен 2026-10-02 (Э6-Э8). Для **свежего** узла включите
+  `true` в `host_vars/aikb.yml`, после первого успешного reindex — выключите обратно. Guard опрашивает Qdrant напрямую
+  (`GET /collections`) и делает разовый `python -m mcp_server.cli reindex` только если зональные коллекции отсутствуют;
+  при недоступном Qdrant — fail-safe (пропуск, данные не трогаем).
 
 Ожидаемо: `Health: mcp-server /health` = **200**, cron-секция применена, `PLAY RECAP … failed=0`.
+
+**После bootstrap (свежий узел):** выключить `mcp_kb_docker__bootstrap_reindex` (`true → false`) в
+`ansible/inventory/host_vars/aikb.yml` и закоммитить — оставленный `true` на живом узле несёт риск
+незапрошенного полного reindex при повторном `deploy.yml` (аудит контурной изоляции 2026-10-02, Н1/Н2).
 
 ## Шаг 6 — приёмка KB (aikb)
 
@@ -202,3 +232,24 @@ aikb (`ansible-compat` требует core ≥2.16); НЕ повторять Э5
 - `scripts/airgap-bundle-ship.sh` — перенос (USB / pipe / rsync).
 - `scripts/airgap-bundle-unpack.sh` — распаковка на узле.
 - Критика распаковки — `.boardData.md §6.4`; открытые пункты доски O13/O14.
+
+---
+
+## ✅ Прогон 2026-10-02 (aikb): первое офлайн-обновление — Э8 закрыт
+
+Первый реальный прогон обновления изолированного узла новым образом, **без переиндексации**.
+
+**Что обновляли:** образ `mcp-knowledge-mcp-server` (фикс blue-green алиаса: `_alias_pairs`, атомарный `swap_alias`, `has_points`, правило «target ≠ active») + код-клон.
+
+**Пакет:** подмножество канонного формата (схема как у `offline-update.sh pack`): `manifest.json` (1 образ) + `repo.git` (`git bundle --all`) + `images/mcp-knowledge-mcp-server_latest.tar.gz` + `CHECKSUMS.sha256`; цель `1c68623`; 303 МиБ. Проверка `offline-update.sh verify` → OK; после переноса sha256 пакета на узле совпала байт-в-байт.
+
+**Порядок на узле (root):** `airgap-bundle-unpack.sh --bundle <pkg.tar.gz>` → `tar -xzf <pkg.tar.gz>` → `offline-update.sh apply-stage <DIR> --clone … --models-dir …` → `docker compose up -d --force-recreate mcp-server`.
+
+**Приёмка:** `/health` = `healthy`; `points=41546` (public 37543 + private 4003); алиасы `knowledge_*→*_v2`; `reconcile: checked=8407, reindexed=0, skipped=8407` — **данные не переиндексировались**; `data/qdrant` и корпус не изменялись.
+
+**Грабли прогона (проверено на практике):**
+- Если базовый `python:3.11-slim` удалён из локального стора, а LAN-зеркало реестра отдаёт 5xx — `bundle-pack` падает на резолве базового образа. Лечение: `gunzip -c python-3.11-slim.tar.gz | docker load` перед сборкой (база лежит в старых бандлах).
+- Перезапущенный/упавший `pack` может перезаписать тег своего образа сборкой из **чистого клона** (`.pack-src` = HEAD без локальных правок). Перед сборкой пакета убедиться, что нужный коммит **закоммичен** (`make push` не коммитит — только `git push`!), иначе в пакет уедет старый код.
+- Перенос (pipe) resumable по частям, но **нельзя запускать два `ship` одновременно**: оба пишут один `.ship-part/<name>.part-*` → sha части не сходится. Запускать одним persistent-процессом; при обрыве — повторить ту же команду.
+- Идемпотентности у `ship` нет: если файл уже лежит в `--dest` с тем же sha, повтор всё равно передаёт заново (~8 мин на 303 МиБ при ≈0,62 МиБ/с).
+- Переиндексация при обновлении **не нужна**: `apply-stage` делает ff-merge кода + `docker load`; модели копируются только при расхождении digest (в логе `SKIP модель`).

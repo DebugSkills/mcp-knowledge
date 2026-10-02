@@ -5,7 +5,11 @@
 - логин `ch@`/`ladmin@`;
 - порт прокси `:3128`.
 
-Allowlist — только легитимные случаи (фейковые тестовые фикстуры, wildcard-адрес).
+Allowlist — только легитимные случаи: фейковые тестовые фикстуры, wildcard-адрес,
+документированные плейсхолдеры (jump-логин `ch@jump`), и сам файл стража
+(SELF_EXCLUDE — его собственные TestScanner-фикстуры, не реальная инфраструктура).
+Реальное обнаружение (внешние IPv4, логины ch@/ladmin@, :3128) в остальных трекаемых
+файлах НЕ ослабляется.
 """
 
 import ipaddress
@@ -28,6 +32,13 @@ SAFE_IPS = {"0.0.0.0"}
 IPV4_ALLOW = ("tests/test_errors_lib.py",)
 # тесты используют фейковые фикстуры прокси (10.9.9.9:3128, proxy.local:3128)
 PORT_3128_ALLOW = ("tests/",)
+# Сам страж содержит фейковые данные в TestScanner-фикстурах (1.2.3.4, 8.8.8.8,
+# ch@, ladmin@) — это его собственные юнит-тесты сканера, не реальная инфраструктура.
+# Самореференсный скан давал бы ложные срабатывания на собственных тестовых данных.
+SELF_EXCLUDE = ("tests/test_no_infra_leaks.py",)
+# test_airgap_bundle_ship.py использует фейковый jump-логин `ch@jump` — документированный
+# плейсхолдер `<jump-user>@<jump-host>` (docs/operations/airgap-first-install.private.md.example).
+LOGIN_ALLOW = ("tests/test_airgap_bundle_ship.py",)
 
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 LOGIN_RE = re.compile(r"\b(?:ch|ladmin)@")
@@ -53,6 +64,8 @@ def scan_text(text, path=""):
             continue
         hits.append(f"{path}: внешний IPv4 {ip}")
     for m in LOGIN_RE.finditer(text):
+        if any(path.startswith(p) for p in LOGIN_ALLOW):
+            continue
         hits.append(f"{path}: логин {m.group(0)}")
     if not any(path.startswith(p) for p in PORT_3128_ALLOW):
         for m in PORT_RE.finditer(text):
@@ -83,6 +96,8 @@ class TestNoInfraLeaks:
     def test_tracked_files_clean(self):
         leaks = []
         for rel in _tracked_files():
+            if rel in SELF_EXCLUDE:
+                continue  # сам страж: его фикстуры — собственные юнит-тесты сканера
             text = _read_text(rel)
             if text is not None:
                 leaks.extend(scan_text(text, rel))
