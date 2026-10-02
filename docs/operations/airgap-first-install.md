@@ -256,43 +256,42 @@ aikb (`ansible-compat` требует core ≥2.16); НЕ повторять Э5
 
 ---
 
-## 🔧 Находки обновления 2026-10-02 (aikb): Н9 / Н10 / Н11, O24
+## 🔧 Находки обновления 2026-10-02 (aikb): Н9 / Н10 / Н11 / Н12, O24
 
 > Дополнение по следам пакета `mcp-kb-update-20261002T143909Z` (образ — фикс blue-green
 > `673ccd3`, контракт путей изоляции — `40840c7`, DATA_ROOT-фикс — `ea8ea04`).
 > Узкоспецифичные шимы узла (симлинк DATA_ROOT, exclude клона) — в приватном файле.
 
-### Н11 — сверка образа в `apply-stage`: один образ, два ID в разных image store
+### Н11 — сверка образа в `apply-stage`: один образ, два ID в разных image store ✅
 
-После `docker load` `apply-stage` сравнивает `docker image inspect .Id` с
-`manifest.images[].id` и падает («после load .Id образа … != manifest …»). Причина —
-**не другой образ**, а разные идентификаторы одного образа в разных image store:
+После `docker load` `apply-stage` сравнивал `.Id` с `manifest.images[].id` и падал
+(«после load .Id образа … != manifest …»). Это **не другой образ**, а разные ID одного:
 
 | Store | IMAGE ID | Что это |
 |-------|----------|---------|
-| overlay2, классический (машина сборки: `docker save`-архив, манифест пакета) | **config-digest** | `blobs/sha256/<config>` = `manifest.json.Config`; пример `sha256:31d74e19…5f341` |
-| containerd image store (узел) | **digest OCI-манифеста** | `index.json.manifests[0].digest`; пример `sha256:539358cc…fbbfb` |
+| overlay2 (машина сборки; манифест пакета) | **config-digest** | `blobs/sha256/<config>` = `manifest.json.Config`; пример `sha256:31d74e19…` |
+| containerd image store (узел) | **digest OCI-манифеста** | `index.json.manifests[0].digest`; пример `sha256:539358cc…` |
 
-При этом `blobs/sha256/<manifest-digest>` → `config.digest` = тот же config-digest —
-это **один и тот же образ**. Проверка даёт ложный отрицательный результат и обрывает
-поток ПОСЛЕ успешного load и ДО git-merge: клон остаётся на прежнем HEAD.
-Диагностика на пакете (распаковать `images/*.tar.gz`): сверить
-`index.json.manifests[0].digest` (manifest digest) и `blobs/sha256/<этот digest>` →
-`config.digest` (config digest) — оба относятся к одному образу; `manifest.json.Config`
-должен указывать на config digest.
-Рекомендация (открытый пункт): сверку делать store-агностично — принимать любой из
-двух digest'ов (в манифест класть оба); при расхождении не обрывать merge клона.
+`blobs/sha256/<manifest-digest>` → `config.digest` = тот же config-digest ⇒ один образ.
+Поток обрывался ПОСЛЕ успешного load и ДО git-merge (клон оставался на прежнем HEAD).
+Фикс: `pack` пишет `images[].digest` (из `index.json`), `apply-stage` принимает любой из
+двух ID (`image_id_acceptable`, backward-compatible с пакетами старого формата);
+регресс-тест `tests/test_airgap_image_id_store_agnostic.py`.
 
-### Ручной добор обновления (apply-stage оборвался на сверке Н11)
+### Н12 — `guard_write_path` возвращал rc=1: ложный STOP `apply-stage` без вывода ✅
+
+Функция заканчивалась на `is_corpus_or_index_path "$p" && die …` → при «не корпус»
+последняя команда давала rc=1 ⇒ под `set -e` `apply-stage` падал СРАЗУ (пустые
+stdout/stderr), не дойдя до проверок. Внесено контрактом путей `40840c7`, найдено
+тестом Н11. Фикс: явный `if is_…; then die …; fi; return 0`.
+
+### Ручной добор (только для узла со СТАРЫМ скриптом)
 
 `docker load` уже прошёл — остаётся довести клон:
 
 ```bash
-cd /opt/mcp-knowledge/mcp-knowledge
-git fetch /var/tmp/update-bundle/<PAKET>/repo.git main
-git merge --ff-only FETCH_HEAD
-git rev-parse --short HEAD
-docker compose up -d --force-recreate mcp-server   # по желанию: образ уже тот же
+git -C /opt/mcp-knowledge/mcp-knowledge fetch /var/tmp/update-bundle/<PAKET>/repo.git main
+git -C /opt/mcp-knowledge/mcp-knowledge merge --ff-only FETCH_HEAD
 ```
 
 ### Н9 — `DATA_ROOT` для `backup.sh` при запуске через ansible
