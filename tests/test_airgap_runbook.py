@@ -35,9 +35,10 @@ class TestRunbookDoc:
 
     def test_reasonable_length(self):
         n = len(RUNBOOK.read_text(encoding="utf-8").splitlines())
-        # Лимит поднят с 220 до 340 (аудит 2026-10-02): добавлен раздел
+        # Лимит поднят с 220 до 340 (аудит 2026-10-02), затем до 360 (make-поток)
+        # Раздел «Весь поток — через таргеты make»: pack→ship→update одной командой
         # «Инвариант контурной изоляции» + шаг «после bootstrap выключить флаг».
-        assert 80 <= n <= 340, f"ранбук подозрительной длины: {n} строк"
+        assert 80 <= n <= 360, f"ранбук подозрительной длины: {n} строк"
 
 
 class TestMakeTarget:

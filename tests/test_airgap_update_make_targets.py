@@ -94,3 +94,93 @@ class TestExtraVarsPassthrough:
         plan = make("update-local-check", "BUNDLE=/tmp/pkg.tar.gz",
                     'EXTRA_VARS=-e update_skip_backup=true').stdout
         assert "--check --diff" in plan and "-e update_skip_backup=true" in plan, plan
+
+
+ROOT_MAKEFILE = ROOT / "Makefile"
+PACK_SUBSET = ROOT / "scripts" / "airgap-pack-subset.sh"
+
+
+def make_root(*args, dry_run=True):
+    cmd = ["make", "-C", str(ROOT)]
+    if dry_run:
+        cmd.append("-n")
+    cmd += list(args)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+
+
+class TestInventoryDirOverride:
+    """update-airgap играет от inventory, который задан явно (на узле он приватный,
+    лежит вне репозитория — /root/mcp-knowledge/ansible/inventory)."""
+
+    def test_default_is_makefile_dir(self):
+        plan = make("update-airgap", "BUNDLE=/tmp/pkg.tar.gz").stdout
+        assert f'-i "{ANSIBLE}/inventory/"' in plan, plan
+
+    def test_override_is_used(self):
+        plan = make("update-airgap", "BUNDLE=/tmp/pkg.tar.gz",
+                    "INVENTORY_DIR=/tmp/priv-inv/").stdout
+        assert '-i "/tmp/priv-inv/"' in plan, plan
+        assert f'-i "{ANSIBLE}/inventory/"' not in plan, plan
+
+
+class TestRootTargets:
+    """Корневой Makefile: весь air-gap-поток — через таргеты (pack → ship → update)."""
+
+    def test_airgap_pack_calls_subset_script(self):
+        plan = make_root("airgap-pack", "ARGS=--out /tmp/x").stdout
+        assert "scripts/airgap-pack-subset.sh" in plan and "--out /tmp/x" in plan, plan
+
+    def test_airgap_update_requires_bundle(self, tmp_path):
+        r = make_root("airgap-update", "BUNDLE=", dry_run=False)
+        assert r.returncode != 0
+        assert "usage: make airgap-update BUNDLE=" in (r.stdout + r.stderr), r.stdout
+
+    def test_airgap_update_forwards_flags(self):
+        plan = make_root("airgap-update", "BUNDLE=/tmp/p.tar.gz", "SKIP_BACKUP=1",
+                         "CHECK=1").stdout
+        assert "update-airgap" in plan, plan
+        assert 'BUNDLE="/tmp/p.tar.gz"' in plan, plan
+        assert "SKIP_BACKUP=1" in plan and "CHECK=1" in plan, plan
+        assert "INVENTORY_DIR=" in plan, plan
+
+    def test_airgap_inventory_default_is_private_ansible(self):
+        text = ROOT_MAKEFILE.read_text(encoding="utf-8")
+        assert "airgap-inventory ?=" in text, "нужна переменная выбора inventory узла"
+        plan = make_root("airgap-update", "BUNDLE=/tmp/p.tar.gz").stdout
+        assert 'INVENTORY_DIR="/root/mcp-knowledge/ansible/inventory/"' in plan, plan
+
+    def test_prod_update_local_passes_extra_vars(self):
+        plan = make_root("prod-update-local", "BUNDLE=/tmp/p.tar.gz",
+                         'EXTRA_VARS=-e update_skip_backup=true').stdout
+        assert "-e update_skip_backup=true" in plan, plan
+
+
+class TestSubsetPackerScript:
+    """Пакет-подмножество — постоянный скрипт (был одноразовый /tmp-скрипт)."""
+
+    def test_help_ok_and_usage(self):
+        r = subprocess.run(["bash", str(PACK_SUBSET), "--help"], capture_output=True,
+                           text=True, timeout=60, check=False)
+        assert r.returncode == 0, r.stderr
+        assert "airgap-pack-subset.sh" in r.stdout and "--out" in r.stdout, r.stdout
+
+    def test_unknown_flag_fails(self):
+        r = subprocess.run(["bash", str(PACK_SUBSET), "--nope"], capture_output=True,
+                           text=True, timeout=60, check=False)
+        assert r.returncode != 0
+        assert "неизвестный аргумент" in r.stderr, r.stderr
+
+    def test_executable_and_self_verifies(self):
+        import os as _os
+        assert _os.access(PACK_SUBSET, _os.X_OK), "скрипт должен быть исполняемым"
+        body = PACK_SUBSET.read_text(encoding="utf-8")
+        assert "verify" in body and "offline-update.sh" in body, (
+            "после сборки скрипт обязан самопроверяться штатным верификатором"
+        )
+
+    def test_manifest_has_both_image_ids(self):
+        """id (config-digest) И digest (OCI-манифест) — иначе Н11 вернётся."""
+        body = PACK_SUBSET.read_text(encoding="utf-8")
+        assert '"id": img_id' in body, body
+        assert 'item["digest"] = digest' in body, body
+        assert "index.json" in body, "digest берётся из index.json docker save"

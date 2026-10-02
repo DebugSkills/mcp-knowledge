@@ -285,18 +285,26 @@ aikb (`ansible-compat` требует core ≥2.16); НЕ повторять Э5
 stdout/stderr), не дойдя до проверок. Внесено контрактом путей `40840c7`, найдено
 тестом Н11. Фикс: явный `if is_…; then die …; fi; return 0`.
 
-### Одной командой: `make update-airgap` (штатный путь)
+### Весь поток — через таргеты make (штатный путь)
 
 ```bash
-make -C ansible update-airgap BUNDLE=/var/tmp/update-bundle/mcp-kb-update-<ISO>.tar.gz \
-     SKIP_BACKUP=1                     # + CHECK=1 — сначала dry-run
+# 1) интернет-машина: пакет-подмножество (код + нужные образы, без пересборки)
+make airgap-pack ARGS="--image kb-console:prod --out /media/usb"
+
+# 2) перенос на узел (resumable, докачка частями)
+make bundle-ship-net ARGS="--pipe-via <jump> --src /media/usb \
+     --files 'mcp-kb-update-*.tar.gz' --dest /var/tmp/update-bundle"
+
+# 3) узел: апдейт ОДНОЙ командой (сначала CHECK=1 — dry-run)
+make airgap-update BUNDLE=/var/tmp/update-bundle/mcp-kb-update-<ISO>.tar.gz SKIP_BACKUP=1
 ```
 
-Сама распаковывает пакет, берёт playbook **из пакета** (а не из локального клона, который
-на узле устаревает — O24), играет от `inventory/` своего каталога; `SKIP_BACKUP=1` →
-`-e update_skip_backup=true` (пропуск preflight-бэкапа, Н10). Ручной добор клона (только
-для узла со СТАРЫМ скриптом): `git -C <клон> fetch <пакет>/repo.git main && git -C <клон>
-merge --ff-only FETCH_HEAD`.
+`airgap-update`: распаковывает пакет → достаёт свежие `ansible/`+playbook **из пакета**
+(не из локального клона, который на узле устаревает — O24) → играет от `inventory/`
+(по умолчанию `/root/mcp-knowledge/ansible/inventory/`, переопределяется
+`airgap-inventory=…`) → `SKIP_BACKUP=1` добавляет `-e update_skip_backup=true` (Н10),
+`CHECK=1` — `--check --diff`. Код-клон playbook обновляет сам (`git fetch` из пакета +
+`ff-only`); `INVENTORY_DIR` = где искать inventory, `AIRGAP_WORK` = рабочий каталог.
 
 ### Н9 — `DATA_ROOT` для `backup.sh` при запуске через ansible
 

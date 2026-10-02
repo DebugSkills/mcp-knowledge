@@ -66,6 +66,10 @@ update-local-check:
 #       CHECK=1 → --check --diff (dry-run).
 # Код-клон (deploy_root/repo_name) playbook обновляет САМ (git fetch из пакета + ff-only).
 AIRGAP_WORK ?= /var/tmp/airgap-make
+# Каталог inventory для update-airgap. По умолчанию — рядом с этим Makefile
+# (там hosts.yml и приватный inventory узла); на узле приватный ansible-клон
+# задаётся явно: make ... INVENTORY_DIR=/root/mcp-knowledge/ansible/inventory/
+INVENTORY_DIR ?= $(CURDIR)/inventory/
 update-airgap:
 	@test -n "$(BUNDLE)" || { echo 'usage: make update-airgap BUNDLE=<пакет.tar.gz|каталог> [SKIP_BACKUP=1] [CHECK=1]'; exit 1; }
 	@set -e; \
@@ -83,7 +87,7 @@ update-airgap:
 	[ -f "$$PB" ] || { echo "в пакете нет ansible/playbooks/update.yml — пересоберите пакет"; exit 1; }; \
 	echo "~~~ playbook из пакета: $$PB"; \
 	cd "$(AIRGAP_WORK)/tree/ansible" && \
-	ansible-playbook -i "$(CURDIR)/inventory/" playbooks/update.yml \
+	ansible-playbook -i "$(INVENTORY_DIR)" playbooks/update.yml \
 	  -e update_source=local -e update_bundle_path="$(BUNDLE)" \
 	  $(if $(filter 1,$(SKIP_BACKUP)),-e update_skip_backup=true,) \
 	  $(if $(CHECK),--check --diff,) \

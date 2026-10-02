@@ -116,7 +116,7 @@ prod-verify:
 #        → (носитель)  make update-bundle-verify DIR=/media/…/mcp-kb-update-….tar.gz
 #        → (aikb)      make prod-update-local BUNDLE=/media/…/mcp-kb-update-….tar.gz
 
-.PHONY: update-bundle update-bundle-verify prod-update-local bundle-pack bundle-unpack bundle-ship-usb bundle-ship-net airgap-runbook
+.PHONY: update-bundle update-bundle-verify prod-update-local bundle-pack bundle-unpack bundle-ship-usb bundle-ship-net airgap-runbook airgap-pack airgap-update
 
 update-bundle:  ## 038: собрать пакет offline-обновления (интернет-машина; ARGS="--with-ollama-image --with-models")
 	./scripts/offline-update.sh pack $(ARGS)
@@ -124,8 +124,26 @@ update-bundle:  ## 038: собрать пакет offline-обновления (
 update-bundle-verify:  ## 038: проверка пакета на носителе (sha256 + bundle + manifest)
 	./scripts/offline-update.sh inspect --check $(DIR)
 
-prod-update-local:  ## 038: air-gap апдейт прода из пакета (BUNDLE=…; перед применением — update-local-check)
-	$(MAKE) -C ansible update-local BUNDLE=$(BUNDLE)
+prod-update-local:  ## 038: air-gap апдейт прода из пакета (BUNDLE=… [EXTRA_VARS="-e …"]; перед применением — update-local-check)
+	$(MAKE) -C ansible update-local BUNDLE=$(BUNDLE) $(EXTRA_VARS)
+
+# ─── Air-gap подмножество (038 Ф3+): пакет кода + ТОЛЬКО нужных образов ───
+# Тот же поток, что update-bundle, но без пересборки своих образов и без внешних
+# (qdrant/caddy) и моделей — для узла, где они уже стоят. Manifest несёт и id
+# (config-digest), и digest OCI-манифеста → сверка на узле store-агностична (Н11).
+#   make airgap-pack ARGS="--image kb-console:prod --out /media/usb"
+airgap-pack:  ## Air-gap: пакет-подмножество (код + локальные образы) — ARGS="--image IMG --out DIR"
+	./scripts/airgap-pack-subset.sh $(ARGS)
+
+# ─── Air-gap апдейт узла ОДНОЙ командой: playbook берётся ИЗ ПАКЕТА (O24-proof) ───
+#   make airgap-update BUNDLE=/var/tmp/update-bundle/mcp-kb-update-<ISO>.tar.gz SKIP_BACKUP=1
+# Сам распаковывает пакет, тянет СВЕЖИЕ ansible/ + playbook из пакета, играет от
+# inventory узла; SKIP_BACKUP=1 → -e update_skip_backup=true; CHECK=1 → --check --diff.
+airgap-inventory ?= /root/mcp-knowledge/ansible/inventory/
+airgap-update:  ## Air-gap: апдейт узла одной командой (BUNDLE=… [SKIP_BACKUP=1] [CHECK=1])
+	@test -n "$(BUNDLE)" || { echo 'usage: make airgap-update BUNDLE=<пакет.tar.gz|каталог> [SKIP_BACKUP=1] [CHECK=1]'; exit 1; }
+	$(MAKE) -C ansible update-airgap BUNDLE="$(BUNDLE)" INVENTORY_DIR="$(airgap-inventory)" \
+	  SKIP_BACKUP=$(SKIP_BACKUP) CHECK=$(CHECK)
 
 bundle-pack:  ## 038: полный офлайн-бандл (образы+код+модели+carrier+python-база) — прогресс и лог (ARGS=…)
 	./scripts/airgap-bundle-pack.sh $(ARGS)
