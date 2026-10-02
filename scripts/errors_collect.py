@@ -800,10 +800,20 @@ def _pulled_error_log_row_event(row: dict, kind, source: str):
         persons = int(row.get("persons") or 0)
     except (TypeError, ValueError):
         persons = 0
+    # T1-3b (watchdog, R2.5/P3-4): не-Svyazi источники (source задаётся конфигом
+    # pulled_error_log) могут задавать marker/priority_hint явно. Svyazi-строки
+    # этих полей не имеют → поведение байт-в-байт прежнее (marker="error_log",
+    # priority от persons, message="[Svyazi error_log] {sig}").
+    marker = row.get("marker") or "error_log"
+    priority_hint = row.get("priority_hint") or ("P1" if persons >= 3 else "P2")
+    if marker == "error_log":
+        message = f"[Svyazi error_log] {signature}"
+    else:
+        message = f"[{marker}] {signature}"
     return make_event(
-        ts, source, f"[Svyazi error_log] {signature}",
-        level="ERROR", marker="error_log", error_code=signature,
-        priority_hint="P1" if persons >= 3 else "P2",
+        ts, source, message,
+        level="ERROR", marker=marker, error_code=signature,
+        priority_hint=priority_hint,
     )
 
 
@@ -1073,6 +1083,12 @@ def update_aggregates(sink: Path, events, cfg: dict,
                 a["priority"], a["class"] = "P2", "T"
             elif any(h == "burst" for h, _ in hints):
                 # 008: [GUARD]-маркер с ЯВНЫМ priority_hint="burst" → P1/T (P2-5)
+                a["priority"], a["class"] = "P1", "T"
+            elif any(h == "watchdog_silent" for h, _ in hints):
+                # T1-3b (R2.5): синтетический сигнал watchdog «tick молчит» → P1/T.
+                # Не burst (нет burst_ts/burst-флага — они приходят только из
+                # гварда), не P0 (процесс-оповещатель мёртв, но коллектор жив и
+                # сам доставляет сигнал в обход него).
                 a["priority"], a["class"] = "P1", "T"
             elif routine_all and not p0:
                 # D1: вся сигнатура — ожидаемая рутина ([MCP] ok fast / start,

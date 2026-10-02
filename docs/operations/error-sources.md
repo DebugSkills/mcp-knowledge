@@ -114,8 +114,9 @@
 | script:errors_notify.py | общий TG-sender (016: weekly+алерты) | sink: — | gap: self — ошибки доставки → reports/tg-errors.log (маскировка <token>/<proxy>), не в sink |
 | script:errors_alert.py | немедленные алерты new-P0/burst (016, cron */5) + **`--resolve SIG`** 028-B (немедленная фиксация: обе половины + audit) | sink: — | gap: self — анти-шторм/skip-решения → reports/tg-errors.log + stdout, не в sink |
 | script:errors_tick.py | единый оповещатель (T1-3: new-P0 мгновенно + дайджест 10:00 MSK + weekly Пн; cron */5) | sink: — | gap: self — ошибки доставки → reports/tg-errors.log + stdout, не в sink |
+| script:errors_watchdog.py | независимый watchdog молчания tick (T1-3b: staleness `[CRON] job=tick` > 30 мин → синтетическое P1 `source=watchdog` + короткое TG; cron */15) | sink: errors_collect.py collect_pulled_error_log (incoming/watchdog.jsonl, конфиг `pulled_error_log` source=watchdog) | covered |
 | script:errors_notify_import.sh | sudo-helper notify.json 0600 из /etc/backup-status.env (016, руками оператора) | sink: — | gap: self — имя отсутствующей переменной в stderr (без значений, R5), не в sink |
-| script:errors_cron.sh | cron-инсталлятор **4 джоб** (016 + prune 028-A: Пн 10:33) (--install/--remove/--status, R8-валидация до записи) | sink: — | gap: self — валидационные отказы в stderr, не в sink; сам НЕ в crontab |
+| script:errors_cron.sh | cron-инсталлятор **4 джоб** (T1-4: collector */5 · tick */5 --send-tg · watchdog */15 · prune Пн 10:33) (--install/--remove/--status, R8-валидация до записи) | sink: — | gap: self — валидационные отказы в stderr, не в sink; сам НЕ в crontab |
 | script:errors_prune.py | prune: ретенция + истечение «мёртвых» сигнатур (ручной/make + **cron Пн 10:33** 028-A; dry-run-first, kill-switch, внутренний flock `.prune.lock` — N-3b) | sink: — | gap: self — вывод только в stdout/stderr |
 | script:errors_migrate_keys_027.py | key-migration merge 027 (ручной, dry-run-first; требует остановки cron коллектора) | sink: — | gap: self — вывод только в stdout/stderr; бэкапы+манифест в .trash/ |
 | script:errors_cleanup_cron_legacy.py | 018: one-shot миграция legacy cron-ключей exit=0 (make errors-cron-cleanup / prod-errors-cron-cleanup) | sink: — | gap: self — ручной пост-деплой шаг; backup в .trash/, dry-run по умолчанию |
@@ -130,6 +131,7 @@
 | source_id | источник | sink: путь-механизм | статус |
 |---|---|---|---|
 | source:svyazi_error_log | Svyazi error_log (chpd): структурные JSONL-документы ops_events_query, владелец — трек G (Wave 2) | sink: errors_collect.py collect_pulled_error_log (локальный файл, byte-offset state + детект ротации; сигнатура Svyazi = error_code, message детерминирован без cnt/persons → дедуп/suppression sink совпадают с триажем Svyazi; конфиг `pulled_error_log`=[{path,source,origin}], пусто = выключен) | covered |
+| source:watchdog | синтетические события watchdog (T1-3b): «tick молчит >30 мин» → стабильная сигнатура `watchdog|tick_silent` P1 | sink: errors_collect.py collect_pulled_error_log (incoming/watchdog.jsonl, конфиг `pulled_error_log`=[{path,source:watchdog}]; watchdog дозаписывает источник идемпотентно) | covered |
 
 ## Известные дыры (честный бэклог, канон §9)
 
@@ -255,9 +257,11 @@ dup-пары) и возвращает частичные метрики — он
 
 ## TG-оповещения Error→Rule (code-2026-09-24-016, спека §7 .boardData.md)
 
-**Каналы доставки** (два, один ops-чат из проекта бекапов — те же креды,
-что у check-backup.sh): weekly-отчёт (агрегаты за 7 дней, Пн 10:02) +
-немедленные алерты (каждые 5 мин). Общая точка входа — shared TG-sender
+**Каналы доставки** (один ops-чат из проекта бекапов — те же креды,
+что у check-backup.sh), все — из единого тика `scripts/errors_tick.py`
+(cron `*/5`): **дайджест 1×/сутки после 10:00 MSK** (утренняя сводка по хостам;
+пусто → «✅ Проблем нет») + **немедленные алерты** new-P0/burst + **weekly**
+(Пн 10:00 MSK, с догоном). Общая точка входа — shared TG-sender
 `scripts/errors_notify.py`: чанки ≤4096 без разрыва строк, continue-on-fail
 (ошибки доставки → `reports/tg-errors.log`, не роняют отчёт), маскировка
 `<token>`/`<proxy>` в логах (R5). Каждое сообщение/чанк начинается host-тегом
@@ -268,7 +272,8 @@ dup-пары) и возвращает частичные метрики — он
 `urllib` `ProxyHandler` при непустом `notify["proxy"]`; пустое значение →
 прямой fallback (только локальная отладка). Креды в URL запрещены.
 
-**Алерты (`scripts/errors_alert.py`, cron `*/5`):** new-P0 (первое попадание
+**Алерты (логика — в `errors_tick.py`; `errors_alert.py` — библиотека
+(`alerts_lock`/suppression-парсеры) и ручной запуск):** new-P0 (первое попадание
 сигнатуры с priority P0, окно 10 мин по `first_seen`) и burst (новый инцидент
 `burst_ts` у P0/P1). Не алертятся: suppressed (активная suppression; истёкшая
 или битая `until` не фильтрует — parse-guard) и investigating. **Анти-шторм:**
@@ -280,13 +285,14 @@ cooldown 120 мин/сигнатуру · ≤2 основных + 1 хвост-�
 **Degraded-режим:** нет `notify.json`/токена → «TG: skip» + лог, exit 0,
 стейт алертов НЕ мутируется (алерты «дозреют» после починки доставки).
 
-**Cron (4 строки, `scripts/errors_cron.sh --install`):** collector `*/5`
-(ПЕРВЫМ — данные важнее алертов), alerts `*/5` **с `--send-tg`** (Д4: без
-флага `errors_alert.py` — dry-run, немедленные алерты не уходили бы никогда),
-weekly `2 10 * * 1` **`--weekly --send-tg`** (Д5: без `--weekly`
-`errors_report.py` дефолтит в read-only view — `--send-tg` обрабатывается
-только внутри weekly-режима, отчёт не уходил бы никогда; эталон —
-`ansible/playbooks/errors.yml:71`). Все
+**Cron (4 строки, `scripts/errors_cron.sh --install`; T1-4, code-2026-09-30-errors-digest):**
+collector `*/5` (ПЕРВЫМ — данные важнее алертов) · tick `*/5` **с `--send-tg`**
+(Д4: без флага `errors_tick.py` — dry-run, ни алерты, ни дайджест, ни weekly
+не уходили бы никогда; тик сам решает ветку: alert/digest/weekly/flush-retry) ·
+watchdog `*/15` (T1-3b: молчание tick > 30 мин → синтетический P1 + короткое TG) ·
+prune `33 10 * * 1` (off-grid минута). Legacy-джобы `errors_alert …--send-tg` и
+`errors_report …--weekly` **вынимаются как сироты** (их логика теперь внутри tick).
+Все
 обёрнуты `cron_wrap.sh` → `[CRON] job=… exit=…` строки (exit≠0 → P0-признак
 `cron_nonzero`, см. class:cron_exit выше; exit=0 → канонический
 heartbeat-msg `[CRON] job=<name> exit=0` — dur/ts в сигнатуру/сообщение

@@ -11,21 +11,21 @@
 # Что делает (--install):
 #   1) бэкап текущего crontab в .trash/crontab-backup-<ts>.txt ДО правки (R6);
 #   2) вынимает старый блок/сироты-строки (идемпотентность: 0 дублей);
-#   3) добавляет маркер-блок из 4 джоб (collector */5 ПЕРВЫМ — P3-c, alerts */5
-#      с --send-tg — Д4: без флага errors_alert.py dry-run и алерты не уходят,
-#      weekly Пн 10:02 --weekly --send-tg — Д5: без --weekly errors_report.py
+#   3) добавляет маркер-блок из 4 джоб (T1-4: collector */5 ПЕРВЫМ — P3-c;
+#      tick */5 --send-tg — единый оповещатель new-P0+дайджест+weekly (Д4:
+#      без флага errors_tick.py dry-run и алерты/сводка не уходят);
+#      watchdog */15 — независимый watchdog молчания tick (T1-3b);
 #      prune Пн 10:33 --confirm — 028-A: истечение/resolved-чистка; off-grid
-#      минута (N-3b: не на сетке */5, иначе гонка RMW с collector/alerts);
-#      лок — ВНУТРИ errors_prune.py (A-3), не в cron-строке
-#      дефолтит в read-only view и отчёт не уходит) — все пути абсолютные +
-#      cd BASE, обёртки cron_wrap.sh
+#      минута (N-3b: не на сетке */5, иначе гонка RMW с collector/tick);
+#      лок — ВНУТРИ errors_prune.py (A-3), не в cron-строке)
+#      — все пути абсолютные + cd BASE, обёртки cron_wrap.sh
 #      пишут [CRON]-строки (exit≠0 → P0-признак cron_nonzero, AC-collect-1);
 #   4) R8-валидация блока ДО записи: cd-префикс абсолютный, путь-токены
 #      абсолютные → иначе exit≠0 и crontab НЕ тронут;
-#   5) config-оверлей: cron_logs += 3 наших лог-файла в
-#      $DATA_ROOT/logs/errors/config.json — ТОЛЬКО в реальном режиме (в
-#      --file preview пропущен; python3-merge union, чужие пути R9).
-# --remove: вынимает ТОЛЬКО маркер-блок + строки с нашими 3 скриптами
+#   5) config-оверлей: cron_logs += 4 наших лог-файла (collector/tick/watchdog/
+#      prune) в $DATA_ROOT/logs/errors/config.json — ТОЛЬКО в реальном режиме
+#      (в --file preview пропущен; python3-merge union, чужие пути R9).
+# --remove: вынимает ТОЛЬКО маркер-блок + строки с нашими скриптами
 #      (вне блока), config-оверлей НЕ трогает (логи могут ещё собираться).
 #
 # set -uo pipefail БЕЗ -e: валидационные exit — управляемые.
@@ -44,7 +44,7 @@ validate_file() {  # $1 = файл со строками cron; проверяе�
   local bad=0 line cmd tok
   while IFS= read -r line; do
     case "$line" in ""|\#*) continue ;; esac
-    case "$line" in *errors_collect*|*errors_alert*|*errors_report*|*cron_wrap*) ;; *) continue ;; esac
+    case "$line" in *errors_collect*|*errors_alert*|*errors_report*|*errors_tick*|*errors_watchdog*|*cron_wrap*) ;; *) continue ;; esac
     cmd="$(printf '%s\n' "$line" | awk '{ $1=$2=$3=$4=$5=""; sub(/^ +/,""); print }')"
     if ! printf '%s\n' "$cmd" | grep -qE '^cd /'; then
       echo "R8 FAIL: команда без абсолютного cd: $line" >&2; bad=1; continue
@@ -63,13 +63,16 @@ validate_file() {  # $1 = файл со строками cron; проверяе�
 }
 
 # ── наши 4 джобы (абсолютные пути; collector ПЕРВЫМ — P3-c) ──
+# T1-4: alerts+weekly мигрированы внутрь tick (единый оповещатель); watchdog —
+# независимый наблюдатель молчания tick (T1-3b). Legacy-строки errors_alert
+# --send-tg / errors_report --weekly вынимаются strip_ours как сироты.
 cron_lines() {
   local CRON_DIR="$DATA_ROOT/logs/cron"
   cat <<EOF
 $MARK_BEGIN
 */5 * * * * cd $BASE && bash $BASE/scripts/cron_wrap.sh collector $CRON_DIR/collector.log -- $BASE/.venv/bin/python $BASE/scripts/errors_collect.py >> $CRON_DIR/collector.log 2>&1
-*/5 * * * * cd $BASE && bash $BASE/scripts/cron_wrap.sh alerts $CRON_DIR/alerts.log -- $BASE/.venv/bin/python $BASE/scripts/errors_alert.py --send-tg >> $CRON_DIR/alerts.log 2>&1
-2 10 * * 1 cd $BASE && bash $BASE/scripts/cron_wrap.sh weekly $CRON_DIR/weekly.log -- $BASE/.venv/bin/python $BASE/scripts/errors_report.py --weekly --send-tg >> $CRON_DIR/weekly.log 2>&1
+*/5 * * * * cd $BASE && bash $BASE/scripts/cron_wrap.sh tick $CRON_DIR/tick.log -- $BASE/.venv/bin/python $BASE/scripts/errors_tick.py --send-tg >> $CRON_DIR/tick.log 2>&1
+*/15 * * * * cd $BASE && bash $BASE/scripts/cron_wrap.sh watchdog $CRON_DIR/watchdog.log -- $BASE/.venv/bin/python $BASE/scripts/errors_watchdog.py >> $CRON_DIR/watchdog.log 2>&1
 33 10 * * 1 cd $BASE && bash $BASE/scripts/cron_wrap.sh prune $CRON_DIR/prune.log -- $BASE/.venv/bin/python $BASE/scripts/errors_prune.py --confirm >> $CRON_DIR/prune.log 2>&1
 $MARK_END
 EOF
@@ -80,7 +83,7 @@ strip_ours() {  # stdin → stdout
   awk -v mb="$MARK_BEGIN" -v me="$MARK_END" '
     $0 == mb { inblock = 1 }
     inblock && $0 == me { inblock = 0; next }
-    !inblock && !/errors_(collect|alert|report|prune)\.py|errors_cron\.sh/ { print }
+    !inblock && !/errors_(collect|alert|report|prune|tick|watchdog)\.py|errors_cron\.sh/ { print }
     inblock { next }
   '
 }
@@ -102,7 +105,7 @@ if cfgp.exists():
     except (ValueError, OSError):
         cfg = {}
 cron_dir = data_root / "logs" / "cron"
-ours = [str(cron_dir / f"{n}.log") for n in ("collector", "alerts", "weekly", "prune")]
+ours = [str(cron_dir / f"{n}.log") for n in ("collector", "tick", "watchdog", "prune")]
 cl = list(cfg.get("cron_logs", []))
 for p in ours:
     if p not in cl:
@@ -207,7 +210,7 @@ case "$ACTION" in
     else
       overlay_config "$TS"
     fi
-    echo "[errors_cron] install OK: 4 джобы (collector */5, alerts */5, weekly Пн 10:02, prune Пн 10:33); бэкап: $BACKUP"
+    echo "[errors_cron] install OK: 4 джобы (collector */5, tick */5 --send-tg, watchdog */15, prune Пн 10:33); бэкап: $BACKUP"
     if [ -n "$MODEL_FILE" ]; then
       echo "[errors_cron] режим --file: реальный crontab НЕ тронут (модель: $MODEL_FILE)"
     fi
@@ -220,14 +223,14 @@ case "$ACTION" in
     printf '%s\n' "$CURRENT" | strip_ours | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba' > "$OUT_TMP"
     write_crontab "$OUT_TMP"
     rm -f "$OUT_TMP"
-    echo "[errors_cron] remove OK: маркер-блок + строки errors_{collect,alert,report,prune} вынуты; config-оверлей оставлен; бэкап: $BACKUP"
+    echo "[errors_cron] remove OK: маркер-блок + строки errors_{collect,tick,watchdog,prune} вынуты; config-оверлей оставлен; бэкап: $BACKUP"
     ;;
   status)
     CURRENT="$(read_crontab)"
-    CNT="$(printf '%s\n' "$CURRENT" | grep -cE 'errors_(collect|alert|report|prune)\.py' || true)"
+    CNT="$(printf '%s\n' "$CURRENT" | grep -cE 'errors_(collect|tick|watchdog|prune)\.py' || true)"
     if printf '%s\n' "$CURRENT" | grep -qF "$MARK_BEGIN"; then
       echo "errors-notify cron: установлен (маркер-блок найден, джоб: $CNT)"
-      printf '%s\n' "$CURRENT" | grep -E 'errors_(collect|alert|report|prune)\.py' | sed 's/^/  /'
+      printf '%s\n' "$CURRENT" | grep -E 'errors_(collect|tick|watchdog|prune)\.py' | sed 's/^/  /'
     elif [ "${CNT:-0}" -gt 0 ]; then
       echo "errors-notify cron: ЧАСТИЧНО (строки без маркер-блока: $CNT) — запустите --install для миграции"
     else

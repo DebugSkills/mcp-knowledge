@@ -250,7 +250,7 @@ def fake_crontab_env(tmp_path):
 
 class TestCronInstall:
     def test_install_four_jobs(self, tmp_path):
-        """AC-cron-1 (028-A): 4 джобы в маркер-блоке, collector ПЕРВЫМ (P3-c)."""
+        """AC-cron-1 (T1-4): 4 джобы в маркер-блоке, collector ПЕРВЫМ (P3-c)."""
         cf = tmp_path / "crontab.txt"
         cf.write_text("17 3 * * * /usr/bin/existing-job\n", encoding="utf-8")
         r = sh(CRON_SH, "--install", "--file", str(cf), "--data-root", str(tmp_path / "data"))
@@ -262,22 +262,15 @@ class TestCronInstall:
         b = block[0]
         assert lines[b + 1].startswith("*/5")  # collector */5 ПЕРВЫМ
         assert "errors_collect.py" in lines[b + 1]
-        assert "errors_alert.py" in lines[b + 2]
-        # Д4 (живая свивка 016): alerts-джоба ОБЯЗАНА иметь --send-tg — без
-        # флага errors_alert.py работает в dry-run (печать плана, exit 0) и
-        # немедленные P0/burst-алерты не уходят НИКОГДА.
+        # T1-4: tick-джоба = единый оповещатель --send-tg (new-P0+дайджест+weekly).
+        # Без флага errors_tick.py dry-run и оповещения не уходят (Д4-аналог).
+        assert lines[b + 2].startswith("*/5")
+        assert "errors_tick.py" in lines[b + 2]
         assert "--send-tg" in lines[b + 2], \
-            f"Д4: alerts-джоба без --send-tg (алерты не отправляются): {lines[b + 2]}"
-        assert lines[b + 3].startswith("2 10 * * 1")  # weekly Пн 10:02
-        assert "errors_report.py" in lines[b + 3]
-        # Д5 (живая свивка 016): weekly-джоба ОБЯЗАНА иметь --weekly — без
-        # флага errors_report.py дефолтит в cmd_view (read-only, :392-394),
-        # --send-tg обрабатывается ТОЛЬКО внутри cmd_weekly ⇒ отчёт не
-        # отправлялся бы НИКОГДА.
-        assert "--weekly" in lines[b + 3], \
-            f"Д5: weekly-джоба без --weekly (упадёт в read-only view): {lines[b + 3]}"
-        assert "--send-tg" in lines[b + 3]  # weekly с отправкой (фиксируем)
-        assert lines[b + 3].index("--weekly") < lines[b + 3].index("--send-tg")
+            f"T1-4: tick-джоба без --send-tg (оповещения не уходят): {lines[b + 2]}"
+        # T1-3b: watchdog-джоба */15 — независимый watchdog молчания tick.
+        assert lines[b + 3].startswith("*/15")
+        assert "errors_watchdog.py" in lines[b + 3]
         # 028-A: 4-я джоба prune — off-grid минута 10:33 (N-3b), --confirm обязателен
         # (иначе вечный dry-run), лок — ВНУТРИ errors_prune.py (A-3), не в cron-строке.
         assert lines[b + 4].startswith("33 10 * * 1"), \
@@ -331,15 +324,17 @@ class TestCronInstall:
         assert content.count(MARK_BEGIN) == 1
         assert content.count(MARK_END) == 1
         assert content.count("errors_collect.py") == 1
-        assert content.count("errors_alert.py") == 1
-        assert content.count("errors_report.py") == 1
-        assert content.count("errors_prune.py") == 1  # 028-A
-        assert content.count("--confirm") == 1  # 028-A
-        # Д4: --send-tg ровно 2 (alerts + weekly) — идемпотентность не даёт
-        # дублей флага, а отсутствие обоих = dry-run-дефект класса Д4.
-        assert content.count("--send-tg") == 2
-        # Д5: --weekly ровно 1 (только weekly-джоба, не alerts/collector).
-        assert content.count("--weekly") == 1
+        assert content.count("errors_tick.py") == 1      # T1-4: единый оповещатель
+        assert content.count("errors_watchdog.py") == 1  # T1-3b
+        assert content.count("errors_prune.py") == 1     # 028-A
+        assert content.count("--confirm") == 1           # 028-A
+        # T1-4: legacy-строки alerts/weekly ушли внутрь tick — их в cron НЕ осталось
+        assert content.count("errors_alert.py") == 0
+        assert content.count("errors_report.py") == 0
+        # Д4-аналог: --send-tg ровно 1 (только tick) — идемпотентность не даёт дублей
+        assert content.count("--send-tg") == 1
+        # Д5-аналог: --weekly ровно 0 (weekly решается внутри tick)
+        assert content.count("--weekly") == 0
 
     def test_config_overlay_cron_logs(self, tmp_path):
         """R9 (Д3): config-оверлей cron_logs — ТОЛЬКО в реальном режиме
@@ -356,7 +351,7 @@ class TestCronInstall:
         merged = json.loads(cfgp.read_text())
         cl = merged["cron_logs"]
         assert "/var/log/mcp-backup.log" in cl  # чужое сохранено
-        for name in ("collector", "alerts", "weekly"):
+        for name in ("collector", "tick", "watchdog", "prune"):
             assert any(name in p for p in cl), f"нет {name}.log в cron_logs"
         assert len([p for p in cl if "collector" in p]) == 1  # без дублей
         assert "errors_collect.py" in state.read_text()  # crontab записан
@@ -377,7 +372,7 @@ class TestCronInstall:
         mo = merged.get("cron_marker_only")
         assert isinstance(mo, list), f"нет cron_marker_only в config.json: {merged.keys()}"
         cron_dir = str(dr / "logs" / "cron")
-        for name in ("collector", "alerts", "weekly", "prune"):
+        for name in ("collector", "tick", "watchdog", "prune"):
             assert f"{cron_dir}/{name}.log" in mo, f"нет {name}.log в cron_marker_only: {mo}"
         assert len(mo) == 4, f"ровно 4 собственных лога, без дублей: {mo}"
 
@@ -423,6 +418,44 @@ class TestCronInstall:
         r = sh(CRON_SH, "--remove", "--file", str(cf), "--data-root", str(tmp_path / "data"))
         assert r.returncode == 0, r.stderr
         assert "errors_prune.py" not in cf.read_text(), "028-N-4: strip_ours не знает errors_prune"
+
+    def test_remove_orphan_tick_watchdog_lines(self, tmp_path):
+        """T1-3b/T1-4: сиротские tick/watchdog-строки вне блока вынимаются --remove
+        (strip_ours обязан знать про errors_tick/errors_watchdog)."""
+        cf = tmp_path / "crontab.txt"
+        cf.write_text(
+            "*/5 * * * * cd /x && /x/scripts/errors_tick.py --send-tg\n"
+            "*/15 * * * * cd /x && /x/scripts/errors_watchdog.py\n", encoding="utf-8")
+        r = sh(CRON_SH, "--remove", "--file", str(cf), "--data-root", str(tmp_path / "data"))
+        assert r.returncode == 0, r.stderr
+        content = cf.read_text()
+        assert "errors_tick.py" not in content, "T1-4: strip_ours не знает errors_tick"
+        assert "errors_watchdog.py" not in content, "T1-3b: strip_ours не знает errors_watchdog"
+
+    def test_migrate_legacy_block_to_tick(self, tmp_path):
+        """T1-4: старый 4-джоб-блок (alerts+weekly) → --install даёт новый блок
+        (tick+watchdog), legacy alerts/report не остаются, 0 дублей."""
+        cf = tmp_path / "crontab.txt"
+        legacy = (
+            "# mcp-knowledge errors-notify (code-2026-09-24-016)\n"
+            "*/5 * * * * cd /x && bash /x/scripts/cron_wrap.sh collector /x/logs/cron/collector.log -- /x/.venv/bin/python /x/scripts/errors_collect.py >> /x/logs/cron/collector.log 2>&1\n"
+            "*/5 * * * * cd /x && bash /x/scripts/cron_wrap.sh alerts /x/logs/cron/alerts.log -- /x/.venv/bin/python /x/scripts/errors_alert.py --send-tg >> /x/logs/cron/alerts.log 2>&1\n"
+            "2 10 * * 1 cd /x && bash /x/scripts/cron_wrap.sh weekly /x/logs/cron/weekly.log -- /x/.venv/bin/python /x/scripts/errors_report.py --weekly --send-tg >> /x/logs/cron/weekly.log 2>&1\n"
+            "33 10 * * 1 cd /x && bash /x/scripts/cron_wrap.sh prune /x/logs/cron/prune.log -- /x/.venv/bin/python /x/scripts/errors_prune.py --confirm >> /x/logs/cron/prune.log 2>&1\n"
+            "# mcp-knowledge errors-notify (end)\n"
+        )
+        cf.write_text(legacy, encoding="utf-8")
+        r = sh(CRON_SH, "--install", "--file", str(cf), "--data-root", str(tmp_path / "data"))
+        assert r.returncode == 0, r.stderr
+        content = cf.read_text()
+        assert content.count(MARK_BEGIN) == 1
+        assert content.count(MARK_END) == 1
+        assert "errors_alert.py" not in content, "T1-4: legacy alerts не убрана"
+        assert "errors_report.py" not in content, "T1-4: legacy weekly не убрана"
+        assert "errors_tick.py" in content
+        assert "errors_watchdog.py" in content
+        assert content.count("errors_collect.py") == 1
+        assert content.count("errors_prune.py") == 1
 
     def test_status(self, tmp_path):
         cf = tmp_path / "crontab.txt"
@@ -553,13 +586,13 @@ def _make_target_recipe(name):
 
 
 class TestRunFlagsMatrix:
-    """Д5: `errors_report.py` без `--weekly` дефолтит в read-only cmd_view
-    (:392-394: `if args.weekly … else cmd_view`) — cron-джоба weekly каждую
-    неделю печатала view-список и НИЧЕГО не отправляла (--send-tg живёт
-    только внутри cmd_weekly). Эталон: ansible/playbooks/errors.yml:71
-    `errors_report.py --weekly [--send-tg]`. Матрица флагов каждой джобы
-    и Makefile-таргета — различима, класс «потерянный флаг запуска» не
-    должен переживать тесты."""
+    """T1-4: cron-матрица 4 джоб — collector (сбор, без флагов), tick
+    (единый оповещатель --send-tg: new-P0+дайджест+weekly), watchdog
+    (молчание tick, флагов нет — шлёт сам при детекте), prune (--confirm,
+    off-grid). Матрица флагов каждой джобы и Makefile-таргета — различима,
+    класс «потерянный флаг запуска» не должен переживать тесты.
+    (Legacy-строки errors_alert --send-tg / errors_report --weekly
+    мигрировали внутрь tick — T1-4.)"""
 
     def _jobs(self, tmp_path):
         cf = tmp_path / "crontab.txt"
@@ -568,15 +601,31 @@ class TestRunFlagsMatrix:
         assert r.returncode == 0, r.stderr
         lines = [ln for ln in cf.read_text().splitlines() if ln.strip()]
         b = next(i for i, ln in enumerate(lines) if ln == MARK_BEGIN)
-        return lines[b + 1], lines[b + 2], lines[b + 3]  # collector, alerts, weekly
+        return lines[b + 1], lines[b + 2], lines[b + 3]  # collector, tick, watchdog
 
-    def test_weekly_line_weekly_and_send_tg(self, tmp_path):
-        """Д5: weekly-строка = И --weekly, И --send-tg (порядок --weekly --send-tg)."""
-        _c, _a, weekly = self._jobs(tmp_path)
-        assert "errors_report.py" in weekly
-        assert "--weekly" in weekly, f"Д5: weekly без --weekly → cmd_view: {weekly}"
-        assert "--send-tg" in weekly, f"Д5: weekly без --send-tg → нет доставки: {weekly}"
-        assert weekly.index("--weekly") < weekly.index("--send-tg")
+    def test_tick_line_send_tg(self, tmp_path):
+        """T1-4/Д4-аналог: tick-джоба = --send-tg (без флага tick dry-run —
+        new-P0/дайджест/weekly не уходят), БЕЗ --weekly (weekly внутри tick)."""
+        _c, tick, _w = self._jobs(tmp_path)
+        assert "errors_tick.py" in tick
+        assert "--send-tg" in tick, f"T1-4: tick без --send-tg → dry-run: {tick}"
+        assert "--weekly" not in tick
+        assert "--alert" not in tick
+
+    def test_watchdog_line_no_send_flags(self, tmp_path):
+        """T1-3b: watchdog-джоба = чистый запуск (флагов нет — шлёт сам при
+        детекте молчания через errors_notify), НЕ --send-tg/--weekly."""
+        _c, _t, watchdog = self._jobs(tmp_path)
+        assert "errors_watchdog.py" in watchdog
+        assert "--send-tg" not in watchdog
+        assert "--weekly" not in watchdog
+
+    def test_collector_line_no_send_flags(self, tmp_path):
+        """Матрица: collector = чистый сбор (без --send-tg/--weekly)."""
+        collector, _t, _w = self._jobs(tmp_path)
+        assert "errors_collect.py" in collector
+        assert "--send-tg" not in collector
+        assert "--weekly" not in collector
 
     def test_prune_line_confirm_offgrid(self, tmp_path):
         """028-A: prune-джоба = off-grid минута + --confirm, без флагов доставки."""
@@ -590,20 +639,6 @@ class TestRunFlagsMatrix:
         assert "errors_prune.py" in prune
         assert "--confirm" in prune
         assert "--send-tg" not in prune and "--weekly" not in prune
-
-    def test_alerts_line_send_tg_no_weekly(self, tmp_path):
-        """Матрица: alerts = --send-tg БЕЗ --weekly (алерт, не отчёт)."""
-        _c, alerts, _w = self._jobs(tmp_path)
-        assert "errors_alert.py" in alerts
-        assert "--send-tg" in alerts
-        assert "--weekly" not in alerts
-
-    def test_collector_line_no_send_flags(self, tmp_path):
-        """Матрица: collector = чистый сбор (без --send-tg/--weekly)."""
-        collector, _a, _w = self._jobs(tmp_path)
-        assert "errors_collect.py" in collector
-        assert "--send-tg" not in collector
-        assert "--weekly" not in collector
 
     def test_makefile_errors_report_runs_weekly(self):
         """Д5-страховка: make errors-report обязан звать --weekly — иначе
