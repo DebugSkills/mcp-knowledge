@@ -99,3 +99,57 @@ class TestBackupDataTask:
             "red-control: после удаления DATA_ROOT из копии таски ключ "
             "не должен обнаруживаться"
         )
+
+
+def _play_vars():
+    doc = yaml.load(UPDATE_YML.read_text(encoding="utf-8"), Loader=_PermissiveLoader)
+    return doc[0].get("vars") or {}
+
+
+class TestSkipBackupEscapeHatch:
+    """update_skip_backup (2026-10-02): осознанный пропуск preflight-бэкапа для air-gap.
+
+    Причина: на узле полный `backup.sh` не проходит (Н10 — тихий RC=1), а решение
+    оператора — фуллбек-промежутки не делать. Флаг должен быть ВЫКЛЮЧЕН по умолчанию
+    и громко предупреждать при включении (не тихий обход).
+    """
+
+    def test_default_off(self):
+        v = _play_vars()
+        assert "update_skip_backup" in v, (
+            "в vars update.yml нет update_skip_backup — нечем осознанно пропустить бэкап"
+        )
+        assert v["update_skip_backup"] is False, (
+            "update_skip_backup должен быть выключен по умолчанию, "
+            "получено: " + repr(v["update_skip_backup"])
+        )
+
+    def test_backup_task_guarded_by_flag(self):
+        task = _backup_task()
+        assert task is not None, "таска бэкапа не найдена"
+        when = str(task.get("when", ""))
+        assert "update_skip_backup" in when and "not" in when, (
+            "таска бэкапа должна иметь when: not (update_skip_backup | bool), "
+            "получено: " + repr(when)
+        )
+
+    def test_warn_task_is_loud(self):
+        tasks = _load_tasks()
+        warn = [x for x in tasks if "ПРОПУЩЕН" in str(x.get("name", ""))]
+        assert warn, "нет предупреждающей таски про пропущенный бэкап (тихий обход — нельзя)"
+        task = warn[0]
+        assert "update_skip_backup" in str(task.get("when", "")), (
+            "warn-таска должна срабатывать по update_skip_backup"
+        )
+        msg = str((task.get("ansible.builtin.debug") or {}).get("msg", ""))
+        assert "НЕ выполняется" in msg and ":prev" in msg, (
+            "warn-таска должна явно говорить, что бэкапа не будет, и называть откат :prev"
+        )
+
+    def test_data_root_env_survives_flag(self):
+        """Флаг не должен ослаблять контракт DATA_ROOT, когда бэкап всё-таки идёт."""
+        task = _backup_task()
+        assert task is not None, "таска бэкапа не найдена"
+        assert "DATA_ROOT" in (task.get("environment") or {}), (
+            "DATA_ROOT-контракт Н9 должен сохраняться (флаг — только про пропуск)"
+        )

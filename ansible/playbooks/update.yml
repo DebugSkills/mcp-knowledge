@@ -42,6 +42,8 @@
     update_branch: main
     update_bundle_path: ""      # local: tar.gz или каталог пакета на этом хосте (флешка/диск)
     update_full_backup: false   # true → полный backup.sh; local — принудительно true (038 Q2)
+    update_skip_backup: false  # true → ПРОПУСТИТЬ preflight-бэкап целиком (осознанный air-gap;
+                               # 2026-10-02: фуллбек-промежутки на узле не нужны — решение оператора)
     update_staging_dir: "{{ deploy_root }}/update-staging"   # распаковка пакета (НЕ в клон)
     health_retries: 10          # попыток каждой health-пробы (delay 5с ⇒ до ~50с)
     clone_dir: "{{ deploy_root }}/{{ repo_name }}"
@@ -267,8 +269,19 @@
       ansible.builtin.set_fact:
         update_full_backup_effective: "{{ update_full_backup | bool or update_source == 'local' }}"
 
+    - name: "Preflight: ВНИМАНИЕ — preflight-бэкап ПРОПУЩЕН (update_skip_backup=true)"
+      tags: [preflight]
+      when: update_skip_backup | bool
+      ansible.builtin.debug:
+        msg: >-
+          ⚠️  update_skip_backup=true — preflight-бэкап перед обновлением НЕ выполняется.
+          Осознанный режим air-gap (фуллбек-промежутки не нужны). Откат возможен только
+          rollback-образом :prev (ROLLBACK_IMAGES) и историей git-клона. Флаг выключен по
+          умолчанию: для обычного узла оставьте update_skip_backup=false.
+
     - name: "Preflight: бэкап перед обновлением (local: полный; git: лёгкий)"
       tags: [preflight]
+      when: not (update_skip_backup | bool)
       ansible.builtin.command:
         cmd: >-
           bash scripts/backup.sh
