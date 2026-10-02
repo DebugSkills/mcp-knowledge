@@ -275,6 +275,12 @@
           {{ '' if (update_full_backup_effective | bool) else '--no-qdrant --no-ssot' }}
         chdir: "{{ clone_dir }}"
       changed_when: false
+      # Н9 (аудит 2026-10-02): данные живут ВНЕ клона ({{ data_root }}), поэтому
+      # backup.sh обязан получить DATA_ROOT — иначе default `$PROJECT_DIR/data`
+      # укажет на <клон>/data, и валидация снапшота упадёт «Snapshot file not found».
+      # Тот же контракт, что у deploy.yml (cron-env) и `make prod-backup`.
+      environment:
+        DATA_ROOT: "{{ data_root }}"
 
     # ════════════════════ pull (git) / merge (local) ════════════════════
     - name: Pull — git pull --ff-only из origin, ветка update_branch, только репо кода  # noqa: command-instead-of-module
