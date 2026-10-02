@@ -12,7 +12,8 @@
 #   повторяет те же гейты с честными changed; apply-stage — standalone-путь).
 #
 # Пакет: repo.git (git bundle --all) + images/<slug>.tar.gz (per-image docker
-# save) + models/ (опц.) + manifest.json (target_commit, image .Id, sha256) +
+# save) + models/ (опц.) + manifest.json (target_commit, image .Id + digest
+# OCI-манифеста, sha256) +
 # CHECKSUMS.sha256. Применение идемпотентно: неизменный коммит → skip merge,
 # совпавший .Id образа → skip load, совпавший digest модели → skip копирования.
 #
@@ -77,9 +78,15 @@ is_corpus_or_index_path() {
 guard_write_path() {
     local label="$1" p="$2"
     [ -n "$p" ] || return 0
-    is_corpus_or_index_path "$p" && die "$label '$p' ведёт внутрь корпуса/индекса \
+    # ВАЖНО: явный return 0. Раньше функция заканчивалась на `is_... && die …`, и при
+    # «не корпус» последняя команда давала rc=1 → под `set -e` apply-stage падал сразу
+    # (ложный STOP БЕЗ вывода) — найдено тестом Н11 2026-10-02.
+    if is_corpus_or_index_path "$p"; then
+        die "$label '$p' ведёт внутрь корпуса/индекса \
 (knowledge / universal/ / data/qdrant) — offline-update переносит ТОЛЬКО код и модели; \
 документы и индексы НЕ трогает. STOP."
+    fi
+    return 0
 }
 
 # ─── manifest_field FILE KEY [SUBKEY IDX] — значение из manifest.json ───
@@ -99,6 +106,41 @@ if isinstance(v, list):
 else:
     print(v)
 ' "$file" "$key"
+}
+
+# ─── image_manifest_digest TAR.GZ → digest OCI-манифеста из index.json ───
+# docker save (OCI-layout, docker 25+) кладёт рядом с legacy manifest.json ещё и
+# index.json, где manifests[0].digest — digest OCI-манифеста. В containerd image
+# store именно он становится IMAGE ID (`docker image inspect -f {{.Id}}`), тогда
+# как в overlay2 — config-digest. Пусто, если index.json нет (классический save) —
+# не ошибка, пакет просто остаётся сверяемым только по .Id (Н11).
+image_manifest_digest() {
+    local file="$1"
+    python3 - "$file" <<'PY' 2>/dev/null || true
+import json, sys, tarfile
+try:
+    with tarfile.open(sys.argv[1], "r:gz") as t:
+        for m in t:
+            if m.name == "index.json":
+                print(json.load(t.extractfile(m))["manifests"][0]["digest"])
+                break
+except Exception:
+    pass
+PY
+}
+
+# ─── image_id_acceptable NEW_ID MANIFEST_ID [MANIFEST_DIGEST] ───
+# 0 = ID приемлем. Один и тот же образ имеет два «ID» в зависимости от image store:
+# config-digest (overlay2: manifest.images[].id) и digest OCI-манифеста (containerd:
+# index.json.manifests[0].digest, пишется в manifest как images[].digest). Н11: сверка
+# только по config-digest ложно обрывала apply-stage ПОСЛЕ успешного docker load.
+# Пустой MANIFEST_DIGEST (пакет старого формата) → поведение прежнее.
+image_id_acceptable() {
+    local new_id="$1" mid="$2" mdig="${3:-}"
+    [ -n "$new_id" ] || return 1
+    [ "$new_id" = "$mid" ] && return 0
+    [ -n "$mdig" ] && [ "$new_id" = "$mdig" ] && return 0
+    return 1
 }
 
 # ─── slug IMAGE_NAME → имя файла без / и : ───
@@ -258,14 +300,17 @@ manifest.target_commit. Закоммитьте правки ИЛИ переда�
     # per-image docker save | gzip + факты для manifest
     local tsv="$staging/.images.tsv"; : > "$tsv"
     for img in "${images[@]}"; do
-        local id file bytes sum
+        local id file bytes sum mdig
         id="$(docker image inspect -f '{{.Id}}' "$img")"
         file="images/$(slug "$img").tar.gz"
         info "docker save $img → $file …"
         docker save "$img" | gzip -1 > "$staging/$file"
         bytes="$(stat -c%s "$staging/$file")"
         sum="$(sha256sum "$staging/$file" | awk '{print $1}')"
-        printf '%s\t%s\t%s\t%s\t%s\n' "$img" "$id" "$file" "$sum" "$bytes" >> "$tsv"
+        mdig="$(image_manifest_digest "$staging/$file")"
+        [ -n "$mdig" ] || info "  ($img: index.json без manifests — сверка только по .Id)"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$img" "$id" "$file" "$sum" "$bytes" "$mdig" >> "$tsv"
     done
 
     # git bundle --all (полный: не требует знания prev-HEAD на pack-машине)
@@ -321,10 +366,14 @@ def tsv(path):
     except FileNotFoundError:
         pass
     return rows
-images = [
-    {"name": r[0], "id": r[1], "file": r[2], "sha256": r[3], "bytes": int(r[4])}
-    for r in tsv(f"{staging}/.images.tsv")
-]
+images = []
+for r in tsv(f"{staging}/.images.tsv"):
+    if len(r) < 5:
+        continue
+    item = {"name": r[0], "id": r[1], "file": r[2], "sha256": r[3], "bytes": int(r[4])}
+    if len(r) > 5 and r[5]:
+        item["digest"] = r[5]   # digest OCI-манифеста (containerd-store ID, Н11)
+    images.append(item)
 models = [{"name": r[0], "digest": r[1]} for r in tsv(f"{staging}/.models.tsv")]
 manifest = {
     "tool_version": tool_version,
@@ -461,12 +510,12 @@ cmd_apply_stage() {
 
     # ── docker load только расходящихся (сравнение .Id) ──
     local loaded=0 skipped=0
-    while IFS=$'\t' read -r name id file _sum _bytes; do
+    while IFS=$'\t' read -r name id file _sum _bytes mdig; do
         [ -n "$name" ] || continue
         local local_id=""
         local_id="$(docker image inspect -f '{{.Id}}' "$name" 2>/dev/null || true)"
-        if [ "$local_id" = "$id" ]; then
-            info "SKIP образ $name (.Id совпал)"
+        if image_id_acceptable "$local_id" "$id" "$mdig"; then
+            info "SKIP образ $name (ID совпал с manifest)"
             skipped=$((skipped+1))
             continue
         fi
@@ -477,11 +526,13 @@ cmd_apply_stage() {
                 info "retag $name → ${name%:*}:prev (rollback-образ)"
             fi
         done
-        info "docker load $name ← $file (локальный: ${local_id:-отсутствует}; пакет: $id)"
+        info "docker load $name ← $file (локальный: ${local_id:-отсутствует}; пакет: $id${mdig:+, $mdig})"
         docker load -i "$pkg/$file"
         local new_id
         new_id="$(docker image inspect -f '{{.Id}}' "$name" 2>/dev/null || true)"
-        [ "$new_id" = "$id" ] || die "после load .Id образа $name ($new_id) != manifest ($id)"
+        image_id_acceptable "$new_id" "$id" "$mdig" \
+            || die "после load ID образа $name ($new_id) не совпал ни с manifest.images[].id \
+($id), ни с digest OCI-манифеста (${mdig:-нет}) — загруженный образ действительно чужой. STOP."
         loaded=$((loaded+1))
     done < <(manifest_field "$pkg/manifest.json" images)
     info "образы: загружено $loaded, пропущено (идентичны) $skipped"
