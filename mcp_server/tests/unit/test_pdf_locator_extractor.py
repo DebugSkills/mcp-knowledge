@@ -22,7 +22,7 @@ import json
 import re
 
 import pytest
-from tests.unit._pdf_fixtures import _build_minimal_pdf
+from unit._pdf_fixtures import _build_minimal_pdf
 
 from mcp_server.content.locator import (
     Locator,

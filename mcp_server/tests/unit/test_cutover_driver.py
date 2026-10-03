@@ -344,6 +344,55 @@ class TestTeardownApply:
         assert calls.count("clear_qdrant") == 1  # повторного сноса не было
 
 
+# ── (з) снапшот-хеш: derived/VCS-метаданные НЕ вход ────────────
+
+
+class TestSnapshotHashExcludesDerived:
+    def test_registry_mutation_does_not_invalidate_snapshot(self, tmp_path):
+        # (а) позитив: SQLite-реестр (registry.db*) — derived/rebuildable, не вход.
+        # Его байты меняются между маркером и прогоном → маркер НЕ должен протухать.
+        cfg = _cfg(tmp_path)
+        cfg.knowledge_dir.mkdir(parents=True)
+        ds = DocumentStore(tmp_path / "documents", max_gb=1)
+        ds.put(b"blob-content")
+        driver = CutoverDriver(cfg)
+        write_marker(driver._marker(2), driver._snapshot_input_hash(), step=2, name="snapshot")
+        assert driver._snapshot_marker_valid()
+        # прямое вмешательство в реестр (не трогая контент-блобы)
+        (tmp_path / "documents" / "registry.db").write_bytes(b"tampered-registry-bytes")
+        assert driver._snapshot_marker_valid()
+
+    def test_blob_content_tamper_invalidates_snapshot(self, tmp_path):
+        # (б) негатив-контроль: реальное изменение КОНТЕНТА блоба → маркер невалиден.
+        cfg = _cfg(tmp_path)
+        cfg.knowledge_dir.mkdir(parents=True)
+        ds = DocumentStore(tmp_path / "documents", max_gb=1)
+        put = ds.put(b"original-blob-content")
+        driver = CutoverDriver(cfg)
+        write_marker(driver._marker(2), driver._snapshot_input_hash(), step=2, name="snapshot")
+        assert driver._snapshot_marker_valid()
+        ds._shard_path(put.sha256).write_bytes(b"tampered-blob-content")
+        assert not driver._snapshot_marker_valid()
+
+    def test_knowledge_md_invalidates_but_git_metadata_ignored(self, tmp_path):
+        # (в) knowledge: изменение .md (контент) инвалидирует; .git/ — нет.
+        cfg = _cfg(tmp_path)
+        cfg.knowledge_dir.mkdir(parents=True)
+        cfg.documents_dir.mkdir(parents=True)
+        (cfg.knowledge_dir / "a.md").write_text("hello")
+        driver = CutoverDriver(cfg)
+        write_marker(driver._marker(2), driver._snapshot_input_hash(), step=2, name="snapshot")
+        assert driver._snapshot_marker_valid()
+        (cfg.knowledge_dir / "a.md").write_text("HELLO")
+        assert not driver._snapshot_marker_valid()
+        # снова валидный маркер → служебная запись под .git/ не инвалидирует
+        write_marker(driver._marker(2), driver._snapshot_input_hash(), step=2, name="snapshot")
+        assert driver._snapshot_marker_valid()
+        (cfg.knowledge_dir / ".git").mkdir(parents=True, exist_ok=True)
+        (cfg.knowledge_dir / ".git" / "index").write_text("git-meta-change")
+        assert driver._snapshot_marker_valid()
+
+
 # ── (е) прерывание → перезапуск с маркера ─────────────────────
 
 

@@ -53,7 +53,7 @@ from mcp_server.models import (
 )
 from mcp_server.storage.document_store import DocumentStore
 from mcp_server.tools.search import _format_point
-from tests.unit._pdf_fixtures import _build_minimal_pdf
+from unit._pdf_fixtures import _build_minimal_pdf
 
 SRC_ID_RE = re.compile(r"^src-[0-9a-f]{16}$")
 LOCATOR_KEYS = ("source_id", "locator_kind", "locator_start", "locator_end")

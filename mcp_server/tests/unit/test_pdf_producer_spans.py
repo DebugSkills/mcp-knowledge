@@ -44,7 +44,7 @@ from mcp_server.content.locator import (
 from mcp_server.content.pdf_preprocessor import PDFPreprocessor
 from mcp_server.content.preprocessor import ImportMeta
 from mcp_server.content.source import make_source_id
-from tests.unit._pdf_fixtures import _build_minimal_pdf
+from unit._pdf_fixtures import _build_minimal_pdf
 
 SRC_ID_RE = re.compile(r"^src-[0-9a-f]{16}$")
 

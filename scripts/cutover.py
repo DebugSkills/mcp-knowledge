@@ -32,6 +32,8 @@ __all__ = [
     "CutoverDriver",
     "CutoverError",
     "CutoverRefusal",
+    "checksum_documents",
+    "checksum_knowledge",
     "checksum_tree",
     "gc_on_empty",
     "marker_valid",
@@ -67,8 +69,16 @@ def _hash_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def checksum_tree(path: Path) -> str:
-    """Детерминированный хеш дерева: sorted относительные пути + sha256 контента."""
+def checksum_tree(
+    path: Path, skip: Callable[[Path], bool] | None = None
+) -> str:
+    """Детерминированный хеш дерева: sorted относительные пути + sha256 контента.
+
+    ``skip`` — опциональный предикат (Path -> bool): True = исключить файл из
+    снапшота. Нужен, чтобы вывести из «входа» derived/VCS-метаданные (SQLite-
+    реестр документ-стора, .git/), чьи байты меняются независимо от контента и
+    потому не являются входом снапшота. По умолчанию исключений нет.
+    """
     if not path.exists():
         return sha256_text(f"<missing:{path}>")
     if path.is_file():
@@ -76,8 +86,41 @@ def checksum_tree(path: Path) -> str:
     entries = []
     for p in sorted(path.rglob("*")):
         if p.is_file():
+            if skip is not None and skip(p):
+                continue
             entries.append(f"{p.relative_to(path)}:{_hash_file(p)}")
     return sha256_text("\n".join(entries))
+
+
+# SQLite-реестр документ-стора (derived/rebuildable, см. document_store).
+_SQLITE_REGISTRY_SUFFIXES = (".db", ".db-wal", ".db-shm", ".db-journal")
+
+
+def _is_sqlite_registry_file(p: Path) -> bool:
+    """True для файлов SQLite-реестра (registry.db*): derived/rebuildable, не вход."""
+    return p.name.endswith(_SQLITE_REGISTRY_SUFFIXES)
+
+
+def _is_git_metadata(p: Path) -> bool:
+    """True для файлов под .git/: VCS-метаданные, не контент."""
+    return ".git" in p.parts
+
+
+def checksum_documents(path: Path) -> str:
+    """Хеш контент-адресуемых блобов documents-стора.
+
+    Инвариант маркера = «вход не изменился». SQLite-реестр (registry.db /
+    -wal / -shm / -journal) — derived/rebuildable (см. DocumentStore), его
+    байты меняются между записью маркера и прогоном независимо от контента,
+    поэтому НЕ входят во «вход снапшота». Вход = сами блобы
+    ``data/documents/<ab>/<cd>/<sha256-64>`` — они остаются покрытыми.
+    """
+    return checksum_tree(path, skip=_is_sqlite_registry_file)
+
+
+def checksum_knowledge(path: Path) -> str:
+    """Хеш SSOT-контента knowledge-дерева (исключая .git/ — VCS-метаданные)."""
+    return checksum_tree(path, skip=_is_git_metadata)
 
 
 def read_marker(path: Path) -> Optional[dict]:
@@ -288,9 +331,9 @@ class CutoverDriver:
 
     def _snapshot_input_hash(self) -> str:
         return sha256_text(
-            checksum_tree(self.cfg.knowledge_dir)
+            checksum_knowledge(self.cfg.knowledge_dir)
             + "|"
-            + checksum_tree(self.cfg.documents_dir)
+            + checksum_documents(self.cfg.documents_dir)
         )
 
     def _cmd(self, name: str, cmd: Optional[Callable]) -> Callable:
@@ -345,9 +388,9 @@ class CutoverDriver:
 
     def _teardown_input_hash(self):
         return sha256_text(
-            checksum_tree(self.cfg.knowledge_dir)
+            checksum_knowledge(self.cfg.knowledge_dir)
             + "|"
-            + checksum_tree(self.cfg.documents_dir)
+            + checksum_documents(self.cfg.documents_dir)
             + "|"
             + ",".join(self.cfg.qdrant_collections)
             + "|"

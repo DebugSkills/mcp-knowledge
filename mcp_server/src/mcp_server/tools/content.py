@@ -1047,7 +1047,7 @@ async def extract_pdf_text(params: dict, app_state) -> dict:
             "chars": len(text),
             "source_path": pdf_path,
         }
-    except Exception as exc:  # ruff: noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.error("[EXTRACT_PDF] failed for %s: %s", pdf_path, exc)
         return {"error": f"PDF text extraction failed: {exc}"}
 

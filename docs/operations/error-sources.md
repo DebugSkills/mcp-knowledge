@@ -37,6 +37,9 @@
 | marker:EXTRACT_PDF | mcp-server, 1 сайт | sink: docker logs mcp-knowledge-server → errors_collect.py | covered |
 | marker:EMBED | mcp-server, 1 сайт | sink: docker logs mcp-knowledge-server → errors_collect.py | covered |
 | marker:REQ | kb-console app.py (каждый запрос) | sink: docker logs kb-console → errors_collect.py | covered |
+| marker:DOCUMENTS_CHECK | mcp-server, 4 сайта (documents_integrity.py) | sink: docker logs mcp-knowledge-server → errors_collect.py (source=docker_logs) | covered |
+| marker:REIMPORT | mcp-server, 2 сайта (content.py) | sink: docker logs mcp-knowledge-server → errors_collect.py (source=docker_logs) | covered |
+| marker:SOURCE_REF_INDEX | mcp-server, 4 сайта (source_ref_runtime.py) | sink: docker logs mcp-knowledge-server → errors_collect.py (source=docker_logs) | covered |
 
 ## Классы строк (не маркеры)
 
@@ -59,6 +62,7 @@
 | service:mcp-server | docker-compose.yml `mcp-server` (mcp-knowledge-server) | sink: errors_collect.py docker logs + docker events | covered |
 | service:kb-console | docker-compose.yml `kb-console` (kb-console) | sink: errors_collect.py docker logs + docker events | covered |
 | service:kb-console-tls | docker-compose.yml `kb-console-tls` (Caddy TLS-фасад, трасса 030) | sink: errors_collect.py docker logs + docker events (runtime-логи; per-site access-лог не включён) | covered |
+| service:kb-converter | docker-compose.yml `kb-converter` (mcp-knowledge-converter, sidecar-канонизатор loopback :8660) | sink: — (сайдкар вне docker_logs-сбора) | gap: сайдкар вне docker_logs-сбора; добавить контейнер в config errors_collect при автоматизации |
 | service:qdrant-prod | docker-compose.prod.yml (mcp-qdrant-prod) | sink: — (air-gap-бандл offline-deploy.sh; вне основного деплоя) | gap: air-gap-контур; при переходе на offline-deploy добавить имя в config.json контейнеров (P2-7) |
 | service:ollama-prod | docker-compose.prod.yml (mcp-knowledge-ollama-prod) | sink: — (air-gap-бандл) | gap: air-gap-контур; аналогично qdrant-prod (P2-7) |
 | source:docker_events | docker events die/oom/restart/health_status | sink: errors_collect.py collect_docker_events | covered |
@@ -107,6 +111,8 @@
 | script:airgap-bundle-unpack.sh | 038: распаковка бандла на целевом хосте (docker load идемпотентно + модели в DATA_ROOT), ручной | sink: — | gap: ручной (air-gap-контур вне прода; FAIL → exit≠0 + лог bundle-unpack-<ts>.log) |
 | script:airgap-clean-src.sh | 038: чистая локальная копия (git clone --local) для сборки бандла — хелпер airgap-bundle-pack.sh, ручной | sink: — | gap: ручной (air-gap-контур вне прода; FAIL → exit≠0) |
 | script:airgap-bundle-ship.sh | 038: передача бандла на узел (USB / rsync / pipe-via jump), resumable, ручной | sink: — | gap: ручной (air-gap-контур вне прода; FAIL → exit≠0 + лог ship-<ts>.log) |
+| script:airgap-pack-subset.sh | 038: air-gap ПОДМНОЖЕСТВО-пакет (обновление-дельта), ручной | sink: — | gap: ручной (air-gap-контур вне прода; fail → exit≠0 + лог) |
+| script:cutover.py | blue-green своп алиасов (reindex), разовый деструктив, ручной | sink: — | gap: ручной (разовый деструктив-cutover, запуск оператором; fail → exit≠0 + отчёт) |
 | script:seed_knowledge.py | разовый сид, ручной | sink: — | gap: разовый; через cron_wrap.sh при использовании |
 | script:backfill_sequence_payload.py | миграция payload, ручной | sink: — | gap: ручной; через cron_wrap.sh (конвенция update-флоу) |
 | script:errors_collect.py | сам коллектор (cron */5) | sink: — | gap: self — анти-рекурсия (P2-2); stderr → mcp-errors-collect.log с ротацией |

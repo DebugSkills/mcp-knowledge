@@ -10,7 +10,7 @@ from mcp_server.content.source import (
     make_source_id,
     register_source,
 )
-from mcp_server.models import KnowledgeEntry, KnowledgeFrontmatter
+from mcp_server.models import KnowledgeEntry
 
 
 class _FakeStore:
