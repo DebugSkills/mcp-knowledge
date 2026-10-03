@@ -11,7 +11,7 @@ AC-1 формулируется GIN-only (F2-1): жертва с цикловы�
 
 import importlib.util
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -29,9 +29,10 @@ eg = _load("eg029", "scripts/errors_guard.py")
 er = _load("er029", "scripts/errors_report.py")
 ea = _load("ea029", "scripts/errors_alert.py")
 
-NOW = "2026-09-26T11:00:00Z"
-BURST_TS = "2026-09-26T10:00:00Z"     # в окне 7d
-OLD_TS = "2026-09-01T10:00:00Z"       # окно истекло
+_NOW = datetime.now(timezone.utc)                                  # time-bomb 029-A08: метки относительны реальным часам
+NOW = _NOW.strftime("%Y-%m-%dT%H:%M:%SZ")
+BURST_TS = (_NOW - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")   # в окне 7d
+OLD_TS = (_NOW - timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")      # окно истекло (>7d)
 BURST_CFG = {"guard": {"enabled": True, "burst_abs": 50, "burst_ratio": 10,
                        "burst_window_cycles": 12, "state_ttl_days": 7}}
 
