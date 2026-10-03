@@ -46,6 +46,7 @@ READ_TOOLS: set[str] = {
     "prompts/list",
     "prompts/get",
     "find_fragment",  # Фаза 13.23: поиск секций в книге (read-only)
+    "source_get",  # Ф5b1: явный доступ к Source-записи (гейт по зоне/license)
 }
 
 # ── Write tools (только MCP_WRITE_KEYS) ──────────────────
@@ -65,6 +66,17 @@ WRITE_TOOLS: set[str] = {
     # 006: read-only доступ к sink ошибок Error→Rule. Инфраструктурный тул
     # (не контентный): sink содержит чувствительные данные → admin-only.
     "errors_query",
+    # Ф5b1: read-only агрегаты documents-контура (инфраструктурный тул —
+    # чувствительные цифры стора → admin-only, паттерн errors_query).
+    "documents_stats",
+    # Ф5b2: integrity-проверка + rebuild реестра documents-контура —
+    # инфраструктурные admin-only (паттерн errors_query / documents_stats).
+    "documents_check",
+    "documents_rebuild",
+    # Ф5b3: mark-and-sweep GC + реканонизация Source — инфраструктурные
+    # admin-only (паттерн errors_query / documents_stats / documents_check).
+    "documents_gc",
+    "documents_retry",
 }
 
 # ── Import tools (MCP_IMPORT_KEYS: read + import_content, без delete/reindex) ──
@@ -88,6 +100,11 @@ EDITOR_TOOLS: set[str] = WRITE_TOOLS - {
     "bulk_resolve_issues",
     "bulk_deprecate_duplicates",
     "errors_query",  # 006: read-only sink, admin-only (отклонение E7, спека §0)
+    "documents_stats",  # Ф5b1: read-only агрегаты стора, admin-only (паттерн errors_query)
+    "documents_check",  # Ф5b2: integrity-проверка стора, admin-only
+    "documents_rebuild",  # Ф5b2: rebuild реестра стора, admin-only
+    "documents_gc",  # Ф5b3: mark-and-sweep GC orphan-блобов, admin-only
+    "documents_retry",  # Ф5b3: реканонизация Source, admin-only
 }
 
 # ── W3.3: белый список subscriber-токенов (план two-zone-access §2.3) ──

@@ -20,6 +20,7 @@
 #   - ./knowledge        — Markdown SSOT (read-write: write_knowledge + git)
 #   - ./data/quality     — отчётные артефакты quality
 #   - ./data/dlq         — dead-letter queue
+#   - ./data/documents   — blob-store оригиналов документов (Фаза 0, code-2026-10-02-bibliography)
 # =============================================================================
 
 services:
@@ -97,6 +98,42 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
 
+  # kb-converter — sidecar-канонизатор документных форматов → canonical PDF
+  # (bibliography Ф1, план §4.3). Bridge-сеть (как qdrant/ollama): внутри 0.0.0.0:8660,
+  # наружу — ТОЛЬКО loopback хоста 127.0.0.1:8660 (host-net mcp-server → localhost:8660).
+  kb-converter:
+    build:
+      context: ./kb-converter
+      dockerfile: Dockerfile
+    image: mcp-knowledge-kb-converter:latest   # явное имя (анти-дрейф; air-gap)
+    container_name: mcp-knowledge-converter
+    ports:
+      - "127.0.0.1:8660:8660"                  # loopback хоста ONLY (паттерн qdrant/ollama)
+    environment:
+      - CONVERTER_BIND=0.0.0.0:8660            # паттерн OLLAMA_HOST — иначе docker-proxy не достучится
+      - CONVERTER_MAX_UNPACKED_BYTES=1073741824  # zip-bomb лимит (1 GiB)
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g                           # физический backstop zip-bomb
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8660/health',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: 2
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   mcp-server:
     image: mcp-knowledge-server:prod
     container_name: mcp-knowledge-server
@@ -110,6 +147,7 @@ services:
       - ./data/dlq:/app/data/dlq
       - ./data/quality:/app/data/quality
       - ./data/tokens:/app/data/tokens       # токен-стор (TokenStore): переживает пересоздание контейнера
+      - ./data/documents:/app/data/documents # blob-store оригиналов (Фаза 0): переживает --force-recreate
       # 006: sink «Error → Rule», read-only для контейнера (errors_query).
       # Единственный интерполированный маунт в prod-файле — осознанно: sink живёт
       # в DATA_ROOT-дереве (контракт errors_collect.py:50, ansible рендерит DATA_ROOT
@@ -130,6 +168,8 @@ services:
       - EMBEDDING_MODEL=BAAI/bge-m3
       - QDRANT_URL=http://localhost:6333
       - QDRANT_PREFER_GRPC=false
+      # Канонизатор kb-converter (bibliography Ф1): sidecar на loopback хоста 8660
+      - CONVERTER_URL=http://localhost:8660
     depends_on:
       qdrant:
         condition: service_healthy

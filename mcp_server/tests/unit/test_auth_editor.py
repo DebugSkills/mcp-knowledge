@@ -43,6 +43,11 @@ class TestEditorToolsetDefinition:
             "bulk_resolve_issues",
             "bulk_deprecate_duplicates",
             "errors_query",
+            "documents_stats",
+            "documents_check",
+            "documents_rebuild",
+            "documents_gc",
+            "documents_retry",
         }
 
     def test_editor_tools_exact_content(self):

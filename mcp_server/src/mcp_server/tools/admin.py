@@ -202,6 +202,13 @@ async def set_zone(params: dict, app_state) -> dict:
             f"set_zone: {knowledge_id} → {zone} ({len(updated_children)} sections)"
         )
 
+    # Шаг 5b2 (Ф3b2): availability-индекс — rescan после SSOT-зоны.
+    # public→private обязан отражаться НЕМЕДЛЕННО (план: subscriber получает
+    # 404 без рестарта): least-strict, индекс — кеш SSOT.
+    from .source_ref_runtime import refresh_source_ref_index
+
+    await refresh_source_ref_index(app_state)
+
     # Шаг 5c: удаление из СТАРОЙ коллекции (root + секции, best-effort)
     if qdrant is not None:
         for kid in [knowledge_id, *child_ids]:

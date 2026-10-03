@@ -57,7 +57,7 @@ from .mcp_handler import handle_mcp_request
 from .metrics import metrics_endpoint, set_embed_backend
 from .progress import ImportProgressTracker
 from .rate_limit import TokenBucketLimiter
-from .storage import MarkdownStore, QdrantClient
+from .storage import DocumentStore, MarkdownStore, QdrantClient
 from .token_store import TokenStore  # W3: SSOT токенов двухконтурной модели
 from .tools.content import (  # code-2026-08-11-queue: convert/analyze операции
     _bg_analyze,
@@ -228,6 +228,13 @@ async def lifespan(app: FastAPI):
     store = MarkdownStore()
     app.state.store = store
 
+    # ── bibliography Ф1: blob-store документов (content-addressed + SQLite-реестр) ──
+    # Каталог data/documents монтируется из DATA_ROOT (Ф0); переживает force-recreate.
+    logger.info("📦 Инициализация DocumentStore (documents_dir=%s)...", settings.DOCUMENTS_DIR)
+    app.state.document_store = DocumentStore(
+        settings.DOCUMENTS_DIR, settings.DOCUMENTS_STORE_MAX_GB
+    )
+
     # ── W3.8: Token store (SSOT токенов) + bootstrap seeding ──
     # env-ключи (MCP_READ_KEYS/MCP_IMPORT_KEYS/MCP_WRITE_KEYS) сидятся в сторе
     # как level=read|import|write, zone=both, source=env — идемпотентно по key_hash.
@@ -298,6 +305,17 @@ async def lifespan(app: FastAPI):
     knowledge_index = KnowledgeIndex(store=store)
     app.state.knowledge_index = knowledge_index
 
+    # ── bibliography Ф3b2: SourceRefIndex (in-memory sha256 → Source-refs) ──
+    # Availability-кеш для blob-доступа (least-strict зоны + license fail-closed).
+    # Startup-скан SSOT ДО reconcile: индекс строится из .md (Qdrant не нужен);
+    # fail-safe — ошибка скана оставляет ПУСТОЙ индекс (fail-closed: блобы
+    # недоступны, но не «ложно выданы»). Ведение — write-path-хуки
+    # (ingest/lifecycle/set_zone/update/delete) через tools.source_ref_runtime.
+    from .tools.source_ref_runtime import init_source_ref_index
+
+    app.state.source_ref_index = await init_source_ref_index(store)
+    logger.info("📚 source_ref_index ready: %s", app.state.source_ref_index.size())
+
     # ── C1: Reconciliation при старте (Фаза 2, задача 2.9) ──
     # Фоновая задача: reindex не должен блокировать старт сервера — иначе
     # healthcheck фейлится → docker restart-loop → процесс убивается в D-state
@@ -324,6 +342,9 @@ async def lifespan(app: FastAPI):
                 get_heavy_lock=lambda: app.state.heavy_ops_lock,
                 set_lock_owner=lambda v: setattr(app.state, "heavy_lock_owner", v),
                 get_lock_owner=lambda: getattr(app.state, "heavy_lock_owner", None),
+                # bibliography Ф3c1: integrity Source-refs ↔ blobs после
+                # reindex-цикла (шаг 5 reconcile; fail-safe внутри).
+                document_store=app.state.document_store,
             )
             logger.info(
                 "✅ Reconciliation: checked=%d, reindexed=%d, skipped=%d, orphans=%d, mode=%s",
@@ -602,6 +623,24 @@ async def metrics_route(request: Request):
     return await metrics_endpoint(request)
 
 
+def _import_provenance(rec: dict) -> dict:
+    """Ф5a1: sparse-провенанс canonical из записи очереди → снапшот (additive).
+
+    Ключи добавляются ТОЛЬКО при фактическом значении (никаких None-заглушек);
+    служебные поля (включая `_params`) не пробрасываются (whitelist-рендер).
+    """
+    out: dict = {}
+    if rec.get("source_id"):
+        out["source_id"] = rec["source_id"]
+    if rec.get("canonical_present") is not None:
+        out["canonical_present"] = rec["canonical_present"]
+    if rec.get("canonical_sha256"):
+        out["canonical_sha256"] = rec["canonical_sha256"]
+    if rec.get("canonical_error"):
+        out["canonical_error"] = rec["canonical_error"]
+    return out
+
+
 # 13.9: Live import progress polling endpoint
 @app.get("/imports/{import_id}/progress")
 async def import_progress(import_id: str, request: Request):
@@ -645,6 +684,7 @@ async def import_progress(import_id: str, request: Request):
                         "messages": [],
                         "_source": "queue",
                     }
+                    snapshot.update(_import_provenance(rec))
                     break
 
     if snapshot is None:
@@ -675,6 +715,7 @@ async def import_progress(import_id: str, request: Request):
             "messages": messages,
             "_source": "queue",
         }
+        snapshot.update(_import_provenance(rec))
     elif rec is not None:
         # running-версия: дополняем tracker-поля свежими полями из queue-rec
         if (snapshot.get("result") is None and rec.get("result") is not None):
@@ -683,6 +724,7 @@ async def import_progress(import_id: str, request: Request):
             snapshot["operation_type"] = rec.get("operation_type", "import")
         if snapshot.get("summary_text") is None and rec.get("summary_text"):
             snapshot["summary_text"] = rec["summary_text"]
+        snapshot.update(_import_provenance(rec))
 
     # Нормализация: tracker.done() пишет "summary", queue-rec пишет "result".
     # Клиент всегда читает snapshot["result"].
@@ -1180,3 +1222,240 @@ async def remove_finished_endpoint(request: Request):
 
     logger.info("[IMPORT] removed %d finished from queue", removed)
     return {"removed": removed}
+
+
+# ═══════════════════════════════════════════════════════════════
+# bibliography Ф4a: HTTP-выдача blob — GET/HEAD /documents/{sha256} (план §3.4)
+# ═══════════════════════════════════════════════════════════════
+
+import re as _re
+from urllib.parse import quote as _url_quote
+
+from fastapi import Response as _Response
+from fastapi.responses import JSONResponse as _JSONResponse
+from fastapi.responses import StreamingResponse as _StreamingResponse
+
+from .metrics import documents_served_total
+from .tools.availability import blob_available_indexed
+
+# Строгий формат id: ровно 64 hex-символа в нижнем регистре (§7 R7 — oracle-имени).
+_DOCUMENT_SHA256_RE = _re.compile(r"\A[0-9a-f]{64}\Z")
+
+# Whitelist Content-Type (§3.4:175): только типы, безопасные к inline-отдаче.
+# text/html СОЗНАТЕЛЬНО исключён: прямой браузерный hit на origin mcp-server
+# с inline html исполняет скрипты на нашем origin даже под nosniff — html
+# отдаётся как octet-stream (скачивание, не исполнение).
+_DOCUMENT_MIME_WHITELIST = frozenset({
+    "application/pdf",
+    "application/epub+zip",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "text/plain",
+    "text/markdown",
+})
+_DOCUMENT_DEFAULT_MIME = "application/octet-stream"
+_DOCUMENT_MIME_EXTENSION = {
+    "application/pdf": ".pdf",
+    "application/epub+zip": ".epub",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+    _DOCUMENT_DEFAULT_MIME: ".bin",
+}
+
+# Чанк потоковой отдачи (§3.3:157 — чанковый async-итератор, не FileResponse).
+_DOCUMENT_CHUNK_BYTES = 1024 * 1024
+
+
+def _document_mime(info) -> str:
+    """Канонический Content-Type из строки реестра (whitelist; дефолт octet-stream).
+
+    Параметры (`; charset=…`) срезаются, регистр нормализуется; всё вне
+    whitelist (вкл. None и text/html) → application/octet-stream.
+    """
+    raw = getattr(info, "mime", None) if info is not None else None
+    if not isinstance(raw, str):
+        return _DOCUMENT_DEFAULT_MIME
+    normalized = raw.split(";", 1)[0].strip().lower()
+    return normalized if normalized in _DOCUMENT_MIME_WHITELIST else _DOCUMENT_DEFAULT_MIME
+
+
+def _sanitize_download_name(raw, sha256: str, mime: str) -> tuple[str, str]:
+    """Имя для Content-Disposition: (utf8-имя, ascii-fallback).
+
+    Источник — реестр (original_filename; при rebuild восстанавливается из
+    Source SSOT). Вырезаются control-символы (C0/DEL, вкл. CRLF), кавычки и
+    оба слэша; пустой/враждебный результат → fallback `<sha256><ext>`.
+    """
+    fallback = f"{sha256}{_DOCUMENT_MIME_EXTENSION.get(mime, '.bin')}"
+    if not isinstance(raw, str):
+        return fallback, fallback
+    cleaned = "".join(
+        ch for ch in raw
+        if ord(ch) >= 0x20 and ord(ch) != 0x7F and ch not in '"\\/'
+    ).strip()
+    return (cleaned or fallback), fallback
+
+
+def _content_disposition(name_utf8: str, fallback_ascii: str) -> str:
+    """inline + RFC 5987: ASCII-fallback `filename` + `filename*=UTF-8''…`."""
+    return (
+        f'inline; filename="{fallback_ascii}"; '
+        f"filename*=UTF-8''{_url_quote(name_utf8, safe='')}"
+    )
+
+
+def _parse_range_header(value: str, size: int) -> tuple[int, int] | None:
+    """Разбор ОДНОГО диапазона `bytes=<s>-<e>` (суффикс `-N`, открытый `s-`).
+
+    Returns:
+        (start, end) включительно; None → невалидный (multi-range, не-bytes,
+        s>e, `-0`) или непересекающийся (start ≥ size) → 416.
+    """
+    spec = value.strip()
+    if not spec.lower().startswith("bytes="):
+        return None
+    body = spec[6:].strip()
+    if "," in body or "-" not in body:
+        return None  # multi-range не поддерживается → невалидный
+    first, _, last = body.partition("-")
+    first, last = first.strip(), last.strip()
+    try:
+        if first == "":
+            if not last:
+                return None
+            suffix = int(last)  # bytes=-N — последние N байт
+            if suffix <= 0:
+                return None
+            start, end = max(0, size - suffix), size - 1
+        else:
+            start = int(first)
+            if start < 0:
+                return None
+            end = size - 1 if not last else int(last)
+    except ValueError:
+        return None
+    if start > end or start >= size:
+        return None
+    return start, min(end, size - 1)
+
+
+async def _stream_document(fh, offset: int, length: int):
+    """Чанковый async-итератор по file-object (blocking read → run_in_executor)."""
+    loop = asyncio.get_running_loop()
+    remaining = length
+    try:
+        if offset:
+            await loop.run_in_executor(None, fh.seek, offset)
+        while remaining > 0:
+            chunk = await loop.run_in_executor(
+                None, fh.read, min(_DOCUMENT_CHUNK_BYTES, remaining)
+            )
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+    finally:
+        await loop.run_in_executor(None, fh.close)
+
+
+async def _serve_document(request: Request, sha256: str, *, head: bool):
+    """Единая логика GET/HEAD: валидация → auth → availability → Range → отдача.
+
+    Порядок проверок строго до отдачи тела. 404-семантика (не 403): недоступен/
+    deprecated/отсутствует — не раскрываем существование blob (§3.4:175).
+    """
+    # 1. Синтаксис id → 400 (до auth: ошибка синтаксиса публична, ничего не раскрывает)
+    if _DOCUMENT_SHA256_RE.match(sha256) is None:
+        raise HTTPException(status_code=400, detail="invalid document id")
+
+    # 2. Auth → 401 + WWW-Authenticate (AuthMiddleware кладёт AuthInfo в state)
+    auth = getattr(request.state, "auth", None)
+    if auth is None or not getattr(auth, "authenticated", False):
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": 'ApiKey realm="documents"'},
+        )
+
+    # 3. Availability — ЕДИНЫЙ существующий предикат (не дублируем): blob_exists ∧
+    #    ∃ ref: зона/статус/license fail-closed. Отсутствие контура → fail-closed 404.
+    store = getattr(request.app.state, "document_store", None)
+    index = getattr(request.app.state, "source_ref_index", None)
+    if store is None or index is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    loop = asyncio.get_running_loop()
+    available = await loop.run_in_executor(
+        None,
+        lambda: blob_available_indexed(sha256, auth, exists_fn=store.exists, index=index),
+    )
+    if not available:
+        raise HTTPException(status_code=404, detail="document not found")
+
+    # 4. Размер + метаданные реестра (race: blob мог быть удалён GC после exists)
+    size = await loop.run_in_executor(None, store.blob_size, sha256)
+    if size is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    info = await loop.run_in_executor(None, store.info, sha256)
+    mime = _document_mime(info)
+    name_utf8, fallback_ascii = _sanitize_download_name(
+        getattr(info, "original_filename", None), sha256, mime
+    )
+
+    # 5. Range — строго после проверок доступности (Range/HEAD не обходят гейты)
+    start, length, status_code = 0, size, 200
+    range_header = request.headers.get("range")
+    if range_header is not None:
+        parsed = _parse_range_header(range_header, size)
+        if parsed is None:
+            return _JSONResponse(
+                status_code=416,
+                content={"detail": "requested range not satisfiable"},
+                headers={
+                    "Content-Range": f"bytes */{size}",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+        start, end = parsed
+        status_code, length = 206, end - start + 1
+
+    headers = {
+        "Content-Type": mime,
+        "Content-Length": str(length),
+        "Content-Disposition": _content_disposition(name_utf8, fallback_ascii),
+        "X-Content-Type-Options": "nosniff",
+        "Accept-Ranges": "bytes",
+    }
+    if status_code == 206:
+        headers["Content-Range"] = f"bytes {start}-{start + length - 1}/{size}"
+
+    documents_served_total.inc()  # метрика выдачи (200/206)
+
+    if head:
+        return _Response(status_code=status_code, headers=headers)
+
+    fh = await loop.run_in_executor(None, store.open_blob, sha256)
+    if fh is None:
+        raise HTTPException(status_code=404, detail="document not found")
+    return _StreamingResponse(
+        _stream_document(fh, start, length),
+        status_code=status_code,
+        headers=headers,
+    )
+
+
+@app.get("/documents/{sha256}")
+async def get_document(sha256: str, request: Request):
+    """GET /documents/{sha256} — выдача blob документа (стриминг, Range/206)."""
+    return await _serve_document(request, sha256, head=False)
+
+
+@app.head("/documents/{sha256}")
+async def head_document(sha256: str, request: Request):
+    """HEAD /documents/{sha256} — те же заголовки и проверки, без тела."""
+    return await _serve_document(request, sha256, head=True)

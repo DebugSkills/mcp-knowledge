@@ -154,9 +154,17 @@ class PDFPreprocessor(ContentPreprocessor):
     ) -> list[Section]:
         """Извлечение текста из PDF → декомпозиция на секции.
 
-        Phase 1: extract text per-page (pdfplumber + OCR fallback) — extract_text().
+        Phase 1 (Ф2b3, сегментный режим): PDFLocatorExtractor.extract_segments —
+        единственный источник разбиения по страницам; спаны локаторов и
+        source_id закладываются в Section.meta в точке извлечения (Л1).
+        v1 ``.txt``-checkpoint в сегментном режиме НЕ читается (план §3.2:
+        HIT v1 = MISS → переизвлечение), но пишется для совместимости
+        потребителей extract_text (convert/extract_pdf_text).
         Phase 2: heading detection (font-size >1.3x median → new section).
         Fallback: per-page sections if <2 headings.
+
+        Реестр без page-экстрактора → легаси-v1 путь (extract_text) БЕЗ
+        спанов: декомпозиция жива, локаторы не фабрикуются (Л1).
 
         cancel_event: проверяется между страницами (P0-1).
         """
@@ -164,11 +172,91 @@ class PDFPreprocessor(ContentPreprocessor):
         if not source_path:
             raise ValueError("source_path is required for PDF decomposition")
 
-        # Phase 1: извлечение полного текста (с checkpoint-кешем)
-        full_text = await self.extract_text(source_path, cancel_event)
+        # Phase 1: сегменты (per-page) через реестр экстракторов локаторов
+        segments = await self._extract_locator_segments(
+            source_path, metadata.content_sha256, cancel_event
+        )
+
+        page_spans = None
+        source_id = None
+        if segments is not None:
+            from .locator import full_sha256, page_spans_for_text  # lazy: цикл импортов
+
+            sha = metadata.content_sha256
+            if sha is None:
+                # pdf canonical ≡ original (Л3): полный sha256 того же файла
+                loop = asyncio.get_running_loop()
+                sha = await loop.run_in_executor(None, full_sha256, source_path)
+            from .source import make_source_id  # Ф1-хелпер: src-<sha256_16>
+
+            source_id = make_source_id(sha)
+
+            full_text = "\n\n".join(seg.text for seg in segments)
+            page_spans = page_spans_for_text(segments)
+
+            # v1-checkpoint совместимость: запись (НЕ чтение)
+            await self._write_v1_checkpoint_compat(
+                source_path, full_text, len(segments)
+            )
+        else:
+            # Легаси-v1: полный текст с checkpoint-кешем (спанов нет — Л1)
+            full_text = await self.extract_text(source_path, cancel_event)
 
         # Phase 2: heading detection + decomposition
-        return await self._build_sections(full_text, metadata, source_path)
+        return await self._build_sections(
+            full_text, metadata, source_path,
+            page_spans=page_spans, source_id=source_id,
+        )
+
+    async def _extract_locator_segments(
+        self,
+        source_path: str,
+        content_sha256: str | None,
+        cancel_event: asyncio.Event | None = None,
+    ):
+        """Ф2b3: сегменты по страницам через реестр экстракторов локаторов.
+
+        P0-1: контракт экстрактора синхронный (внутри возможен OCR) →
+        run_in_executor. Возвращает None, если page-экстрактор не
+        зарегистрирован (реестр сброшен тестом / окружение без
+        авторегистрации) — вызывающий уходит в легаси-v1 путь без спанов.
+        """
+        from .locator import get_locator_extractor
+
+        try:
+            extractor = get_locator_extractor("page")
+        except ValueError as exc:
+            logger.warning(
+                "PDF decompose: page-экстрактор не зарегистрирован → "
+                "легаси-v1 путь без спанов (%s)", exc,
+            )
+            return None
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: extractor.extract_segments(
+                source_path, content_sha256=content_sha256, cancel_event=cancel_event
+            ),
+        )
+
+    async def _write_v1_checkpoint_compat(
+        self, source_path: str, full_text: str, pages: int
+    ) -> None:
+        """Записать v1 ``{prefix_hash}.txt``-checkpoint из сегментного текста.
+
+        Сегментный режим v1-кеш НЕ ЧИТАЕТ (план §3.2: HIT v1 = MISS →
+        переизвлечение) — запись нужна для совместимости extract_text
+        (convert/extract_pdf_text) и регрессии checkpoint-тестов.
+        """
+        cache_dir = Path(self._cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        await self._prune_pdf_cache(cache_dir)
+        content_hash = self._compute_content_hash(source_path)
+        (cache_dir / f"{content_hash}.txt").write_text(full_text, encoding="utf-8")
+        logger.info(
+            "PDF checkpoint written: %s (%d chars, %d pages)",
+            content_hash[:12], len(full_text), pages,
+        )
 
     async def extract_text(
         self,
@@ -396,6 +484,8 @@ class PDFPreprocessor(ContentPreprocessor):
         full_text: str,
         metadata: ImportMeta,
         source_path: str,
+        page_spans: list | None = None,
+        source_id: str | None = None,
     ) -> list[Section]:
         """Декомпозиция извлечённого текста в секции.
 
@@ -405,6 +495,9 @@ class PDFPreprocessor(ContentPreprocessor):
         3. Текст между heading-boundaries → секция
         4. Fallback: <2 headings → постранично
         5. Chunking: oversized секции → hybrid_split
+
+        Ф2b3: page_spans (координаты full_text) + source_id — продюсер
+        спанов локаторов; None → ключи у секций не появляются (Л1).
         """
 
         # Собираем font-size информацию из PDF
@@ -412,10 +505,15 @@ class PDFPreprocessor(ContentPreprocessor):
 
         if not heading_boundaries or len(heading_boundaries) < 2:
             # Fallback: per-page decomposition
-            return await self._fallback_per_page(full_text, metadata)
+            return await self._fallback_per_page(
+                full_text, metadata, page_spans=page_spans, source_id=source_id
+            )
 
         # Собираем секции по heading boundaries
-        return await self._sections_by_headings(full_text, heading_boundaries, metadata)
+        return await self._sections_by_headings(
+            full_text, heading_boundaries, metadata,
+            page_spans=page_spans, source_id=source_id,
+        )
 
     async def _detect_headings(self, source_path: str) -> list[tuple[int, str]]:
         """Обнаружить заголовки по font-size эвристике.
@@ -478,16 +576,36 @@ class PDFPreprocessor(ContentPreprocessor):
         return heading_lines
 
     async def _fallback_per_page(
-        self, full_text: str, metadata: ImportMeta
+        self,
+        full_text: str,
+        metadata: ImportMeta,
+        page_spans: list | None = None,
+        source_id: str | None = None,
     ) -> list[Section]:
-        """Fallback: каждая страница → одна секция."""
+        """Fallback: каждая страница → одна секция.
+
+        Ф2b3: в сегментном режиме страницы берутся из page_spans (спаны
+        сегментов в координатах full_text) — РЕАЛЬНЫЕ границы страниц, а не
+        эвристика split("\n\n"), ломавшаяся на пустых строках внутри
+        страницы. Каждая секция (в т.ч. chunk-часть длинной страницы)
+        целиком происходит со своей страницы → её спан [0, len(body)) —
+        атрибуция по построению, точная даже при мутациях hybrid_split.
+        """
         from .splitting import hybrid_split
 
-        pages = full_text.split("\n\n")
+        if page_spans is not None:
+            from .locator import LocatorSpan, spans_to_meta
+
+            pages: list[tuple[str, object]] = [
+                (full_text[span.offset_start:span.offset_end], span)
+                for span in page_spans
+            ]
+        else:
+            pages = [(page_text, None) for page_text in full_text.split("\n\n")]
         sections: list[Section] = []
         seq = 0
 
-        for page_text in pages:
+        for page_text, span in pages:
             pt = page_text.strip()
             if not pt:
                 continue
@@ -528,19 +646,30 @@ class PDFPreprocessor(ContentPreprocessor):
                     metadata.cross_subjects,
                 )
 
+                meta = {
+                    "knowledge_id": knowledge_id,
+                    "domain": metadata.domain,
+                    "subject": metadata.subject,
+                    "project": metadata.project,
+                    # Ф2b4.D (план, строка 335): PDF-секции — content_type="pdf",
+                    # не "book". Источник — контракт препроцессора.
+                    "content_type": self.content_type,
+                    "cross_subjects": metadata.cross_subjects,
+                }
+                # Ф2b3 (Л1): спаны — только при реальной странице; ключи
+                # locator_spans/source_id появляются и исчезают вместе
+                if span is not None and source_id is not None:
+                    meta["locator_spans"] = spans_to_meta(
+                        [LocatorSpan(span.locator, 0, len(chunk))]
+                    )
+                    meta["source_id"] = source_id
+
                 sections.append(Section(
                     title=section_title,
                     body=chunk,
                     sequence_number=seq,
                     tags=tags,
-                    meta={
-                        "knowledge_id": knowledge_id,
-                        "domain": metadata.domain,
-                        "subject": metadata.subject,
-                        "project": metadata.project,
-                        "content_type": "book",
-                        "cross_subjects": metadata.cross_subjects,
-                    },
+                    meta=meta,
                 ))
 
         return sections
@@ -550,8 +679,15 @@ class PDFPreprocessor(ContentPreprocessor):
         full_text: str,
         heading_boundaries: list[tuple[int, str]],
         metadata: ImportMeta,
+        page_spans: list | None = None,
+        source_id: str | None = None,
     ) -> list[Section]:
-        """Разбиение текста по обнаруженным заголовкам."""
+        """Разбиение текста по обнаруженным заголовкам.
+
+        Ф2b3: base — абсолютное смещение ``remaining`` в full_text, чтобы
+        для каждого тела секции вычислить его диапазон (границы
+        нормализованного .strip()-ом тела) и клиппировать page_spans.
+        """
 
         # Упрощённая реализация: разбиваем по заголовкам в полном тексте
         sections: list[Section] = []
@@ -559,34 +695,55 @@ class PDFPreprocessor(ContentPreprocessor):
 
         # Если заголовков нет в тексте — fallback per-page
         remaining = full_text
+        base = 0
         for heading_idx, heading_text in heading_boundaries:
             # Ищем heading в remaining тексте
             pos = remaining.find(heading_text)
             if pos < 0:
                 continue
 
-            body = remaining[:pos].strip()
+            raw_body = remaining[:pos]
+            body = raw_body.strip()
             if body:
                 seq += 1
+                body_range = None
+                if page_spans is not None:
+                    lead = len(raw_body) - len(raw_body.lstrip())
+                    body_range = (base + lead, base + lead + len(body))
                 sections.extend(
-                    await self._make_sections_from_text(body, heading_text, seq, metadata)
+                    await self._make_sections_from_text(
+                        body, heading_text, seq, metadata,
+                        body_range=body_range, page_spans=page_spans,
+                        source_id=source_id,
+                    )
                 )
 
             # Двигаемся дальше
             remaining = remaining[pos + len(heading_text):]
+            base = base + pos + len(heading_text)
 
         # Последний блок
-        if remaining.strip():
+        raw_tail = remaining
+        tail = raw_tail.strip()
+        if tail:
             seq += 1
+            body_range = None
+            if page_spans is not None:
+                lead = len(raw_tail) - len(raw_tail.lstrip())
+                body_range = (base + lead, base + lead + len(tail))
             sections.extend(
                 await self._make_sections_from_text(
-                    remaining, "Последний раздел", seq, metadata
+                    tail, "Последний раздел", seq, metadata,
+                    body_range=body_range, page_spans=page_spans,
+                    source_id=source_id,
                 )
             )
 
         if not sections:
             # Fallback если ничего не получилось
-            return await self._fallback_per_page(full_text, metadata)
+            return await self._fallback_per_page(
+                full_text, metadata, page_spans=page_spans, source_id=source_id
+            )
 
         return sections
 
@@ -596,11 +753,22 @@ class PDFPreprocessor(ContentPreprocessor):
         title: str,
         seq: int,
         metadata: ImportMeta,
+        body_range: tuple[int, int] | None = None,
+        page_spans: list | None = None,
+        source_id: str | None = None,
     ) -> list[Section]:
-        """Создать секцию(и) из текстового блока с chunking."""
+        """Создать секцию(и) из текстового блока с chunking.
+
+        Ф2b3: body_range — диапазон тела (нормализованного) в координатах
+        full_text; chunk-секции локализуются в теле поиском с курсором
+        (монотонность). Мутирующий hybrid_split (join предложений) может
+        сделать чанк нелокализуемым → у этого чанка спанов НЕТ (Л1:
+        неточные offsets не фабрикуются).
+        """
         from .splitting import hybrid_split
 
         sections: list[Section] = []
+        track_spans = page_spans is not None and body_range is not None
 
         if len(body) > 4000:
             chunks = await hybrid_split(
@@ -611,6 +779,7 @@ class PDFPreprocessor(ContentPreprocessor):
         else:
             chunk_texts = [body]
 
+        cursor = 0
         for chunk_idx, chunk in enumerate(chunk_texts):
             section_title = title if chunk_idx == 0 else f"{title} (часть {chunk_idx + 1})"
             content_hash = hashlib.sha256(chunk[:200].encode()).hexdigest()
@@ -632,19 +801,37 @@ class PDFPreprocessor(ContentPreprocessor):
                 metadata.cross_subjects,
             )
 
+            meta = {
+                "knowledge_id": knowledge_id,
+                "domain": metadata.domain,
+                "subject": metadata.subject,
+                "project": metadata.project,
+                # Ф2b4.D (план, строка 335): PDF-секции — content_type="pdf",
+                # не "book". Источник — контракт препроцессора.
+                "content_type": self.content_type,
+                "cross_subjects": metadata.cross_subjects,
+            }
+            if track_spans:
+                from .locator import clip_spans_to_range, spans_to_meta
+
+                found = body.find(chunk, cursor)
+                if found >= 0:
+                    cursor = found + len(chunk)
+                    clipped = clip_spans_to_range(
+                        page_spans, body_range[0] + found,
+                        body_range[0] + found + len(chunk),
+                    )
+                    # Л1: ключи появляются только при непустом пересечении
+                    if clipped and source_id is not None:
+                        meta["locator_spans"] = spans_to_meta(clipped)
+                        meta["source_id"] = source_id
+
             sections.append(Section(
                 title=section_title,
                 body=chunk,
                 sequence_number=seq,
                 tags=tags,
-                meta={
-                    "knowledge_id": knowledge_id,
-                    "domain": metadata.domain,
-                    "subject": metadata.subject,
-                    "project": metadata.project,
-                    "content_type": "book",
-                    "cross_subjects": metadata.cross_subjects,
-                },
+                meta=meta,
             ))
 
         return sections

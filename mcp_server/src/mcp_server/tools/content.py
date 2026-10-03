@@ -26,11 +26,14 @@ import logging
 import os as _os
 import uuid as _uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from ..config import settings
+from ..content.ingest import ingest_source
 from ..content.linking import build_collection
 from ..content.preprocessor import ImportMeta
 from ..content.registry import get as get_preprocessor
+from ..content.source_refs import merge_source_refs, refs_from_section_meta
 from ..models import KnowledgeEntry, KnowledgeFrontmatter
 from .zone_utils import resolve_zone
 
@@ -61,12 +64,69 @@ def _p(tracker, import_id: str, method: str, *args) -> None:  # type: ignore[no-
         pass
 
 
+# ── Ф3c2a: source_refs (bibliography, план §3.4) ──────────
+
+
+async def _scan_existing_paths(store) -> dict[str, Path]:
+    """Один upfront-скан SSOT → {knowledge_id: path} (stem-индекс).
+
+    Прецедент: source_ref_runtime.rebuild / documents_integrity
+    (reindex_scan + _parse_file). На свежем импорте файлов-коллизий нет —
+    parse не выполняется вовсе; парсинг существующего файла ТОЛЬКО при
+    коллизии id (переимпорт: make_knowledge_id детерминирован).
+    """
+    try:
+        return {p.stem: p for p in await store.reindex_scan()}
+    except Exception:
+        return {}
+
+
+def _merged_source_refs(store, existing_paths: dict, knowledge_id: str, meta: dict):
+    """Merge source_refs из meta секции в существующие refs записи.
+
+    existing-wins (ручные/Ф3c2b правки не затираются), foreign-ссылки
+    сохраняются; подробности — content.source_refs.
+    """
+    incoming = refs_from_section_meta(meta)
+    existing = None
+    path = existing_paths.get(knowledge_id)
+    if path is not None:
+        try:
+            existing = store._parse_file(path).frontmatter.source_refs
+        except Exception:
+            existing = None
+    return merge_source_refs(existing, incoming)
+
+
 # ── 13.21: Import queue (submit + bg task + cancel) ──────────
 
 # In-memory import queue records (сессионная)
 # Поля: import_id, name, status (queued|running|done|error|cancelled),
 # phase (parsing|indexing|done), imported, total, error, created_at, finished_at
 _import_queue: list[dict] = []
+
+
+def _import_provenance_from_ingest(result: dict) -> dict:
+    """Ф5a1: sparse-провенанс canonical из _ingest_result → поля записи очереди.
+
+    Sparse-конвенция: ключ добавляется ТОЛЬКО при фактическом значении
+    (никаких None/False-заглушек по умолчанию). `canonical_present` — bool,
+    пишется когда известен (True/False); `canonical_sha256` — только при
+    canonical; `canonical_error` — только при persisted-отказе (Ф4b3).
+    `format` в контракт очереди не входит — оставлено на Ф5a2.
+    """
+    out: dict = {}
+    if result.get("source_id"):
+        out["source_id"] = result["source_id"]
+    if result.get("canonical_present") is not None:
+        out["canonical_present"] = result["canonical_present"]
+    canonical = result.get("canonical") or {}
+    if canonical.get("sha256"):
+        out["canonical_sha256"] = canonical["sha256"]
+    error = (result.get("blobs") or {}).get("canonical_error")
+    if error:
+        out["canonical_error"] = error
+    return out
 
 
 async def submit_import(params: dict, app_state) -> dict:
@@ -217,6 +277,7 @@ async def _bg_import(
                 break
 
     requeued = False  # 023 Block C-1b: skip temp-file cleanup if re-queued
+    keep_source_file = False  # P0-2 (bibliography Ф1): сохранить temp при отказе put(original)
     try:
         # 023 Block C-1b (P1-4): ручной acquire + identity-check + owner.
         # Фантомный лок (recovery 022 заменил O→N пока мы ждали) НЕ держим —
@@ -277,6 +338,55 @@ async def _bg_import(
                 _p(tracker, import_id, "error", err)
                 return
             _update_log(import_id, "info", "validate OK")
+
+            # ── bibliography Ф1: сохранить original blob + Source-запись ДО unlink ──
+            # put(original) первым (fail-closed: отказ не теряет оригинал), для PDF
+            # canonical == original (as-is). Выполняется ДО decompose — даже при сбое
+            # декомпозиции blob/Source сохранены (provenance закладывается в точке извлечения).
+            try:
+                _ingest_zone, _ = resolve_zone(params.get("zone"), None)
+            except ValueError:
+                _ingest_zone = "private"
+            try:
+                _ingest_result = await ingest_source(
+                    app_state,
+                    format="pdf",
+                    domain=domain,
+                    subject=subject,
+                    source_path=source_path,
+                    mime="application/pdf",
+                    filename=params.get("filename"),
+                    zone=_ingest_zone,
+                    project=project,
+                    bibliography=params.get("bibliography"),
+                    license=params.get("license"),
+                    public_allowed=params.get("public_allowed"),
+                    locator_kind=params.get("locator_kind") or "page",
+                    title=title or (source_path.split("/")[-1] if source_path else None),
+                )
+                _update_log(import_id, "info",
+                            f"source blob stored: {_ingest_result['source_id']} "
+                            f"(canonical_present={_ingest_result['canonical_present']})")
+                # Ф2b3: canonical sha256 → продюсер спанов в decompose
+                # (Section.meta locator_spans/source_id). Для pdf canonical ≡
+                # original (as-is); вне PDF-оси canonical нет → original.
+                metadata.content_sha256 = (
+                    (_ingest_result.get("canonical") or {}).get("sha256")
+                    or _ingest_result["original"]["sha256"]
+                )
+                # Ф5a1: провенанс-статус canonical → запись очереди (observability;
+                # sparse — ключи только при фактическом значении).
+                _update_queue(**_import_provenance_from_ingest(_ingest_result))
+            except Exception as _exc:  # noqa: BLE001
+                # P0-2 (bibliography Ф1, critic): отказ put(original) — НЕ проглатываем.
+                # fail-closed §4.1: abort импорта + сохранить temp-PDF (оригинал НЕ теряется).
+                _err = f"source blob store failed: {_exc}"
+                logger.error("[IMPORT] %s (abort)", _err)
+                keep_source_file = True
+                _update_queue(status="error", error=_err, collection_id="")
+                _update_log(import_id, "error", f"source ingest failed (abort): {_exc}")
+                _p(tracker, import_id, "error", _err)
+                return
 
             # Decompose (with cancel_event)
             try:
@@ -367,7 +477,8 @@ async def _bg_import(
     finally:
         # [P0-3] Cleanup temp file — only if in /tmp/ (server-owned temp files).
         # 023 Block C-1b: skip if re-queued (new _bg_import needs the file).
-        if not requeued and source_path and _os.path.exists(source_path) and source_path.startswith("/tmp/"):
+        # P0-2 (bibliography Ф1): skip if put(original) failed — оригинал сохраняем.
+        if not requeued and not keep_source_file and source_path and _os.path.exists(source_path) and source_path.startswith("/tmp/"):
             try:
                 _os.unlink(source_path)
                 logger.info("[IMPORT] temp file deleted: %s", source_path)
@@ -446,6 +557,9 @@ async def _batch_write_sections(
     except Exception as e:
         return {"error": f"Failed to create collection root: {e}"}
 
+    # Ф3c2a: upfront stem-индекс SSOT — один скан на импорт (не N rglob)
+    existing_paths = await _scan_existing_paths(store)
+
     imported = 0
     failed = 0
     failed_sections: list[dict] = []
@@ -468,7 +582,11 @@ async def _batch_write_sections(
                 tags=section.tags,
                 cross_subjects=meta.get("cross_subjects", []),
                 zone=zone,
+                locator_spans=meta.get("locator_spans"),
+                source_id=meta.get("source_id"),
             )
+            # Ф3c2a: source_refs — merge из meta (existing-wins, foreign сохраняются)
+            fm.source_refs = _merged_source_refs(store, existing_paths, fm.knowledge_id, meta)
             entry = KnowledgeEntry(frontmatter=fm, content=section.body)
             await store.write_entry(entry)
 
@@ -935,6 +1053,72 @@ async def extract_pdf_text(params: dict, app_state) -> dict:
 
 
 
+async def _reimport_in_place_preflight(app_state, collection_id: str) -> dict:
+    """Ф6a (§3.6): preflight reimport-in-place — lock → pre-checks → delete cascade.
+
+    Порядок: acquire heavy_ops_lock (сериализация с другими тяжёлыми операциями —
+    «один импорт за раз») → pre-checks (старая запись существует; integrity
+    зелёный, если document_store доступен) → delete cascade старой записи
+    (переиспользуем crud.delete_entry, не дублируем). Возвращает {"error": ...}
+    при отказе (явный reason, полусостояние не создаётся: cascade либо не
+    начинался, либо завершён) либо {"cascade_deleted": N}.
+    """
+    from .crud import delete_entry as _delete_entry
+
+    heavy_ops_lock = getattr(app_state, "heavy_ops_lock", None)
+    if heavy_ops_lock is None:
+        return {"error": "reimport_in_place: heavy_ops_lock not initialized"}
+
+    try:
+        await asyncio.wait_for(
+            heavy_ops_lock.acquire(), timeout=settings.RECONCILE_LOCK_WAIT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        return {"error": "reimport_in_place: heavy_ops_lock busy (another heavy operation running)"}
+
+    try:
+        store = app_state.store
+        # Pre-check 1: старая запись существует.
+        try:
+            existing = await store.read(collection_id)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"reimport_in_place: pre-check read failed: {exc}"}
+        if existing is None:
+            return {"error": f"reimport_in_place: target collection '{collection_id}' not found"}
+
+        # Pre-check 2: integrity зелёный ДО удаления (если document_store доступен).
+        document_store = getattr(app_state, "document_store", None)
+        if document_store is not None:
+            from .documents_integrity import documents_check
+
+            try:
+                report = await documents_check(store, document_store, create_issues=False)
+            except Exception as exc:  # noqa: BLE001
+                return {"error": f"reimport_in_place: integrity pre-check failed: {exc}"}
+            if not report.get("ok"):
+                return {
+                    "error": "reimport_in_place: integrity pre-check not green; abort before delete",
+                    "integrity": {
+                        k: report.get(k) for k in (
+                            "missing_blob", "sha_mismatch", "canonical_missing",
+                            "dangling_source_refs", "orphans", "errors",
+                        ) if report.get(k)
+                    },
+                }
+
+        # Delete cascade старой записи (crud.delete_entry, cascade=True).
+        del_result = await _delete_entry(
+            {"knowledge_id": collection_id, "cascade": True}, app_state,
+        )
+        if del_result.get("error"):
+            return {
+                "error": f"reimport_in_place: cascade delete failed: {del_result['error']}",
+            }
+        return {"cascade_deleted": del_result.get("cascade_deleted", 0)}
+    finally:
+        heavy_ops_lock.release()
+
+
 async def import_content(params: dict, app_state) -> dict:
     """MCP Tool #16: import_content — декомпозиция + batch запись в SSOT.
 
@@ -1001,6 +1185,8 @@ async def import_content(params: dict, app_state) -> dict:
     # ── Replace params (Фаза 13.x) ──────────────────────────
     replace_collection_id = params.get("replace_collection_id", "")
     replace_on_partial = params.get("replace_on_partial", False)
+    # Ф6a (§3.6): reimport-in-place — осознанный пере-импорт под тем же id.
+    reimport_in_place = params.get("reimport_in_place", False)
 
     # ── kb-console-roles Ф1.6: серверный replace-гейт (P1-1/Q4) ──
     # Единая точка всех путей импорта (book: submit_import; pdf: _bg_import) —
@@ -1174,18 +1360,55 @@ async def import_content(params: dict, app_state) -> dict:
         zone=zone,
     )
 
-    # ── Self-replace guard ───────────────────────────────────
-    # После build_collection: новый collection_id не должен совпадать с заменяемым.
-    if replace_collection_id and replace_collection_id == collection.knowledge_id:
+    # ── Self-replace guard + reimport-in-place (Ф6a §3.6) ────
+    # После build_collection: новый collection_id не должен совпадать с заменяемым
+    # (защита от случайности). Осознанный пере-импорт под тем же id — только через
+    # reimport_in_place=True СОВМЕСТНО с replace_collection_id == ожидаемому id.
+    self_replace = bool(replace_collection_id and replace_collection_id == collection.knowledge_id)
+
+    if reimport_in_place:
+        if not replace_collection_id:
+            return {
+                "error": "reimport_in_place requires 'replace_collection_id' set "
+                "to the expected collection id"
+            }
+        if not self_replace:
+            return {
+                "error": (
+                    f"reimport_in_place: replace_collection_id '{replace_collection_id}' "
+                    f"does not match expected collection id '{collection.knowledge_id}'. "
+                    "Reimport-in-place reuses the SAME id — pass replace_collection_id "
+                    "equal to the deterministic id, or drop reimport_in_place."
+                )
+            }
+
+    if self_replace and not reimport_in_place:
         return {
             "error": f"Self-replace detected: new collection_id '{collection.knowledge_id}' "
             f"equals replace_collection_id. Use update_entry or change the title."
         }
 
+    # ── Reimport-in-place preflight (Ф6a §3.6) ───────────────
+    # heavy_ops_lock → pre-checks → delete cascade старой записи. Выполняется
+    # ДО batch-write (root ещё не перезаписан): освобождаем тот же id.
+    reimport_cascade_deleted = 0
+    if reimport_in_place:
+        preflight = await _reimport_in_place_preflight(app_state, collection.knowledge_id)
+        if preflight.get("error"):
+            return preflight
+        reimport_cascade_deleted = preflight.get("cascade_deleted", 0)
+        logger.info(
+            "[REIMPORT] in-place: old collection %s deleted (+%d children)",
+            collection.knowledge_id, reimport_cascade_deleted,
+        )
+
     # ── Batch write: по секциям ─────────────────────────────
     store = app_state.store
     pipeline = app_state.pipeline
     knowledge_index = getattr(app_state, "knowledge_index", None)
+
+    # Ф3c2a: upfront stem-индекс SSOT — один скан на импорт (не N rglob)
+    existing_paths = await _scan_existing_paths(store)
 
     imported = 0
     failed = 0
@@ -1226,7 +1449,11 @@ async def import_content(params: dict, app_state) -> dict:
                 tags=section.tags,
                 cross_subjects=meta.get("cross_subjects", []),
                 zone=zone,
+                locator_spans=meta.get("locator_spans"),
+                source_id=meta.get("source_id"),
             )
+            # Ф3c2a: source_refs — merge из meta (existing-wins, foreign сохраняются)
+            fm.source_refs = _merged_source_refs(store, existing_paths, fm.knowledge_id, meta)
             entry = KnowledgeEntry(frontmatter=fm, content=section.body)
 
             # SSOT запись (без git-коммита — батчим ниже)
@@ -1391,7 +1618,7 @@ async def import_content(params: dict, app_state) -> dict:
     replaced_collection_id_val = None
     cascade_deleted = 0
     replace_skipped_reason = ""
-    if replace_collection_id:
+    if replace_collection_id and not reimport_in_place:
         should_replace = (failed == 0) or (replace_on_partial and imported > 0)
         if should_replace:
             _p(tracker, import_id, "set_phase", "replacing")
@@ -1426,6 +1653,28 @@ async def import_content(params: dict, app_state) -> dict:
     result["replaced_collection_id"] = replaced_collection_id_val
     result["cascade_deleted"] = cascade_deleted
     result["replace_skipped_reason"] = replace_skipped_reason
+
+    # ── Reimport-in-place: результат + финальный integrity (§3.6 Ф6a) ──
+    if reimport_in_place:
+        result["reimport_in_place"] = True
+        result["replaced"] = True
+        result["replaced_collection_id"] = collection.knowledge_id
+        result["cascade_deleted"] = reimport_cascade_deleted
+        result["replace_skipped_reason"] = ""
+        result["integrity_ok"] = None
+        result["integrity"] = None
+        document_store = getattr(app_state, "document_store", None)
+        if document_store is not None:
+            from .documents_integrity import documents_check
+
+            try:
+                integrity = await documents_check(store, document_store, create_issues=False)
+                result["integrity_ok"] = bool(integrity.get("ok"))
+                result["integrity"] = integrity
+            except Exception as exc:  # noqa: BLE001 — фиксируем, не роняем
+                logger.warning("[REIMPORT] final integrity check failed: %s", exc)
+                result["integrity_ok"] = False
+                result["integrity"] = {"error": str(exc)}
 
     logger.info(
         "[IMPORT] done collection=%s imported=%d failed=%d partial=%s indexed=%s",

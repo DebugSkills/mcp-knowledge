@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # backup.sh — бэкап Qdrant (snapshot) + Markdown SSOT (git push / tar)
-# Использование: ./backup.sh [--no-ssot] [--no-qdrant] [--test-restore]
+#            + documents blob-store (Фаза 0, code-2026-10-02-bibliography)
+# Использование: ./backup.sh [--no-ssot] [--no-qdrant] [--no-documents] [--test-restore]
 #   --test-restore  Проверить полный цикл: snapshot → restore → verify → cleanup
 # Cron: ежедневно в 3:00
 
@@ -15,6 +16,7 @@ DATA_ROOT="${DATA_ROOT:-$PROJECT_DIR/data}"
 BACKUP_DIR="$DATA_ROOT/backups"
 SNAPSHOT_DIR="$DATA_ROOT/qdrant/snapshots"
 KNOWLEDGE_DIR="$PROJECT_DIR/../knowledge"
+DOCUMENTS_DIR="$DATA_ROOT/documents"   # blob-store оригиналов (Фаза 0, code-2026-10-02-bibliography)
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 RETENTION_DAYS=7
 
@@ -356,6 +358,37 @@ backup_errors_state() {
     echo "[$(date -Iseconds)] errors state tar: $BACKUP_DIR/errors-state-${TIMESTAMP}.tar.gz"
 }
 
+# --- Documents blob-store backup (Фаза 0, code-2026-10-02-bibliography) ---
+# Каталог data/documents (blob-store оригиналов) — в бэкап-сет + sha256-манифест.
+# Манифест (детерминированный, отсортированный): `<sha256>  <относительный-путь>`
+# на каждый blob — restore/verify сверяет файлы по хешу (гейт A4). Пустой каталог
+# или отсутствие каталога → no-op с сообщением (гейт A6 — бэкап не падает).
+backup_documents() {
+    local docs_dir="$DOCUMENTS_DIR"
+    echo "[$(date -Iseconds)] Backing up documents (blob-store)..."
+    if [ ! -d "$docs_dir" ]; then
+        echo "[$(date -Iseconds)] documents: каталог $docs_dir отсутствует — пропуск (не ошибка)."
+        return 0
+    fi
+    # Есть ли хоть один файл? Пусто → no-op (гейт A6).
+    if [ -z "$(find "$docs_dir" -type f -print -quit 2>/dev/null)" ]; then
+        echo "[$(date -Iseconds)] documents: каталог пуст — бэкап пропущен (no-op)."
+        return 0
+    fi
+    mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
+    local tar_file="$BACKUP_DIR/documents-${TIMESTAMP}.tar.gz"
+    local manifest_file="${tar_file}.sha256"
+    tar -czf "$tar_file" -C "$docs_dir" . 2>&1
+    # Манифест: sha256 каждого файла (относительный путь от корня docs), сортировка
+    # по пути — детерминизм (одинаковый манифест при неизменном содержимом).
+    # Пути blob'ов — hex-имена (sha256), без пробелов/newline → формат sha256sum безопасен.
+    (cd "$docs_dir" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum) > "$manifest_file"
+    chmod 600 "$manifest_file"
+    echo "[$(date -Iseconds)] documents tar: $tar_file ($(stat -c%s "$tar_file" 2>/dev/null || echo 0) bytes)"
+    echo "[$(date -Iseconds)] documents manifest: $manifest_file ($(wc -l < "$manifest_file") файлов)"
+}
+
 # --- Ротация старых бэкапов ---
 rotate_backups() {
     echo "[$(date -Iseconds)] Rotating backups older than ${RETENTION_DAYS} days..."
@@ -364,6 +397,13 @@ rotate_backups() {
     find "$BACKUP_DIR" -name "secrets-*.tar.gz" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
     # Error→Rule state (Ф4): тот же retention, что остальные тары
     find "$BACKUP_DIR" -name "errors-state-*.tar.gz" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
+    # Documents blob-store (Фаза 0): тар + манифест — тот же retention (О-5: общий)
+    find "$BACKUP_DIR" -name "documents-*.tar.gz" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
+    find "$BACKUP_DIR" -name "documents-*.tar.gz.sha256" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
+    # P2-5/P2-b: pre-restore-копии (создаются restore-плейбуком) — паттерн `pre-restore-*`
+    # ловит и легитимные тары, и мусорные имена вида `pre-restore-console-$(date`
+    # (следствие старого command+$(date …) до фикса P1-A)
+    find "$BACKUP_DIR" -name "pre-restore-*" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
     # 2026-08-09: ротация Qdrant-снапшотов (раньше копились бесконечно).
     # Файлы снапшотов теперь в bind-mount (data/qdrant/snapshots) — удаляем по mtime.
     find "$SNAPSHOT_DIR" -name "backup-*.snapshot" -mtime "+${RETENTION_DAYS}" -delete 2>/dev/null || true
@@ -401,6 +441,28 @@ backup_weekly_snapshots() {
         fi
     done
     echo "[$(date -Iseconds)] Weekly-4: готово ($(ls "$week_dir" | wc -l) файлов)."
+}
+
+# --- Weekly documents-копия (Фаза 0, code-2026-10-02-bibliography) ---
+# Отдельная от qdrant-weekly: documents НЕ зависят от Qdrant (P2-c) — при
+# --no-qdrant в воскресенье documents-копия всё равно делается. Offsite забирает
+# weekly целиком (О-1); манифест копируем рядом для restore-verify (гейт A4).
+backup_weekly_documents() {
+    if [ "$(date +%u)" != "7" ]; then
+        return 0
+    fi
+    local week_dir="$SNAPSHOT_DIR/weekly/$(date +%G-W%V)"
+    echo "[$(date -Iseconds)] Weekly: documents-копия в ${week_dir}..."
+    mkdir -p "$week_dir"
+    local docs_tar
+    docs_tar="$(ls -t "$BACKUP_DIR"/documents-*.tar.gz 2>/dev/null | head -1 || true)"
+    if [ -n "$docs_tar" ]; then
+        cp -p "$docs_tar" "$week_dir/"
+        cp -p "${docs_tar}.sha256" "$week_dir/" 2>/dev/null || true
+        echo "    ✔ documents: $(basename "$docs_tar")"
+    else
+        echo "    — documents: таров нет, пропуск"
+    fi
 }
 
 # --- Console-state untar-drill (036 §2.2: presence + канонический путь + integrity) ---
@@ -522,6 +584,61 @@ print(ok)
     return "$rc"
 }
 
+# --- Documents untar-drill (Фаза 0): tar-целостность + выборочная sha256-сверка ---
+# Последний documents-тар: tar -tzf (целостность) → untar во временный каталог →
+# сверка первых 3 файлов манифеста по sha256 (гейт A3 — быстрый hash-check;
+# полная сверка всех файлов — в restore scope=documents, гейт A4). Возвращает 0/1;
+# отсутствие тара — skip (return 0 с сообщением).
+verify_documents_drill() {
+    echo "[$(date -Iseconds)] Documents drill (Фаза 0)..."
+    local tar_file manifest_file
+    tar_file="$(ls -t "$BACKUP_DIR"/documents-*.tar.gz 2>/dev/null | head -1 || true)"
+    manifest_file="${tar_file}.sha256"
+    if [ -z "$tar_file" ]; then
+        echo "    — documents-таров нет — drill пропущен (не ошибка)."
+        return 0
+    fi
+    echo "    Tar: $tar_file"
+    tar -tzf "$tar_file" > /dev/null || {
+        echo "    ✖ tar -tzf FAILED (архив битый): $tar_file"
+        return 1
+    }
+    if [ ! -f "$manifest_file" ]; then
+        echo "    ✖ FAIL: манифест отсутствует: $manifest_file"
+        return 1
+    fi
+    local tmp
+    tmp="$(mktemp -d)"
+    tar -xzf "$tar_file" -C "$tmp" || { rm -rf "$tmp"; return 1; }
+    local rc=0 checked=0 total line expected rel actual
+    total="$(wc -l < "$manifest_file")"
+    # Детерминированная выборочная сверка: первые 3 файла отсортированного манифеста
+    # (файлов <3 → сверяем все). Пустой манифест не бывает (tar создаётся только при
+    # непустом каталоге) — но это признак порчи, FAIL.
+    if [ "$total" -eq 0 ]; then
+        echo "    ✖ FAIL: манифест пуст (tar создан, но манифест без файлов)"
+        rm -rf "$tmp"
+        return 1
+    fi
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        read -r expected rel <<< "$line"
+        actual="$(sha256sum "$tmp/$rel" 2>/dev/null | awk '{print $1}')"
+        if [ "$actual" = "$expected" ]; then
+            checked=$((checked + 1))
+            echo "    ✔ $rel"
+        else
+            echo "    ✖ FAIL: $rel (sha256 mismatch: ожидался $expected, получен $actual)"
+            rc=1
+        fi
+    done < <(sed -n '1,3p' "$manifest_file")
+    rm -rf "$tmp"
+    if [ "$rc" -eq 0 ]; then
+        echo "    ✔ documents drill: $checked/$total (выборка) файлов сверено"
+    fi
+    return "$rc"
+}
+
 # --- Verify-режим (--verify, code-2026-09-22-002 Ф3; В2(б) «не молчи когда всё ок») ---
 # НЕ создаёт новые бэкапы — проверяет существующие:
 #   1) qdrant test-restore (ПОЛНЫЙ цикл recover — ТРЕБУЕТ живого Qdrant;
@@ -564,6 +681,15 @@ verify_mode() {
     verify_console_drill && rc=0 || rc=1
     [ "$rc" -ne 0 ] && fails=$((fails + 1))
 
+    # 4. Documents drill (Фаза 0, code-2026-10-02-bibliography)
+    if [ "$NO_DOCUMENTS" = true ]; then
+        echo "[SKIP] Documents drill: --no-documents."
+    else
+        checks=$((checks + 1))
+        verify_documents_drill && rc=0 || rc=1
+        [ "$rc" -ne 0 ] && fails=$((fails + 1))
+    fi
+
     echo ""
     if [ "$fails" -eq 0 ] && [ "$checks" -gt 0 ]; then
         echo "✅ RESTORE TEST PASSED (${checks} проверок, 0 провалов)"
@@ -582,28 +708,31 @@ echo "=== MCP Knowledge Backup: ${TIMESTAMP} ==="
 
 NO_QDRANT=false
 NO_SSOT=false
+NO_DOCUMENTS=false
 TEST_RESTORE=false
 VERIFY=false
 for arg in "$@"; do
     case "$arg" in
         --no-qdrant)    NO_QDRANT=true ;;
         --no-ssot)      NO_SSOT=true ;;
+        --no-documents) NO_DOCUMENTS=true ;;
         --test-restore) TEST_RESTORE=true ;;
         --verify)       VERIFY=true ;;
         --help|-h)
-            echo "Usage: $0 [--no-ssot] [--no-qdrant] [--test-restore] [--verify]"
+            echo "Usage: $0 [--no-ssot] [--no-qdrant] [--no-documents] [--test-restore] [--verify]"
             echo ""
             echo "Options:"
             echo "  --no-ssot       Skip SSOT (Markdown) backup"
             echo "  --no-qdrant     Skip Qdrant snapshot"
+            echo "  --no-documents  Skip documents blob-store backup"
             echo "  --test-restore  Run full restore test cycle and exit"
-            echo "  --verify        Verify existing backups (test-restore + sha256 + console-drill) and exit"
+            echo "  --verify        Verify existing backups (test-restore + sha256 + console-drill + documents-drill) and exit"
             echo "  --help, -h      Show this help"
             exit 0
             ;;
         *)
             echo "ERROR: Unknown argument: $arg"
-            echo "Usage: $0 [--no-ssot] [--no-qdrant] [--test-restore] [--verify]"
+            echo "Usage: $0 [--no-ssot] [--no-qdrant] [--no-documents] [--test-restore] [--verify]"
             exit 1
             ;;
     esac
@@ -624,8 +753,13 @@ fi
 
 # Regular backup flow
 [ "$NO_QDRANT" = false ] && create_qdrant_snapshot
-[ "$NO_QDRANT" = false ] && backup_weekly_snapshots   # P2-7: вс-копии (no-op в остальные дни)
 [ "$NO_SSOT" = false ] && backup_ssot_git
+# P2-1 (code-2026-10-02-bibliography): documents ДО weekly — иначе воскресный
+# weekly-тар забирает прошлый прогон (backup_documents шёл после weekly).
+[ "$NO_DOCUMENTS" = false ] && backup_documents       # Фаза 0: blob-store оригиналов
+# P2-c: documents-weekly НЕ гейтится NO_QDRANT (documents не зависят от Qdrant)
+[ "$NO_DOCUMENTS" = false ] && backup_weekly_documents
+[ "$NO_QDRANT" = false ] && backup_weekly_snapshots   # P2-7: вс-копии qdrant (no-op в остальные дни)
 # 036 §2.2: ошибка console-state (битая БД и т.п.) НЕ прерывает остальные
 # бэкапы — rc фиксируется и отдаётся в exit ПОСЛЕ полного прогона.
 CONSOLE_RC=0

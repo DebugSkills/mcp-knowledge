@@ -9,6 +9,10 @@ embedder, но pdf_preprocessor.py звал её без await и без ново
 проекта, который не обёрнут в `await` / `asyncio.create_task` / `asyncio.run` —
 независимо от покрытия веток. Ловит класс «сигнатура/async-статус изменился,
 вызывающий код не обновлён» на CI.
+
+Async-ГЕНЕРАТОРЫ (yield в теле) исключены: их вызов возвращает async-итератор
+(например, для StreamingResponse), await к нему неприменим (TypeError) —
+это не coroutine-leak (Ф4a: _stream_document).
 """
 
 from __future__ import annotations
@@ -26,13 +30,34 @@ ALLOWED_COROUTINE_WRAPPERS = {"create_task", "run"}
 WHITELIST: set[tuple[str, str]] = set()
 
 
+def _has_yield(fn: ast.AsyncFunctionDef) -> bool:
+    """Тело самой функции (без вложенных def) содержит yield → async-генератор.
+
+    Вложенные функции — своя область: yield внутри nested-def не делает
+    внешнюю async-функцию генератором.
+    """
+    stack = list(fn.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if isinstance(node, (ast.Yield, ast.YieldFrom)):
+            return True
+        stack.extend(ast.iter_child_nodes(node))
+    return False
+
+
 def _collect_async_names() -> set[str]:
-    """Имена всех async-функций проекта (по AST)."""
+    """Имена async-функций проекта (по AST), КРОМЕ async-генераторов.
+
+    Вызов async-генератора возвращает async-итератор (не корутину): await не
+    требуется и невозможен — такие имена не участвуют в аудите.
+    """
     names: set[str] = set()
     for py in SRC_ROOT.rglob("*.py"):
         tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
         for node in ast.walk(tree):
-            if isinstance(node, ast.AsyncFunctionDef):
+            if isinstance(node, ast.AsyncFunctionDef) and not _has_yield(node):
                 names.add(node.name)
     return names
 
@@ -172,3 +197,28 @@ def test_caller_audit_sanity_scan_covers_pdf_preprocessor():
     # Ключевые методы должны быть async (13.25 регрессия: были sync)
     assert asyncio.iscoroutinefunction(PDFPreprocessor._fallback_per_page)
     assert asyncio.iscoroutinefunction(PDFPreprocessor._make_sections_from_text)
+
+
+def test_has_yield_distinguishes_generators():
+    """Ф4a-регрессия аудита: async-генератор ≠ корутина (yield виден только в своём теле)."""
+    code = (
+        "async def agen():\n"
+        "    yield 1\n"
+        "\n"
+        "async def plain():\n"
+        "    return 2\n"
+        "\n"
+        "async def outer_with_nested_gen():\n"
+        "    def _nested():\n"
+        "        yield 9\n"
+        "    return _nested\n"
+    )
+    tree = ast.parse(code)
+    fns = {
+        n.name: n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.AsyncFunctionDef)
+    }
+    assert _has_yield(fns["agen"]) is True          # генератор — await не нужен
+    assert _has_yield(fns["plain"]) is False        # корутина — аудит активен
+    assert _has_yield(fns["outer_with_nested_gen"]) is False  # yield в nested-def

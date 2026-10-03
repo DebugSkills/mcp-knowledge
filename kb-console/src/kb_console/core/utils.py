@@ -24,6 +24,170 @@ _IMPORT_LEVEL_COLORS: dict[str, str] = {
 }
 
 
+# Ф5a2: 5 whitelist-причин отсутствия canonical (citation.py:_CANONICAL_ERROR_REASONS, §3.4:192).
+# Непредставимые субкоды сервер маппит в conversion_failed; здесь — человекочитаемый текст.
+_CANONICAL_REASON_TEXT: dict[str, str] = {
+    "queued": "канонизация поставлена в очередь",
+    "conversion_failed": "конвертация в PDF не удалась",
+    "conversion_timeout": "конвертация превысила таймаут",
+    "converter_unavailable": "конвертер недоступен",
+    "quota_exceeded": "квота хранилища документов превышена",
+}
+
+
+def canonical_reason_text(reason: str | None) -> str:
+    """Человекочитаемая причина отсутствия canonical (Ф5a2).
+
+    Неизвестная/отсутствующая причина возвращается как есть (не падает —
+    forward-compatible; KeyError не бросаем).
+    """
+    if not reason:
+        return ""
+    return _CANONICAL_REASON_TEXT.get(reason, reason)
+
+
+def human_size(n: float | None) -> str:
+    """Человекочитаемый размер в байтах (Ф5c2): B/KB/MB/GB/TB.
+
+    None/нечисло → «—» (sparse-безопасно: не выдумываем размер).
+    """
+    if n is None:
+        return "—"
+    try:
+        size = float(n)
+    except (TypeError, ValueError):
+        return "—"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return "—"
+
+
+def short_sha(sha: str | None) -> str:
+    """Короткий вид sha256 (Ф5c2): первые 12 символов + «…». Пусто/None → «»."""
+    if not isinstance(sha, str) or not sha:
+        return ""
+    return sha[:12] + "…"
+
+
+def _blob_line(kind: str, blob: dict) -> str:
+    """Строка блоба (Ф5c2): present/available + mime + size + короткий sha.
+
+    Sparse-безопасно: size/mime отсутствуют → соответствующие части пропускаются.
+    """
+    flags = "present" if blob.get("present") is True else "absent"
+    flags += " · " + ("available" if blob.get("available") is True else "unavailable")
+    parts: list[str] = [kind, flags]
+    mime = blob.get("mime")
+    if mime:
+        parts.append(str(mime))
+    size = human_size(blob.get("size"))
+    if size != "—":
+        parts.append(size)
+    sha = short_sha(blob.get("sha256"))
+    if sha:
+        parts.append(sha)
+    return " · ".join(parts)
+
+
+def _canonical_error_line(canonical_error: dict | None) -> str:
+    """Бейдж отсутствия canonical (Ф5c2): human-причина через canonical_reason_text."""
+    reason = None
+    if isinstance(canonical_error, dict):
+        reason = canonical_error.get("reason")
+    reason_text = canonical_reason_text(reason)
+    line = "⚠ canonical недоступен"
+    if reason_text:
+        line += f": {reason_text}"
+    return line
+
+
+def render_source_card(source: dict | None, container: ui.element) -> None:
+    """Ф5c2: карточка Source — метаданные + оба блоба + canonical_error.
+
+    `source=None` (сетевой сбой) или `{"error": ...}` (гейт сервера) →
+    нейтральный «нет данных» БЕЗ раскрытия существования/зоны/лицензии/причины
+    (никакого «недоступно из-за license=unknown» — утечки нет).
+
+    Sparse-поля не фабрикуются: нет ключа → нет строки (без «нет данных»-шума
+    для отсутствующих метаданных/блоба).
+    """
+    container.clear()
+    with container:
+        if not isinstance(source, dict) or "error" in source:
+            ui.label("нет данных").classes("text-caption text-grey")
+            return
+
+        title = source.get("title") or source.get("source_id") or "—"
+        ui.label(f"📄 {title}").classes("text-subtitle2")
+
+        meta: list[str] = []
+        if source.get("format"):
+            meta.append(f"format: {source['format']}")
+        if source.get("license"):
+            meta.append(f"license: {source['license']}")
+        zone = source.get("zone")
+        if zone:
+            meta.append("🌍 public" if zone == "public" else "🔒 private")
+        if source.get("status"):
+            meta.append(f"status: {source['status']}")
+        if meta:
+            ui.label(" · ".join(meta)).classes("text-caption text-grey")
+
+        blobs = source.get("blobs")
+        if isinstance(blobs, dict):
+            for kind in ("original", "canonical"):
+                blob = blobs.get(kind)
+                if not isinstance(blob, dict):
+                    continue  # sparse: блоба нет — не фабрикуем
+                ui.label(_blob_line(kind, blob)).classes("text-caption font-mono")
+
+        canonical_error = source.get("canonical_error")
+        if canonical_error:
+            ui.label(_canonical_error_line(canonical_error)).classes(
+                "text-caption text-orange"
+            )
+            ui.label(
+                "Цитаты и постраничный просмотр могут быть недоступны — "
+                "исходник сохранён, но канонический PDF отсутствует (pdf_only-фоллбэк)."
+            ).classes("text-caption text-grey")
+
+
+def _render_provenance(snapshot: dict) -> None:
+    """Ф5a2: рендер провенанса canonical (sparse — только при наличии ключей).
+
+    Ключа нет → статус неизвестен/неприменим — ничего не добавляем
+    (без «нет данных»-шума).
+    """
+    source_id = snapshot.get("source_id")
+    canonical_present = snapshot.get("canonical_present")
+    canonical_sha256 = snapshot.get("canonical_sha256")
+    canonical_error = snapshot.get("canonical_error")
+
+    if source_id:
+        ui.label(f"источник: {source_id}").classes("text-caption text-grey")
+
+    if canonical_present is True:
+        text = "✅ canonical"
+        if canonical_sha256:
+            text += f" ({canonical_sha256[:12]}…)"
+        ui.label(text).classes("text-caption")
+    elif canonical_present is False or canonical_error:
+        reason = None
+        if isinstance(canonical_error, dict):
+            reason = canonical_error.get("reason")
+        reason_text = canonical_reason_text(reason)
+        label = "⚠ canonical недоступен"
+        if reason_text:
+            label += f": {reason_text}"
+        ui.label(label).classes("text-caption text-orange")
+        ui.label(
+            "Цитаты и постраничный просмотр могут быть недоступны — "
+            "исходник сохранён, но канонический PDF отсутствует (pdf_only-фоллбэк)."
+        ).classes("text-caption text-grey")
+
+
 def render_import_progress(snapshot: dict, container: ui.element) -> None:
     """Отрисовать прогресс-бар импорта и панель логов в заданном контейнере.
 
@@ -50,6 +214,7 @@ def render_import_progress(snapshot: dict, container: ui.element) -> None:
         ui.linear_progress(
             value=(imported / total) if total else 0,
         ).props("rounded").classes("w-full")
+        _render_provenance(snapshot)
         msgs = snapshot.get("messages", [])
         if msgs:
             with ui.column().classes("w-full q-mt-xs gap-0"):

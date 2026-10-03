@@ -121,6 +121,14 @@ def page_requests() -> None:
     build_requests()
 
 
+@ui.page("/documents")
+def page_documents() -> None:
+    """Страница «Документы» — администрирование хранилища (bibliography Ф5c1, admin-only)."""
+    render_header("documents")
+    from .pages.documents import build_documents
+    build_documents()
+
+
 # ── Start ───────────────────────────────────────────────────
 
 # kb-console-roles Ф2: users-стор + bootstrap админа из env (идемпотентно).
@@ -180,6 +188,13 @@ from .pages import requests_page, requests_print
 
 requests_page.register_api(core.app)
 requests_print.register_print_route(core.app)
+
+# bibliography Ф4c: консоль-прокси выдачи документов — GET/HEAD /documents/{sha256}.
+# Гейт зоны/роль-ключ — в хендлере (documents_proxy); неаутентифицированные —
+# 302 /login от ConsoleAuthMiddleware (существующее поведение консоли).
+from .documents_proxy import register_documents_proxy
+
+register_documents_proxy(core.app)
 
 # 035 §3б: секрет подписи cookie-сессий (env → файл в volume → ephemeral)
 # и ЯВНЫЕ параметры cookie: абсолютные 12ч (дефолт Starlette 14 суток

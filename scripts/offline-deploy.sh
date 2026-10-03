@@ -29,6 +29,7 @@ BUNDLE="$GIT_ROOT/mcp-kb-airgap-bundle.tar.gz"
 MCP_IMAGE="mcp-knowledge-server:prod"
 QDRANT_IMAGE="qdrant/qdrant:v1.13.4"
 KB_CONSOLE_IMAGE="kb-console:prod"
+KB_CONVERTER_IMAGE="mcp-knowledge-kb-converter:latest"
 COMPOSE_PROD="docker-compose.prod.yml"
 
 # Ollama-модели, которые нужны embedder'у (основная + fallback)
@@ -130,14 +131,15 @@ prepare() {
     echo "=== [prepare] Сборка air-gap bundle (машина с интернетом) ==="
     rm -rf "$GIT_ROOT/artifacts" && mkdir -p "$STAGING_DIR"/{images,ollama,scripts}
 
-    echo "[1/5] Building mcp-server image (без torch)..."
+    echo "[1/6] Building mcp-server image (без torch)..."
     docker build -t "$MCP_IMAGE" "$GIT_ROOT/mcp_server"
 
-    echo "[2/6] Building kb-console image (NiceGUI-клиент)..."
+    echo "[2/6] Building kb-console + kb-converter images..."
     docker build -t "$KB_CONSOLE_IMAGE" "$GIT_ROOT/kb-console"
+    docker build -t "$KB_CONVERTER_IMAGE" "$GIT_ROOT/kb-converter"
 
-    echo "[3/6] Saving Docker images (mcp-server + qdrant + kb-console)..."
-    docker save "$MCP_IMAGE" "$QDRANT_IMAGE" "$KB_CONSOLE_IMAGE" -o "$STAGING_DIR/images/images.tar"
+    echo "[3/6] Saving Docker images (mcp-server + qdrant + kb-console + kb-converter)..."
+    docker save "$MCP_IMAGE" "$QDRANT_IMAGE" "$KB_CONSOLE_IMAGE" "$KB_CONVERTER_IMAGE" -o "$STAGING_DIR/images/images.tar"
     echo "  images.tar: $(du -sh "$STAGING_DIR/images/images.tar" | cut -f1)"
 
     echo "[4/6] Exporting Ollama models..."

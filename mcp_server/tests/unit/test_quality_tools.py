@@ -20,7 +20,7 @@ import pytest
 from mcp_server.quality.issues import create_issue, set_store_dir
 from mcp_server.tools.quality import (
     _bg_scan,
-    _cascade_set_payload,
+    _scroll_child_ids,
     bulk_deprecate_duplicates,
     bulk_resolve_issues,
     cancel_quality_scan,
@@ -47,10 +47,24 @@ def quality_tempdir():
 
 @pytest.fixture
 def mock_app_state():
-    """Minimal app_state mock для quality tools."""
+    """Minimal app_state mock для quality tools.
+
+    Ф3a (SSOT-first): deprecate/restore/merge требуют читаемый SSOT-store —
+    read возвращает реальную KnowledgeEntry (root, published), set_status_many
+    — «ничего не изменилось» (идемпотентный мок без git-эффектов).
+    """
+    from mcp_server.models import KnowledgeEntry, KnowledgeFrontmatter
+
     state = MagicMock()
     state.qdrant = MagicMock()
-    state.store = MagicMock()
+    state.store = AsyncMock()
+    state.store.read.return_value = KnowledgeEntry(
+        frontmatter=KnowledgeFrontmatter(
+            knowledge_id="mock-kid", domain="d", subject="s"
+        ),
+        content="mock",
+    )
+    state.store.set_status_many.return_value = ([], [], [])
     return state
 
 
@@ -946,14 +960,14 @@ class TestResolveQualityIssueCascade:
 # ═══════════════════════════════════════════════════════════════
 
 
-class TestCascadeSetPayload:
-    """_cascade_set_payload — scroll по parent + set_payload на секции (13.15: async)."""
+class TestScrollChildIds:
+    """_scroll_child_ids — pagination scroll по parent (13.14 механика, Ф3а:
+    ids собираются ДО записей — SSOT-first)."""
 
     @pytest.mark.asyncio
-    async def test_sets_payload_on_all_children(self):
-        """Дочерние секции получают set_payload с переданным payload."""
+    async def test_returns_all_children(self):
+        """Дочерние секции находятся по parent_knowledge_id."""
         mock_qdrant = MagicMock()
-        mock_qdrant.set_payload = MagicMock()
 
         child1 = MagicMock()
         child1.payload = {"knowledge_id": "sec-1"}
@@ -962,30 +976,22 @@ class TestCascadeSetPayload:
 
         mock_qdrant.scroll = MagicMock(return_value=([child1, child2], None))
 
-        payload = {"status": "deprecated"}
-        affected = await _cascade_set_payload(mock_qdrant, "book-x", payload, "deprecated")
+        ids = await _scroll_child_ids(mock_qdrant, "book-x")
 
-        assert affected == 2
-        assert mock_qdrant.set_payload.call_count == 2
+        assert ids == ["sec-1", "sec-2"]
 
     @pytest.mark.asyncio
     async def test_handles_empty_children(self):
-        """Нет дочерних секций → affected=0."""
+        """Нет дочерних секций → пустой список."""
         mock_qdrant = MagicMock()
-        mock_qdrant.set_payload = MagicMock()
         mock_qdrant.scroll = MagicMock(return_value=([], None))
 
-        payload = {"status": "deprecated"}
-        affected = await _cascade_set_payload(mock_qdrant, "book-x", payload, "deprecated")
-
-        assert affected == 0
-        mock_qdrant.set_payload.assert_not_called()
+        assert await _scroll_child_ids(mock_qdrant, "book-x") == []
 
     @pytest.mark.asyncio
     async def test_paginated_scroll_for_many_children(self):
         """Пагинированный scroll при >1000 секций."""
         mock_qdrant = MagicMock()
-        mock_qdrant.set_payload = MagicMock()
 
         def _child(kid):
             c = MagicMock()
@@ -999,11 +1005,17 @@ class TestCascadeSetPayload:
             (batch2, None),
         ])
 
-        payload = {"status": "deprecated"}
-        affected = await _cascade_set_payload(mock_qdrant, "book-x", payload, "deprecated")
+        ids = await _scroll_child_ids(mock_qdrant, "book-x")
 
-        assert affected == 8
-        assert mock_qdrant.set_payload.call_count == 8
+        assert len(ids) == 8
+
+    @pytest.mark.asyncio
+    async def test_scroll_error_returns_collected(self):
+        """Ошибка scroll не роняет lifecycle — возвращено накопленное (Ф3а)."""
+        mock_qdrant = MagicMock()
+        mock_qdrant.scroll = MagicMock(side_effect=RuntimeError("qdrant down"))
+
+        assert await _scroll_child_ids(mock_qdrant, "book-x") == []
 
 
 # ═══════════════════════════════════════════════════════════════

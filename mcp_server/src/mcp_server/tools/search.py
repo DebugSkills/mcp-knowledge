@@ -18,6 +18,7 @@ import time
 from ..metrics import search_latency, tag_search_latency
 from ..storage.schema import collection_for_zone
 from .auth_zone import zones_from_auth
+from .citation_enrich import enrich_results_with_citations
 from .read import _derive_title
 
 logger = logging.getLogger("mcp_knowledge.tools.search")
@@ -35,9 +36,14 @@ def _is_meaningful_content(content: str) -> bool:
     return _ALNUM_RE.search(stripped) is not None
 
 
+# Ф2b2 (bibliography, план §3.2:148): локаторные поля выдачи — присутствуют
+# только если реально записаны в payload (Л1: чанк без спанов → ключей нет).
+_LOCATOR_PAYLOAD_FIELDS = ("source_id", "locator_kind", "locator_start", "locator_end")
+
+
 def _format_point(point, payload: dict) -> dict:
     """Форматировать одну точку Qdrant в результат поиска."""
-    return {
+    result = {
         "knowledge_id": payload.get("knowledge_id", ""),
         "chunk_id": payload.get("chunk_id", str(point.id)),
         "content": payload.get("content", ""),
@@ -53,6 +59,10 @@ def _format_point(point, payload: dict) -> dict:
         "parent_knowledge_id": payload.get("parent_knowledge_id"),
         "content_type": payload.get("content_type"),
     }
+    for key in _LOCATOR_PAYLOAD_FIELDS:
+        if key in payload:
+            result[key] = payload[key]
+    return result
 
 
 async def search_knowledge(params: dict, app_state) -> dict:
@@ -89,9 +99,12 @@ async def search_knowledge(params: dict, app_state) -> dict:
     content_type = params.get("content_type")
     if content_type:
         filters["content_type"] = content_type
-    # Root-заглушки коллекций (content_type=collection) — шум в результатах:
-    # исключаем по умолчанию, если пользователь явно не ищет коллекции.
-    exclude_content_types = None if content_type == "collection" else ["collection"]
+    # Root-заглушки коллекций (content_type=collection) и Source-записи — шум в
+    # результатах: исключаем по умолчанию, если пользователь явно не ищет их.
+    # (bibliography Ф1 R1: source исключается как collection; явный запрос — осознанный доступ.)
+    exclude_content_types = (
+        None if content_type in ("collection", "source") else ["collection", "source"]
+    )
 
     # Фаза 13.14: исключаем deprecated-записи из поиска по умолчанию
     include_deprecated = params.get("include_deprecated", False)
@@ -175,6 +188,10 @@ async def search_knowledge(params: dict, app_state) -> dict:
         "search_knowledge: query='%s', top_k=%d, found=%d, latency=%.3fs",
         query[:80], top_k, len(formatted), search_elapsed,
     )
+
+    # bibliography Ф4b2 (§3.4:189): read-time batch-enrichment цитатами —
+    # после выдачи (payload не трогается), auth из params["_auth"].
+    await enrich_results_with_citations(formatted, params, app_state)
     return {"query": query, "results": formatted, "total": len(formatted)}
 
 
@@ -182,6 +199,8 @@ async def search_by_tags(params: dict, app_state) -> dict:
     """Поиск записей по тегам через Qdrant payload filter (без GPU).
 
     match_all=True → AND (все теги), match_all=False → OR (любой тег).
+    Фаза 13.14 (fix2b P2-3): deprecated-записи исключаются по умолчанию —
+    паритет с search_knowledge; явный include_deprecated=True возвращает их.
     """
     tags = params.get("tags", [])
     if not tags or not isinstance(tags, list):
@@ -189,6 +208,18 @@ async def search_by_tags(params: dict, app_state) -> dict:
 
     match_all = params.get("match_all", True)
     limit = min(params.get("limit", 500), 1000)
+
+    # R2 (bibliography Ф1): Source-записи (и collection-заглушки) исключаются из
+    # выдачи по тегам; явный content_type=source — осознанный доступ к метаданным.
+    content_type = params.get("content_type")
+    exclude_content_types = (
+        None if content_type in ("collection", "source") else ["collection", "source"]
+    )
+
+    # Фаза 13.14 (fix2b P2-3): deprecated-записи исключаются из тег-поиска по
+    # умолчанию (include_deprecated=False), как в search_knowledge.
+    include_deprecated = params.get("include_deprecated", False)
+    exclude_statuses = None if include_deprecated else ["deprecated"]
 
     qdrant = app_state.qdrant
     loop = asyncio.get_running_loop()
@@ -205,6 +236,8 @@ async def search_by_tags(params: dict, app_state) -> dict:
                 match_all=match_all,
                 limit=limit,
                 collection_name=collection_for_zone(z),
+                exclude_content_types=exclude_content_types,
+                exclude_statuses=exclude_statuses,
             ),
         )
         results.extend(batch)
@@ -222,7 +255,7 @@ async def search_by_tags(params: dict, app_state) -> dict:
         if kid in seen:
             continue
         seen.add(kid)
-        formatted.append({
+        item = {
             "knowledge_id": kid,
             "chunk_id": payload.get("chunk_id", str(point.id)),
             "content": content,
@@ -230,7 +263,13 @@ async def search_by_tags(params: dict, app_state) -> dict:
             "subject": payload.get("subject", ""),
             "tags": payload.get("tags", []),
             "section_header": payload.get("section_header", ""),
-        })
+        }
+        # Ф4b2: локаторные поля (для citation-enrichment), Л1 — только если
+        # реально записаны в payload (паттерн _format_point).
+        for key in _LOCATOR_PAYLOAD_FIELDS:
+            if key in payload:
+                item[key] = payload[key]
+        formatted.append(item)
 
     truncated = len(results) >= limit
     tag_elapsed = time.monotonic() - t0
@@ -239,6 +278,8 @@ async def search_by_tags(params: dict, app_state) -> dict:
         "search_by_tags: tags=%s, match_all=%s, found=%d, truncated=%s, latency=%.3fs",
         tags, match_all, len(formatted), truncated, tag_elapsed,
     )
+    # bibliography Ф4b2: та же citation-проводка, что в search_knowledge.
+    await enrich_results_with_citations(formatted, params, app_state)
     return {
         "tags": tags,
         "match_all": match_all,

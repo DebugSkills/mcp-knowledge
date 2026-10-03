@@ -132,7 +132,10 @@ def mock_qdrant() -> MagicMock:
 
     # search_by_tags()
     def _fake_search_by_tags(tags, match_all: bool = True, limit: int = 500,
-                             collection_name: str | None = None):
+                             collection_name: str | None = None,
+                             exclude_content_types: list[str] | None = None,
+                             exclude_statuses: list[str] | None = None):
+        client._last_tags_exclude_statuses = exclude_statuses
         point = MagicMock()
         point.id = 2
         point.score = 1.0
@@ -303,6 +306,19 @@ def mock_store(sample_entry: KnowledgeEntry) -> MagicMock:
         return knowledge_id == sample_entry.frontmatter.knowledge_id
 
     store.delete = _delete
+
+    # Ф3a (SSOT-first): lifecycle-переходы идут через set_status_many —
+    # реалистичный мок: sample_entry меняется, прочие — already/failed.
+    async def _set_status_many(knowledge_ids, status, commit_message=None):
+        kid = sample_entry.frontmatter.knowledge_id
+        changed = [k for k in knowledge_ids if k == kid]
+        return (
+            changed,
+            [k for k in knowledge_ids if k != kid],
+            [],
+        )
+
+    store.set_status_many = _set_status_many
 
     return store
 

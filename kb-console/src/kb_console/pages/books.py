@@ -32,8 +32,9 @@ from collections.abc import Callable
 
 from nicegui import ui
 
-from ..config import MCP_API_KEY, MCP_SERVER_URL
+from ..config import MCP_SERVER_URL
 from ..core.data_cache import cache
+from ..core.identity import mcp_api_key
 from ..core.mcp_client import MCPClient
 from ..core.utils import _sanitize_title
 
@@ -297,7 +298,7 @@ async def show_book_dialog(
             динамического timeout set_zone; неизвестен → консервативно 300).
     """
     import asyncio
-    client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+    client = MCPClient(base_url=MCP_SERVER_URL, api_key=mcp_api_key())
     current_title: str = title or collection_id
     current_zone: str = "private"
 
@@ -483,7 +484,7 @@ def build_books() -> None:
         nonlocal _client
         view_container.clear()
         if _client is None:
-            _client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+            _client = MCPClient(base_url=MCP_SERVER_URL, api_key=mcp_api_key())
 
         # Прелоадер (Фаза C3): spinner при загрузке списка
         with view_container:
@@ -572,7 +573,7 @@ def build_books() -> None:
                                     async def _confirm_delete() -> None:
                                         confirm_dialog.close()
                                         ui.notify("Удаляю книгу…", type="info")
-                                        client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+                                        client = MCPClient(base_url=MCP_SERVER_URL, api_key=mcp_api_key())
                                         try:
                                             result = await client.delete_entry(cid, cascade=True)
                                             if result.get("deleted"):

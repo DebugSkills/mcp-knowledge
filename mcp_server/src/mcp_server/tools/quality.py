@@ -439,201 +439,135 @@ async def resolve_quality_issue(params: dict, app_state) -> dict:
             return {"resolved": True, "issue_id": issue_id, "status": "ignored", "side_effects": side_effects}
 
         elif action == "deprecate":
-            # Lifecycle: установить status=deprecated в Qdrant payload
+            # Ф3a (bibliography §3.6): двойная запись SSOT-first —
+            # (1) frontmatter status=deprecated (+ git-коммит), (2) payload.
+            # При расхождении выигрывает SSOT; обратный порядок запрещён.
             try:
-                qdrant = getattr(app_state, 'qdrant', None)
-                if qdrant:
-                    loop = asyncio.get_running_loop()
-                    from qdrant_client.models import FieldCondition, Filter, MatchValue
-
-                    from mcp_server.quality.lifecycle import (
-                        make_deprecation_payload_update,
-                    )
-                    payload = make_deprecation_payload_update()
-                    # Зона записи из SSOT frontmatter (_entry_zone) — иначе deprecate
-                    # public-записи был silent no-op в private-коллекции (P1-1 W2).
-                    zone = await _entry_zone(app_state, knowledge_id)
-                    await loop.run_in_executor(
-                        None,
-                        lambda k=knowledge_id, p=payload, z=zone: qdrant.set_payload(
-                            payload=p,
-                            points_filter=Filter(
-                                must=[FieldCondition(key="knowledge_id", match=MatchValue(value=k))]
-                            ),
-                            collection_name=collection_for_zone(z),
-                        ),
-                    )
-                    side_effects.append(f"Qdrant payload status set to 'deprecated' for knowledge_id={knowledge_id}")
-
-                    # Cascade: deprecate все дочерние секции (Фаза 13.14)
-                    if cascade:
-                        cascade_affected = await _cascade_set_payload(
-                            qdrant,
-                            knowledge_id,
-                            payload,
-                            "deprecated",
-                            zone=zone,
-                        )
-                        side_effects.append(
-                            f"LIFECYCLE cascade: {cascade_affected} child sections set to 'deprecated' for book {knowledge_id}"
-                        )
-                        logger.info(
-                            "[LIFECYCLE] cascade deprecate: %d sections for book %s",
-                            cascade_affected, knowledge_id,
-                        )
-
-                if issue_id:
-                    update_issue_status(issue_id, "resolved", reason or "deprecated")
-                # Фаза 1 (1d): закрыть ВСЕ open dup-issues записи (не одну) —
-                # иначе «висящие» проблемы на уже скрытой записи.
-                closed = close_all_dup_issues(
-                    knowledge_id, reason or "record deprecated"
+                outcome = await _lifecycle_transition(
+                    app_state, knowledge_id, "deprecated", cascade
                 )
-                if closed:
-                    side_effects.append(
-                        f"Closed {closed} open duplicate-issue(s) for {knowledge_id}"
-                    )
-                # Фаза 1 (1e): аудит действия
-                write_audit(
-                    action="deprecate",
-                    knowledge_id=knowledge_id,
-                    actor="operator",
-                    reason=reason or "deprecated by operator",
-                    metadata={"cascade_affected": cascade_affected, "issues_closed": closed},
+            except _LifecycleSSOTError as exc:
+                return {"resolved": False, "error": f"Deprecate failed: {exc}"}
+            side_effects.extend(outcome["side_effects"])
+            cascade_affected = outcome["cascade_affected"]
+
+            if issue_id:
+                update_issue_status(issue_id, "resolved", reason or "deprecated")
+            # Фаза 1 (1d): закрыть ВСЕ open dup-issues записи (не одну) —
+            # иначе «висящие» проблемы на уже скрытой записи.
+            closed = close_all_dup_issues(
+                knowledge_id, reason or "record deprecated"
+            )
+            if closed:
+                side_effects.append(
+                    f"Closed {closed} open duplicate-issue(s) for {knowledge_id}"
                 )
-                # Task 1: инкремент data_version после мутации
-                try:
-                    app_state.data_version += 1
-                except Exception:  # noqa: S110
-                    pass  # best-effort
-                return {
-                    "resolved": True,
-                    "issue_id": issue_id,
-                    "knowledge_id": knowledge_id,
-                    "status": "resolved",
+            idempotent = outcome["idempotent"] and not closed
+            # Фаза 1 (1e): аудит действия
+            write_audit(
+                action="deprecate",
+                knowledge_id=knowledge_id,
+                actor="operator",
+                reason=reason or "deprecated by operator",
+                metadata={
                     "cascade_affected": cascade_affected,
                     "issues_closed": closed,
-                    "side_effects": side_effects,
-                }
-            except Exception as exc:
-                logger.error("deprecate lifecycle failed for %s: %s", knowledge_id, exc)
-                return {"resolved": False, "error": f"Deprecate failed: {exc}"}
-
-        elif action == "restore":
-            # Lifecycle: установить status=published в Qdrant payload (reversibility)
-            try:
-                qdrant = getattr(app_state, 'qdrant', None)
-                if qdrant:
-                    loop = asyncio.get_running_loop()
-                    from qdrant_client.models import FieldCondition, Filter, MatchValue
-
-                    from mcp_server.quality.lifecycle import make_restore_payload_update
-                    payload = make_restore_payload_update()
-                    # Зона записи из SSOT frontmatter (_entry_zone) — P1-1 W2.
-                    zone = await _entry_zone(app_state, knowledge_id)
-                    await loop.run_in_executor(
-                        None,
-                        lambda k=knowledge_id, p=payload, z=zone: qdrant.set_payload(
-                            payload=p,
-                            points_filter=Filter(
-                                must=[FieldCondition(key="knowledge_id", match=MatchValue(value=k))]
-                            ),
-                            collection_name=collection_for_zone(z),
-                        ),
-                    )
-                    side_effects.append(f"Qdrant payload status set to 'published' for knowledge_id={knowledge_id}")
-
-                    # Cascade: restore все дочерние секции (Фаза 13.14)
-                    if cascade:
-                        cascade_affected = await _cascade_set_payload(
-                            qdrant,
-                            knowledge_id,
-                            payload,
-                            "published",
-                            zone=zone,
-                        )
-                        side_effects.append(
-                            f"LIFECYCLE cascade: {cascade_affected} child sections set to 'published' for book {knowledge_id}"
-                        )
-                        logger.info(
-                            "[LIFECYCLE] cascade restore: %d sections for book %s",
-                            cascade_affected, knowledge_id,
-                        )
-
-                if issue_id:
-                    update_issue_status(issue_id, "resolved", reason or "restored")
-                # Фаза 3 (1e, P1-NEW-1): restore-audit — СРАЗУ после update_issue_status,
-                # ПЕРЕД data_version++. Без этого cooldown-щит (2d) не находит
-                # «ts последнего restore» → восстановленная запись re-auto-deprecate.
-                write_audit(
-                    action="restore",
-                    knowledge_id=knowledge_id,
-                    actor="operator",
-                    reason=reason or "restored by operator",
-                    metadata={
-                        "restored_by_operator": True,  # явный сигнал для cooldown-щита
-                        "cascade_affected": cascade_affected,
-                        "issue_id": issue_id or None,
-                    },
-                )
-                # Task 1: инкремент data_version после мутации
+                    "ssot_changed": len(outcome["ssot_changed"]),
+                    "payload_affected": outcome["payload_affected"],
+                    "payload_error": outcome["payload_error"],
+                    "idempotent": idempotent,
+                },
+            )
+            # Task 1: инкремент data_version после РЕАЛЬНОЙ мутации
+            # (Ф3a: чистый no-op повтор не инвалидирует кэши).
+            if outcome["ssot_changed"] or closed or outcome["payload_error"]:
                 try:
                     app_state.data_version += 1
                 except Exception:  # noqa: S110
                     pass  # best-effort
-                # Фаза 3: restore переоткрывает dup-issues записи — пара снова
-                # видна в Review Queue, cooldown-щит защищает от авто-re-deprecate.
-                # (иначе идемпотентный create_issue возвращает закрытый issue → дубль невидим)
-                try:
-                    from mcp_server.quality.issues import reopen_dup_issues
+            return {
+                "resolved": True,
+                "issue_id": issue_id,
+                "knowledge_id": knowledge_id,
+                "status": "resolved",
+                "cascade_affected": cascade_affected,
+                "issues_closed": closed,
+                "idempotent": idempotent,
+                "payload_error": outcome["payload_error"],
+                "side_effects": side_effects,
+            }
 
-                    reopened = reopen_dup_issues(knowledge_id)
-                    if reopened:
-                        side_effects.append(f"Reopened {reopened} dup-issue(s) for {knowledge_id}")
-                except Exception as exc:
-                    logger.warning("reopen_dup_issues failed (non-fatal): %s", exc)
-                return {
-                    "resolved": True,
-                    "issue_id": issue_id,
-                    "knowledge_id": knowledge_id,
-                    "status": "resolved",
-                    "cascade_affected": cascade_affected,
-                    "side_effects": side_effects,
-                }
-            except Exception as exc:
-                logger.error("restore lifecycle failed for %s: %s", knowledge_id, exc)
+        elif action == "restore":
+            # Ф3a: симметричная двойная запись SSOT-first (reversibility):
+            # frontmatter status=published (+git) → payload.
+            try:
+                outcome = await _lifecycle_transition(
+                    app_state, knowledge_id, "published", cascade
+                )
+            except _LifecycleSSOTError as exc:
                 return {"resolved": False, "error": f"Restore failed: {exc}"}
+            side_effects.extend(outcome["side_effects"])
+            cascade_affected = outcome["cascade_affected"]
+
+            if issue_id:
+                update_issue_status(issue_id, "resolved", reason or "restored")
+            # Фаза 3 (1e, P1-NEW-1): restore-audit — СРАЗУ после update_issue_status,
+            # ПЕРЕД data_version++. Без этого cooldown-щит (2d) не находит
+            # «ts последнего restore» → восстановленная запись re-auto-deprecate.
+            write_audit(
+                action="restore",
+                knowledge_id=knowledge_id,
+                actor="operator",
+                reason=reason or "restored by operator",
+                metadata={
+                    "restored_by_operator": True,  # явный сигнал для cooldown-щита
+                    "cascade_affected": cascade_affected,
+                    "issue_id": issue_id or None,
+                    "ssot_changed": len(outcome["ssot_changed"]),
+                    "payload_error": outcome["payload_error"],
+                    "idempotent": outcome["idempotent"],
+                },
+            )
+            # Фаза 3: restore переоткрывает dup-issues записи — пара снова
+            # видна в Review Queue, cooldown-щит защищает от авто-re-deprecate.
+            reopened = 0
+            try:
+                from mcp_server.quality.issues import reopen_dup_issues
+
+                reopened = reopen_dup_issues(knowledge_id)
+                if reopened:
+                    side_effects.append(f"Reopened {reopened} dup-issue(s) for {knowledge_id}")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("reopen_dup_issues failed (non-fatal): %s", exc)
+            # Task 1: инкремент data_version после РЕАЛЬНОЙ мутации (Ф3a).
+            if outcome["ssot_changed"] or outcome["payload_error"] or reopened:
+                try:
+                    app_state.data_version += 1
+                except Exception:  # noqa: S110
+                    pass  # best-effort
+            return {
+                "resolved": True,
+                "issue_id": issue_id,
+                "knowledge_id": knowledge_id,
+                "status": "resolved",
+                "cascade_affected": cascade_affected,
+                "idempotent": outcome["idempotent"],
+                "payload_error": outcome["payload_error"],
+                "side_effects": side_effects,
+            }
 
         elif action == "merge":
             if not target_id:
                 return {"resolved": False, "error": "target_id is required for merge action"}
-            # Merge: deprecate source + update issue (content merge — future)
+            # Merge: deprecate источника двойной записью SSOT-first (Ф3a) —
+            # иначе полный reindex воскрешал merge-жертву (SSOT=published).
             try:
-                qdrant = getattr(app_state, 'qdrant', None)
-                if qdrant:
-                    loop = asyncio.get_running_loop()
-                    from qdrant_client.models import FieldCondition, Filter, MatchValue
-
-                    from mcp_server.quality.lifecycle import (
-                        make_deprecation_payload_update,
-                    )
-                    payload = make_deprecation_payload_update()
-                    # Зона записи из SSOT frontmatter (_entry_zone) — P1-1 W2.
-                    zone = await _entry_zone(app_state, knowledge_id)
-                    await loop.run_in_executor(
-                        None,
-                        lambda k=knowledge_id, p=payload, z=zone: qdrant.set_payload(
-                            payload=p,
-                            points_filter=Filter(
-                                must=[FieldCondition(key="knowledge_id", match=MatchValue(value=k))]
-                            ),
-                            collection_name=collection_for_zone(z),
-                        ),
-                    )
-                    side_effects.append(f"Source '{knowledge_id}' deprecated via Qdrant payload")
-            except Exception as exc:
-                logger.error("merge lifecycle failed for %s: %s", knowledge_id, exc)
+                outcome = await _lifecycle_transition(
+                    app_state, knowledge_id, "deprecated", cascade=False
+                )
+            except _LifecycleSSOTError as exc:
                 return {"resolved": False, "error": f"Merge failed: {exc}"}
+            side_effects.extend(outcome["side_effects"])
             update_issue_status(issue_id, "resolved", f"merged into {target_id}. {reason}")
             # Фаза 1 (1g): честная семантика — merge = deprecate источника
             # (обратимо через restore), контент НЕ консолидируется.
@@ -692,67 +626,215 @@ async def _entry_zone(app_state, knowledge_id: str) -> str:
     return zone or ZONE_PRIVATE
 
 
-async def _cascade_set_payload(
+class _LifecycleSSOTError(Exception):
+    """SSOT-first нарушен: без записи источника правды payload не пишется (Ф3a)."""
+
+
+async def _lifecycle_transition(
+    app_state,
+    knowledge_id: str,
+    target_status: str,
+    cascade: bool,
+) -> dict:
+    """Ф3a: двойная запись lifecycle-статуса — SSOT-first.
+
+    Порядок строго (1)→(2), обратный запрещён:
+      (1) SSOT: frontmatter status (+ version, updated_at, ОДИН git-коммит
+          на пачку root+секции) через MarkdownStore.set_status_many;
+      (2) payload: Qdrant set_payload — ТОЛЬКО записям с подтверждённым
+          SSOT-статусом (производная не опережает источник правды).
+
+    Root (parent_knowledge_id=None) → cascade ДЕФОЛТ и единственный путь:
+    явный cascade=False для книги игнорируется (иначе SSOT-потомки
+    разъезжаются с корнем). Секционные записи — режим как был (параметр).
+
+    Идемпотентность: set_status_many пропускает уже-целевые записи (без
+    версии/коммита); payload-запись остаётся дешёвой самопочинкой
+    (retry до-пишет метку после частичного сбоя).
+
+    При падении payload-пути после успешной SSOT итоговое состояние =
+    целевое (SSOT winner): ошибка логируется и возвращается в
+    payload_error; reconcile (updated_at-дрейф) дозалечит payload.
+
+    Raises:
+        _LifecycleSSOTError: SSOT недоступен / запись не найдена /
+            root-запись не смогла сменить статус.
+    """
+    store = getattr(app_state, "store", None)
+    if (
+        store is None
+        or not hasattr(store, "read")
+        or not hasattr(store, "set_status_many")
+    ):
+        raise _LifecycleSSOTError(
+            f"SSOT store unavailable for {knowledge_id}: lifecycle requires SSOT-first"
+        )
+    try:
+        entry = await store.read(knowledge_id)
+    except Exception as exc:  # noqa: BLE001
+        raise _LifecycleSSOTError(
+            f"SSOT read failed for {knowledge_id}: {exc}"
+        ) from exc
+    if entry is None:
+        raise _LifecycleSSOTError(
+            f"SSOT entry not found for {knowledge_id}: lifecycle requires SSOT-first"
+        )
+
+    fm = entry.frontmatter
+    # Зона из SSOT frontmatter (P1-1 W2) — запись уже прочитана, второй раз не читаем.
+    zone = getattr(fm, "zone", None) or ZONE_PRIVATE
+    is_root = getattr(fm, "parent_knowledge_id", None) is None
+    effective_cascade = bool(cascade) or is_root
+
+    qdrant = getattr(app_state, "qdrant", None)
+    child_ids: list[str] = []
+    if qdrant is not None and effective_cascade:
+        child_ids = await _scroll_child_ids(qdrant, knowledge_id, zone)
+
+    target_ids = [knowledge_id, *child_ids]
+    suffix = f" (+{len(child_ids)} sections)" if child_ids else ""
+    changed, already, failed = await store.set_status_many(
+        target_ids,
+        target_status,
+        commit_message=f"lifecycle {target_status}: {knowledge_id}{suffix}",
+    )
+    if knowledge_id in failed:
+        raise _LifecycleSSOTError(
+            f"SSOT status write failed for {knowledge_id} (target={target_status})"
+        )
+
+    side_effects: list[str] = [
+        f"SSOT frontmatter status='{target_status}': {len(changed)} changed, "
+        f"{len(already)} already target (single git commit)"
+    ]
+
+    # Ф3b2: availability-индекс — рескан из SSOT сразу после SSOT-записи
+    # (winner): даже при сбое payload ниже индекс согласован с источником
+    # правды. deprecate публичного Source → blob недоступен БЕЗ рестарта.
+    from .source_ref_runtime import refresh_source_ref_index
+
+    index_refresh = await refresh_source_ref_index(app_state)
+    if index_refresh.get("refreshed"):
+        side_effects.append(
+            f"source_ref_index rescan: {index_refresh.get('refs', 0)} refs"
+        )
+
+    # (2) payload — только подтверждённым в SSOT.
+    payload_affected = 0
+    payload_error: str | None = None
+    if qdrant is not None:
+        from mcp_server.quality.lifecycle import (
+            make_deprecation_payload_update,
+            make_restore_payload_update,
+        )
+
+        payload_update = (
+            make_deprecation_payload_update()
+            if target_status == "deprecated"
+            else make_restore_payload_update()
+        )
+        loop = asyncio.get_running_loop()
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        for kid in target_ids:
+            if kid in failed:
+                continue
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda k=kid, p=payload_update, z=zone: qdrant.set_payload(
+                        payload=p,
+                        points_filter=Filter(
+                            must=[FieldCondition(
+                                key="knowledge_id", match=MatchValue(value=k)
+                            )]
+                        ),
+                        collection_name=collection_for_zone(z),
+                    ),
+                )
+                payload_affected += 1
+            except Exception as exc:  # noqa: BLE001
+                # SSOT уже целевой → winner; reconcile дозалечит payload.
+                payload_error = f"payload write failed for {kid}: {exc}"
+                logger.error("[LIFECYCLE] %s", payload_error)
+
+    side_effects.append(
+        f"Qdrant payload status set to '{target_status}' for knowledge_id={knowledge_id}"
+    )
+    cascade_affected = len([c for c in child_ids if c not in failed])
+    if cascade_affected:
+        side_effects.append(
+            f"LIFECYCLE cascade: {cascade_affected} child sections set to "
+            f"'{target_status}' for book {knowledge_id}"
+        )
+        logger.info(
+            "[LIFECYCLE] cascade %s: %d sections for book %s",
+            target_status, cascade_affected, knowledge_id,
+        )
+
+    return {
+        "zone": zone,
+        "is_root": is_root,
+        "cascade_affected": cascade_affected,
+        "ssot_changed": changed,
+        "ssot_already": already,
+        "ssot_failed": failed,
+        "payload_affected": payload_affected,
+        "payload_error": payload_error,
+        "idempotent": not changed and not payload_error and not failed,
+        "side_effects": side_effects,
+    }
+
+
+async def _scroll_child_ids(
     qdrant,
     parent_knowledge_id: str,
-    payload: dict,
-    new_status: str,
     zone: str = ZONE_PRIVATE,
-) -> int:
-    """Фаза 13.14+13.15: применить set_payload ко всем дочерним секциям книги.
+) -> list[str]:
+    """Scroll дочерних секций книги по parent_knowledge_id (без записи).
 
-    Scroll по parent_knowledge_id → set_payload на каждую секцию.
-    Все Qdrant-вызовы — через run_in_executor (не блокируют event loop).
-    Возвращает число затронутых секций.
-
-    W2.13: зона параметризована (zone) — вызывающий резолвит её из SSOT-записи
-    (_entry_zone). TODO: зона из контекста запроса — W3.
+    Выделен из _cascade_set_payload (Фаза 13.14) для SSOT-first (Ф3а):
+    ids детей нужны ДО записи payload. Все Qdrant-вызовы — через
+    run_in_executor. Ошибки scroll не роняют lifecycle — каскад идёт по
+    фактически найденным секциям, расхождение дозалечит reconcile.
     """
     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
     loop = asyncio.get_running_loop()
-    affected = 0
+    child_ids: list[str] = []
     offset = None
-    while True:
-        _off = offset
-        points, next_offset = await loop.run_in_executor(
-            None,
-            lambda o=_off: qdrant.scroll(
-                scroll_filter=Filter(
-                    must=[FieldCondition(key="parent_knowledge_id", match=MatchValue(value=parent_knowledge_id))]
+    try:
+        while True:
+            _off = offset
+            points, next_offset = await loop.run_in_executor(
+                None,
+                lambda o=_off: qdrant.scroll(
+                    scroll_filter=Filter(
+                        must=[FieldCondition(
+                            key="parent_knowledge_id",
+                            match=MatchValue(value=parent_knowledge_id),
+                        )]
+                    ),
+                    limit=1000,
+                    offset=o,
+                    with_payload=["knowledge_id"],
+                    with_vectors=False,
+                    collection_name=collection_for_zone(zone),
                 ),
-                limit=1000,
-                offset=o,
-                with_payload=["knowledge_id"],
-                with_vectors=False,
-                collection_name=collection_for_zone(zone),
-            ),
+            )
+            for point in points:
+                kid = point.payload.get("knowledge_id") if point.payload else None
+                if kid:
+                    child_ids.append(kid)
+            if next_offset is None or len(points) == 0:
+                break
+            offset = next_offset
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[LIFECYCLE] child scroll failed for parent=%s: %s (cascade=0)",
+            parent_knowledge_id, exc,
         )
-        for point in points:
-            kid = point.payload.get("knowledge_id") if point.payload else None
-            if kid:
-                try:
-                    await loop.run_in_executor(
-                        None,
-                        lambda k=kid, p=payload: qdrant.set_payload(
-                            payload=p,
-                            points_filter=Filter(
-                                must=[FieldCondition(key="knowledge_id", match=MatchValue(value=k))]
-                            ),
-                            collection_name=collection_for_zone(zone),
-                        ),
-                    )
-                    affected += 1
-                except Exception as exc:
-                    logger.warning(
-                        "[LIFECYCLE] cascade set_payload failed for child %s (parent=%s): %s",
-                        kid, parent_knowledge_id, exc,
-                    )
-        if next_offset is None or len(points) == 0:
-            break
-        offset = next_offset
-
-    return affected
+    return child_ids
 
 
 async def _batch_resolve_book_titles(
@@ -1476,9 +1558,14 @@ def _restored_shielded_kids(audit_records: list[dict] | None = None) -> set[str]
 async def bulk_deprecate_duplicates(params: dict, app_state) -> dict:
     """Пакетно deprecate записи-дубликаты (Фаза 1 dedup + Фаза 3 авто-гейт).
 
-    Для каждого целевого knowledge_id: set_payload status=deprecated
-    (скрыть из поиска, обратимо через restore) → закрыть ВСЕ его open
-    dup-issues → записать в audit.jsonl. Контент .md НЕ трогается.
+    Для каждого целевого knowledge_id — двойная запись SSOT-first
+    (Ф3-fix1, P1-2 Critic Ф3): (1) frontmatter status=deprecated через
+    ОДИН batch MarkdownStore.set_status_many (один git-коммит на пачку),
+    (2) Qdrant set_payload ТОЛЬКО записям с подтверждённым SSOT-статусом
+    → закрыть ВСЕ его open dup-issues → записать в audit.jsonl.
+    Payload-only ветка УДАЛЕНА: полный reindex строит payload из SSOT
+    и воскрешал bulk-скрытия (нарушение acceptance-2 для bulk-класса).
+    Source-цели дополнительно инвалидируют source_ref_index (Ф3b2).
 
     Фаза 3: actor="auto" — гейт ЦЕЛИКОМ внутри тула (config + FP=0 за ≥N
     полных сканов + hash_only + cooldown + cap). Вызывающий не доверяется.
@@ -1582,71 +1669,156 @@ async def bulk_deprecate_duplicates(params: dict, app_state) -> dict:
         return {"resolved": False, "error": "No targets: provide issue_ids or knowledge_id or filter"}
 
     qdrant = getattr(app_state, "qdrant", None)
-    loop = asyncio.get_running_loop()
     side_effects: list[str] = []
     total_issues_closed = 0
     deprecated_count = 0
 
+    # ── Ф3-fix1 (P1-2): SSOT-first — как _lifecycle_transition, но batch:
+    # (1) ОДИН set_status_many на пачку (один git-коммит), (2) payload.
+    # Payload-only запрещён: полный reindex строит payload из SSOT и
+    # воскрешал bulk-скрытия (RESURRECTED в зонде критика).
+    store = getattr(app_state, "store", None)
+    if store is None or not hasattr(store, "read") or not hasattr(store, "set_status_many"):
+        return {
+            "resolved": False,
+            "error": "SSOT store unavailable: bulk deprecate requires SSOT-first (no payload-only)",
+            "side_effects": side_effects,
+            "truncated": truncated,
+        }
+
+    # Pre-read: зона (payload-коллекция), Source-детект (ref-index),
+    # отсутствие в SSOT → failed (производная не опережает источник правды).
+    zones: dict[str, str] = {}
+    ssot_failed: set[str] = set()
+    source_affected = False
     for target in target_kids:
-        # Фаза 3 (2c, P2-NEW-4): авто-путь — audit-FIRST strict. Без audit-записи
-        # авто-скрытие невозможно; сбой аудита → abort пачки (остаток не трогаем).
-        if is_auto and not write_audit(
-            action="bulk_deprecate",
-            knowledge_id=target,
-            actor=actor,
-            reason=reason or "auto R1 exact content-hash (FP=0 gate)",
-            metadata={"issues_closed": None, "auto": True},
-            strict=True,
-        ):
-            logger.error(
-                "[AUTO-DEDUP] strict audit failed for %s — aborting batch", target,
+        try:
+            entry = await store.read(target)
+        except Exception as exc:
+            logger.warning("bulk_deprecate: SSOT read failed for %s: %s", target, exc)
+            entry = None
+        if entry is None:
+            ssot_failed.add(target)
+            side_effects.append(f"FAILED {target}: SSOT entry not found (no payload)")
+            continue
+        fm = getattr(entry, "frontmatter", None)
+        zones[target] = getattr(fm, "zone", None) or ZONE_PRIVATE
+        if getattr(fm, "content_type", None) == "source":
+            source_affected = True
+
+    # Фаза 3 (2c, P2-NEW-4): авто-путь — audit-FIRST strict, ДО мутаций.
+    # Без audit-записи авто-скрытие невозможно; сбой аудита → abort пачки.
+    if is_auto:
+        for target in target_kids:
+            if not write_audit(
+                action="bulk_deprecate",
+                knowledge_id=target,
+                actor=actor,
+                reason=reason or "auto R1 exact content-hash (FP=0 gate)",
+                metadata={"issues_closed": None, "auto": True},
+                strict=True,
+            ):
+                logger.error(
+                    "[AUTO-DEDUP] strict audit failed for %s — aborting batch", target,
+                )
+                return {
+                    "resolved": False,
+                    "error": f"strict audit failed for {target} (batch aborted)",
+                    "deprecated_count": 0,
+                    "issues_closed": 0,
+                    "side_effects": side_effects,
+                    "truncated": truncated,
+                }
+
+    # (1) SSOT: ОДИН batch set_status_many → один git-коммит на пачку.
+    ssot_targets = [t for t in target_kids if t not in ssot_failed]
+    changed: list[str] = []
+    already: list[str] = []
+    batch_failed: list[str] = []
+    if ssot_targets:
+        try:
+            changed, already, batch_failed = await store.set_status_many(
+                ssot_targets,
+                "deprecated",
+                commit_message=(
+                    f"bulk deprecate: {len(ssot_targets)} duplicates (actor={actor})"
+                ),
             )
+        except Exception as exc:
+            logger.error("bulk_deprecate: SSOT batch write failed: %s", exc)
             return {
                 "resolved": False,
-                "error": f"strict audit failed for {target} (batch aborted)",
-                "deprecated_count": deprecated_count,
-                "issues_closed": total_issues_closed,
+                "error": f"SSOT batch write failed: {exc}",
+                "deprecated_count": 0,
+                "issues_closed": 0,
                 "side_effects": side_effects,
                 "truncated": truncated,
             }
-        try:
-            if qdrant:
-                from qdrant_client.models import FieldCondition, Filter, MatchValue
+    failed_ids = set(batch_failed)
+    confirmed = [t for t in ssot_targets if t not in failed_ids]
+    for target in batch_failed:
+        side_effects.append(f"FAILED {target}: SSOT status write failed (no payload)")
+    if changed:
+        side_effects.append(
+            f"SSOT frontmatter status='deprecated': {len(changed)} changed, "
+            f"{len(already)} already target (single git commit per batch)"
+        )
 
-                from mcp_server.quality.lifecycle import make_deprecation_payload_update
+    # Ф3b2: Source-цели → инвалидция ref-index ресканом из SSOT (winner):
+    # даже при сбое payload ниже индекс согласован с источником правды.
+    if source_affected:
+        from .source_ref_runtime import refresh_source_ref_index
 
-                payload = make_deprecation_payload_update()
-                # Зона записи из SSOT frontmatter (_entry_zone) — P1-1 W2.
-                zone = await _entry_zone(app_state, target)
+        index_refresh = await refresh_source_ref_index(app_state)
+        if index_refresh.get("refreshed"):
+            side_effects.append(
+                f"source_ref_index rescan: {index_refresh.get('refs', 0)} refs"
+            )
+
+    # (2) payload — только записям с подтверждённым SSOT-статусом.
+    if qdrant is not None and confirmed:
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        from mcp_server.quality.lifecycle import make_deprecation_payload_update
+
+        payload_update = make_deprecation_payload_update()
+        loop = asyncio.get_running_loop()
+        for target in confirmed:
+            try:
                 await loop.run_in_executor(
                     None,
-                    lambda t=target, p=payload, z=zone: qdrant.set_payload(
-                        payload=p,
+                    lambda t=target: qdrant.set_payload(
+                        payload=payload_update,
                         points_filter=Filter(
-                            must=[FieldCondition(key="knowledge_id", match=MatchValue(value=t))]
+                            must=[FieldCondition(
+                                key="knowledge_id", match=MatchValue(value=t)
+                            )]
                         ),
-                        collection_name=collection_for_zone(z),
+                        collection_name=collection_for_zone(zones.get(t) or ZONE_PRIVATE),
                     ),
                 )
                 side_effects.append(f"Deprecated {target}")
-            # Закрыть все open dup-issues записи
-            closed = close_all_dup_issues(target, reason or "deprecated in batch")
-            total_issues_closed += closed
-            if closed:
-                side_effects.append(f"Closed {closed} dup-issue(s) for {target}")
-            # Операторский путь: аудит ПОСЛЕ (как было); авто — уже выше (audit-FIRST)
-            if not is_auto:
-                write_audit(
-                    action="bulk_deprecate",
-                    knowledge_id=target,
-                    actor=actor,
-                    reason=reason or "deprecated in batch",
-                    metadata={"issues_closed": closed},
-                )
-            deprecated_count += 1
-        except Exception as exc:
-            logger.error("bulk_deprecate failed for %s: %s", target, exc)
-            side_effects.append(f"FAILED {target}: {exc}")
+            except Exception as exc:
+                # SSOT уже deprecated (winner); reconcile дозалечит payload.
+                logger.error("bulk_deprecate payload failed for %s: %s", target, exc)
+                side_effects.append(f"Payload write failed for {target}: {exc}")
+
+    # Issues + аудит подтверждённых целей (операторский путь — аудит ПОСЛЕ
+    # мутации, как было; авто — уже выше, audit-FIRST).
+    for target in confirmed:
+        closed = close_all_dup_issues(target, reason or "deprecated in batch")
+        total_issues_closed += closed
+        if closed:
+            side_effects.append(f"Closed {closed} dup-issue(s) for {target}")
+        if not is_auto:
+            write_audit(
+                action="bulk_deprecate",
+                knowledge_id=target,
+                actor=actor,
+                reason=reason or "deprecated in batch",
+                metadata={"issues_closed": closed},
+            )
+        deprecated_count += 1
 
     # data_version++ (кэш-инвалидация)
     try:
@@ -1665,6 +1837,9 @@ async def bulk_deprecate_duplicates(params: dict, app_state) -> dict:
         "side_effects": side_effects,
         "audited": True,
         "truncated": truncated,
+        "ssot_changed": len(changed),
+        "ssot_already": len(already),
+        "ssot_failed": len(ssot_failed) + len(batch_failed),
     }
 
 

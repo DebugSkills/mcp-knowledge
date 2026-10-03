@@ -17,6 +17,14 @@ from .browse import list_domains, list_projects, list_subjects
 from .collections import list_collections
 from .content import cancel_import, extract_pdf_text, import_content
 from .crud import delete_entry, update_entry, write_knowledge
+from .documents_admin import (
+    documents_check,
+    documents_gc,
+    documents_rebuild,
+    documents_retry,
+    documents_stats,
+    source_get,
+)
 from .errors_query import errors_query
 from .fragments import add_fragment, delete_fragment, find_fragment, update_fragment
 from .quality import (
@@ -69,6 +77,7 @@ _SEARCH_TAGS_SCHEMA: dict[str, Any] = {
         "tags": {"type": "array", "items": {"type": "string"}, "description": "Теги для поиска"},
         "match_all": {"type": "boolean", "default": True, "description": "AND (true) или OR (false)"},
         "limit": {"type": "integer", "default": 500, "minimum": 1, "maximum": 1000},
+        "include_deprecated": {"type": "boolean", "default": False, "description": "Показывать deprecated-записи в результатах (Фаза 13.14, паритет с search_knowledge)"},
         "zone": {"type": "string", "enum": ["public", "private"], "description": "Зона поиска: public|private (по умолчанию — из токена/обе)"},
     },
     "required": ["tags"],
@@ -89,6 +98,26 @@ _GET_MAP_SCHEMA: dict[str, Any] = {
     },
 }
 
+# Ф3c2b (bibliography): source_ref-item для MCP-контрактов write/update.
+# Копии (dict(...)) — мутации одной схемы не текут в соседние тула.
+_SOURCE_REF_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "source_id": {"type": "string", "description": "ID Source-записи (src-<sha256_16>)"},
+        "locator": {
+            "type": "object",
+            "description": "Локатор цитаты {kind: page|timestamp|..., start, end} (опционально)",
+        },
+    },
+    "required": ["source_id"],
+}
+_DOCUMENTS_PROPERTY: dict[str, Any] = {
+    "type": "array",
+    "items": _SOURCE_REF_ITEM_SCHEMA,
+    "description": "Ссылки на Source-записи: [{source_id, locator?}]. Fail-closed: source "
+    "должен существовать и иметь content_type=source (bibliography Ф3c2b)",
+}
+
 _WRITE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -101,6 +130,11 @@ _WRITE_SCHEMA: dict[str, Any] = {
         "knowledge_id": {"type": "string", "description": "Опциональный ID (авто-генерация если не указан)"},
         "wait_for_index": {"type": "boolean", "default": False},
         "zone": {"type": "string", "enum": ["public", "private"], "default": "private", "description": "Зона доступа записи (W1): public | private"},
+        "documents": dict(_DOCUMENTS_PROPERTY),
+        "source_refs": {
+            **_DOCUMENTS_PROPERTY,
+            "description": "Алиас documents: [{source_id, locator?}] — при задании обоих объединяются с дедупом",
+        },
     },
     "required": ["content", "domain", "subject"],
 }
@@ -111,6 +145,7 @@ _UPDATE_SCHEMA: dict[str, Any] = {
         "knowledge_id": {"type": "string"},
         "content": {"type": "string"},
         "version": {"type": "integer", "description": "Optimistic locking: ожидаемая версия"},
+        "source_refs": dict(_DOCUMENTS_PROPERTY),
     },
     "required": ["knowledge_id", "content"],
 }
@@ -436,6 +471,66 @@ _ERRORS_QUERY_SCHEMA: dict[str, Any] = {
     },
 }
 
+# Ф5b1 (bibliography): source_get + documents_stats — read/admin tools консоли.
+_SOURCE_GET_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "source_id": {"type": "string", "description": "ID Source-записи (src-<sha256_16>)"},
+    },
+    "required": ["source_id"],
+}
+
+_DOCUMENTS_STATS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+}
+
+# Ф5b2 (bibliography): documents_check + documents_rebuild — admin-only тулы.
+_DOCUMENTS_CHECK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "create_issues": {
+            "type": "boolean",
+            "default": False,
+            "description": "Фиксировать дефекты в quality-issues. По умолчанию False "
+                           "(read-only: не плодить issues при открытии админ-страницы).",
+        },
+    },
+}
+
+_DOCUMENTS_REBUILD_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+}
+
+# Ф5b3 (bibliography): documents_gc + documents_retry — admin-only тулы.
+_DOCUMENTS_GC_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "dry_run": {
+            "type": "boolean",
+            "default": True,
+            "description": "Только отчёт (без удаления). По умолчанию True.",
+        },
+        "allow_empty_index": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "Разрешить удаление при недоступном/пустом индексе (fail-closed "
+                "по умолчанию: деградация индекса не удаляет блобы)."
+            ),
+        },
+    },
+}
+
+_DOCUMENTS_RETRY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "source_id": {"type": "string", "description": "ID Source-записи (src-<sha256_16>)"},
+    },
+    "required": ["source_id"],
+}
+
 # ── Tool definitions ───────────────────────────────────────
 
 TOOLS: list[dict[str, Any]] = [
@@ -532,7 +627,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "bulk_deprecate_duplicates",
-        "description": "Пакетно deprecate записи-дубликаты (Фаза 1 dedup): скрыть из поиска (обратимо через restore), закрыть все их dup-issues, записать в audit.jsonl. Контент .md не трогается.",
+        "description": "Пакетно deprecate записи-дубликаты (Фаза 1 dedup): скрыть из поиска (обратимо через restore), закрыть все их dup-issues, записать в audit.jsonl. SSOT-first (Ф3-fix1): frontmatter status + один git-коммит на пачку, затем payload; переживает полный reindex.",
         "inputSchema": _BULK_DEPRECATE_DUPLICATES_SCHEMA,
     },
     {
@@ -608,6 +703,37 @@ TOOLS: list[dict[str, Any]] = [
                        "(поиск по нормализованному сообщению). Admin-only.",
         "inputSchema": _ERRORS_QUERY_SCHEMA,
     },
+    # ── Ф5b1: documents-контур (source_get read / documents_stats admin) ──
+    {
+        "name": "source_get",
+        "description": "Получить Source-запись (метаданные + блобы original/canonical). Read-scope, гейт по зоне/license/status — отказ без oracle (Source исключён из общей выдачи).",
+        "inputSchema": _SOURCE_GET_SCHEMA,
+    },
+    {
+        "name": "documents_stats",
+        "description": "Агрегаты document-контура: квота, число блобов (всего/orphans), canonicalization-jobs, grace-дни. Admin-only, без абсолютных путей FS.",
+        "inputSchema": _DOCUMENTS_STATS_SCHEMA,
+    },
+    {
+        "name": "documents_check",
+        "description": "Integrity-проверка document-контура: source-без-blob, canonical-потеря, sha-mismatch, orphans, битые ссылки. Admin-only; read-only по умолчанию (create_issues=False), агрегат + краткий список дефектов.",
+        "inputSchema": _DOCUMENTS_CHECK_SCHEMA,
+    },
+    {
+        "name": "documents_rebuild",
+        "description": "Перестроить реестр blob-стора из FS + Source SSOT (идемпотентно). Admin-only. Возвращает счётчики added/updated/removed.",
+        "inputSchema": _DOCUMENTS_REBUILD_SCHEMA,
+    },
+    {
+        "name": "documents_gc",
+        "description": "Mark-and-sweep GC orphan-блобов: кандидаты = physical − referenced, старше grace. Admin-only; dry-run по умолчанию (ничего не удаляет).",
+        "inputSchema": _DOCUMENTS_GC_SCHEMA,
+    },
+    {
+        "name": "documents_retry",
+        "description": "Реканонизация Source (original → canonical PDF, тот же путь что ingest). Admin-only; идемпотентно (canonical есть → already_present).",
+        "inputSchema": _DOCUMENTS_RETRY_SCHEMA,
+    },
 ]
 
 # ── Handler dispatch table (реальные реализации) ───────────
@@ -648,4 +774,11 @@ TOOL_HANDLERS = {
     "find_fragment": find_fragment,
     # Error→Rule sink (006): admin-only read-only
     "errors_query": errors_query,
+    # Ф5b1: documents-контур
+    "source_get": source_get,
+    "documents_stats": documents_stats,
+    "documents_check": documents_check,
+    "documents_rebuild": documents_rebuild,
+    "documents_gc": documents_gc,
+    "documents_retry": documents_retry,
 }

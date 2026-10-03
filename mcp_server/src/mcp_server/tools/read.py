@@ -19,6 +19,7 @@ import time
 
 from ..storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
 from .auth_zone import is_subscriber
+from .citation_enrich import citations_for_refs
 
 logger = logging.getLogger("mcp_knowledge.tools.read")
 
@@ -182,7 +183,7 @@ async def get_entry(params: dict, app_state) -> dict:
         except Exception as exc:
             logger.warning("get_entry: _build_toc failed for %s: %s", knowledge_id, exc)
             children = []
-    return {
+    resp = {
         "knowledge_id": fm.knowledge_id,
         "domain": fm.domain,
         "subject": fm.subject,
@@ -215,6 +216,30 @@ async def get_entry(params: dict, app_state) -> dict:
         # code-2026-08-19-zone-ui: бейдж зоны в kb-console (диалог книги)
         "zone": getattr(fm, "zone", ZONE_PRIVATE),
     }
+
+    # bibliography Ф4b2 (§3.4:189): read-time citation-enrichment записи.
+    # Секции — frontmatter.source_id; root/рукописные — source_refs[].
+    # 1 distinct-источник → citation/citation_reason на верхнем уровне;
+    # >1 → citations-список с тем же поэлементным контрактом.
+    refs: list[tuple[str, dict | None]] = []
+    fm_source_refs = getattr(fm, "source_refs", None) or []
+    for ref in fm_source_refs:
+        if isinstance(ref, dict) and ref.get("source_id"):
+            locator = ref.get("locator")
+            refs.append((str(ref["source_id"]), locator if isinstance(locator, dict) else None))
+    if not refs and getattr(fm, "source_id", None):
+        refs.append((str(fm.source_id), None))
+    if refs:
+        citations = await citations_for_refs(refs, params.get("_auth"), app_state)
+        distinct = {sid for sid, _ in refs}
+        if len(distinct) == 1:
+            if "citation" in citations[0]:
+                resp["citation"] = citations[0]["citation"]
+            if "citation_reason" in citations[0]:
+                resp["citation_reason"] = citations[0]["citation_reason"]
+        else:
+            resp["citations"] = citations
+    return resp
 
 
 async def _public_knowledge_map(domain: str | None, app_state) -> dict:

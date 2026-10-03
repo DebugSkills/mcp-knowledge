@@ -144,6 +144,11 @@ def build_payload_point(
     content_type: str | None = None,
     sequence_number: int | None = None,
     zone: str = ZONE_PRIVATE,
+    source_id: str | None = None,
+    locator_kind: str | None = None,
+    locator_start: int | float | None = None,
+    locator_end: int | float | None = None,
+    status: str | None = None,
 ) -> qmodels.PointStruct:
     """Собрать PointStruct для upsert."""
     payload = {
@@ -170,4 +175,23 @@ def build_payload_point(
         payload["sequence_number"] = sequence_number
     # W2: зона доступа (не перетирать существующий ключ, если он уже есть)
     payload.setdefault("zone", zone)
+    # Ф2b2 (bibliography, план §3.2:148): локаторные поля чанка — ВНЕ
+    # PAYLOAD_INDEXES (факт №16: без Qdrant-индексов, миграция коллекций
+    # не нужна). Л1 provenance: ключ пишется ТОЛЬКО при реально добытом
+    # значении; нет спанов/источника → ключа НЕТ (не null-заглушка).
+    if source_id is not None:
+        payload["source_id"] = source_id
+    if locator_kind is not None:
+        payload["locator_kind"] = locator_kind
+    if locator_start is not None:
+        payload["locator_start"] = locator_start
+    if locator_end is not None:
+        payload["locator_end"] = locator_end
+    # Ф3a (bibliography, план §3.6:225): lifecycle-статус из frontmatter —
+    # полный reindex не смывает метку deprecated. Sparse-запись (Л1): ключ
+    # пишется ТОЛЬКО при непубличном статусе; отсутствие = published
+    # (backward-compatible с Фазами 0-13). Поле ВНЕ PAYLOAD_INDEXES —
+    # прецедент факт №16 (без Qdrant-индексов миграция коллекций не нужна).
+    if status is not None and status != "published":
+        payload["status"] = status
     return qmodels.PointStruct(id=point_id, vector=vector, payload=payload)

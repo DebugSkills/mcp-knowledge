@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from mcp_server.content.registry import reset as registry_reset
+from mcp_server.storage.document_store import DocumentStore
 
 
 @pytest.fixture(autouse=True)
@@ -28,9 +29,14 @@ def reset_registry():
 
 
 @pytest.fixture
-def app_state_mock():
+def app_state_mock(tmp_path):
     """Create app.state mock with heavy_ops_lock and import queue."""
     state = MagicMock()
+    # Реальный blob-store в tmp (Ф5-fix2): ingest_source кладёт original blob
+    # сюда; без него _get_store отдал бы MagicMock auto-attr → make_source_id
+    # падал бы и P0-2 (keep_source_file=True) сохранял temp. Source-запись пишется
+    # в state.store (mock ниже). Не пишем в реальный DATA_ROOT/DOCUMENTS_DIR.
+    state.document_store = DocumentStore(tmp_path / "documents", max_gb=1)
     state.heavy_ops_lock = asyncio.Lock()
     state.scan_lock = state.heavy_ops_lock  # backward compat
     state.settings = MagicMock()

@@ -355,11 +355,11 @@
       # В --check merge скипнут и HEAD != target — это ПЛАН применения, не ошибка (038 §5.5).
 
     # ════════════════════ build (только git) ════════════════════
-    - name: "Build: пересобрать образы mcp-server + kb-console (git-режим; local везёт готовые)"
+    - name: "Build: пересобрать образы mcp-server + kb-console + kb-converter (git-режим; local везёт готовые)"
       tags: [build]
       when: update_source == 'git'
       ansible.builtin.command:
-        cmd: docker compose -f {{ compose_file }} build mcp-server kb-console
+        cmd: docker compose -f {{ compose_file }} build mcp-server kb-console kb-converter
         chdir: "{{ clone_dir }}"
       changed_when: false   # docker build кешируется сам; changed-статус неинформативен
 
@@ -405,7 +405,7 @@
         else
           if [ -n "$local_id" ]; then
             case "{{ img.name }}" in
-              mcp-knowledge-mcp-server:latest|kb-console:prod)
+              mcp-knowledge-mcp-server:latest|kb-console:prod|mcp-knowledge-kb-converter:latest)
                 docker tag "{{ img.name }}" "$(echo '{{ img.name }}' | cut -d: -f1):prev"
                 echo "retag {{ img.name }} → :prev (rollback-образ)" ;;
             esac

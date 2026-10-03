@@ -15,6 +15,7 @@ from mcp_server.tools.collections import list_collections
 from mcp_server.tools.content import extract_pdf_text
 from mcp_server.tools.crud import delete_entry, update_entry, write_knowledge
 from mcp_server.tools.read import get_entry, get_knowledge_map
+from mcp_server.storage.qdrant_client import QdrantClient
 from mcp_server.tools.search import search_by_tags, search_knowledge
 
 pytestmark = pytest.mark.asyncio
@@ -62,6 +63,74 @@ async def test_search_knowledge_include_deprecated_skips_filter(app_state):
     assert exclude_statuses is None, (
         f"Expected None (no filter), got {exclude_statuses}"
     )
+
+
+# ── Фаза 13.14 (fix2b P2-3): deprecated exclusion from TAG search ──
+
+
+async def test_search_by_tags_excludes_deprecated_by_default(app_state):
+    """Тег-поиск по умолчанию передаёт exclude_statuses=["deprecated"] в qdrant.search_by_tags()."""
+    result = await search_by_tags({"tags": ["test"]}, app_state)
+    assert "error" not in result
+    exclude_statuses = getattr(app_state.qdrant, "_last_tags_exclude_statuses", "MISSING")
+    assert exclude_statuses == ["deprecated"], (
+        f"Expected ['deprecated'], got {exclude_statuses}"
+    )
+
+
+async def test_search_by_tags_include_deprecated_skips_filter(app_state):
+    """include_deprecated=True → exclude_statuses=None (скрытые записи доступны явно)."""
+    result = await search_by_tags({"tags": ["test"], "include_deprecated": True}, app_state)
+    assert "error" not in result
+    exclude_statuses = getattr(app_state.qdrant, "_last_tags_exclude_statuses", "MISSING")
+    assert exclude_statuses is None, (
+        f"Expected None (no filter), got {exclude_statuses}"
+    )
+
+
+def _qdrant_with_spy():
+    """QdrantClient без сети: внутренний SDK-клиент → MagicMock-spy (scroll)."""
+    client = QdrantClient.__new__(QdrantClient)
+    client._client = MagicMock()
+    client._client.scroll.return_value = ([], None)
+    return client
+
+
+async def test_search_by_tags_storage_builds_status_must_not():
+    """storage: exclude_statuses реально строит must_not по status (AND-ветка)."""
+    client = _qdrant_with_spy()
+    client.search_by_tags(
+        tags=["x"],
+        collection_name="knowledge_private_test",
+        exclude_content_types=["collection", "source"],
+        exclude_statuses=["deprecated"],
+    )
+    flt = client._client.scroll.call_args.kwargs["scroll_filter"]
+    must_not = {(c.key, c.match.value) for c in flt.must_not}
+    assert ("status", "deprecated") in must_not
+    assert ("content_type", "collection") in must_not
+    assert ("content_type", "source") in must_not
+
+
+async def test_search_by_tags_storage_or_branch_keeps_must_not():
+    """storage: OR-ветка (match_all=False) тоже несёт status-must_not."""
+    client = _qdrant_with_spy()
+    client.search_by_tags(
+        tags=["x"], match_all=False,
+        collection_name="knowledge_private_test",
+        exclude_statuses=["deprecated"],
+    )
+    flt = client._client.scroll.call_args.kwargs["scroll_filter"]
+    must_not = {(c.key, c.match.value) for c in (flt.must_not or [])}
+    assert ("status", "deprecated") in must_not
+
+
+async def test_search_by_tags_storage_no_statuses_no_must_not():
+    """storage: без exclude_statuses must_not пуст (backward-compat)."""
+    client = _qdrant_with_spy()
+    client.search_by_tags(tags=["x"], collection_name="knowledge_private_test")
+    flt = client._client.scroll.call_args.kwargs["scroll_filter"]
+    assert flt.must_not is None
 
 
 async def test_search_by_tags_and(app_state):
@@ -392,14 +461,14 @@ async def test_search_knowledge_content_type_filter(app_state):
 
 
 async def test_search_knowledge_excludes_collections_by_default(app_state):
-    """По умолчанию root-коллекции исключаются из результатов поиска."""
+    """По умолчанию root-коллекции И Source-записи исключаются из результатов."""
     result = await search_knowledge(
         {"query": "test", "top_k": 3},
         app_state,
     )
     assert "error" not in result
     qdrant = app_state.qdrant
-    assert getattr(qdrant, "_last_search_exclude", None) == ["collection"]
+    assert getattr(qdrant, "_last_search_exclude", None) == ["collection", "source"]
 
 
 async def test_search_knowledge_keeps_collections_when_requested(app_state):

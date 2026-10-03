@@ -21,9 +21,10 @@ import uuid
 from datetime import datetime, timezone
 
 from ..config import settings
+from ..content.locator import locators_for_chunk
 from ..embedding.manager import EmbeddingManager
 from ..metrics import pipeline_backpressure
-from ..models import Chunk, KnowledgeEntry, WriteResult
+from ..models import Chunk, KnowledgeEntry, WriteResult, is_indexable
 from ..storage.markdown_store import MarkdownStore
 from ..storage.qdrant_client import QdrantClient
 from ..storage.schema import (
@@ -56,6 +57,37 @@ def _updated_at_payload(fm) -> dict:
     if getattr(fm, "updated_at_explicit", True) is False:
         return {}
     return {"updated_at": fm.updated_at.isoformat()}
+
+
+def locator_payload(fm, ch: Chunk) -> dict:
+    """Ф2b2 (bibliography): локаторные поля payload точки чанка — план §3.2:148.
+
+    Скалярная проекция локаторов чанка через реальный маппинг §3.2:147
+    (``locators_for_chunk``): пересечено несколько спанов одного kind →
+    покрывающий диапазон [min(start), max(end)] (страницы 7 и 9 → 7..9);
+    чанк на стыке разных kind → primary-kind самого раннего спана (полный
+    список без схлопывания остаётся в frontmatter locator_spans — payload
+    его не заменяет). ``source_id`` — из frontmatter секции (продюсер Ф2b3
+    заполняет из Section.meta).
+
+    Л1 provenance: нет пересечённых спанов → НЕТ никаких ключей (не
+    null-заглушки); значения происходят только из реальных спанов.
+    """
+    locators = locators_for_chunk(ch)
+    if not locators:
+        return {}
+    primary_kind = locators[0].kind
+    starts = [loc.start for loc in locators if loc.kind == primary_kind]
+    ends = [loc.end for loc in locators if loc.kind == primary_kind]
+    payload: dict = {
+        "locator_kind": primary_kind,
+        "locator_start": min(starts),
+        "locator_end": max(ends),
+    }
+    source_id = getattr(fm, "source_id", None)
+    if source_id:
+        payload["source_id"] = source_id
+    return payload
 
 
 class IndexingPipeline:
@@ -127,6 +159,13 @@ class IndexingPipeline:
         Returns:
             WriteResult с knowledge_id и статусом
         """
+        # N1 (bibliography Ф1): Source-записи (content_type="source") НЕ индексируются.
+        # Предикат на входе очереди (defence-in-depth; истинный choke point — _process_batch).
+        if not is_indexable(entry):
+            kid = entry.frontmatter.knowledge_id
+            self._completed.add(kid)
+            return WriteResult(knowledge_id=kid, indexed=True, pending=False)
+
         event = asyncio.Event() if wait_for_index else None
         item = {
             "entry": entry,
@@ -220,9 +259,14 @@ class IndexingPipeline:
             try:
                 entry = self._store._parse_file(path)
                 kid = entry.frontmatter.knowledge_id
+                # W1 (bibliography Ф1): Source-записи не индексируются — skip ДО чанкования.
+                if not is_indexable(entry):
+                    total_docs += 1
+                    continue
                 chunks = self._chunker.chunk(
                     knowledge_id=kid,
                     content=entry.content,
+                    locator_spans=entry.frontmatter.locator_spans,
                 )
                 if chunks:
                     # delete-before-upsert: идемпотентность + защита от гонки
@@ -442,9 +486,13 @@ class IndexingPipeline:
         for i, path in enumerate(paths):
             try:
                 entry = self._store._parse_file(path)
+                # W2 (bibliography Ф1): Source-записи не индексируются — skip ДО чанкования.
+                if not is_indexable(entry):
+                    continue
                 chunks = self._chunker.chunk(
                     knowledge_id=entry.frontmatter.knowledge_id,
                     content=entry.content,
+                    locator_spans=entry.frontmatter.locator_spans,
                 )
                 if chunks:
                     await self._index_chunks(entry, chunks, collection_name=collection_name)
@@ -482,9 +530,12 @@ class IndexingPipeline:
         for i, path in enumerate(paths):
             try:
                 entry = self._store._parse_file(path)
+                if not is_indexable(entry):
+                    continue
                 chunks = self._chunker.chunk(
                     knowledge_id=entry.frontmatter.knowledge_id,
                     content=entry.content,
+                    locator_spans=entry.frontmatter.locator_spans,
                 )
                 if chunks:
                     await self._index_chunks(entry, chunks)
@@ -554,6 +605,22 @@ class IndexingPipeline:
 
     async def _process_batch(self, batch: list[dict]):
         """Обработать батч: chunk → embed → upsert."""
+        # N1 (bibliography Ф1): истинный choke point — Source-записи отфильтровываются
+        # ДО чанкования. Пропущенные помечаются completed + сигналятся (wait_for_index
+        # не зависает); прямых callers (crud/fragments/admin/content) это покрывает.
+        indexable: list[dict] = []
+        for item in batch:
+            entry: KnowledgeEntry = item["entry"]
+            if is_indexable(entry):
+                indexable.append(item)
+                continue
+            kid = entry.frontmatter.knowledge_id
+            self._completed.add(kid)
+            self._sync.signal_if_registered(kid)
+            if item.get("event"):
+                item["event"].set()
+        batch = indexable
+
         # Собираем все чанки
         all_chunks: list[tuple[dict, list[Chunk]]] = []
         for item in batch:
@@ -561,6 +628,7 @@ class IndexingPipeline:
             chunks = self._chunker.chunk(
                 knowledge_id=entry.frontmatter.knowledge_id,
                 content=entry.content,
+                locator_spans=entry.frontmatter.locator_spans,
             )
             all_chunks.append((item, chunks))
 
@@ -613,6 +681,8 @@ class IndexingPipeline:
                 content_type=getattr(fm, "content_type", None),
                 sequence_number=getattr(fm, "sequence_number", None),
                 zone=zone,
+                status=getattr(fm, "status", None),
+                **locator_payload(fm, ch),
             )
             points_by_collection.setdefault(collection, []).append(point)
 
@@ -725,6 +795,8 @@ class IndexingPipeline:
                     content_type=getattr(fm, "content_type", None),
                     sequence_number=getattr(fm, "sequence_number", None),
                     zone=zone,
+                    status=getattr(fm, "status", None),
+                    **locator_payload(fm, ch),
                 )
                 points.append(point)
 

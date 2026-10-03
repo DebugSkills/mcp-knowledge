@@ -55,6 +55,11 @@ class TestErrorsQuerySetInvariants:
             "bulk_resolve_issues",
             "bulk_deprecate_duplicates",
             "errors_query",
+            "documents_stats",
+            "documents_check",
+            "documents_rebuild",
+            "documents_gc",
+            "documents_retry",
         }
 
     def test_membership_invariants(self):

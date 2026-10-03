@@ -89,6 +89,14 @@ reindex:
 backup:
 	bash scripts/backup.sh
 
+# Ф6b: green-field cutover-драйвер (идемпотентный; dry-run по умолчанию).
+#   make cutover                                      — dry-run (план, ничего не меняет)
+#   make cutover APPLY=1 CONFIRM_DESTRUCTIVE=<token>  — реальный прогон (снос шага 4 — только по confirm)
+cutover:  ## Ф6b: green-field cutover-драйвер (dry-run; APPLY=1 + CONFIRM_DESTRUCTIVE=TOKEN)
+	.venv/bin/python scripts/cutover.py $(if $(APPLY),--apply,) \
+	    $(if $(CONFIRM_DESTRUCTIVE),--confirm-destructive $(CONFIRM_DESTRUCTIVE),) \
+	    $(ARGS)
+
 # ═══════════════════════════════════════════════════════════════
 # E2E-тесты (Фаза 9) — реальный Qdrant (REST localhost:6333) + Ollama
 # ═══════════════════════════════════════════════════════════════

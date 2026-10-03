@@ -1018,3 +1018,72 @@ class MCPClient:
         if response.status_code != 200:
             return {"removed": 0, "reason": f"HTTP {response.status_code}"}
         return response.json()
+
+    # ── bibliography Ф5c1: documents admin tools ─────────────
+
+    async def documents_stats(self) -> dict[str, Any]:
+        """Сводка хранилища документов (квота/orphans/jobs/grace_days).
+
+        Returns:
+            {"quota": {"used_bytes": N, "max_bytes": N, "used_pct": f},
+             "blobs": {"total": N, "orphans": N},
+             "jobs": {...}, "grace_days": N}
+        """
+        return await self.tools_call("documents_stats", {})
+
+    async def documents_check(self, create_issues: bool = False) -> dict[str, Any]:
+        """Проверка целостности реестра документов (read-only дефолт).
+
+        Args:
+            create_issues: True — зафиксировать найденные проблемы как issues.
+
+        Returns:
+            {"ok": bool, "counts": {...}, "issues": {category: count},
+             "samples": {category: [items]}}
+        """
+        return await self.tools_call(
+            "documents_check", {"create_issues": create_issues},
+        )
+
+    async def documents_rebuild(self) -> dict[str, Any]:
+        """Пересобрать реестр документов (идемпотентно).
+
+        Returns:
+            {"added": N, "updated": N, "removed": N}
+        """
+        return await self.tools_call("documents_rebuild", {})
+
+    async def documents_gc(self, dry_run: bool = True) -> dict[str, Any]:
+        """Сборка мусора документов (GC). dry_run=True — безопасный дефолт.
+
+        Args:
+            dry_run: True — превью кандидатов; False — фактическое удаление.
+
+        Returns:
+            dry-run: {"candidates": N, "reclaimable_bytes": N, "kept_fresh": N, "kept_referenced": N}
+            real:    {"deleted": N, "freed_bytes": N, "errors": [...]}
+        """
+        return await self.tools_call("documents_gc", {"dry_run": dry_run})
+
+    async def documents_retry(self, source_id: str) -> dict[str, Any]:
+        """Повторить канонизацию документа по source_id.
+
+        Returns:
+            {"status": "ok"|"already_present"|"failed", "reason"?, "canonical_sha256"?}
+        """
+        return await self.tools_call(
+            "documents_retry", {"source_id": source_id},
+        )
+
+    async def source_get(self, source_id: str) -> dict[str, Any]:
+        """Ф5b1/Ф5c2: получить Source-запись (метаданные + оба блоба).
+
+        Гейт сервера (чужая зона / license=unknown / deprecated) → отказ без
+        oracle: {"error": "Source not found: '…'"}.
+
+        Returns:
+            {"source_id", "title", "domain", "subject", "format", "license",
+             "zone", "status", "blobs": {"original": {...}, "canonical": {...}},
+             "canonical_error"? {reason, message, at}}.
+        """
+        return await self.tools_call("source_get", {"source_id": source_id})

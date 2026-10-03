@@ -16,11 +16,21 @@
 #   V4  console     :8085, auth-aware: CONSOLE_AUTH=required(+пароль) →
 #                   без кредов 302 + Location */login* (035 gate v3),
 #                   с Basic-кредами 200 (back-compat); auth off → 200.
+#   V5  console-tls  kb-console TLS-фасад (035/030): с LAN-адреса TLS-ответ,
+#                   без кредов 302 + Location */login*, с Basic-кредами 200.
+#   V6  documents   blob-store mount (Фаза 0, code-2026-10-02-bibliography):
+#                   статически compose объявляет /app/data/documents (A1);
+#                   runtime — bind-mount активен, не overlay (A2).
+#   V7  converter   sidecar-канонизатор kb-converter (bibliography Ф1/Ф5): GET /health
+#                   → валидный JSON со статусом; отсутствие/невалидный → FAIL.
+#                   VERIFY_SKIP_CONVERTER=1 — явный SKIP (sidecar штатно выключен).
 #
 # Env: VERIFY_WAIT (сек ожидания health, дефолт 120) · VERIFY_LOG_TAIL
 #      (строк логов, дефолт 300) · VERIFY_MIN_TOOLS (дефолт 30) ·
 #      VERIFY_LOG_FILE / VERIFY_LOG_CMD (источник лога V2 вместо docker;
-#      для тестов) · --help
+#      для тестов) · VERIFY_NO_DOCKER=1 (тест-хук V6: скип runtime-проверки) ·
+#      CONVERTER_HEALTH_URL (V7, дефолт http://localhost:8660/health) ·
+#      VERIFY_SKIP_CONVERTER=1 (явный SKIP V7) · --help
 # Выход: exit = число упавших проверок (0 = зелёно). Секреты не печатаются.
 
 set -euo pipefail
@@ -30,6 +40,7 @@ ENV_FILE="$ROOT/.env"
 SERVER_HEALTH_URL="${SERVER_HEALTH_URL:-http://localhost:8000/health}"
 MCP_URL="${MCP_URL:-http://localhost:8000/mcp}"
 CONSOLE_URL="${CONSOLE_URL:-http://localhost:8085/}"
+CONVERTER_HEALTH_URL="${CONVERTER_HEALTH_URL:-http://localhost:8660/health}"
 CONTAINER="${VERIFY_CONTAINER:-mcp-knowledge-server}"
 WAIT="${VERIFY_WAIT:-120}"
 LOG_TAIL="${VERIFY_LOG_TAIL:-300}"
@@ -66,7 +77,7 @@ finish() {
 }
 
 help() {
-    sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 0
 }
 
@@ -325,10 +336,97 @@ v5_console_tls() {
     return 0
 }
 
+# ── V6 documents: blob-store mount (Фаза 0, code-2026-10-02-bibliography) ──
+# A1 (config): compose-файлы (dev+prod) объявляют маунт /app/data/documents.
+# A2 (survive): при живом контейнере — bind-mount активен (данные ВНЕ overlay,
+# переживают --force-recreate). Smoke GET /documents + registry.db — Фазы 1/4
+# (эндпоинт/реестр появятся позже; здесь только целостность маунта).
+v6_documents() {
+    local dev_compose prod_compose
+    # Тест-хук (паттерн VERIFY_LOG_FILE): переопределить пути compose для тестов.
+    dev_compose="${VERIFY_COMPOSE_DEV:-$ROOT/docker-compose.yml}"
+    prod_compose="${VERIFY_COMPOSE_PROD:-$ROOT/docker-compose.prod.yml}"
+    local ok=1 missing=""
+    # P2-4: якорный grep — строка обязана быть элементом списка volume (^[space]*- …),
+    # закомментированный mount (# …) не считается.
+    grep -qE '^[[:space:]]*-[[:space:]]+.*:/app/data/documents' "$dev_compose" 2>/dev/null || { ok=0; missing="$missing dev"; }
+    grep -qE '^[[:space:]]*-[[:space:]]+.*:/app/data/documents' "$prod_compose" 2>/dev/null || { ok=0; missing="$missing prod"; }
+    if [ "$ok" = "0" ]; then
+        FAILED=$((FAILED + 1)); FAILED_IDS+=("V6")
+        say_fail 6 "documents mount" "нет маунта /app/data/documents в compose:${missing}"
+        return 0
+    fi
+    # runtime: bind-mount (не overlay) — только при живом контейнере.
+    # VERIFY_NO_DOCKER=1 — тест-хук (как VERIFY_LOG_FILE): принудительный SKIP runtime.
+    if [ "${VERIFY_NO_DOCKER:-}" = "1" ] || ! command -v docker >/dev/null 2>&1; then
+        SKIPPED=$((SKIPPED + 1))
+        say_skip 6 "documents mount runtime" "docker недоступен (статическая проверка A1 пройдена)"
+        return 0
+    fi
+    if [ -z "$(docker ps --filter "name=$CONTAINER" -q 2>/dev/null || true)" ]; then
+        SKIPPED=$((SKIPPED + 1))
+        say_skip 6 "documents mount runtime" "контейнер $CONTAINER не запущен (статическая A1 пройдена)"
+        return 0
+    fi
+    local mtype
+    mtype="$(docker inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/app/data/documents"}}{{.Type}}{{end}}{{end}}' 2>/dev/null || true)"
+    if [ "$mtype" = "bind" ]; then
+        PASSED=$((PASSED + 1))
+        say_pass 6 "documents mount" "bind-mount /app/data/documents активен (не overlay)"
+    else
+        FAILED=$((FAILED + 1)); FAILED_IDS+=("V6")
+        say_fail 6 "documents mount" "bind-mount /app/data/documents не найден (Type=${mtype:-—})"
+    fi
+    return 0
+}
+
+# ── V7 converter: sidecar-канонизатор kb-converter (bibliography Ф1/Ф5) ──
+# Ф5 documents_retry и Ф1 канонизация зависят от сайдкара → его молчаливое
+# отсутствие в проде = скрытый дефект. Probe GET /health → валидный JSON со
+# статусом; отсутствие/невалидный → FAIL. VERIFY_SKIP_CONVERTER=1 — явный
+# SKIP (sidecar штатно выключен, INGEST_POLICY=pdf_only), НЕ дефолт.
+v7_converter() {
+    if [ "${VERIFY_SKIP_CONVERTER:-}" = "1" ]; then
+        SKIPPED=$((SKIPPED + 1))
+        say_skip 7 "converter" "VERIFY_SKIP_CONVERTER=1 — sidecar штатно выключен"
+        return 0
+    fi
+    local body
+    body="$(curl -sf -m 10 "$CONVERTER_HEALTH_URL" 2>/dev/null || true)"
+    if [ -z "$body" ]; then
+        FAILED=$((FAILED + 1)); FAILED_IDS+=("V7")
+        say_fail 7 "converter" "нет ответа $CONVERTER_HEALTH_URL (sidecar kb-converter не поднят?)"
+        return 0
+    fi
+    if [ -z "$PY" ]; then
+        FAILED=$((FAILED + 1)); FAILED_IDS+=("V7")
+        say_fail 7 "converter" "python недоступен для разбора JSON"
+        return 0
+    fi
+    local status
+    if ! status="$(printf '%s' "$body" | "$PY" -c '
+import json, sys
+d = json.load(sys.stdin)
+s = d.get("status")
+if not s:
+    raise SystemExit("no status field")
+print(s)
+' 2>/dev/null)"; then
+        FAILED=$((FAILED + 1)); FAILED_IDS+=("V7")
+        say_fail 7 "converter" "JSON невалиден или нет поля status: $(printf '%s' "$body" | head -c 120)"
+        return 0
+    fi
+    PASSED=$((PASSED + 1))
+    say_pass 7 "converter /health" "status=$status (sidecar kb-converter жив)"
+    return 0
+}
+
 v1_health
 v2_logs
 v3_tools
 v4_console
 v5_console_tls
+v6_documents
+v7_converter
 
 finish

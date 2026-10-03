@@ -19,8 +19,9 @@
 # Использование:
 #   scripts/airgap-pack-subset.sh [--out DIR] [--image IMG]... [--tag ISO] [--help]
 #     --out DIR     куда положить пакет (default: <repo>/artifacts)
-#     --image IMG   добавляемый образ (default: mcp-knowledge-mcp-server:latest;
-#                   повторяемый: --image kb-console:prod)
+#     --image IMG   добавляемый образ (default: mcp-knowledge-mcp-server:latest
+#                   + mcp-knowledge-kb-converter:latest — канонизатор Ф1+; прочие
+#                   sidecar'ы, напр. kb-console:prod, — через повторяемый --image)
 #     --tag ISO     явный ISO-суффикс имени пакета (default: date -u +%Y%m%dT%H%M%SZ)
 # Выход: <out>/mcp-kb-update-<ISO>.tar.gz (+ каталог) — самопроверка
 # `offline-update.sh verify` в конце; строки ISO/sha256/target/digest в stdout.
@@ -32,7 +33,7 @@ GIT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VERIFY_SH="$SCRIPT_DIR/offline-update.sh"
 
 OUT="$GIT_ROOT/artifacts"
-IMAGES=("mcp-knowledge-mcp-server:latest")
+IMAGES=("mcp-knowledge-mcp-server:latest" "mcp-knowledge-kb-converter:latest")
 ISO=""
 
 die() { echo "ОШИБКА: $*" >&2; exit 1; }

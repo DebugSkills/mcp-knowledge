@@ -42,6 +42,7 @@ UPDATE_MODELS_NEEDED=("mxbai-embed-large" "nomic-embed-text" "qwen2.5:7b")
 BASE_IMAGES=(
     "mcp-knowledge-mcp-server:latest"
     "kb-console:prod"
+    "mcp-knowledge-kb-converter:latest"
     "qdrant/qdrant:v1.13.4"
     "caddy:2-alpine"
 )
@@ -49,6 +50,7 @@ BASE_IMAGES=(
 ROLLBACK_IMAGES=(
     "mcp-knowledge-mcp-server:latest"
     "kb-console:prod"
+    "mcp-knowledge-kb-converter:latest"
 )
 
 die() { echo "ОШИБКА: $*" >&2; exit 1; }
@@ -275,9 +277,9 @@ manifest.target_commit. Закоммитьте правки ИЛИ переда�
     branch="$(git -C "$GIT_ROOT" rev-parse --abbrev-ref HEAD)"
 
     # build своих образов с фиксированным проектом (P1-2: -p mcp-knowledge)
-    info "build mcp-server + kb-console (docker compose -p $COMPOSE_PROJECT) …"
+    info "build mcp-server + kb-console + kb-converter (docker compose -p $COMPOSE_PROJECT) …"
     ( cd "$GIT_ROOT" && docker compose -p "$COMPOSE_PROJECT" -f docker-compose.yml \
-        build mcp-server kb-console ) || die "docker compose build FAILED"
+        build mcp-server kb-console kb-converter ) || die "docker compose build FAILED"
 
     # внешние образы: pull при отсутствии
     local img

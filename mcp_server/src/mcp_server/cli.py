@@ -2,6 +2,7 @@
 
 - reindex: полный переиндекс из Markdown SSOT
 - dlq-replay: возврат задач из DLQ в очередь
+- documents-check: integrity documents (Source-refs ↔ blobs, Ф3c1)
 - token: управление токенами доступа (create/list/revoke/rotate) — W4.5,
   план two-zone-access §2.3: самодокументируемый формат mcp_<уровень><зона>_<secret>
   (v1.5) + визуальные бейджи (v1.3)
@@ -56,6 +57,31 @@ async def reindex():
     finally:
         await pipeline.stop()
         qdrant.close()
+
+
+async def documents_check_cmd() -> dict:
+    """Integrity-проверка documents: Source-refs ↔ blob-стор (Ф3c1).
+
+    Полный цикл: каждый ref каждого Source → blob существует ∧ sha256
+    пересчитан потоково и совпал; canonical-chain (canonical жив ∧ provenance
+    полон); orphan-sweep (blob без refs — кандидат GC). Дефекты →
+    quality-issues (broken_link/orphaned, идемпотентно).
+
+    Использование: python -m mcp_server.cli documents-check
+    Exit-code планировщику: 0 — чисто, 1 — есть дефекты.
+    """
+    import json as _json
+
+    from .config import settings
+    from .storage import DocumentStore, MarkdownStore
+    from .tools.documents_integrity import documents_check
+
+    store = MarkdownStore()
+    document_store = DocumentStore(settings.DOCUMENTS_DIR, settings.DOCUMENTS_STORE_MAX_GB)
+
+    report = await documents_check(store, document_store)
+    logger.info("DOCUMENTS-CHECK отчёт: %s", _json.dumps(report, ensure_ascii=False))
+    return report
 
 
 async def dlq_replay():
@@ -157,6 +183,7 @@ async def dlq_replay():
                             parent_knowledge_id=getattr(fm, "parent_knowledge_id", None),
                             content_type=getattr(fm, "content_type", None),
                             zone=zone,
+                            status=getattr(fm, "status", None),
                         )
                         points.append(point)
                     qdrant.upsert_points(
@@ -432,7 +459,7 @@ def cmd_token(argv: list[str]) -> None:
 def main():
     """Точка входа: python -m mcp_server.cli <command>"""
     if len(sys.argv) < 2:
-        print("Usage: python -m mcp_server.cli <reindex|dlq-replay|token>")
+        print("Usage: python -m mcp_server.cli <reindex|dlq-replay|documents-check|token>")
         sys.exit(1)
 
     command = sys.argv[1]
@@ -440,11 +467,14 @@ def main():
         asyncio.run(reindex())
     elif command == "dlq-replay":
         asyncio.run(dlq_replay())
+    elif command == "documents-check":
+        report = asyncio.run(documents_check_cmd())
+        sys.exit(0 if report.get("ok") else 1)
     elif command == "token":
         cmd_token(sys.argv[2:])
     else:
         print(f"Неизвестная команда: {command}")
-        print("Доступные команды: reindex, dlq-replay, token")
+        print("Доступные команды: reindex, dlq-replay, documents-check, token")
         sys.exit(1)
 
 

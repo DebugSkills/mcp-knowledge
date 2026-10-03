@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -22,6 +23,7 @@ from fastapi import Request
 from fastapi.responses import Response
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 
+from .config import settings
 from .storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
 
 logger = logging.getLogger("mcp_knowledge.metrics")
@@ -111,6 +113,56 @@ quality_gate_skipped = Counter(
     "mcp_quality_gate_skipped_total",
     "Сколько раз quality-gate (collision check / dup-gate) был пропущен (non-fatal)",
     ["gate", "reason"],
+)
+# ── bibliography Ф3b2: SourceRefIndex fail-safe ──────────────
+source_ref_index_errors = Counter(
+    "mcp_source_ref_index_errors_total",
+    "Ошибки скана/рескана SourceRefIndex (fail-safe: пустой индекс, fail-closed)",
+    ["op"],
+)
+
+# ── bibliography Ф3c3: documents blob-store (P1-6) ───────────
+# G11: регистрируется ТОЛЬКО при DOCUMENTS_SIZE_METRIC_ENABLED (boot-time) —
+# при False метрика отсутствует в exposition вовсе (prometheus экспонирует
+# Gauge сразу при регистрации, «не выставлять» недостаточно); мёртвый конфиг
+# (Ф0) приведён в действие. Двойной гейт в update_* покрывает runtime-флип.
+documents_bytes: Gauge | None = (
+    Gauge(
+        "mcp_documents_bytes",
+        "Σ размеров физических blob-ов в реестре document_store (байт)",
+    )
+    if settings.DOCUMENTS_SIZE_METRIC_ENABLED
+    else None
+)
+documents_blobs_total = Gauge(
+    "mcp_documents_blobs_total",
+    "Число физических blob-ов (строк реестра) document_store",
+)
+documents_sources_total = Gauge(
+    "mcp_documents_sources_total",
+    "Число Source-записей в SourceRefIndex (SSOT content_type=source)",
+)
+documents_orphans_total = Gauge(
+    "mcp_documents_orphans_total",
+    "Orphan-blob'ы (кандидаты GC) из последнего integrity-отчёта documents_check",
+)
+documents_jobs_pending_total = Gauge(
+    "mcp_documents_jobs_pending_total",
+    "Canonicalization-jobs в статусе pending (таблица registry.db)",
+)
+documents_jobs_failed_total = Gauge(
+    "mcp_documents_jobs_failed_total",
+    "Canonicalization-jobs в статусе failed (таблица registry.db)",
+)
+documents_quota_exceeded = Counter(
+    "mcp_documents_quota_exceeded_total",
+    "Отказов записи blob-а по квоте document_store (QuotaExceededError, G7)",
+)
+
+# Ф4a: HTTP-выдача blob (GET/HEAD /documents/{sha256}, план §3.4).
+documents_served_total = Counter(
+    "mcp_documents_served_total",
+    "Успешные HTTP-выдачи blob через GET/HEAD /documents (статусы 200/206)",
 )
 
 # ── Фаза 12: Observability metrics (V2) ─────────────────────
@@ -239,6 +291,68 @@ def record_index_gen_latency(elapsed_seconds: float) -> None:
     index_gen_latency.observe(elapsed_seconds)
 
 
+# ── Documents metrics (Ф3c3) ───────────────────────────────
+
+# Последний integrity-отчёт documents_check → orphans-gauge.
+# None — проверка ни разу не выполнялась (gauge = 0). Обновляется из
+# reconcile (шаг 5) через record_documents_integrity; чтение — без IO.
+_documents_integrity_orphans: int | None = None
+
+
+def record_documents_integrity(report: dict) -> None:
+    """Запомнить последний integrity-отчёт documents_check (orphans для gauge).
+
+    Fail-safe: битый отчёт → значение не меняется.
+    """
+    global _documents_integrity_orphans
+    try:
+        _documents_integrity_orphans = len(report.get("orphans") or [])
+    except Exception:
+        pass
+
+
+def update_documents_metrics(document_store, app_state=None) -> None:
+    """Обновить documents-метрики из реестра/ref-index/последнего отчёта.
+
+    СИНХРОННАЯ (блокирующий SQLite) — из async-кода звать через
+    run_in_executor (см. metrics_endpoint). Каждая группа независима и
+    fail-safe: сбой сбора → соответствующие gauge-ы не выставляются.
+
+    - mcp_documents_bytes — Σ size реестра (только при
+      DOCUMENTS_SIZE_METRIC_ENABLED, иначе gauge не эмитится вовсе);
+    - mcp_documents_blobs_total — строк реестра;
+    - mcp_documents_jobs_{pending,failed}_total — canonicalization_jobs;
+    - mcp_documents_sources_total — Source-записей SourceRefIndex;
+    - mcp_documents_orphans_total — последний documents_check (0 если не было).
+    """
+    # Реестр: bytes + blobs
+    try:
+        total = document_store.total_bytes()
+        if documents_bytes is not None and settings.DOCUMENTS_SIZE_METRIC_ENABLED:
+            documents_bytes.set(total)
+        documents_blobs_total.set(document_store.count())
+    except Exception:
+        pass
+    # Canonicalization-jobs по статусам
+    try:
+        counts = document_store.job_counts()
+        documents_jobs_pending_total.set(counts.get("pending", 0))
+        documents_jobs_failed_total.set(counts.get("failed", 0))
+    except Exception:
+        pass
+    # Source-записи из ref-index (in-memory, без IO); нет индекса → 0
+    try:
+        index = getattr(app_state, "source_ref_index", None)
+        documents_sources_total.set(index.sources if index is not None else 0)
+    except Exception:
+        pass
+    # Orphans из последнего integrity-отчёта (0 — проверка не выполнялась)
+    try:
+        documents_orphans_total.set(_documents_integrity_orphans or 0)
+    except Exception:
+        pass
+
+
 # ── /metrics endpoint handler ──────────────────────────────
 
 
@@ -262,6 +376,18 @@ async def metrics_endpoint(request: Request) -> Response:
 
     try:
         update_collection_metrics(app_state.qdrant)
+    except Exception:
+        pass
+
+    # Ф3c3: documents-метрики — сбор синхронный (SQLite/FS) → executor;
+    # fail-safe: сбой сбора не роняет эндпоинт (gauge-ы остаются прежними).
+    try:
+        document_store = getattr(app_state, "document_store", None)
+        if document_store is not None:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, update_documents_metrics, document_store, app_state
+            )
     except Exception:
         pass
 

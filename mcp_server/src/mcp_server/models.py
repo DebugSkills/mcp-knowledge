@@ -48,8 +48,37 @@ class KnowledgeFrontmatter(BaseModel):
     # ── Фаза 5: parent-child collection fields ──────────────
     parent_knowledge_id: str | None = Field(None, description="ID родительской коллекции (null для root)")
     sequence_number: int | None = Field(None, ge=1, description="Порядковый номер в коллекции (1..N)")
-    content_type: str | None = Field(None, description="Тип контента: book | pdf | collection | ...")
+    content_type: str | None = Field(None, description="Тип контента: book | pdf | collection | source | ...")
     children: list[dict] | None = Field(None, description="Список children для collection-root (TOC)")
+    # ── Source SSOT (code-2026-10-02-bibliography, Фаза 1, план §3.1) ──
+    # Источник документа: format/locator_kind/blobs/bibliography/license.
+    # Запись content_type="source" НЕ индексируется (INDEX_EXCLUDED_CONTENT_TYPES).
+    format: str | None = Field(None, description="Формат источника: pdf|docx|md|epub|html|txt|audio|video|image|sheet|url")
+    locator_kind: str | None = Field(None, description="Ось адресации цитат (page|timestamp|image|sheet_row|...)")
+    ingest_policy_applied: str | None = Field(None, description="Журнал политики ingest (normalize|pdf_only)")
+    bibliography: dict | None = Field(None, description="CSL-библиография (type/author/title/issued/publisher/...)")
+    license: str | None = Field(None, description="Лицензия: own|cc-*|licensed|restricted|unknown")
+    public_allowed: bool | None = Field(None, description="Машиночитаемая политика публикации (из license)")
+    blobs: dict | None = Field(None, description="blobs {original, canonical, derived[]} с sha256/provenance")
+    source_refs: list[dict] | None = Field(None, description="Ссылки Knowledge-записи на Source (source_id + locator)")
+    # ── Locator-aware pipeline (bibliography Ф2b1, план §3.2:127-131) ──
+    # Спаны локаторов СЕКЦИИ: [{locator: {kind, start, end, display},
+    # offset_start, offset_end}]. Offsets — полуоткрытый интервал [start, end)
+    # относительно тела секции КАК ОНО СЕРИАЛИЗУЕТСЯ В .md (entry.content
+    # после `---`). Round-trip инвариант (§3.2:130): write→read возвращает
+    # те же offsets. Л1 provenance: спанов нет → поля нет (None;
+    # exclude_none=True в _write_file не пишет ключ в YAML).
+    locator_spans: list[dict] | None = Field(
+        None,
+        description="Спаны локаторов секции: [{locator{kind,start,end,display}, offset_start, offset_end}]",
+    )
+    # Ф2b2 (bibliography, план §3.1:120): «секции — source_id + locator_spans».
+    # ID Source-записи (src-<sha256_16>); продюсер Ф2b3 заполняет из Section.meta.
+    # None → ключ не пишется в YAML (exclude_none) и не попадает в payload (Л1).
+    source_id: str | None = Field(
+        None,
+        description="ID Source-записи для секции/записи с локаторами (src-<sha256_16>)",
+    )
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         description="Дата создания",
@@ -116,6 +145,23 @@ class KnowledgeEntry(BaseModel):
         return self.frontmatter.zone
 
 
+# ── Indexability (bibliography Фаза 1, план §3.5) ──────────
+
+# Единый предикат «Source НЕ индексируется»: типы контента, исключённые
+# из векторизации (индексация/реконсиляция/выдача — три контура, N1 choke point).
+INDEX_EXCLUDED_CONTENT_TYPES = frozenset({"source"})
+
+
+def is_indexable(entry_or_frontmatter) -> bool:
+    """Предикат индексации: Source-записи (content_type="source") исключены.
+
+    Принимает KnowledgeEntry или KnowledgeFrontmatter (duck-typing).
+    """
+    fm = getattr(entry_or_frontmatter, "frontmatter", entry_or_frontmatter)
+    content_type = getattr(fm, "content_type", None)
+    return content_type not in INDEX_EXCLUDED_CONTENT_TYPES
+
+
 # ── Chunk ──────────────────────────────────────────────────
 
 class Chunk(BaseModel):
@@ -127,6 +173,16 @@ class Chunk(BaseModel):
     section_header: str = Field("", description="Заголовок ## секции-родителя")
     chunk_index: int = Field(..., ge=0, description="Индекс чанка внутри документа")
     token_count: int = Field(..., description="Фактическое количество токенов XLM-R")
+    # ── Locator-aware pipeline (bibliography Ф2b1, план §3.2:147) ──
+    # char_start/char_end — [start, end) в координатах тела секции КАК ОНО
+    # СЕРИАЛИЗУЕТСЯ В .md; вычисляются ДО мутаций чанкера (.strip() тела и
+    # вставка "## header" их не сдвигают: offsets относятся к исходному телу,
+    # а не к мутированному чанк-контенту). locator_spans — спаны СЕКЦИИ,
+    # унаследованные чанком как есть; выборка по пересечению —
+    # content.locator.locators_for_chunk. Л1: спанов нет → поля НЕТ (None).
+    char_start: int | None = Field(None, ge=0, description="Начало чанка [char_start, char_end), координаты сериализованного тела секции")
+    char_end: int | None = Field(None, ge=0, description="Конец чанка [char_start, char_end), координаты сериализованного тела секции")
+    locator_spans: list[dict] | None = Field(None, description="Спаны локаторов секции (унаследованы; маппинг — locators_for_chunk)")
 
 
 # ── Qdrant Point ──────────────────────────────────────────
@@ -171,6 +227,10 @@ class WriteRequest(BaseModel):
     )
     zone: str = Field(
         default="private", description="Зона доступа (W1.2): public | private"
+    )
+    source_refs: list[dict] | None = Field(
+        None,
+        description="Ссылки на Source-записи (source_id + locator) — bibliography Ф3c2",
     )
 
 

@@ -79,3 +79,6 @@ ansible/hardware/
 docs/hardware-*.md
 .cline
 kb-console-quality-after-deploy-011-2026-09-24.png
+
+# Draft/scratch space (черновики, ревизии, критики) — не в репу
+.tmp/

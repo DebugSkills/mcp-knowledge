@@ -20,8 +20,9 @@ from nicegui import ui
 
 from ..components.auth_banner import AuthBanner
 from ..components.queue_console import build_import_queue
-from ..config import MCP_API_KEY, MCP_SERVER_URL
+from ..config import MCP_SERVER_URL
 from ..core.auth_polling import Backoff, poll_step
+from ..core.identity import mcp_api_key
 from ..core.mcp_client import MCPClient
 from ..core.utils import (
     MAX_FILE_SIZE,
@@ -97,7 +98,7 @@ def build_import() -> None:
                 with open(tmp_path, "wb") as f:
                     f.write(raw)
                 try:
-                    client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+                    client = MCPClient(base_url=MCP_SERVER_URL, api_key=mcp_api_key())
                     upload_result = await client.upload_pdf(tmp_path, filename)
                     await client.close()
                     pdf_path = upload_result.get("pdf_path", "")
@@ -242,7 +243,7 @@ def build_import() -> None:
     async def _load_replace_options() -> None:
         """Загрузить список коллекций для replace-дропдауна."""
         try:
-            client = MCPClient(base_url=MCP_SERVER_URL, api_key=MCP_API_KEY)
+            client = MCPClient(base_url=MCP_SERVER_URL, api_key=mcp_api_key())
             books = await client.list_collections()
             opts: dict[str, str] = {}
             for b in books:
@@ -395,7 +396,7 @@ def build_import() -> None:
 
         client = MCPClient(
             base_url=MCP_SERVER_URL,
-            api_key=MCP_API_KEY,
+            api_key=mcp_api_key(),
             timeout=IMPORT_TIMEOUT,
         )
         try:
@@ -479,7 +480,7 @@ def build_import() -> None:
 
         client = MCPClient(
             base_url=MCP_SERVER_URL,
-            api_key=MCP_API_KEY,
+            api_key=mcp_api_key(),
             timeout=ANALYZE_TIMEOUT,
         )
         try:
@@ -556,7 +557,7 @@ def build_import() -> None:
 
         client = MCPClient(
             base_url=MCP_SERVER_URL,
-            api_key=MCP_API_KEY,
+            api_key=mcp_api_key(),
             timeout=IMPORT_TIMEOUT,
         )
         # 13.9: старт живого прогресса — поллинг GET /imports/{id}/progress

@@ -42,7 +42,8 @@ class FakeQdrant:
         return self._points(collection_name)[offset: offset + top_k]
 
     def search_by_tags(self, tags=None, match_all=True, limit=500,
-                       collection_name=None):
+                       collection_name=None, exclude_content_types=None,
+                       exclude_statuses=None):
         self.search_calls.append(collection_name)
         out = []
         for p in self.points.get(collection_name, []):

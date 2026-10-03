@@ -107,6 +107,13 @@ class Settings(BaseSettings):
     TOKENS_DIR: str = "/app/data/tokens"
     TOKEN_INDEX_TTL_SEC: int = 5  # TTL in-memory индекса (перечитывание файла)
 
+    # bibliography Ф4b2 (план §3.4:189): TTL-кэш Source-frontmatter для
+    # read-time citation-enrichment. Паттерн TOKEN_INDEX_TTL_SEC: короткий TTL —
+    # defence-in-depth; первичная свежесть — write-хуки source_ref_runtime.
+    SOURCE_CACHE_TTL_SEC: int = 5
+    # Верхняя граница кэша (LRU-вытеснение старейшего).
+    SOURCE_CACHE_MAX_ENTRIES: int = 256
+
     # Quality scan scheduler (13.19) — ночной периодический скан ВНУТРИ контейнера
     QUALITY_SCAN_CRON_ENABLED: bool = True
     QUALITY_SCAN_CRON_HOUR: int = 3
@@ -151,6 +158,45 @@ class Settings(BaseSettings):
     # [P0-2] Checkpoint cleanup: предотвращение disk exhaustion
     PDF_IMPORT_CACHE_MAX_AGE_DAYS: int = 30
     PDF_IMPORT_CACHE_MAX_SIZE_MB: int = 500
+
+    # ── Documents blob-store (code-2026-10-02-bibliography, Фаза 0) ──────────
+    # Каталог оригиналов документов (blob-store). Монтируется из DATA_ROOT
+    # (compose: data/documents → /app/data/documents) — переживает
+    # docker compose --force-recreate (гейт A2). Сам document_store (put/get/
+    # sharded ab/cd/ + SQLite-реестр) — Фаза 1; здесь только пути/лимиты.
+    DOCUMENTS_DIR: str = "/app/data/documents"
+    # Квота стора (решение 8): 10 GB. Проверка ДО put (Фаза 1) + метрика
+    # documents_quota_exceeded_total (G7). Env-override (паттерн QUALITY_DIR).
+    DOCUMENTS_STORE_MAX_GB: int = 10
+    # GC grace-period (О-2): сирота-blob удаляется после N дней без ссылок
+    # (mark-and-sweep, Фаза 6). Env-override.
+    DOCUMENTS_GC_GRACE_DAYS: int = 30
+    # Ретеншн operational-джоб (Ф3c2c): завершённые (done/failed)
+    # canonicalization-jobs удаляются из registry через N дней от ЗАВЕРШЕНИЯ
+    # (cutoff-поле COALESCE(updated_at, created_at)); running/pending
+    # не удаляются. Env-override.
+    DOCUMENTS_JOBS_RETENTION_DAYS: int = 30
+    # Заготовка метрики размера стора (G11: documents_bytes). Фактический
+    # подсчёт — Фаза 1 (document_store); флаг включает экспорт метрики.
+    DOCUMENTS_SIZE_METRIC_ENABLED: bool = True
+
+    # ── Канонизатор kb-converter (bibliography Ф1, план §4) ──────────
+    # Sidecar-конвертер документных форматов → canonical PDF (loopback :8660).
+    CONVERTER_URL: str = "http://localhost:8660"
+    # Политика ingest (план §4.1 decision-16 / §4.6): normalize — канонизировать
+    # non-PDF (DEFAULT, канон); pdf_only — аварийный deploy-time fallback (non-PDF
+    # принимается как original БЕЗ canonical → цитирование недоступно,
+    # reason=policy_pdf_only). pdf_only включается ТОЛЬКО явно через env.
+    INGEST_POLICY: str = "normalize"
+    # Лимиты конвертера (план §4.6): вход/выход/распаковка (zip-bomb)/страницы.
+    CONVERTER_MAX_INPUT_BYTES: int = 104_857_600      # 100 MB
+    CONVERTER_MAX_OUTPUT_BYTES: int = 524_288_000     # 500 MB
+    CONVERTER_MAX_UNPACKED_BYTES: int = 1_073_741_824  # 1 GiB (кумулятивный zip-счётчик)
+    CONVERTER_MAX_PAGES: int = 2000
+    # Таймауты по формату (план §4.6).
+    CONVERTER_TIMEOUT_DOCX: float = 120.0
+    CONVERTER_TIMEOUT_MD_TXT_HTML: float = 60.0
+    CONVERTER_TIMEOUT_EPUB: float = 180.0
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

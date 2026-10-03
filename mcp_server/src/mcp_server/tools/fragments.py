@@ -91,37 +91,14 @@ async def add_fragment(params: dict, app_state) -> dict:
     # Без явного zone → наследование зоны книги (без конфликта/issue).
     parent_zone = getattr(root_fm, "zone", None) or ZONE_PRIVATE
 
-    # NH-iter2-1: lifecycle-статус канонически в Qdrant payload — deprecate живёт
-    # ТОЛЬКО в payload (quality.py:381 set_payload status=deprecated), SSOT
-    # frontmatter.status НЕ обновляется. Проверяем payload с fallback на frontmatter.
+    # Ф3-fix2a (P2-2): SSOT-winner. Lifecycle-статус канонически живёт в
+    # SSOT frontmatter: _lifecycle_transition (quality.py) пишет двойной
+    # записью — СНАЧАЛА MarkdownStore.set_status_many (frontmatter + git),
+    # ЗАТЕМ Qdrant payload; reconcile дозалечивает payload ИЗ SSOT.
+    # Payload — производная: при расхождении выигрывает SSOT, guard читает
+    # только frontmatter (payload-wins ветка удалена; легаси payload-only
+    # deprecate до Ф3 не каноничен — полный reindex его и так смывает).
     root_status = getattr(root_fm, "status", None) or "published"
-    try:
-        from qdrant_client.models import FieldCondition, Filter, MatchValue
-
-        qdrant_raw = _get_qdrant(app_state)
-        loop = asyncio.get_running_loop()
-
-        def _status_scroll():
-            return qdrant_raw.scroll(
-                scroll_filter=Filter(must=[FieldCondition(
-                    key="knowledge_id", match=MatchValue(value=collection_id),
-                )]),
-                limit=1,
-                with_payload=["status"],
-                with_vectors=False,
-                collection_name=collection_for_zone(parent_zone),
-            )
-
-        points, _ = await loop.run_in_executor(None, _status_scroll)
-        for pt in points or []:
-            payload_status = (pt.payload or {}).get("status")
-            if payload_status:
-                root_status = payload_status
-                break
-    except Exception as exc:
-        logger.warning(
-            "add_fragment: status check via Qdrant failed, fallback frontmatter: %s", exc,
-        )
     if root_status == "deprecated":
         return {"error": f"Cannot add fragment to deprecated collection '{collection_id}'"}
 
@@ -486,6 +463,12 @@ async def find_fragment(params: dict, app_state) -> dict:
         }
         for r in result.get("results", [])
     ]
+    # bibliography Ф4b2: citation-поля из enriched-выдачи search_knowledge
+    # (контракты опциональных ключей сохраняются: нет цитаты → нет ключа).
+    for frag, r in zip(fragments, result.get("results", [])):
+        for key in ("citation", "citation_reason"):
+            if key in r:
+                frag[key] = r[key]
 
     return {
         "collection_id": collection_id,

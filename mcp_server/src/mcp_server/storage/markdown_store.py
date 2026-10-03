@@ -82,6 +82,7 @@ class MarkdownStore:
             tags=req.tags,
             version=1,
             zone=req.zone,  # W1.8: проброс зоны доступа
+            source_refs=req.source_refs,  # Ф3c2a: ссылки на Source (bibliography)
             created_at=now,
             updated_at=now,
         )
@@ -210,6 +211,60 @@ class MarkdownStore:
             )
         return deleted
 
+    async def set_status_many(
+        self,
+        knowledge_ids: list[str],
+        status: str,
+        commit_message: str | None = None,
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Массово установить lifecycle-статус в frontmatter (Ф3a, SSOT-first).
+
+        Для каждого knowledge_id (атомарно под _git_lock, как update):
+        - записи нет / ошибка чтения-записи → failed (payload для них
+          писать нельзя — производная не опережает источник правды);
+        - статус уже целевой → already (идемпотентность: без версии и коммита);
+        - иначе → status + version+1 + updated_at=now → changed.
+
+        Изменённые записи получают ОДИН git-коммит на пачку (прецедент
+        delete_many, Фаза 13.22 P1: N+1 коммитов на книгу недопустимы).
+
+        Returns:
+            (changed, already, failed) — списки knowledge_id.
+        """
+        changed: list[str] = []
+        already: list[str] = []
+        failed: list[str] = []
+        async with self._git_lock:
+            for knowledge_id in knowledge_ids:
+                try:
+                    path = self._find_by_id(knowledge_id)
+                    if path is None:
+                        logger.warning(
+                            "set_status_many: %s not found in SSOT", knowledge_id
+                        )
+                        failed.append(knowledge_id)
+                        continue
+                    entry = self._parse_file(path)
+                    if entry.frontmatter.status == status:
+                        already.append(knowledge_id)
+                        continue
+                    entry.frontmatter.status = status
+                    entry.frontmatter.version += 1
+                    entry.frontmatter.updated_at = datetime.now(timezone.utc)
+                    self._write_file(path, entry)
+                    changed.append(knowledge_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "set_status_many: failed for %s: %s", knowledge_id, exc
+                    )
+                    failed.append(knowledge_id)
+        if changed:
+            await self.flush(
+                commit_message
+                or f"lifecycle status={status}: {len(changed)} entries"
+            )
+        return changed, already, failed
+
     async def list_entries(self, domain: str | None = None,
                            subject: str | None = None) -> list[str]:
         """Список knowledge_id в заданном домене/предмете (или все)."""
@@ -234,13 +289,23 @@ class MarkdownStore:
         return sorted(ids)
 
     async def reindex_scan(self) -> list[Path]:
-        """Обход всех .md для полного reindex (задача 1.9)."""
-        paths = []
-        for md_file in self._root.rglob("*.md"):
-            if ".trash" in md_file.parts or md_file.name.startswith("_"):
-                continue
-            paths.append(md_file)
-        return sorted(paths)
+        """Обход всех .md для полного reindex (задача 1.9).
+
+        Ф3-fix2a (P3, rglob-honesty): rglob — блокирующий FS-обход, на
+        больших корпусах заметно держит event loop (startup-скан
+        source_ref_index, полный reindex). Вынесен в run_in_executor —
+        декларация source_ref_runtime.py «rglob не блокирует event loop»
+        становится правдой. Все вызывающие уже await-ят этот метод.
+        """
+        def _scan_sync() -> list[Path]:
+            return sorted(
+                md_file
+                for md_file in self._root.rglob("*.md")
+                if ".trash" not in md_file.parts
+                and not md_file.name.startswith("_")
+            )
+
+        return await asyncio.get_running_loop().run_in_executor(None, _scan_sync)
 
     # ── Internal helpers ───────────────────────────────────
 

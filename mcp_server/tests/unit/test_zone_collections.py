@@ -220,7 +220,9 @@ class TestReindexZoneIsolation:
 
         def _entry(knowledge_id: str, zone: str) -> SimpleNamespace:
             return SimpleNamespace(
-                frontmatter=SimpleNamespace(knowledge_id=knowledge_id, zone=zone),
+                frontmatter=SimpleNamespace(
+                    knowledge_id=knowledge_id, zone=zone, locator_spans=None
+                ),
                 content=f"# {knowledge_id}\n\nSection content.",
             )
 

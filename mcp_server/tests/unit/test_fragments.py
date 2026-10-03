@@ -147,10 +147,15 @@ class TestAddFragment:
         assert "error" in result
         assert "deprecated" in result["error"].lower()
 
-    async def test_deprecated_via_qdrant_payload(self, app_state):
-        """NH-iter2-1 (фикс): lifecycle-статус канонически в Qdrant payload —
-        deprecate живёт только в payload (quality.py:381), SSOT frontmatter
-        может оставаться published → guard должен сработать по payload."""
+    async def test_stale_payload_deprecated_does_not_override_ssot(self, app_state):
+        """Ф3-fix2a (P2-2): SSOT-winner — payload лишь производная от SSOT.
+
+        Легаси payload-only deprecate (до Ф3) / частичный сбой payload-записи
+        НЕ блокируют add_fragment: канонический статус живёт в SSOT
+        frontmatter (двойная запись SSOT-first из _lifecycle_transition),
+        reconcile дозалечивает payload ИЗ SSOT, не наоборот.
+        Прежний payload-wins тест (NH-iter2-1) инвертирован осознанно.
+        """
         from datetime import datetime, timezone
 
         from mcp_server.models import KnowledgeEntry, KnowledgeFrontmatter
@@ -160,59 +165,95 @@ class TestAddFragment:
                 knowledge_id="payload-dep-book",
                 domain="eng", subject="test",
                 content_type="collection",
-                status="published",  # SSOT не обновлён
+                status="published",  # SSOT — источник правды
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
             ),
             content="# Book\n\n...",
         )
         app_state.store.read = AsyncMock(return_value=published_root)
-        # Qdrant payload говорит deprecated
-
+        # Qdrant payload говорит deprecated (stale) — НЕ источник правды
         dep_point = MagicMock()
         dep_point.payload = {"knowledge_id": "payload-dep-book", "status": "deprecated"}
         app_state.qdrant.scroll = MagicMock(return_value=([dep_point], None))
+        app_state.store.write_entry = AsyncMock()
+        app_state.store.flush = AsyncMock()
+        app_state.pipeline.enqueue = AsyncMock(return_value=type("R", (), {"indexed": True})())
 
         result = await add_fragment(
             {"collection_id": "payload-dep-book", "title": "T", "content": "C"},
             app_state,
         )
-        assert "error" in result
-        assert "deprecated" in result["error"].lower()
+        assert "error" not in result, result
 
-    async def test_deprecated_payload_overrides_frontmatter(self, app_state):
-        """Payload published перекрывает устаревший frontmatter deprecated
-        (restore живёт тоже в payload)."""
+    async def test_ssot_deprecated_wins_over_stale_payload_published(self, app_state):
+        """Ф3-fix2a (P2-2): расхождение SSOT=deprecated vs payload=published
+        (частичный сбой payload-этапа после успешной SSOT-записи в
+        _lifecycle_transition) → guard БЛОКИРУЕТ: SSOT winner.
+
+        Прежний payload-wins тест (payload published «воскрешал» SSOT
+        deprecated) инвертирован осознанно: производная (payload) не может
+        отменять источник правды (frontmatter). Мутация «вернуть
+        payload-wins» роняет этот тест.
+        """
         from datetime import datetime, timezone
 
         from mcp_server.models import KnowledgeEntry, KnowledgeFrontmatter
 
-        stale_deprecated_root = KnowledgeEntry(
+        deprecated_root = KnowledgeEntry(
             frontmatter=KnowledgeFrontmatter(
                 knowledge_id="restored-book",
                 domain="eng", subject="test",
                 content_type="collection",
-                status="deprecated",  # SSOT устарел
+                status="deprecated",  # SSOT-запись состоялась
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
             ),
             content="# Book\n\n...",
         )
-        app_state.store.read = AsyncMock(return_value=stale_deprecated_root)
+        app_state.store.read = AsyncMock(return_value=deprecated_root)
+        # Stale payload уверяет «published» (payload-запись не дошла) —
+        # не может воскресить deprecated-книгу.
         ok_point = MagicMock()
         ok_point.payload = {"knowledge_id": "restored-book", "status": "published"}
         app_state.qdrant.scroll = MagicMock(return_value=([ok_point], None))
-        app_state.store.write_entry = AsyncMock()
-        app_state.store.flush = AsyncMock()
-        app_state.pipeline.enqueue = AsyncMock(return_value=type("R", (), {"indexed": True})())
-        app_state.knowledge_index.update_section = AsyncMock()
 
         result = await add_fragment(
             {"collection_id": "restored-book", "title": "T", "content": "C"},
             app_state,
         )
-        assert "error" not in result
-        assert result["fragment_id"]
+        assert "error" in result
+        assert "deprecated" in result["error"].lower()
+
+    async def test_ssot_write_precedes_payload_and_survives_payload_failure(
+        self, app_state,
+    ):
+        """Ф3-fix2a (P2-2): SSOT-first порядок — store.write_entry (SSOT
+        frontmatter) строго ДО pipeline.enqueue (Qdrant payload); падение
+        payload-этапа НЕ роняет SSOT-исход (winner): flush коммитится,
+        ответ без error, indexed=False."""
+        order: list[str] = []
+        app_state.store.write_entry = AsyncMock(
+            side_effect=lambda entry: order.append("ssot_write"),
+        )
+        app_state.store.flush = AsyncMock(
+            side_effect=lambda *a, **k: order.append("git_commit"),
+        )
+        app_state.pipeline.enqueue = AsyncMock(
+            side_effect=RuntimeError("payload index down"),
+        )
+
+        result = await add_fragment(
+            {"collection_id": "eng-testing-book-collection",
+             "title": "Order", "content": "body"},
+            app_state,
+        )
+
+        assert "error" not in result, result
+        assert result["indexed"] is False
+        app_state.pipeline.enqueue.assert_awaited_once()
+        # SSOT записан и закоммичен; payload-сбой не прервал SSOT-исход
+        assert order == ["ssot_write", "git_commit"]
 
     async def test_title_sanitization_applied(self, app_state):
         """Title with \n and leading # is sanitized in the generated body."""

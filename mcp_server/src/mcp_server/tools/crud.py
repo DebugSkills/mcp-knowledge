@@ -17,6 +17,7 @@ import asyncio
 import logging
 import time
 
+from ..content.source_refs import merge_source_refs
 from ..metrics import quality_gate_skipped, record_write_latency
 from ..models import VersionConflictError, WriteRequest
 from ..storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
@@ -49,6 +50,41 @@ def _recommended_field_warnings(params: dict, strict: bool) -> tuple[list[dict],
             else:
                 warnings.append(msg)
     return issues, warnings, blocked
+
+
+async def _validate_source_refs(refs: list, app_state, *, param_name: str) -> list[str] | None:
+    """Ф3c2b (bibliography): fail-closed валидация source_refs ДО записи.
+
+    Каждый item: object с непустой строкой ``source_id``; запись существует
+    (``store.read``) и её ``content_type == "source"``. Собирает ВСЕ ошибки
+    (не только первую); ``None`` = валидно.
+
+    Формат сообщений: ``{param_name}: 'source_id' must be a non-empty string`` /
+    ``{param_name}: source 'X' not found`` / ``{param_name}: 'X' is not a
+    Source (content_type='book')``.
+    """
+    store = app_state.store
+    errors: list[str] = []
+    for item in refs:
+        if not isinstance(item, dict):
+            errors.append(f"{param_name}: item must be an object, got {type(item).__name__}")
+            continue
+        sid = item.get("source_id")
+        if not isinstance(sid, str) or not sid.strip():
+            errors.append(f"{param_name}: 'source_id' must be a non-empty string")
+            continue
+        try:
+            src_entry = await store.read(sid)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{param_name}: source '{sid}' read failed: {exc}")
+            continue
+        if src_entry is None:
+            errors.append(f"{param_name}: source '{sid}' not found")
+            continue
+        ct = getattr(src_entry.frontmatter, "content_type", None)
+        if ct != "source":
+            errors.append(f"{param_name}: '{sid}' is not a Source (content_type={ct!r})")
+    return errors or None
 
 
 async def write_knowledge(params: dict, app_state) -> dict:
@@ -151,6 +187,25 @@ async def write_knowledge(params: dict, app_state) -> dict:
         }
     # ── End quality gate ──
 
+    # Ф3c2b (bibliography): documents / алиас source_refs → fm.source_refs.
+    # Fail-closed ДО записи: битый item / несуществующий / не-Source → отказ
+    # (ВСЕ ошибки собраны), SSOT не трогаем. Оба параметра → merge с дедупом
+    # по (source_id, locator.kind): alias-first (существующие ключи выигрывают).
+    documents_in = params.get("documents")
+    refs_in = params.get("source_refs")
+    for pname, pval in (("documents", documents_in), ("source_refs", refs_in)):
+        if pval is not None and not isinstance(pval, list):
+            return {"error": f"{pname}: must be an array of {{source_id, locator?}} objects"}
+    source_refs = merge_source_refs(refs_in, documents_in)
+    if source_refs is not None:
+        refs_errors = await _validate_source_refs(source_refs, app_state, param_name="documents")
+        if refs_errors:
+            logger.warning(
+                "write_knowledge: documents validation failed (%d errors) — write refused",
+                len(refs_errors),
+            )
+            return {"error": "; ".join(refs_errors), "errors": refs_errors}
+
     wait_for_index = params.get("wait_for_index", False)
 
     # Шаг 1: SSOT запись
@@ -165,6 +220,7 @@ async def write_knowledge(params: dict, app_state) -> dict:
         knowledge_id=params.get("knowledge_id"),
         wait_for_index=wait_for_index,
         zone=zone,
+        source_refs=source_refs,  # Ф3c2b: documents/alias после fail-closed валидации
     )
     entry = await store.write(req)
     knowledge_id = entry.frontmatter.knowledge_id
@@ -213,6 +269,7 @@ async def write_knowledge(params: dict, app_state) -> dict:
         "subject": subject,
         "indexed": indexed,
         "pending": pending,
+        "documents_linked": len(source_refs or []),  # Ф3c2b
         "quality_report": {
             "blocked": False,
             "issues": quality_issues,
@@ -290,11 +347,30 @@ async def update_entry(params: dict, app_state) -> dict:
         }
     # ── End quality gate ──
 
+    # Ф3c2b (bibliography): source_refs — та же fail-closed валидация ДО
+    # store.update; применение через metadata (setattr в frontmatter — поле
+    # fm.source_refs, models.py). Явный [] очищает refs (→ None, Л1: ключ
+    # source_refs не пишется в YAML).
+    refs_upd = params.get("source_refs")
+    metadata_update: dict = {}
+    if refs_upd is not None:
+        if not isinstance(refs_upd, list):
+            return {"error": "source_refs: must be an array of {source_id, locator?} objects"}
+        refs_errors = await _validate_source_refs(refs_upd, app_state, param_name="source_refs")
+        if refs_errors:
+            logger.warning(
+                "update_entry: source_refs validation failed for %s (%d errors) — update refused",
+                knowledge_id, len(refs_errors),
+            )
+            return {"error": "; ".join(refs_errors), "errors": refs_errors}
+        metadata_update["source_refs"] = refs_upd or None
+
     store = app_state.store
     try:
         entry = await store.update(
             knowledge_id,
             content=content,
+            metadata=metadata_update or None,
             expected_version=expected_version,
         )
     except VersionConflictError as e:
@@ -333,6 +409,11 @@ async def update_entry(params: dict, app_state) -> dict:
         logger.warning("INDEX update failed for %s: %s", knowledge_id, exc)
 
     logger.info("update_entry: %s v%d", knowledge_id, entry.frontmatter.version)
+    # Ф3b2: точечное обновление Source-ref (license/zone/public_allowed могли
+    # измениться — upsert по source_id; не-Source записи игнорируются).
+    from .source_ref_runtime import index_add_entry
+
+    index_add_entry(app_state, entry)
     # Task 1: инкремент data_version после мутации
     try:
         app_state.data_version += 1
@@ -427,6 +508,12 @@ async def delete_entry(params: dict, app_state) -> dict:
                         logger.warning("[DELETE] cascade: failed to delete qdrant point %s: %s", child_id, exc)
 
             logger.info("[DELETE] cascade: %d child sections deleted for book %s", cascade_deleted, knowledge_id)
+            # Ф3b2: снять refs удалённых секций (идемпотентно; Source-секций не
+            # бывает — но инвариант «нет stale-refs» поддержан глобально).
+            from .source_ref_runtime import index_remove_id
+
+            for child_id in child_ids:
+                index_remove_id(app_state, child_id)
         except Exception as exc:
             logger.error("[DELETE] cascade scroll failed for %s: %s", knowledge_id, exc)
 
@@ -434,6 +521,12 @@ async def delete_entry(params: dict, app_state) -> dict:
     deleted = await store.delete(knowledge_id)
     if not deleted:
         return {"error": f"Knowledge entry not found: '{knowledge_id}'"}
+
+    # Шаг 1b (Ф3b2): снять Source-ref удалённой записи из availability-индекса.
+    # Least-strict: пока на blob ссылается ДРУГОЙ ref — он остаётся доступен.
+    from .source_ref_runtime import index_remove_id
+
+    removed_refs = index_remove_id(app_state, knowledge_id)
 
     # Шаг 2: Удаление из Qdrant (позиционно — run_in_executor не принимает kwargs)
     await loop.run_in_executor(
@@ -449,8 +542,8 @@ async def delete_entry(params: dict, app_state) -> dict:
             logger.warning("INDEX update failed for domain=%s: %s", domain, exc)
 
     logger.info(
-        "[DELETE] delete_entry: %s → .trash/ + Qdrant removed (cascade_deleted=%d)",
-        knowledge_id, cascade_deleted,
+        "[DELETE] delete_entry: %s → .trash/ + Qdrant removed (cascade_deleted=%d, source_refs_removed=%d)",
+        knowledge_id, cascade_deleted, removed_refs,
     )
     # Task 1: инкремент data_version после мутации
     try:

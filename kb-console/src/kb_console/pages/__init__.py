@@ -15,6 +15,7 @@ from collections.abc import Callable
 
 from . import (
     books,
+    documents,
     import_page,
     quality,
     requests_page,
@@ -35,6 +36,7 @@ ROUTES: list[tuple[str, str, Callable[[], None], str]] = [
     ("/tokens", "Токены", tokens.build_tokens, "admin"),  # W5; admin-only — У-3/Ф3.2
     ("/users", "Пользователи", users_page.build_users, "admin"),  # Ф3.2
     ("/requests", "Заявки", requests_page.build_requests, "admin"),  # 036 Ф2
+    ("/documents", "Документы", documents.build_documents, "admin"),  # bibliography Ф5c1
 ]
 
 # PAGES оставлен для обратной совместимости (если где-то ещё используется).

@@ -21,7 +21,13 @@ from __future__ import annotations
 from typing import Any
 
 from ..auth import parse_basic_credentials
-from ..config import api_key_for_role
+from ..config import (
+    MCP_API_KEY,
+    MCP_API_KEY_ADMIN,
+    MCP_API_KEY_CONTRIBUTOR,
+    MCP_API_KEY_EDITOR,
+    api_key_for_role,
+)
 
 ROLE_LEVEL: dict[str, int] = {"admin": 3, "editor": 2, "contributor": 1}
 """Порядок привилегий для require_min-гейтов (admin > editor > contributor)."""
@@ -125,6 +131,24 @@ def api_key_for_request(
             contributor=contributor,
         )
     return base
+
+
+def mcp_api_key() -> str:
+    """MCP-ключ текущего page-запроса (Ф4-fix1 P1-1): identity → роль-ключ.
+
+    Для страниц с роль-зависимой выдачей (поиск/книги): сервер строит citation
+    по ключу вызывающего (§3.4), поэтому консоль обязана слать ключ сессии —
+    base-ключ здесь даёт admin-эквивалент и private-утечку в выдаче.
+    Legacy (пустой стор / вне page-context) → base, бит-в-бит с 002.
+    """
+    return api_key_for_request(
+        current_identity(),
+        base=MCP_API_KEY,
+        has_users=_has_users(),
+        admin=MCP_API_KEY_ADMIN,
+        editor=MCP_API_KEY_EDITOR,
+        contributor=MCP_API_KEY_CONTRIBUTOR,
+    )
 
 
 # ── Page-context helpers (Ф3.2) ──────────────────────────────

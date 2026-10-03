@@ -438,9 +438,35 @@ class QdrantClient:
         match_all: bool = True,
         limit: int = 500,
         collection_name: str | None = None,
+        exclude_content_types: list[str] | None = None,
+        exclude_statuses: list[str] | None = None,
     ) -> list[qmodels.ScoredPoint]:
-        """Поиск по тегам через payload filter (без embedding, без GPU)."""
+        """Поиск по тегам через payload filter (без embedding, без GPU).
+
+        exclude_content_types: аддитивный must_not по content_type (R2, bibliography Ф1)
+        — по образцу search(). Source/collection-заглушки не попадают в выдачу.
+        exclude_statuses: аддитивный must_not по status — по образцу search()
+        (Фаза 13.14, fix2b P2-3): например ["deprecated"] — тег-канал не
+        отдаёт скрытые записи.
+        """
         collection_name = self._require_collection(collection_name)
+        must_not_conditions = []
+        if exclude_content_types:
+            must_not_conditions.extend(
+                qmodels.FieldCondition(
+                    key="content_type",
+                    match=qmodels.MatchValue(value=ct),
+                )
+                for ct in exclude_content_types
+            )
+        if exclude_statuses:
+            must_not_conditions.extend(
+                qmodels.FieldCondition(
+                    key="status",
+                    match=qmodels.MatchValue(value=st),
+                )
+                for st in exclude_statuses
+            )
         if match_all:
             # AND: все теги должны присутствовать — N отдельных MatchValue условий
             must_conditions = [
@@ -450,7 +476,10 @@ class QdrantClient:
                 )
                 for tag in tags
             ]
-            query_filter = qmodels.Filter(must=must_conditions)
+            query_filter = qmodels.Filter(
+                must=must_conditions,
+                must_not=must_not_conditions or None,
+            )
         else:
             # OR: любой из тегов
             should_conditions = [
@@ -460,7 +489,10 @@ class QdrantClient:
                 )
                 for tag in tags
             ]
-            query_filter = qmodels.Filter(should=should_conditions)
+            query_filter = qmodels.Filter(
+                should=should_conditions,
+                must_not=must_not_conditions or None,
+            )
 
         results = self._client.scroll(
             collection_name=collection_name,

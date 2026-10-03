@@ -8,7 +8,7 @@
 #
 # restore — ДЕСТРУКТИВЕН и интерактивен: печатает план перезаписи, требует
 # restore_confirm=yes (extra-vars) И живой pause-ответ оператора.
-# restore_scope: qdrant | ssot | console | secrets | all (default all).
+# restore_scope: qdrant | ssot | console | secrets | documents | all (default all).
 
 - name: Бэкап, верификация и восстановление mcp-knowledge
   hosts: mcp_kb_new
@@ -20,13 +20,14 @@
     clone_dir: "{{ deploy_root }}/{{ repo_name }}"
     backup_dir: "{{ data_root }}/backups"
     snapshot_dir: "{{ data_root }}/qdrant/snapshots"
-    restore_scope: all            # qdrant|ssot|console|secrets|all
+    restore_scope: all            # qdrant|ssot|console|secrets|documents|all
     restore_confirm: "no"         # деструктивный гейт: должен быть 'yes'
     restore_snapshot: ""          # имя .snapshot для qdrant; '' = последний по mtime
     scope_qdrant: "{{ restore_scope in ['qdrant', 'all'] }}"
     scope_ssot: "{{ restore_scope in ['ssot', 'all'] }}"
     scope_console: "{{ restore_scope in ['console', 'all'] }}"
     scope_secrets: "{{ restore_scope in ['secrets', 'all'] }}"
+    scope_documents: "{{ restore_scope in ['documents', 'all'] }}"
 
   tasks:
     # ════════════════════ backup ════════════════════
@@ -35,6 +36,11 @@
       ansible.builtin.command:
         cmd: bash scripts/backup.sh
         chdir: "{{ clone_dir }}"
+      # DATA_ROOT (code-2026-10-02-bibliography, REV.3 §3.9): manual-таг без env
+      # уводил backup.sh в clone_dir/data (дефолт), а не в {{ data_root }}.
+      # Паттерн — cron-секция deploy.yml (cron-env DATA_ROOT).
+      environment:
+        DATA_ROOT: "{{ data_root }}"
       register: backup_out
       changed_when: true   # создаёт артефакты (snapshot/tar) — честный changed
 
@@ -60,13 +66,17 @@
       ansible.builtin.command:
         cmd: bash scripts/backup.sh --verify
         chdir: "{{ clone_dir }}"
+      # DATA_ROOT: как у backup-таска — verify читает тары из {{ data_root }}/backups
+      # (не из clone_dir/data). REV.3 §3.9.
+      environment:
+        DATA_ROOT: "{{ data_root }}"
       register: verify_out
       changed_when: false
-      failed_when: >-
-        verify_out.rc != 0
-        and 'RESTORE TEST FAILED' not in verify_out.stdout
-      # Провал верификации = падение задачи (non-zero): для cron/ручного прогона
-      # видно сразу; полный отчёт — в debug ниже.
+      # P1-4 (code-2026-10-02-bibliography): гейт A3 обязан быть enforced —
+      # провал --verify (rc != 0) = падение задачи. Старая логика была инвертирована:
+      # при реальном провале маркер 'RESTORE TEST FAILED' есть → условие ложно →
+      # задача НЕ падала. Правильно: падать при любом non-zero rc.
+      failed_when: verify_out.rc != 0
 
     - name: Verify — отчёт
       tags: [verify]
@@ -83,6 +93,7 @@
           - "  ssot:    НЕТ перезаписи — клон из bare-репо в {{ deploy_root }}/knowledge.restored (живой ../knowledge не трогаем)"
           - "  console: {{ data_root }}/console/*.jsonl + {{ data_root }}/tokens/*.jsonl (текущие копируются в pre-restore-тар)"
           - "  secrets: {{ clone_dir }}/.env (текущий копируется в .env.pre-restore)"
+          - "  documents: {{ data_root }}/documents (blob-store; текущие в pre-restore-тар, затем sha256-сверка с манифестом)"
           - "  после: docker compose restart kb-console mcp-server + health ×4"
 
     - name: Restore — гейт restore_confirm (должен быть явный yes)
@@ -102,10 +113,24 @@
     - name: Restore qdrant — найти снапшот для recover  # noqa: command-instead-of-module
       tags: [restore]
       when: scope_qdrant | bool
-      ansible.builtin.command:
-        cmd: ls -t {{ snapshot_dir }}/knowledge/*.snapshot | head -1
+      # P1-1: command не исполняет glob/pipe (ls -t …|head -1 был мёртвым).
+      # shell + find: %T@ — mtime; awk читает весь ввод (без SIGPIPE), печатает
+      # путь первого (новейшего) файла. Ошибка discovery — fail-loud.
+      ansible.builtin.shell:
+        cmd: >-
+          set -euo pipefail;
+          d="{{ snapshot_dir }}/knowledge";
+          [ -d "$d" ] || { echo "snapshot_dir/knowledge не существует: $d" >&2; exit 1; };
+          find "$d" -maxdepth 1 -name '*.snapshot' -printf '%T@ %p\n' 2>/dev/null |
+            sort -rn | awk 'NR==1 { print $2 }'
+        executable: /bin/bash
       register: snap_file
       changed_when: false
+      # P2-a: явный guard на пустой stdout (единообразно с console/secrets);
+      # не срабатывает при явном restore_snapshot (оператор назвал файл сам).
+      failed_when:
+        - snap_file.stdout | length == 0
+        - not restore_snapshot
 
     - name: Restore qdrant — recover через API (перезапись коллекции knowledge)
       tags: [restore]
@@ -151,8 +176,14 @@
     - name: Restore console — последний console-state-тар  # noqa: command-instead-of-module
       tags: [restore]
       when: scope_console | bool
-      ansible.builtin.command:
-        cmd: ls -t {{ backup_dir }}/console-state-*.tar.gz | head -1
+      ansible.builtin.shell:
+        cmd: >-
+          set -euo pipefail;
+          d="{{ backup_dir }}";
+          [ -d "$d" ] || { echo "backup_dir не существует: $d" >&2; exit 1; };
+          find "$d" -maxdepth 1 -name 'console-state-*.tar.gz' -printf '%T@ %p\n' 2>/dev/null |
+            sort -rn | awk 'NR==1 { print $2 }'
+        executable: /bin/bash
       register: console_tar
       changed_when: false
       failed_when: console_tar.stdout | length == 0
@@ -160,13 +191,20 @@
     - name: Restore console — pre-restore-копия текущего состояния  # noqa: command-instead-of-module
       tags: [restore]
       when: scope_console | bool
-      ansible.builtin.command:
-        cmd: >-
-          tar -czf {{ backup_dir }}/pre-restore-console-$(date +%Y%m%d-%H%M%S).tar.gz
-          -C {{ data_root }} console tokens
+      # P1-A (critic iter.2): command без shell — shlex резал `$(date +%F)` по пробелу
+      # → мусорный файл `pre-restore-console-$(date` + rc=2. shell: $(date) раскрывается.
+      ansible.builtin.shell:
+        cmd: tar -czf {{ backup_dir }}/pre-restore-console-$(date +%Y%m%d-%H%M%S).tar.gz -C {{ data_root }} console tokens
       register: pre_console
       changed_when: true
       failed_when: pre_console.rc != 0
+
+    - name: Restore console — подготовить временный каталог (чисто)
+      tags: [restore]
+      when: scope_console | bool
+      ansible.builtin.shell:
+        cmd: rm -rf /tmp/mcp-restore-console && mkdir -p /tmp/mcp-restore-console
+      changed_when: true
 
     - name: Restore console — распаковка тара во временный каталог
       tags: [restore]
@@ -201,8 +239,14 @@
     - name: Restore secrets — последний secrets-тар  # noqa: command-instead-of-module
       tags: [restore]
       when: scope_secrets | bool
-      ansible.builtin.command:
-        cmd: ls -t {{ backup_dir }}/secrets-*.tar.gz | head -1
+      ansible.builtin.shell:
+        cmd: >-
+          set -euo pipefail;
+          d="{{ backup_dir }}";
+          [ -d "$d" ] || { echo "backup_dir не существует: $d" >&2; exit 1; };
+          find "$d" -maxdepth 1 -name 'secrets-*.tar.gz' -printf '%T@ %p\n' 2>/dev/null |
+            sort -rn | awk 'NR==1 { print $2 }'
+        executable: /bin/bash
       register: secrets_tar
       changed_when: false
       failed_when: secrets_tar.stdout | length == 0
@@ -213,6 +257,13 @@
       ansible.builtin.command:
         cmd: cp -p {{ clone_dir }}/.env {{ clone_dir }}/.env.pre-restore
         creates: "{{ clone_dir }}/.env.pre-restore"
+
+    - name: Restore secrets — подготовить временный каталог (чисто)
+      tags: [restore]
+      when: scope_secrets | bool
+      ansible.builtin.shell:
+        cmd: rm -rf /tmp/mcp-restore-secrets && mkdir -p /tmp/mcp-restore-secrets
+      changed_when: true
 
     - name: Restore secrets — распаковка во временный каталог
       tags: [restore]
@@ -245,6 +296,96 @@
         msg: >-
           .env восстановлен из тара. Источник истины секретов — ansible-vault:
           правки делать в vault.yml + make prod-run (deploy.yml перерендерит .env).
+
+    # ── scope=documents (blob-store, Фаза 0, code-2026-10-02-bibliography) ──
+    # Пустой/отсутствующий documents-тар = легальный скип (A6-симметрия: green-field
+    # без импортированных доков → backup_documents no-op → тара нет) — не ошибка.
+    - name: Restore documents — последний documents-тар  # noqa: command-instead-of-module
+      tags: [restore]
+      when: scope_documents | bool
+      # P0-1 (code-2026-10-02-bibliography): command не исполняет glob/pipe →
+      # «ls -t …|head -1» был мёртвым, а failed_when:false маскировал это под
+      # вечный легальный A6-скип. shell+find: реальная ошибка (нет backup_dir) —
+      # fail-loud; легитимный пустой stdout (таров нет) — скип ниже.
+      ansible.builtin.shell:
+        cmd: >-
+          set -euo pipefail;
+          d="{{ backup_dir }}";
+          [ -d "$d" ] || { echo "backup_dir не существует: $d" >&2; exit 1; };
+          find "$d" -maxdepth 1 -name 'documents-*.tar.gz' -printf '%T@ %p\n' 2>/dev/null |
+            sort -rn | awk 'NR==1 { print $2 }'
+        executable: /bin/bash
+      register: documents_tar
+      changed_when: false
+
+    - name: Restore documents — скип (нет тара)
+      tags: [restore]
+      when: scope_documents | bool and documents_tar.stdout | length == 0
+      ansible.builtin.debug:
+        msg: "documents: таров нет — restore пропущен (пустой store, не ошибка)."
+
+    - name: Restore documents — pre-restore-копия текущего каталога
+      tags: [restore]
+      when: scope_documents | bool and documents_tar.stdout | length > 0
+      # P0-3 (critic iter.2): строки tar/-C были отступлены глубже → YAML `>-`
+      # сохранял newline → `tar -czf FILE` БЕЗ операндов → rc=2 всегда. Весь
+      # tar-вызов — ОДНА строка на общем уровне отступа (складывается в одну).
+      ansible.builtin.command:
+        cmd: >-
+          bash -c 'set -e;
+          if [ -d "{{ data_root }}/documents" ]; then
+          tar -czf {{ backup_dir }}/pre-restore-documents-$(date +%Y%m%d-%H%M%S).tar.gz -C {{ data_root }} documents;
+          fi; true'
+      register: pre_documents
+      changed_when: true
+      failed_when: pre_documents.rc != 0
+
+    - name: Restore documents — подготовить временный каталог (чисто)
+      tags: [restore]
+      when: scope_documents | bool and documents_tar.stdout | length > 0
+      ansible.builtin.shell:
+        cmd: rm -rf /tmp/mcp-restore-documents && mkdir -p /tmp/mcp-restore-documents
+      changed_when: true
+
+    - name: Restore documents — распаковка во временный каталог
+      tags: [restore]
+      when: scope_documents | bool and documents_tar.stdout | length > 0
+      ansible.builtin.unarchive:
+        src: "{{ documents_tar.stdout }}"
+        dest: /tmp/mcp-restore-documents
+        remote_src: true
+
+    - name: Restore documents — sha256-сверка всех файлов с манифестом (гейт A4)
+      tags: [restore]
+      when: scope_documents | bool and documents_tar.stdout | length > 0
+      ansible.builtin.command:
+        cmd: >-
+          bash -c 'set -e;
+          manifest="{{ documents_tar.stdout }}.sha256";
+          [ -f "$manifest" ] || { echo "FAIL: манифест отсутствует: $manifest"; exit 1; };
+          cd /tmp/mcp-restore-documents && sha256sum -c "$manifest"'
+      register: verify_documents
+      changed_when: false
+      failed_when: verify_documents.rc != 0
+
+    - name: Restore documents — вернуть файлы в каталог documents
+      tags: [restore]
+      when: scope_documents | bool and documents_tar.stdout | length > 0
+      ansible.builtin.command:
+        cmd: >-
+          bash -c 'set -e;
+          mkdir -p {{ data_root }}/documents;
+          cp -a /tmp/mcp-restore-documents/. {{ data_root }}/documents/;
+          true'
+      register: copy_documents
+      changed_when: true
+
+    - name: Restore documents — cleanup временного каталога
+      tags: [restore]
+      when: scope_documents | bool and documents_tar.stdout | length > 0
+      ansible.builtin.file:
+        path: /tmp/mcp-restore-documents
+        state: absent
 
     # ── финал: рестарт сервисов, коснувшихся данных + health ──
     - name: Restore — рестарт kb-console и mcp-server (подхват файлов состояния)

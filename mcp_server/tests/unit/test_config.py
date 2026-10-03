@@ -102,3 +102,25 @@ class TestAutoDedupSettings:
         settings = Settings(_env_file=None)
         assert settings.AUTO_DEDUP_ENABLED is True
         assert settings.AUTO_DEDUP_MAX_PER_SCAN == 50
+
+
+class TestDocumentsSettings:
+    """Фаза 0 (code-2026-10-02-bibliography): blob-store документов."""
+
+    def test_documents_defaults(self):
+        """Дефолты: dir=/app/data/documents, квота 10GB, grace 30d, метрика on."""
+        settings = Settings(_env_file=None)
+        assert settings.DOCUMENTS_DIR == "/app/data/documents"
+        assert settings.DOCUMENTS_STORE_MAX_GB == 10
+        assert settings.DOCUMENTS_GC_GRACE_DAYS == 30
+        assert settings.DOCUMENTS_SIZE_METRIC_ENABLED is True
+
+    def test_documents_env_override(self, monkeypatch):
+        """Env-переопределение квоты, grace и метрики (паттерн QUALITY_DIR)."""
+        monkeypatch.setenv("DOCUMENTS_STORE_MAX_GB", "5")
+        monkeypatch.setenv("DOCUMENTS_GC_GRACE_DAYS", "7")
+        monkeypatch.setenv("DOCUMENTS_SIZE_METRIC_ENABLED", "false")
+        settings = Settings(_env_file=None)
+        assert settings.DOCUMENTS_STORE_MAX_GB == 5
+        assert settings.DOCUMENTS_GC_GRACE_DAYS == 7
+        assert settings.DOCUMENTS_SIZE_METRIC_ENABLED is False

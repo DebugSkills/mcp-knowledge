@@ -172,7 +172,7 @@ def _make_pipeline(
     chunker = MagicMock()
     default_chunks = [_make_chunk("default")]
 
-    def _chunk(knowledge_id, content):
+    def _chunk(knowledge_id, content, locator_spans=None):
         if chunker_overrides and knowledge_id in chunker_overrides:
             ov = chunker_overrides[knowledge_id]
             if isinstance(ov, Exception):

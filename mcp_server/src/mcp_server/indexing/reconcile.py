@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable
 
 from ..config import settings
+from ..models import is_indexable
 from ..storage.markdown_store import MarkdownStore
 from ..storage.qdrant_client import QdrantClient
 from ..storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
@@ -79,6 +80,8 @@ class ReconcileResult:
         self.mode: str = "none"
         # 023-B: число записей с updated_at-дрейфом (fm новее payload Qdrant)
         self.drifted: int = 0
+        # bibliography Ф3c1: отчёт documents_check (None — стор не передан)
+        self.documents_integrity: dict | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -90,6 +93,7 @@ class ReconcileResult:
             "errors": self.errors,
             "mode": self.mode,
             "drifted": self.drifted,
+            "documents_integrity": self.documents_integrity,
         }
 
 
@@ -105,6 +109,9 @@ async def reconcile(
     get_heavy_lock: Callable[[], asyncio.Lock] | None = None,
     set_lock_owner: Callable[[str | None], None] | None = None,
     get_lock_owner: Callable[[], str | None] | None = None,
+    # bibliography Ф3c1: documents integrity (None → шаг 5 пропускается;
+    # легаси-вызовы/харнессы без document_store не меняют поведения).
+    document_store=None,
 ) -> dict:
     """Выполнить полную сверку Markdown SSOT ↔ Qdrant при старте.
 
@@ -118,6 +125,9 @@ async def reconcile(
             (поведение = до Block C; харнессы T/D).
         set_lock_owner / get_lock_owner: рушки маркера владельца лока
             (``heavy_lock_owner``). Протокол compare-and-clear в ``finally``.
+        document_store: DocumentStore (bibliography Ф1) — после reindex-цикла
+            выполняется documents_check (integrity Source-refs ↔ blobs,
+            §3.6:226); None → проверка пропускается.
 
     Returns:
         dict с результатами: {checked, reindexed, skipped, deleted_orphans, errors}
@@ -155,6 +165,13 @@ async def reconcile(
         try:
             entry = store._parse_file(path)
             kid = entry.frontmatter.knowledge_id
+
+            # W3 (bibliography Ф1): Source-записи не индексируются — skip, НЕ
+            # попадают в missing_in_qdrant (устраняет «вечное доиндексирование»).
+            if not is_indexable(entry):
+                result.skipped += 1
+                logger.debug("[RECONCILE] %s source — skipped (not indexable)", kid)
+                continue
 
             if kid not in qdrant_meta:
                 # Запись есть в Markdown, но отсутствует в Qdrant
@@ -354,6 +371,30 @@ async def reconcile(
         )
     else:
         await _detect_parent_child_orphans(store, md_paths, result)
+
+    # ── Шаг 5 (bibliography Ф3c1): documents integrity check ────────
+    # Source-refs ↔ blob-стор: существование + потоковый re-hash +
+    # canonical-chain + orphan-sweep; дефекты → quality-issues (§3.6:226).
+    # Ядро — run_in_executor (не блокирует event loop); fail-safe: сбой
+    # проверки не роняет reconcile (ошибка → result.errors).
+    if document_store is not None:
+        try:
+            from ..tools.documents_integrity import documents_check as _documents_check
+
+            result.documents_integrity = await _documents_check(store, document_store)
+            # Ф3c3: последний integrity-отчёт → orphans-gauge (fail-safe внутри)
+            from ..metrics import record_documents_integrity
+
+            record_documents_integrity(result.documents_integrity)
+            if not result.documents_integrity.get("ok", True):
+                logger.warning(
+                    "[RECONCILE] documents integrity: OK=false (%s)",
+                    result.documents_integrity.get("counts"),
+                )
+        except Exception as e:  # noqa: BLE001 — fail-safe
+            msg = f"Documents integrity check failed: {e}"
+            result.errors.append(msg)
+            logger.warning("[RECONCILE] %s", msg)
 
     summary = result.to_dict()
     logger.info(

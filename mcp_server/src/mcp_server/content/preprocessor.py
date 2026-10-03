@@ -22,6 +22,10 @@ class ImportMeta:
     tags: list[str] = field(default_factory=list)
     cross_subjects: list[str] = field(default_factory=list)
     source_path: str | None = None  # путь к бинарному файлу на диске (для PDF и др.)
+    # Ф2b3 (bibliography): полный sha256 canonical-блоба из document_store.put
+    # (для pdf canonical ≡ original). Прокидывается ingest-путём ДО decompose;
+    # None → продюсер вычисляет полный sha256 сам (того же артефакта).
+    content_sha256: str | None = None
 
 
 @dataclass
