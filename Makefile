@@ -292,12 +292,18 @@ errors-cron-cleanup:  ## 018: миграция legacy cron-ключей exit=0 �
 # рендерится ansible, переживает деплои). Ключ — ТОЛЬКО точная сигнатура
 # (диапазоны кодов/regex запрещены архитектурно). Прод: запуск на хосте aikb
 # с DATA_ROOT из prod .env. Каждый add/remove пишет audit.jsonl.
+#
+# Квотинг (code-2026-10-03-f1-quoting): SIG/REASON/UNTIL передаются скрипту
+# ЧЕРЕЗ ОКРУЖЕНИЕ (--from-env), а не интерполяцией "$(SIG)" в shell-рецепт —
+# сигнатуры с кавычками/пайпами/пробелами не искажаются молча и не роняют shell.
 
-errors-guard-add:  ## Гвард: заглушить ТОЧНУЮ сигнатуру (SIG=… REASON=… [UNTIL=YYYY-MM-DD])
-	.venv/bin/python scripts/errors_guard.py add "$(SIG)" --reason "$(REASON)" $(if $(UNTIL),--until $(UNTIL))
+export SIG REASON UNTIL
 
-errors-guard-remove:  ## Гвард: снять глушение (SIG=…)
-	.venv/bin/python scripts/errors_guard.py remove "$(SIG)"
+errors-guard-add:  ## Гвард: заглушить ТОЧНУЮ сигнатуру (SIG=… REASON=… [UNTIL=YYYY-MM-DD]; кавычки в SIG ок)
+	.venv/bin/python scripts/errors_guard.py add --from-env
+
+errors-guard-remove:  ## Гвард: снять глушение (SIG=…; кавычки в SIG ок)
+	.venv/bin/python scripts/errors_guard.py remove --from-env
 
 errors-resolve:  ## 028-B: пометить сигнатуру исправленной (SIG=… [REASON=…] [ACTOR=…] [DRY=1])
 	.venv/bin/python scripts/errors_alert.py --resolve "$(SIG)" $(if $(REASON),--reason "$(REASON)") $(if $(ACTOR),--actor "$(ACTOR)") $(if $(DRY),--dry-run)

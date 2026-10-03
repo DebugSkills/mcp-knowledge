@@ -389,3 +389,58 @@ def test_17_burst_decay_7d(tmp_path, monkeypatch):
     report = max((tmp_path / "reports").glob("report-*.md")).read_text()
     sec = report.split("### Burst-инциденты за 7d")[1].split("##")[0]
     assert "docker_logs|REQ|" not in sec, "декей исключает из weekly-подсекции"
+
+
+# ── 18. Квотинг (code-2026-10-03-f1-quoting): --from-env — кавычки/пайпы ──
+
+def test_18_quoting_from_env(tmp_path, monkeypatch):
+    """SIG/REASON/UNTIL через окружение: байт-в-байт, идемпотентность, remove."""
+    sig = 'http_400|/api/x|{"a|b":1} "quoted" спейс'
+    monkeypatch.setenv("SIG", sig)
+    monkeypatch.setenv("REASON", 'шум: {"json"} |= pipe')
+    monkeypatch.setenv("UNTIL", "2099-01-01")
+    assert eg.main(["--sink", str(tmp_path), "add", "--from-env"]) == 0
+    sup = json.loads((tmp_path / "suppression.json").read_text())
+    assert list(sup) == [sig], "ключ байт-в-байт = $SIG (кавычки/пайпы не искажаются)"
+    assert sup[sig]["reason"] == 'шум: {"json"} |= pipe'
+    assert sup[sig]["until"] == "2099-01-01"
+    audit = [json.loads(l) for l in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    assert audit[-1]["action"] == "add" and audit[-1]["sig"] == sig
+    # идемпотентность: повторный add — тот же единственный ключ, без ошибки
+    assert eg.main(["--sink", str(tmp_path), "add", "--from-env"]) == 0
+    sup2 = json.loads((tmp_path / "suppression.json").read_text())
+    assert list(sup2) == [sig] and sup2[sig]["reason"] == 'шум: {"json"} |= pipe'
+    # remove --from-env снимает тот же ключ (символ-в-символ)
+    assert eg.main(["--sink", str(tmp_path), "remove", "--from-env"]) == 0
+    assert json.loads((tmp_path / "suppression.json").read_text()) == {}
+
+
+# ── 19. Контракт --from-env: ошибки + приоритет positional + UNTIL-валидация ──
+
+def test_19_from_env_contract(tmp_path, monkeypatch):
+    monkeypatch.delenv("SIG", raising=False)
+    monkeypatch.delenv("REASON", raising=False)
+    # нет ни positional, ни $SIG → exit 2, файлы состояния не создаются
+    assert eg.main(["--sink", str(tmp_path), "add", "--from-env"]) == 2
+    assert not (tmp_path / "suppression.json").exists()
+    # $SIG есть, reason нет ни флагом, ни $REASON → exit 2
+    monkeypatch.setenv("SIG", "s")
+    assert eg.main(["--sink", str(tmp_path), "add", "--from-env"]) == 2
+    # $UNTIL невалиден → exit 1 (тот же валидатор, что у --until)
+    monkeypatch.setenv("REASON", "r")
+    monkeypatch.setenv("UNTIL", "01.01.2099")
+    assert eg.main(["--sink", str(tmp_path), "add", "--from-env"]) == 1
+    # positional с кавычками — прежний интерфейс прямого вызова не сломан
+    monkeypatch.delenv("UNTIL", raising=False)
+    sig = 'x|{"a":1}'
+    assert eg.main(["--sink", str(tmp_path), "add", sig, "--reason", "r"]) == 0
+    assert sig in json.loads((tmp_path / "suppression.json").read_text())
+    # positional/флаги приоритетнее окружения (явное > env)
+    monkeypatch.setenv("SIG", "env-sig")
+    assert eg.main(["--sink", str(tmp_path), "add", sig, "--from-env",
+                    "--reason", "r"]) == 0
+    sup = json.loads((tmp_path / "suppression.json").read_text())
+    assert sig in sup and "env-sig" not in sup
+    # remove без сигнатуры вовсе → exit 2
+    monkeypatch.delenv("SIG", raising=False)
+    assert eg.main(["--sink", str(tmp_path), "remove", "--from-env"]) == 2

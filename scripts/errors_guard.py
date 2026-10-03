@@ -305,16 +305,38 @@ def main(argv=None) -> int:
                     help="override каталога sink (дефолт $DATA_ROOT/logs/errors)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p_add = sub.add_parser("add", help="глушить ТОЧНУЮ сигнатуру (regex/коды запрещены)")
-    p_add.add_argument("sig")
-    p_add.add_argument("--reason", required=True, help="зачем (идёт в audit.jsonl)")
+    p_add.add_argument("sig", nargs="?",
+                       help="точная сигнатура (при --from-env берётся из env SIG)")
+    p_add.add_argument("--reason", default=None,
+                       help="зачем (идёт в audit.jsonl; при --from-env — env REASON)")
     p_add.add_argument("--until", default=None, help="YYYY-MM-DD (нет = бессрочно)")
+    p_add.add_argument("--from-env", action="store_true",
+                       help="sig/reason/until из env SIG/REASON/UNTIL — значения идут "
+                            "через окружение, а не через shell-строку: кавычки/пайпы/"
+                            "пробелы в сигнатуре не искажаются (Makefile-цели guard)")
     p_rem = sub.add_parser("remove", help="снять глушение")
-    p_rem.add_argument("sig")
+    p_rem.add_argument("sig", nargs="?", help="точная сигнатура (или --from-env → env SIG)")
+    p_rem.add_argument("--from-env", action="store_true",
+                       help="сигнатура из env SIG (кавычки/спецсимволы — безопасно)")
     sub.add_parser("list", help="показать лист")
     args = ap.parse_args(argv)
     sink = Path(args.sink) if args.sink else DATA_ROOT / "logs" / "errors"
     actor = os.environ.get("USER") or getpass.getuser()
+    # Квотинг-фикс (code-2026-10-03-f1-quoting): make экспортирует SIG/REASON/
+    # UNTIL в окружение — интерполяция «"$(SIG)"» в рецепте ломалась на кавычках
+    # (молча съедала " либо роняла shell). Явные аргументы приоритетнее env.
+    if getattr(args, "from_env", False):
+        args.sig = args.sig or os.environ.get("SIG") or None
+        if args.cmd == "add":
+            args.reason = args.reason or os.environ.get("REASON") or None
+            args.until = args.until or os.environ.get("UNTIL") or None
     if args.cmd == "add":
+        if not args.sig:
+            print("сигнатура не задана: positional sig или --from-env (env SIG)")
+            return 2
+        if not args.reason:
+            print("--reason обязателен (или env REASON при --from-env)")
+            return 2
         if args.until:
             try:
                 datetime.strptime(args.until, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -323,6 +345,9 @@ def main(argv=None) -> int:
                 return 1
         return cli_add(sink, args.sig, args.reason, args.until, actor)
     if args.cmd == "remove":
+        if not args.sig:
+            print("сигнатура не задана: positional sig или --from-env (env SIG)")
+            return 2
         return cli_remove(sink, args.sig, actor)
     return cli_list(sink)
 
