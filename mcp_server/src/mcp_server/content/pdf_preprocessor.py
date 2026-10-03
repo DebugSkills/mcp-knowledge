@@ -15,7 +15,9 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import time as _time
+from bisect import bisect_left
 from pathlib import Path
 
 from ..config import settings
@@ -29,6 +31,87 @@ logger = logging.getLogger("mcp_knowledge.content.pdf_preprocessor")
 HEADING_RATIO = 1.3
 # Минимум символов текста на странице, чтобы считать её текстовой (не скан)
 MIN_TEXT_CHARS_PER_PAGE = 20
+
+# Порог минимальной длины нормализованного чанка для локализации (fail-safe Л1):
+# короче — чанк неоднозначен, спаны не фабрикуются.
+MIN_NORM = 24
+
+_WS_COLLAPSE_RE = re.compile(r"\s+")
+
+
+def _collapse(s: str) -> str:
+    """Схлопнуть серии пробельных в один пробел.
+
+    Единственная доказанная мутация splitting.py (split + strip + " ".join) —
+    схлопывание пробельных серий на границах предложений. Нормализация
+    идентична с обеих сторон (body и chunk), поэтому поиск по нормали
+    эквивалентен поиску по исходному тексту с точной картой позиций.
+    """
+    return _WS_COLLAPSE_RE.sub(" ", s)
+
+
+def normalize_with_map(s: str) -> tuple[str, list[int]]:
+    """Нормализовать пробелы и построить карту позиций norm -> source.
+
+    Returns:
+        (norm, pos_map): ``norm = _collapse(s)`` (каждая серия пробельных
+        заменена одним пробелом); ``pos_map[i]`` — индекс в ``s`` символа,
+        которому соответствует ``norm[i]`` (для схлопнутого пробела — индекс
+        ПЕРВОГО символа серии); ``pos_map[len(norm)] = len(s)`` — сентинел
+        конца матча. ``pos_map`` строго монотонен (bisect-инвертируем).
+    """
+    norm = _collapse(s)
+    pos_map: list[int] = []
+    s_pos = 0
+    for run in _WS_COLLAPSE_RE.finditer(s):
+        pos_map.extend(range(s_pos, run.start()))
+        pos_map.append(run.start())
+        s_pos = run.end()
+    pos_map.extend(range(s_pos, len(s)))
+    pos_map.append(len(s))  # sentinel
+    return norm, pos_map
+
+
+def locate_chunk(
+    body: str,
+    chunk: str,
+    cursor: int,
+    norm_body: str,
+    map_body: list[int],
+    cursor_norm: int,
+    prev_end: int,
+) -> tuple[int, int] | None:
+    """Локализовать чанк в теле секции (fast-path verbatim -> нормализованный).
+
+    Возвращает ``(start, end)`` — полуоткрытый интервал в координатах
+    ``body``, либо ``None`` (fail-safe Л1: нелокализуемый/короткий/
+    немонотонный чанк -> спанов нет, фабрикации нет).
+
+    - fast-path: ``body.find(chunk, cursor)`` — вербатимные чанки (сохраняет
+      текущие golden-тесты байт-в-байт);
+    - иначе: ``norm_body.find(_collapse(chunk).strip(), cursor_norm)`` с
+      обратным маппингом через ``map_body``;
+    - ``len(nc) < MIN_NORM`` -> ``None`` (короткий неоднозначный чанк);
+    - монотонность: ``start < prev_end`` -> ``None`` (защитный guard).
+    """
+    # fast-path: вербатимное вхождение
+    p = body.find(chunk, cursor)
+    if p >= 0:
+        end = p + len(chunk)
+        return (p, end) if p >= prev_end else None
+
+    # нормализованный поиск
+    nc = _collapse(chunk).strip()
+    if len(nc) < MIN_NORM:
+        return None
+    p = norm_body.find(nc, cursor_norm)
+    if p < 0:
+        return None
+    start = map_body[p]
+    end = map_body[p + len(nc)]
+    if start < prev_end:
+        return None
+    return (start, end)
 
 
 class PDFPreprocessor(ContentPreprocessor):
@@ -779,7 +862,17 @@ class PDFPreprocessor(ContentPreprocessor):
         else:
             chunk_texts = [body]
 
+        if track_spans:
+            from .locator import clip_spans_to_range, spans_to_meta
+
+            norm_body, map_body = normalize_with_map(body)
+        else:
+            norm_body, map_body = "", []
+
         cursor = 0
+        cursor_norm = 0
+        prev_end = 0
+        unlocated_chunks = 0
         for chunk_idx, chunk in enumerate(chunk_texts):
             section_title = title if chunk_idx == 0 else f"{title} (часть {chunk_idx + 1})"
             content_hash = hashlib.sha256(chunk[:200].encode()).hexdigest()
@@ -812,19 +905,25 @@ class PDFPreprocessor(ContentPreprocessor):
                 "cross_subjects": metadata.cross_subjects,
             }
             if track_spans:
-                from .locator import clip_spans_to_range, spans_to_meta
-
-                found = body.find(chunk, cursor)
-                if found >= 0:
-                    cursor = found + len(chunk)
+                located = locate_chunk(
+                    body, chunk, cursor,
+                    norm_body, map_body, cursor_norm, prev_end,
+                )
+                if located is not None:
+                    start, end = located
+                    cursor = end
+                    cursor_norm = bisect_left(map_body, end)
+                    prev_end = end
                     clipped = clip_spans_to_range(
-                        page_spans, body_range[0] + found,
-                        body_range[0] + found + len(chunk),
+                        page_spans, body_range[0] + start,
+                        body_range[0] + end,
                     )
                     # Л1: ключи появляются только при непустом пересечении
                     if clipped and source_id is not None:
                         meta["locator_spans"] = spans_to_meta(clipped)
                         meta["source_id"] = source_id
+                else:
+                    unlocated_chunks += 1
 
             sections.append(Section(
                 title=section_title,
@@ -833,5 +932,11 @@ class PDFPreprocessor(ContentPreprocessor):
                 tags=tags,
                 meta=meta,
             ))
+
+        if track_spans and unlocated_chunks:
+            logger.warning(
+                "PDF section '%s': %d/%d chunks unlocated (no locator spans, Л1)",
+                title, unlocated_chunks, len(chunk_texts),
+            )
 
         return sections
