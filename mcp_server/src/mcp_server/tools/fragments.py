@@ -217,8 +217,14 @@ async def add_fragment(params: dict, app_state) -> dict:
 async def update_fragment(params: dict, app_state) -> dict:
     """Обновить секцию книги: content и/или title (перезапись # заголовка).
 
-    Параметры: fragment_id (required); content?, title?, version? (optional).
+    Параметры: fragment_id (required); content?, title?, version?, zone?,
+    source_id? (optional).
     VersionConflictError → conflict=True ответ.
+
+    T2a (bibliography): source_id — привязка Source к секции (fm.source_id,
+    читается read.py как refs → read-time citation). None → не меняется;
+    "" → отвязать (Л1: ключ не пишется в YAML); непустая строка →
+    fail-closed валидация (запись существует, content_type == "source").
     """
     fragment_id = params.get("fragment_id", "")
     content = params.get("content")
@@ -236,6 +242,23 @@ async def update_fragment(params: dict, app_state) -> dict:
         return {"error": f"Fragment not found: '{fragment_id}'"}
     if getattr(entry.frontmatter, "parent_knowledge_id", None) is None:  # P1-5
         return {"error": f"'{fragment_id}' is not a book section (no parent_knowledge_id)"}
+
+    # T2a (bibliography): fail-closed валидация source_id ДО записи (и до
+    # zone-блока — отказ не оставляет побочных эффектов). Непустая строка →
+    # привязка; "" → отвязка; None → параметр не задан, поведение прежнее.
+    source_id_param = params.get("source_id")
+    if source_id_param:
+        from .crud import _validate_source_refs
+
+        src_errors = await _validate_source_refs(
+            [{"source_id": source_id_param}], app_state, param_name="source_id",
+        )
+        if src_errors:
+            logger.warning(
+                "update_fragment: source_id validation failed for %s (%d errors) — update refused",
+                fragment_id, len(src_errors),
+            )
+            return {"error": "; ".join(src_errors), "errors": src_errors}
 
     # W1.5: монозональность — zone секции против зоны книги (только при явном zone)
     zone_param = params.get("zone")
@@ -261,6 +284,13 @@ async def update_fragment(params: dict, app_state) -> dict:
                 partial_public=zone_partial,
             )
         update_metadata = {"zone": final_zone}
+
+    # T2a (bibliography): source_id → в тот же metadata-апдейт (store.update
+    # применит через setattr: models.py поле есть; "" → None — Л1: ключ
+    # не пишется в YAML).
+    if source_id_param is not None:
+        update_metadata = update_metadata or {}
+        update_metadata["source_id"] = source_id_param or None
 
     # Построить новый контент
     new_content = entry.content
@@ -337,6 +367,8 @@ async def update_fragment(params: dict, app_state) -> dict:
         resp["zone_forced"] = True
     if zone_partial:
         resp["book_partial_public"] = True
+    if source_id_param is not None:
+        resp["source_id"] = updated.frontmatter.source_id
     return resp
 
 

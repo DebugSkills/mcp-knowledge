@@ -367,6 +367,7 @@ _UPDATE_FRAGMENT_SCHEMA: dict[str, Any] = {
         "version": {"type": "integer", "description": "Optimistic locking: ожидаемая версия"},
         "wait_for_index": {"type": "boolean", "default": False},
         "zone": {"type": "string", "enum": ["public", "private"], "description": "Зона доступа раздела (W1): public | private; без параметра зона не меняется"},
+        "source_id": {"type": "string", "description": "Привязать Source-запись (src-<sha256_16>) к секции: fail-closed (запись существует, content_type='source'); '' — отвязать; без параметра — не меняется (bibliography T2a)"},
     },
     "required": ["fragment_id"],
 }
