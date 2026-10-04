@@ -875,7 +875,7 @@ class CutoverDriver:
         results: list[dict] = []
         # Fail-closed база: хеш «входа» на момент СТАРТА apply. Снос меняет дерево,
         # поэтому сверяем снапшот с предусловием прогона, а не с текущим состоянием.
-        pre_snapshot_hash = self._snapshot_input_hash() if apply else None
+        pre_snapshot_hash = self._snapshot_input_hash()
 
         def step_defs():
             return [
@@ -934,7 +934,9 @@ class CutoverDriver:
 
             # 2) деструктивный шаг: гейты снапшота и confirm
             if destructive:
-                snapshot_ok = self._snapshot_marker_valid()
+                # Сверка с базисом (resume после частичного apply), а не с живым
+                # состоянием: сам снос меняет вход (см. _record_basis).
+                snapshot_ok = self.apply_snapshot_ok(pre_snapshot_hash)
                 confirm_ok = confirm_destructive == self.cfg.destructive_token
                 if not (snapshot_ok and confirm_ok):
                     missing = []

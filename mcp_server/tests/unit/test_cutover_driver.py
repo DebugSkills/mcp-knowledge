@@ -264,17 +264,39 @@ class TestTeardownGate:
             driver.run(dry_run=False, apply=True, confirm_destructive=None)
         assert "clear_qdrant" not in calls
 
-    def test_refused_apply_without_snapshot(self, tmp_path, monkeypatch):
+    def test_refused_apply_without_snapshot(self, tmp_path):
         cfg = _cfg(tmp_path)
         calls = []
         cfg.clear_qdrant = lambda _c: calls.append("clear_qdrant")
         driver = CutoverDriver(cfg)
-        write_marker(driver._marker(2), driver._snapshot_input_hash(), step=2, name="snapshot")
-        write_marker(driver._marker(3), sha256_text("stop-v1"), step=3, name="stop")
-        monkeypatch.setattr(driver, "_snapshot_marker_valid", lambda: False)
+        # маркер снапшота не соответствует входу → деструктивный шаг отказывает
+        # (шаг 2 вне выборки: сверяем гейт, а не реальный прогон снапшота)
+        write_marker(driver._marker(2), "wrong-hash", step=2, name="snapshot")
         with pytest.raises(CutoverRefusal):
-            driver.run(dry_run=False, apply=True, confirm_destructive=DEFAULT_DESTRUCTIVE_TOKEN)
+            driver.run(
+                dry_run=False, apply=True,
+                confirm_destructive=DEFAULT_DESTRUCTIVE_TOKEN, only_steps={4},
+            )
         assert "clear_qdrant" not in calls
+
+    def test_destructive_step_allowed_with_basis_after_partial_apply(self, tmp_path, monkeypatch):
+        cfg = _cfg(tmp_path)
+        cfg.knowledge_dir.mkdir(parents=True)
+        calls = []
+        cfg.clear_qdrant = lambda _c: calls.append("clear_qdrant")
+        driver = CutoverDriver(cfg)
+        h_live = driver._snapshot_input_hash()
+        write_marker(driver._marker(2), h_live, step=2, name="snapshot")
+        driver._record_basis(h_live)
+        (cfg.knowledge_dir / "drift.md").write_text("drift\n")   # частичный apply изменил вход
+        monkeypatch.setattr(driver, "_load_sources_and_plan", lambda: (set(), set(), {}))
+        report = driver.run(
+            dry_run=False, apply=True,
+            confirm_destructive=DEFAULT_DESTRUCTIVE_TOKEN, only_steps={4},
+        )
+        step4 = [s for s in report["steps"] if s["step"] == 4][0]
+        assert step4["status"] == "done", step4
+        assert calls == ["clear_qdrant"]
 
 
 # ── (ж) реальный delete-путь _action_teardown в apply-режиме ──
