@@ -316,12 +316,21 @@ class MCPClient:
             return raw.get("results", [])
         return raw if isinstance(raw, list) else []
 
-    async def update_entry(self, knowledge_id: str, content: str) -> dict[str, Any]:
+    async def update_entry(
+        self,
+        knowledge_id: str,
+        content: str,
+        source_refs: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """Обновить запись (контент body) через update_entry тул.
 
         Args:
             knowledge_id: ID записи для обновления.
             content: Новый markdown-контент (заменяет body, frontmatter сохраняется).
+            source_refs: Ссылки на Source-записи (bibliography T2b, опционально):
+                ``[{source_id, locator?}]``; сервер валидирует fail-closed
+                (Source существует, content_type == "source"). None → параметр
+                не отправляется (привязки не меняются).
 
         Returns:
             Результат update_entry (словарь с knowledge_id, title и др.).
@@ -330,11 +339,13 @@ class MCPClient:
             Использует per-call timeout 60s — серверный update_entry может
             занимать >10s на больших книгах (git commit YAML с 7032 children).
         """
-        return await self.tools_call(
-            "update_entry",
-            {"knowledge_id": knowledge_id, "content": content},
-            timeout=60.0,
-        )
+        params: dict[str, Any] = {
+            "knowledge_id": knowledge_id,
+            "content": content,
+        }
+        if source_refs is not None:
+            params["source_refs"] = source_refs
+        return await self.tools_call("update_entry", params, timeout=60.0)
 
     # ── Fragment operations (Фаза 13.23) ────────────────────────
 
@@ -368,6 +379,7 @@ class MCPClient:
         content: str | None = None,
         title: str | None = None,
         version: int | None = None,
+        source_id: str | None = None,
     ) -> dict[str, Any]:
         """Обновить раздел книги с optimistic locking.
 
@@ -376,6 +388,11 @@ class MCPClient:
             content: Новое содержание (Markdown).
             title: Новый заголовок.
             version: Ожидаемая версия (optimistic locking).
+            source_id: Привязка Source к секции (bibliography T2b, опционально):
+                непустая строка — привязать, "" — отвязать, None — параметр
+                не отправляется (привязка не меняется). Сервер валидирует
+                fail-closed: Source существует и content_type == "source",
+                отказ → {"error", "errors[]} без записи.
 
         Returns:
             {"fragment_id": ..., "version": ..., "updated_at": ...}
@@ -391,6 +408,8 @@ class MCPClient:
             params["title"] = title
         if version is not None:
             params["version"] = version
+        if source_id is not None:
+            params["source_id"] = source_id
         return await self.tools_call("update_fragment", params, timeout=60.0)
 
     async def delete_fragment(self, fragment_id: str) -> dict[str, Any]:

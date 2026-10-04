@@ -21,6 +21,11 @@ code-2026-08-11-book-fragments (Фаза 13.23):
   - Удалён workaround прямого fetch (TOC теперь on-the-fly из Qdrant).
   - Сохранён fallback: TOC + notify при ненайденном фрагменте (NH-iter3-7).
 
+code-2026-10-02-bibliography (P3-2b):
+  - Диалог «Изменить раздел»: поле «Источник (source_id)» — привязка Source
+    к секции (prefill из citation, пусто = отвязать, ошибки errors[] без
+    потери ввода, перечитка секции после привязки).
+
 render_book_detail / show_book_dialog переиспользуются страницей «Поиск»
 (кнопка «Открыть книгу» в результатах).
 """
@@ -34,9 +39,10 @@ from nicegui import ui
 
 from ..config import MCP_SERVER_URL
 from ..core.data_cache import cache
-from ..core.identity import mcp_api_key
+from ..core.identity import ROLE_LEVEL, current_role, mcp_api_key
 from ..core.mcp_client import MCPClient
 from ..core.utils import _sanitize_title
+from ..documents_proxy import citation_viewer_url
 
 # Пагинация TOC: книги бывают на тысячи секций — рендерим постранично,
 # иначе NiceGUI-слот перегружается и рвётся websocket-handshake.
@@ -61,6 +67,134 @@ def _find_section_child(children: list[dict], section_id: str | None) -> dict | 
     if section_id is None:
         return None
     return next((c for c in children if c.get("knowledge_id") == section_id), None)
+
+
+def _citation_pages_label(locator: dict | None) -> str | None:
+    """Человекочитаемые страницы/время из citation.locator (P3-1).
+
+    kind=page → «С. 12» / «С. 12–14»; kind=timestamp → «12:34» / «01:02:03».
+    Битый/чужой kind → None (страницы не выдумываем; deep-link живёт
+    фрагментом URL из citation_viewer_url). Чистая функция.
+    """
+    if not isinstance(locator, dict):
+        return None
+    kind = locator.get("kind")
+    start = locator.get("start")
+
+    def _num(v: object) -> int | None:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        return int(v)
+
+    if kind == "page":
+        s = _num(start)
+        if s is None:
+            return None
+        e = _num(locator.get("end"))
+        return f"С. {s}" if e is None or e == s else f"С. {s}–{e}"
+    if kind == "timestamp":
+        s = _num(start)
+        if s is None:
+            return None
+        e = _num(locator.get("end"))
+
+        def _mmss(total: int) -> str:
+            h, rem = divmod(total, 3600)
+            m, sec = divmod(rem, 60)
+            return f"{h:02d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+        return _mmss(s) if e is None or e == s else f"{_mmss(s)}–{_mmss(e)}"
+    return None
+
+
+def _citation_view_model(citation: object, *, admin_viewer: bool) -> dict | None:
+    """Решение о рендере блока «Источник» из citation payload get_entry (P3-1).
+
+    None ⇔ блока нет: citation отсутствует/не dict, formatted пуст (инвариант
+    «нет citation → нет UI» — пустышку не рендерим) или private-source ниже
+    admin (§3.4: ни кнопки, ни намёка — гейт как в search.py:153-165;
+    серверный гейт прокси documents_proxy — вторая линия).
+    Кнопка «Документ» — только при полном уровне (б) (viewer_url+sha256):
+    частичный рендер ссылки запрещён (паттерн search.py:149-151).
+    Данные уже в payload get_entry — без дополнительных запросов (no N+1).
+    """
+    if not isinstance(citation, dict):
+        return None
+    if citation.get("zone") == "private" and not admin_viewer:
+        return None
+    formatted = str(citation.get("formatted") or "").strip()
+    if not formatted:
+        return None
+    return {
+        "formatted": formatted,
+        "pages": _citation_pages_label(citation.get("locator")),
+        "doc_url": citation_viewer_url(citation),
+    }
+
+
+def _render_citation_block(vm: dict | None) -> None:
+    """Отрисовать компактный блок «Источник» (в активном NiceGUI-слоте).
+
+    vm=None → no-op. Текст ГОСТ-ссылки (formatted) + страницы из locator +
+    кнопка «Документ» (viewer-URL в новой вкладке, как search.py:163-165).
+    """
+    if vm is None:
+        return
+    text = vm["formatted"] + (f"  ·  {vm['pages']}" if vm.get("pages") else "")
+    with ui.row().classes("items-center gap-2 q-mt-xs"):
+        ui.icon("format_quote").classes("text-caption text-grey")
+        ui.label(text).classes("text-caption text-grey-8")
+        doc_url = vm.get("doc_url")
+        if doc_url:
+            ui.button("Документ", icon="picture_as_pdf").props("flat dense") \
+                .on_click(lambda u=doc_url: ui.open(u, new_tab=True))
+
+# ── Чистые функции поля «Источник» в диалоге редактирования (T2b) ──
+
+def _source_field_prefill(sec_entry: object) -> str:
+    """Текущий source_id секции для префилла поля (T2b).
+
+    get_entry не отдаёт fm.source_id на верхнем уровне — читаемый путь:
+    citation.source_id (read-time enrichment, read.py:230-237). Citation
+    отсутствует/скрыт (нет привязки, private ниже admin, сломанный CSL)
+    → "" (значение не выдумываем). Чистая функция.
+    """
+    if not isinstance(sec_entry, dict):
+        return ""
+    citation = sec_entry.get("citation")
+    if not isinstance(citation, dict):
+        return ""
+    sid = citation.get("source_id")
+    return sid if isinstance(sid, str) else ""
+
+
+def _source_save_value(current: str, entered: object) -> str | None:
+    """Решение, что отправить в update_fragment.source_id (T2b).
+
+    None = параметр не отправлять (сервер не меняет привязку): поле не
+    трогали ИЛИ текущее значение неизвестно (citation скрыт) — fail-safe
+    против молчаливой отвязки. Изменённое значение → отправить как есть
+    (непустое = привязать, "" = отвязать). Чистая функция.
+    """
+    entered_norm = entered.strip() if isinstance(entered, str) else ""
+    if entered_norm == current:
+        return None
+    return entered_norm
+
+
+def _source_error_message(result: object) -> str:
+    """Человекочитаемая ошибка сохранения из отказа сервера (T2b).
+
+    Серверный fail-closed отказ: {"error": "; ".join(...), "errors": [...]}
+    (fragments.py:261) — показываем errors[] целиком (все причины),
+    fallback на error. Всегда непустая строка.
+    """
+    if not isinstance(result, dict):
+        return "неизвестная ошибка"
+    errors = result.get("errors")
+    if isinstance(errors, list) and errors:
+        return "; ".join(str(e) for e in errors)
+    return str(result.get("error") or "неизвестная ошибка")
 
 
 # ── Переиспользуемый рендер детали книги (для «Книги» и диалога «Поиска») ──
@@ -100,6 +234,9 @@ async def render_book_detail(
     if on_zone_loaded is not None:
         on_zone_loaded(entry.get("zone", "private"))
 
+    # P3-1: гейт приватных citation — роль сессии (паттерн search.py:100)
+    admin_viewer = ROLE_LEVEL.get(current_role(), 0) >= ROLE_LEVEL["admin"]
+
     title = entry.get("title") or collection_id
     children = entry.get("children") or []
     children.sort(key=lambda c: c.get("sequence_number") or 0)
@@ -133,6 +270,13 @@ async def render_book_detail(
                 if sec and "error" in sec:
                     ui.label(f"❌ {sec['error']}").classes("text-negative")
                     return
+                # P3-1: блок «Источник» из citation payload секции
+                _render_citation_block(
+                    _citation_view_model(
+                        sec.get("citation") if isinstance(sec, dict) else None,
+                        admin_viewer=admin_viewer,
+                    )
+                )
                 ui.markdown(sec.get("content", "_(пусто)_") if sec else "_(пусто)_")
         except RuntimeError as e:
             if "parent slot" in str(e) or "has been deleted" in str(e):
@@ -158,6 +302,9 @@ async def render_book_detail(
         # Префилл: контент минус первый # заголовок
         heading_match = re.match(r"^#\s+.+?\n\n?", current_content)
         prefilled = current_content[heading_match.end():] if heading_match else current_content
+        # T2b (bibliography): текущая привязка Source — из citation payload
+        # этого же get_entry (дополнительных запросов нет)
+        current_source = _source_field_prefill(sec_entry)
 
         _edit_textarea = None
         _edit_save_btn = None
@@ -171,12 +318,25 @@ async def render_book_detail(
                 if _edit_save_btn is not None:
                     _edit_save_btn.enable()
                 return
+            # T2b: None = не менять привязку, "" = отвязать, строка = привязать
+            source_save = _source_save_value(current_source, _source_input.value)
             try:
                 result = await client.update_fragment(
                     section_id, content=new_content, version=current_version,
+                    source_id=source_save,
                 )
             except Exception as exc:
                 ui.notify(f"Ошибка обновления: {exc}", type="negative")
+                if _edit_save_btn is not None:
+                    _edit_save_btn.enable()
+                return
+            if result.get("error"):
+                # T2b: fail-closed отказ сервера (например, source_id не
+                # прошёл валидацию) — диалог открыт, ввод не теряется
+                ui.notify(
+                    f"Не сохранено: {_source_error_message(result)}",
+                    type="negative",
+                )
                 if _edit_save_btn is not None:
                     _edit_save_btn.enable()
                 return
@@ -192,12 +352,25 @@ async def render_book_detail(
             edit_dialog.close()
             ui.notify("Раздел обновлён", type="positive")
             cache.invalidate("books")
-            await render_book_detail(container, client, collection_id)
+            if source_save is not None:
+                # T2b: привязка изменилась — перечитать секцию (get_entry),
+                # чтобы блок «Источник» (P3-1) появился/обновился сразу
+                await _show_section(section)
+            else:
+                await render_book_detail(container, client, collection_id)
 
         with ui.dialog() as edit_dialog, ui.card().classes("w-[600px] max-w-[90vw]"):
             ui.label(f"Изменить: {section.get('title', '—')}").classes("text-h6")
             ui.label(f"ID: {section_id}  ·  Версия: {current_version}").classes("text-caption text-grey")
             _edit_textarea = ui.textarea(value=prefilled).classes("w-full").props("autogrow")
+            # T2b: привязка Source к секции (update_fragment source_id)
+            _source_input = ui.input(
+                label="Источник (source_id)", value=current_source,
+            ).classes("w-full").props("dense clearable")
+            ui.label(
+                "Формат: src-<sha256_16>. Очистка поля отвязывает источник"
+                " (только если он был показан выше)",
+            ).classes("text-caption text-grey")
             with ui.row().classes("gap-2 q-mt-md"):
                 _edit_save_btn = ui.button("Сохранить", on_click=_save_edit, icon="save").props("color=primary")
                 ui.button("Отмена", on_click=edit_dialog.close).props("flat")
@@ -240,6 +413,10 @@ async def render_book_detail(
             ui.label(title).classes("text-h5")
             ui.label(f"{entry.get('domain', '—')}/{entry.get('subject', '—')}"
                      f"  ·  секций: {total}").classes("text-caption text-grey")
+            # P3-1: блок «Источник» из citation payload книги (если есть)
+            _render_citation_block(
+                _citation_view_model(entry.get("citation"), admin_viewer=admin_viewer)
+            )
             ui.separator()
             if not children:
                 ui.label("В книге нет секций (TOC пуст)").classes("text-grey")
