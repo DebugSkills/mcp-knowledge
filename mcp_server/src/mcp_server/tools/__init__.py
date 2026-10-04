@@ -409,6 +409,10 @@ _IMPORT_CONTENT_SCHEMA: dict[str, Any] = {
         "replace_collection_id": {"type": "string", "description": "ID коллекции для ЗАМЕНЫ: после успешного импорта старая книга удаляется (cascade). Import-first: старая цела до подтверждения успеха новой."},
         "replace_on_partial": {"type": "boolean", "default": False, "description": "Удалить старую книгу даже при partial_success импорта (failed>0). Default False — безопасно."},
         "pdf_path": {"type": "string", "description": "Путь к PDF-файлу на сервере (из POST /upload, опционально для content_type=pdf)"},
+        "license": {
+            "type": "string",
+            "description": "Лицензия источника: licensed | public-domain | unknown (fail-closed по умолчанию)",
+        },
         "zone": {"type": "string", "enum": ["public", "private"], "default": "private", "description": "Зона доступа книги (W1): public | private. При replace_collection_id без явной zone наследуется зона заменяемой книги."},
     },
     "required": ["content", "domain", "subject"],

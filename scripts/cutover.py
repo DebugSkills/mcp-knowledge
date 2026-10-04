@@ -195,6 +195,7 @@ class CutoverConfig:
     pilot_pdf: Path = Path("pilot.pdf")
     pilot_domain: str = "networking"
     pilot_subject: str = "http3"
+    pilot_license: str = "licensed"
     chown_owner: str = "ladmin:ladmin"
     chown_targets: list[Path] = field(default_factory=list)
 
@@ -607,6 +608,7 @@ def _cmd_pilot_import(cfg: "CutoverConfig") -> None:
             "pdf_path": pdf_path,
             "domain": cfg.pilot_domain,
             "subject": cfg.pilot_subject,
+            "license": cfg.pilot_license,
         },
         timeout=900,
     )
