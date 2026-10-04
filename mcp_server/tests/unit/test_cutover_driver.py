@@ -700,3 +700,16 @@ class TestWiring:
         assert calls == []  # снос/стек не запускались
         assert not driver._marker(4).exists()
 
+    def test_checksum_knowledge_ignores_derived_gen_yaml(self, tmp_path):
+        kd = tmp_path / "knowledge"
+        (kd / "networking").mkdir(parents=True)
+        (kd / "networking" / "a.md").write_text("content\n")
+        gen = kd / "networking" / "_INDEX.gen.yaml"
+        gen.write_text("version: 1\n")
+        h1 = cutover.checksum_knowledge(kd)
+        gen.write_text("version: 2\n")          # сервер регенерировал индекс
+        (kd / "INDEX.gen.yaml").write_text("x: 1\n")
+        assert cutover.checksum_knowledge(kd) == h1   # derived — не вход
+        (kd / "networking" / "a.md").write_text("content changed\n")
+        assert cutover.checksum_knowledge(kd) != h1   # контент — вход
+

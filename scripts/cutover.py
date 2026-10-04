@@ -118,9 +118,22 @@ def checksum_documents(path: Path) -> str:
     return checksum_tree(path, skip=_is_sqlite_registry_file)
 
 
+def _is_derived_index_file(p: Path) -> bool:
+    """True для derived-индексов knowledge (`*.gen.yaml`).
+
+    INDEX.gen.yaml / _INDEX.gen.yaml регенерируются работающим сервером
+    (derived, rebuildable) и не являются входом снапшота — иначе любая
+    переиндексация фонового процесса инвалидировала бы снапшот (найдено на
+    Ф6c: дрейф *_INDEX.gen.yaml между снапшотом и apply).
+    """
+    return p.name.endswith(".gen.yaml")
+
+
 def checksum_knowledge(path: Path) -> str:
-    """Хеш SSOT-контента knowledge-дерева (исключая .git/ — VCS-метаданные)."""
-    return checksum_tree(path, skip=_is_git_metadata)
+    """Хеш SSOT-контента knowledge-дерева (исключая .git/ и derived *.gen.yaml)."""
+    return checksum_tree(
+        path, skip=lambda p: _is_git_metadata(p) or _is_derived_index_file(p)
+    )
 
 
 def read_marker(path: Path) -> Optional[dict]:
@@ -872,7 +885,8 @@ class CutoverDriver:
                 entry["status"] = "refused"
                 entry["detail"] = (
                     "apply запрещён: снапшот шага 2 не валиден относительно старта "
-                    "(отсутствует/расхождение CHECKSUMS)"
+                    "(вход knowledge/documents изменился после снапшота либо CHECKSUMS "
+                    "отсутствуют). Пересоберите снапшот: ARGS=\"--only-steps 2\""
                 )
                 results.append(entry)
                 raise CutoverRefusal(entry["detail"])
