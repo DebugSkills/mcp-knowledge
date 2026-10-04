@@ -466,6 +466,31 @@ def _download(url: str, dest: Path, timeout: int = 300) -> None:
             fh.write(chunk)
 
 
+def _wait_health(base_url: str, timeout_s: int = 120) -> dict:
+    """Дождаться готовности сервера после deploy (иначе шаг 6 падал Connection refused)."""
+    import urllib.error  # noqa: F401  (симметрия обработки, см. except ниже)
+    import urllib.request
+
+    deadline = time.time() + timeout_s
+    last: object = "нет попыток"
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(
+                base_url.rstrip("/") + "/health", timeout=5
+            ) as resp:
+                data = json.loads(resp.read().decode() or "{}")
+            if data.get("status") in ("healthy", "ok", "degraded"):
+                return data
+            last = data.get("status")
+        except Exception as exc:  # noqa: BLE001 — ждём готовности, причина в тексте
+            last = str(exc)
+        time.sleep(3)
+    raise CutoverError(
+        f"сервер не отвечает на /health за {timeout_s}s — повторите шаг 6 "
+        f"(--only-steps 6). Последняя причина: {last}"
+    )
+
+
 def _mcp_rpc(base_url: str, key: str, method: str, params: dict, timeout: int = 300) -> dict:
     """Generic JSON-RPC вызов MCP (tools/list, tools/call) c X-API-Key."""
     import urllib.request
@@ -543,6 +568,7 @@ def _cmd_deploy(cfg: "CutoverConfig") -> None:
 
 
 def _cmd_reindex(cfg: "CutoverConfig") -> None:
+    _wait_health(cfg.mcp_base_url)
     key = _read_env_key(cfg.env_file, "MCP_WRITE_KEYS")
     if not key:
         raise CutoverError("reindex: нет admin-ключа (MCP_WRITE_KEYS) в " + str(cfg.env_file))
@@ -552,7 +578,7 @@ def _cmd_reindex(cfg: "CutoverConfig") -> None:
 
 
 def _cmd_smoke(cfg: "CutoverConfig") -> dict:
-    health = _http_json("GET", cfg.mcp_base_url.rstrip("/") + "/health")
+    health = _wait_health(cfg.mcp_base_url, timeout_s=60)
     status = health.get("status")
     if status not in ("healthy", "ok", "degraded"):
         raise CutoverError(f"smoke: /health status={status!r}")

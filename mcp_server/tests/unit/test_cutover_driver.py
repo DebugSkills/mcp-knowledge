@@ -781,3 +781,7 @@ class TestWiring:
         driver._record_basis("OTHER")
         assert read_marker(driver._basis_path()) is None
 
+    def test_wait_health_raises_clear_error_on_timeout(self):
+        with pytest.raises(CutoverError, match="/health"):
+            cutover._wait_health("http://127.0.0.1:9", timeout_s=0)
+
