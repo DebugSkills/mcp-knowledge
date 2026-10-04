@@ -812,6 +812,7 @@ class CutoverDriver:
         dry_run: bool = True,
         apply: bool = False,
         confirm_destructive: Optional[str] = None,
+        only_steps: Optional[set[int]] = None,
     ) -> dict:
         """Прогон шагов 2-8. dry-run: план без изменений; apply: реальные действия."""
         results: list[dict] = []
@@ -833,6 +834,12 @@ class CutoverDriver:
             ]
 
         for step_no, name, destructive, probe, action in step_defs():
+            if only_steps and step_no not in only_steps:
+                results.append({
+                    "step": step_no, "name": name, "status": "skipped",
+                    "detail": "вне выборки --only-steps",
+                })
+                continue
             probe_result = probe()
             ih, plan = probe_result[0], probe_result[1]
             marker = self._marker(step_no)
@@ -948,6 +955,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--aliases", default=None, help="csv Qdrant-алиасов")
     p.add_argument("--env-file", default=None, help="путь к .env (ключи читает сам скрипт)")
     p.add_argument("--pilot-pdf", default=None, help="PDF пилотного импорта (шаг 8)")
+    p.add_argument("--only-steps", default=None,
+                   help="csv номеров шагов для частичного прогона (напр. 1,2 = снапшот)")
     return p
 
 
@@ -992,12 +1001,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     cfg.clear_qdrant = _cmd_qdrant_clear_legacy
 
     dry_run = not args.apply
+    only_steps = (
+        {int(x) for x in args.only_steps.split(",") if x.strip()}
+        if args.only_steps else None
+    )
     driver = CutoverDriver(cfg)
     try:
         report = driver.run(
             dry_run=dry_run,
             apply=args.apply,
             confirm_destructive=args.confirm_destructive,
+            only_steps=only_steps,
         )
     except CutoverRefusal as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)

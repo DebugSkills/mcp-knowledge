@@ -677,3 +677,26 @@ class TestWiring:
         env.write_text('MCP_WRITE_KEYS=["k1","k2"]\nOTHER=1\n')
         assert cutover._read_env_key(env, "MCP_WRITE_KEYS") == "k1"
         assert cutover._read_env_key(env, "ABSENT") == ""
+
+    def test_only_steps_partial_run(self, tmp_path, monkeypatch):
+        calls = []
+        cfg = _cfg(
+            tmp_path,
+            stop_cmd=lambda: calls.append("stop"),
+            deploy_cmd=lambda: calls.append("deploy"),
+            reindex_cmd=lambda: calls.append("reindex"),
+            smoke_cmd=lambda: calls.append("smoke"),
+            import_pilot_cmd=lambda: calls.append("pilot"),
+            clear_qdrant=lambda _c: calls.append("clear_qdrant"),
+        )
+        cfg.knowledge_dir.mkdir(parents=True)
+        driver = CutoverDriver(cfg)
+        monkeypatch.setattr(driver, "_action_snapshot", lambda: None)
+        report = driver.run(
+            dry_run=False, apply=True, only_steps={1, 2},
+            confirm_destructive=DEFAULT_DESTRUCTIVE_TOKEN,
+        )
+        assert [s["step"] for s in report["steps"] if s["status"] != "skipped"] == [1, 2]
+        assert calls == []  # снос/стек не запускались
+        assert not driver._marker(4).exists()
+
