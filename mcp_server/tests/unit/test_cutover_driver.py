@@ -453,3 +453,227 @@ class TestMarkers:
         assert checksum_tree(d) == c1  # детерминизм
         (d / "b.txt").write_text("WORLD")
         assert checksum_tree(d) != c1  # контент-чувствительность
+
+
+# ── C1 (code-2026-10-02-bibliography): keep-правило ∪ fail-closed ∪ assert delete ──
+
+
+class TestKeepRuleSections:
+    def test_keeps_sections_and_root_collection_of_kept_source(self, tmp_path):
+        # P0 keep-rule: Source (живой blob ∧ зелёный) ∪ секции со source_refs/
+        # source_id на kept-Source ∪ корневая коллекция с детьми из keep.
+        ds = DocumentStore(tmp_path / "documents", max_gb=1)
+        source = _source_entry("src-ecc538dc3d8e9cb3", _live_blobs(ds))
+
+        sec_refs = KnowledgeEntry(frontmatter=KnowledgeFrontmatter(
+            knowledge_id="sec-refs", domain="networking", subject="http3",
+            content_type="pdf", zone="private", status="published",
+            parent_knowledge_id="coll-rfc",
+            source_refs=[{"source_id": "src-ecc538dc3d8e9cb3",
+                          "locator": {"kind": "page", "start": 1, "end": 1}}],
+        ), content="# sec-refs\n")
+        sec_sid = KnowledgeEntry(frontmatter=KnowledgeFrontmatter(
+            knowledge_id="sec-sid", domain="networking", subject="http3",
+            content_type="pdf", zone="private", status="published",
+            parent_knowledge_id="coll-rfc",
+            source_id="src-ecc538dc3d8e9cb3",
+        ), content="# sec-sid\n")
+        root = KnowledgeEntry(frontmatter=KnowledgeFrontmatter(
+            knowledge_id="coll-rfc", domain="networking", subject="http3",
+            content_type="collection", zone="private", status="published",
+        ), content="# coll\n")
+        # секция, ссылающаяся на НЕ-kept Source → teardown (не спасена)
+        sec_dangling = KnowledgeEntry(frontmatter=KnowledgeFrontmatter(
+            knowledge_id="sec-dangling", domain="networking", subject="http3",
+            content_type="pdf", zone="private", status="published",
+            parent_knowledge_id="coll-rfc",
+            source_id="src-missing",
+        ), content="# sec-dangling\n")
+        legacy_book = _entry("legacy-book", "book")
+
+        keep, teardown, _ = plan_teardown(
+            [source, sec_refs, sec_sid, root, sec_dangling, legacy_book], ds
+        )
+
+        assert keep == {"src-ecc538dc3d8e9cb3", "sec-refs", "sec-sid", "coll-rfc"}
+        assert teardown == {"sec-dangling", "legacy-book"}
+
+
+class TestFailClosed:
+    def test_zero_blobs_with_source_refs_refuses(self, tmp_path):
+        # P1: 0 физических блобов при Source с непустыми refs → отказ (не снести всё)
+        ds = DocumentStore(tmp_path / "documents", max_gb=1)
+        source = _source_entry(
+            "src-orphaned",
+            {"original": {"sha256": "0" * 64, "mime": "application/pdf",
+                          "size": 1, "original_filename": "m.pdf"}, "derived": []},
+        )
+        with pytest.raises(CutoverRefusal):
+            plan_teardown([source], ds)
+
+    def test_unavailable_store_refuses(self, tmp_path):
+        # P1: blob-store недоступен (каталог не существует) → 0 блобов → отказ
+        ds = cutover._ReadOnlyDocumentStore(tmp_path / "nonexistent" / "documents")
+        source = _source_entry(
+            "src-x",
+            {"original": {"sha256": "0" * 64, "mime": "application/pdf",
+                          "size": 1, "original_filename": "m.pdf"}, "derived": []},
+        )
+        with pytest.raises(CutoverRefusal):
+            plan_teardown([source], ds)
+
+    def test_does_not_fire_with_live_blob(self, tmp_path):
+        # P1 негатив-контроль: живой блоб есть → guard НЕ срабатывает ложно
+        ds = DocumentStore(tmp_path / "documents", max_gb=1)
+        source = _source_entry("src-live", _live_blobs(ds))
+        keep, teardown, _ = plan_teardown([source], ds)
+        assert keep == {"src-live"}
+        assert teardown == set()
+
+
+class TestPartialDeleteAssert:
+    def test_action_teardown_raises_on_partial_delete(self, tmp_path, monkeypatch):
+        # P2: delete_many вернул < len(teardown) → CutoverError (тихий частичный снос запрещён)
+        import asyncio
+
+        from mcp_server.storage.markdown_store import MarkdownStore
+
+        cfg = _cfg(tmp_path)
+        cfg.knowledge_dir.mkdir(parents=True)
+        store = MarkdownStore(knowledge_root=cfg.knowledge_dir)
+        book = _entry("legacy-book", "book")
+        asyncio.run(store.write_entry(book))
+
+        async def fake_delete_many(self, knowledge_ids, commit_message=None):
+            return 0  # симулируем: ни один файл не удалился
+
+        monkeypatch.setattr(MarkdownStore, "delete_many", fake_delete_many)
+        cfg.clear_qdrant = lambda _c: None  # изолируем: CutoverError — ТОЛЬКО от assert delete
+        driver = CutoverDriver(cfg)
+        with pytest.raises(CutoverError):
+            driver._action_teardown()
+
+
+# ── C2: wiring (пути/коллекции/команды/гейты) ─────────────────
+
+
+class TestWiring:
+    def test_main_defaults_paths_collections_commands(self, monkeypatch):
+        captured = {}
+
+        def fake_run(self, **kw):
+            captured["cfg"] = self.cfg
+            return {"dry_run": True, "apply": False, "steps": []}
+
+        monkeypatch.setattr(cutover.CutoverDriver, "run", fake_run)
+        assert cutover.main([]) == 0
+        cfg = captured["cfg"]
+        base = ROOT.parent  # <repo>/mcp-knowledge
+        assert cfg.knowledge_dir == base / "knowledge"
+        assert cfg.documents_dir == base / "data" / "documents"
+        assert cfg.qdrant_collections == ["knowledge_public", "knowledge_private"]
+        assert cfg.legacy_collections == ["knowledge_v1"]
+        assert cfg.legacy_collection_prefixes == ("knowledge_e2e_",)
+        for name in (
+            "stop_cmd", "deploy_cmd", "reindex_cmd", "smoke_cmd",
+            "import_pilot_cmd", "snapshot_qdrant", "clear_qdrant",
+        ):
+            assert getattr(cfg, name) is not None, name
+        assert (base / "knowledge" / ".git") in cfg.chown_targets
+        assert cfg.env_file == ROOT / ".env"
+
+    def test_main_cli_overrides(self, monkeypatch):
+        captured = {}
+
+        def fake_run(self, **kw):
+            captured["cfg"] = self.cfg
+            return {"dry_run": True, "apply": False, "steps": []}
+
+        monkeypatch.setattr(cutover.CutoverDriver, "run", fake_run)
+        assert cutover.main(["--knowledge-dir", "/tmp/k", "--pilot-pdf", "/tmp/p.pdf"]) == 0
+        cfg = captured["cfg"]
+        assert cfg.knowledge_dir == Path("/tmp/k")
+        assert cfg.pilot_pdf == Path("/tmp/p.pdf")
+
+    def test_clear_qdrant_only_legacy_not_aliased(self, tmp_path, monkeypatch):
+        deleted = []
+
+        def fake_http(method, url, payload=None, timeout=120):
+            if url.endswith("/collections"):
+                return {"result": {"collections": [
+                    {"name": "knowledge_public_v2"}, {"name": "knowledge_private_v2"},
+                    {"name": "knowledge_v1"}, {"name": "knowledge_e2e_public_v2"},
+                    {"name": "knowledge_e2e_private_v2"}]}}
+            if url.endswith("/aliases"):
+                return {"result": {"aliases": [
+                    {"alias_name": "knowledge_public", "collection_name": "knowledge_public_v2"},
+                    {"alias_name": "knowledge_private", "collection_name": "knowledge_private_v2"}]}}
+            if method == "DELETE":
+                deleted.append(url.rsplit("/", 1)[-1])
+                return {}
+            raise AssertionError(url)
+
+        monkeypatch.setattr(cutover, "_http_json", fake_http)
+        cutover._cmd_qdrant_clear_legacy(_cfg(tmp_path))
+        assert deleted == ["knowledge_v1", "knowledge_e2e_public_v2", "knowledge_e2e_private_v2"]
+
+    def test_apply_snapshot_gate(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        cfg.knowledge_dir.mkdir(parents=True)
+        driver = CutoverDriver(cfg)
+        assert driver.apply_snapshot_ok("H") is False
+        write_marker(driver._marker(2), "H", step=2, name="snapshot")
+        assert driver.apply_snapshot_ok("H") is True
+        assert driver.apply_snapshot_ok("OTHER") is False
+        assert driver.apply_snapshot_ok(None) is False
+
+    def test_preflight_raises_with_hint_when_git_broken(self, tmp_path, monkeypatch):
+        kd = tmp_path / "knowledge"
+        (kd / ".git").mkdir(parents=True)
+        cfg = _cfg(tmp_path, knowledge_dir=kd)
+
+        class R:
+            returncode = 1
+
+        monkeypatch.setattr(cutover.subprocess, "run", lambda *a, **k: R())
+        with pytest.raises(CutoverError, match="safe.directory"):
+            CutoverDriver(cfg)._action_preflight()
+
+    def test_preflight_skips_non_git_dir(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        cfg.knowledge_dir.mkdir(parents=True)
+        CutoverDriver(cfg)._action_preflight()  # не должно бросать
+
+    def test_post_chown_existing_targets_only(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(cutover, "_run", lambda cmd: calls.append(cmd))
+        existing = tmp_path / "e"
+        existing.mkdir()
+        cfg = _cfg(
+            tmp_path,
+            chown_owner="ladmin:ladmin",
+            chown_targets=[existing, tmp_path / "missing"],
+        )
+        CutoverDriver(cfg)._action_post_chown()
+        assert calls == [["chown", "-R", "ladmin:ladmin", str(existing)]]
+
+    def test_smoke_requires_min_tools(self, tmp_path, monkeypatch):
+        cfg = _cfg(tmp_path)
+        monkeypatch.setattr(cutover, "_http_json", lambda *a, **k: {"status": "healthy"})
+        monkeypatch.setattr(
+            cutover, "_mcp_rpc",
+            lambda *a, **k: {"tools": [{"name": f"t{i}"} for i in range(12)]},
+        )
+        with pytest.raises(CutoverError, match="<30"):
+            cutover._cmd_smoke(cfg)
+        monkeypatch.setattr(
+            cutover, "_mcp_rpc",
+            lambda *a, **k: {"tools": [{"name": f"t{i}"} for i in range(31)]},
+        )
+        assert cutover._cmd_smoke(cfg)["tools"] == 31
+
+    def test_read_env_key_first_value_never_logs(self, tmp_path):
+        env = tmp_path / ".env"
+        env.write_text('MCP_WRITE_KEYS=["k1","k2"]\nOTHER=1\n')
+        assert cutover._read_env_key(env, "MCP_WRITE_KEYS") == "k1"
+        assert cutover._read_env_key(env, "ABSENT") == ""

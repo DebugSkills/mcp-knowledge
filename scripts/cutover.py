@@ -164,9 +164,26 @@ class CutoverConfig:
     quality_dir: Path
     dlq_dir: Path
     qdrant_url: str = "http://localhost:6333"
-    qdrant_collections: list[str] = field(default_factory=lambda: ["knowledge", "knowledge_public"])
-    qdrant_aliases: list[str] = field(default_factory=lambda: ["knowledge_private"])
+    qdrant_collections: list[str] = field(
+        default_factory=lambda: ["knowledge_public", "knowledge_private"]
+    )
+    qdrant_aliases: list[str] = field(default_factory=list)
     destructive_token: str = DEFAULT_DESTRUCTIVE_TOKEN
+
+    # C2-wiring: окружение + внешние действия.
+    legacy_collections: list[str] = field(default_factory=lambda: ["knowledge_v1"])
+    legacy_collection_prefixes: tuple[str, ...] = ("knowledge_e2e_",)
+    compose_files: list[str] = field(default_factory=list)
+    services_to_stop: list[str] = field(
+        default_factory=lambda: ["mcp-server", "kb-console", "kb-console-tls"]
+    )
+    mcp_base_url: str = "http://localhost:8000"
+    env_file: Path = Path(".env")
+    pilot_pdf: Path = Path("pilot.pdf")
+    pilot_domain: str = "networking"
+    pilot_subject: str = "http3"
+    chown_owner: str = "ladmin:ladmin"
+    chown_targets: list[Path] = field(default_factory=list)
 
     # Внешние действия (None = не сконфигурировано; apply-шаг упадёт).
     stop_cmd: Optional[Callable[[], None]] = None
@@ -228,20 +245,49 @@ def _parse_entries_readonly(knowledge_dir: Path) -> list:
     return entries
 
 
+def _has_nonempty_blob_refs(blobs) -> bool:
+    """True, если у записи есть хотя бы один blob-ref с sha256 (Source «с блобами»)."""
+    for _kind, ref in _iter_blob_refs(blobs):
+        sha = ref.get("sha256")
+        if isinstance(sha, str) and sha:
+            return True
+    return False
+
+
+def _references_kept_source(fm, kept_sources: set[str]) -> bool:
+    """True, если ``source_id`` (поле) ИЛИ ``source_refs[]`` указывают на kept-Source."""
+    sid_field = getattr(fm, "source_id", None)
+    if isinstance(sid_field, str) and sid_field in kept_sources:
+        return True
+    for ref in getattr(fm, "source_refs", None) or []:
+        if not isinstance(ref, dict):
+            continue
+        rid = ref.get("source_id")
+        if isinstance(rid, str) and rid in kept_sources:
+            return True
+    return False
+
+
 def plan_teardown(entries, document_store) -> tuple[set[str], set[str], dict]:
     """Разделить ВСЕ записи корпуса на keep и teardown (F-1, план §6:353).
 
-    keep = Source-записи с ≥1 физически живым blob ∧ «зелёным» integrity
-    (нет ни одного дефекта, ссылающегося на их source_id: missing_blob /
-    sha_mismatch / canonical_missing / provenance_incomplete / errors).
+    keep =
+      1) Source-записи с ≥1 физически живым blob ∧ «зелёным» integrity
+         (нет ни одного дефекта по их source_id: missing_blob / sha_mismatch /
+         canonical_missing / provenance_incomplete / errors);
+      2) записи, чьи ``source_refs[]`` / ``source_id`` указывают на kept-Source
+         (секции RFC и пр.);
+      3) корневые коллекции (``content_type: collection``), чьи дети попали в keep.
 
     teardown = все прочие записи: битые Source (нет blob / дефект integrity)
-    И non-Source legacy (книги/collection/pdf-секции/…). Детерминизм — через
-    реальную `check_documents` (тот же SSOT-источник, что и контур).
+    И non-Source legacy (книги/collection/pdf-секции/…) без kept-связей.
 
-    Записи без knowledge_id — вне классификации (не удаляются по id).
+    Fail-closed (P1): если blob-store деградирован (0 физических блобов) при
+    наличии хотя бы одного Source с непустыми refs → CutoverRefusal — отказ
+    вместо «снести всё». Записи без knowledge_id — вне классификации
+    (не удаляются по id). Детерминизм — через реальную ``check_documents``.
     """
-    from mcp_server.tools.documents_integrity import check_documents
+    from mcp_server.tools.documents_integrity import check_documents, physical_blobs
 
     report = check_documents(entries, document_store, create_issues=False)
     defective: set[str] = set()
@@ -257,15 +303,26 @@ def plan_teardown(entries, document_store) -> tuple[set[str], set[str], dict]:
             if isinstance(sid, str) and sid:
                 defective.add(sid)
 
-    keep: set[str] = set()
-    teardown: set[str] = set()
+    # ── Fail-closed guard: деградация blob-store → стоп до любых мутаций ──
+    source_with_refs = any(
+        getattr(getattr(e, "frontmatter", None), "content_type", None) == "source"
+        and _has_nonempty_blob_refs(getattr(getattr(e, "frontmatter", None), "blobs", None))
+        for e in entries
+    )
+    if source_with_refs and not physical_blobs(document_store):
+        raise CutoverRefusal(
+            "снос запрещён: blob-store деградирован (0 физических блобов) при "
+            "наличии Source с непустыми refs — отказ вместо сноса всего корпуса"
+        )
+
+    # ── проход 1: kept Sources (живой blob ∧ зелёный) ──
+    kept_sources: set[str] = set()
     for entry in entries:
         fm = getattr(entry, "frontmatter", None)
         sid = getattr(fm, "knowledge_id", None) or ""
         if not sid:
-            continue  # запись без id — вне классификации (не удаляется по id)
+            continue
         if getattr(fm, "content_type", None) != "source":
-            teardown.add(sid)  # non-Source legacy → снос
             continue
         has_live_blob = False
         for _kind, ref in _iter_blob_refs(getattr(fm, "blobs", None)):
@@ -274,9 +331,40 @@ def plan_teardown(entries, document_store) -> tuple[set[str], set[str], dict]:
                 has_live_blob = True
                 break
         if has_live_blob and sid not in defective:
+            kept_sources.add(sid)
+
+    keep: set[str] = set(kept_sources)
+
+    # ── проход 2: секции со source_refs/source_id на kept-Source ──
+    kept_parents: set[str] = set()
+    for entry in entries:
+        fm = getattr(entry, "frontmatter", None)
+        sid = getattr(fm, "knowledge_id", None) or ""
+        if not sid or sid in keep:
+            continue
+        if _references_kept_source(fm, kept_sources):
             keep.add(sid)
-        else:
+            parent = getattr(fm, "parent_knowledge_id", None)
+            if isinstance(parent, str) and parent:
+                kept_parents.add(parent)
+
+    # ── проход 3: корневые коллекции с детьми в keep ──
+    for entry in entries:
+        fm = getattr(entry, "frontmatter", None)
+        sid = getattr(fm, "knowledge_id", None) or ""
+        if not sid or sid in keep:
+            continue
+        if getattr(fm, "content_type", None) == "collection" and sid in kept_parents:
+            keep.add(sid)
+
+    # ── teardown = всё с id, не попавшее в keep ──
+    teardown: set[str] = set()
+    for entry in entries:
+        fm = getattr(entry, "frontmatter", None)
+        sid = getattr(fm, "knowledge_id", None) or ""
+        if sid and sid not in keep:
             teardown.add(sid)
+
     return keep, teardown, report
 
 
@@ -315,6 +403,210 @@ def gc_on_empty(document_store, index=None, grace_days: int = 30) -> dict:
 # ── Драйвер ────────────────────────────────────────────────────
 
 
+
+# ── Внешние действия (C2-wiring) ───────────────────────────────
+
+
+def _run(cmd: list[str]) -> None:
+    subprocess.run(cmd, check=True)
+
+
+def _compose_cmd(cfg: "CutoverConfig") -> list[str]:
+    cmd = ["docker", "compose"]
+    for f in cfg.compose_files:
+        cmd += ["-f", f]
+    return cmd
+
+
+def _read_env_key(env_file: Path, var: str) -> str:
+    """Первый ключ из .env (значение НИКОГДА не логируется/не печатается)."""
+    if not env_file.exists():
+        return ""
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        if line.startswith(var + "="):
+            val = line.split("=", 1)[1].strip().strip('"').strip("'")
+            val = val.lstrip("[").rstrip("]")
+            return val.split(",")[0].strip().strip('"').strip("'")
+    return ""
+
+
+def _http_json(method: str, url: str, payload: Optional[dict] = None, timeout: int = 120) -> dict:
+    import urllib.request
+
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode()
+    return json.loads(raw) if raw.strip() else {}
+
+
+def _download(url: str, dest: Path, timeout: int = 300) -> None:
+    import urllib.request
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(url, timeout=timeout) as resp, dest.open("wb") as fh:
+        while True:
+            chunk = resp.read(1 << 16)
+            if not chunk:
+                break
+            fh.write(chunk)
+
+
+def _mcp_rpc(base_url: str, key: str, method: str, params: dict, timeout: int = 300) -> dict:
+    """Generic JSON-RPC вызов MCP (tools/list, tools/call) c X-API-Key."""
+    import urllib.request
+
+    payload = json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    ).encode()
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/mcp",
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "X-API-Key": key,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode()
+    if raw.lstrip().startswith(("event:", "data:")):
+        raw = "".join(ln[5:] for ln in raw.splitlines() if ln.startswith("data:"))
+    d = json.loads(raw)
+    if "error" in d:
+        raise CutoverError(f"MCP {method}: {d['error']}")
+    return d.get("result", d)
+
+
+def _mcp_tool(base_url: str, key: str, tool: str, args: dict, timeout: int = 300) -> dict:
+    res = _mcp_rpc(base_url, key, "tools/call", {"name": tool, "arguments": args}, timeout)
+    if isinstance(res, dict) and "content" in res and res["content"]:
+        text = res["content"][0].get("text")
+        try:
+            return json.loads(text or "{}")
+        except ValueError:
+            return {"_text": text}
+    return res if isinstance(res, dict) else {"_result": res}
+
+
+def _upload_file(base_url: str, key: str, path: Path) -> str:
+    """POST /upload (multipart) → путь PDF на сервере."""
+    import urllib.request
+    import uuid
+
+    boundary = "----cutover" + uuid.uuid4().hex
+    body = b"".join([
+        f"--{boundary}\r\n".encode(),
+        f'Content-Disposition: form-data; name="file"; filename="{path.name}"\r\n'.encode(),
+        b"Content-Type: application/pdf\r\n\r\n",
+        path.read_bytes(),
+        f"\r\n--{boundary}--\r\n".encode(),
+    ])
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/upload",
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "X-API-Key": key,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        res = json.loads(resp.read().decode() or "{}")
+    pdf_path = res.get("path") or res.get("pdf_path") or res.get("file_path")
+    if not pdf_path:
+        raise CutoverError(f"upload: сервер не вернул путь PDF ({sorted(res)})")
+    return str(pdf_path)
+
+
+def _cmd_docker_stop(cfg: "CutoverConfig") -> None:
+    _run([*_compose_cmd(cfg), "stop", *cfg.services_to_stop])
+
+
+def _cmd_deploy(cfg: "CutoverConfig") -> None:
+    _run(["make", "deploy"])
+
+
+def _cmd_reindex(cfg: "CutoverConfig") -> None:
+    key = _read_env_key(cfg.env_file, "MCP_WRITE_KEYS")
+    if not key:
+        raise CutoverError("reindex: нет admin-ключа (MCP_WRITE_KEYS) в " + str(cfg.env_file))
+    res = _mcp_tool(cfg.mcp_base_url, key, "reindex", {})
+    if res.get("error"):
+        raise CutoverError(f"reindex: {res['error']}")
+
+
+def _cmd_smoke(cfg: "CutoverConfig") -> dict:
+    health = _http_json("GET", cfg.mcp_base_url.rstrip("/") + "/health")
+    status = health.get("status")
+    if status not in ("healthy", "ok", "degraded"):
+        raise CutoverError(f"smoke: /health status={status!r}")
+    key = _read_env_key(cfg.env_file, "MCP_READ_KEYS") or _read_env_key(cfg.env_file, "MCP_WRITE_KEYS")
+    tools = _mcp_rpc(cfg.mcp_base_url, key, "tools/list", {})
+    names = [t.get("name") for t in (tools.get("tools") or [])]
+    if len(names) < 30:
+        raise CutoverError(f"smoke: tools/list вернул {len(names)} (<30)")
+    return {"status": status, "tools": len(names)}
+
+
+def _cmd_pilot_import(cfg: "CutoverConfig") -> None:
+    if not cfg.pilot_pdf.exists():
+        raise CutoverError(f"pilot: PDF не найден: {cfg.pilot_pdf}")
+    key = _read_env_key(cfg.env_file, "MCP_IMPORT_KEYS") or _read_env_key(cfg.env_file, "MCP_WRITE_KEYS")
+    if not key:
+        raise CutoverError("pilot: нет import-ключа (MCP_IMPORT_KEYS/MCP_WRITE_KEYS)")
+    pdf_path = _upload_file(cfg.mcp_base_url, key, cfg.pilot_pdf)
+    res = _mcp_tool(
+        cfg.mcp_base_url,
+        key,
+        "import_content",
+        {
+            "content": "",
+            "content_type": "pdf",
+            "pdf_path": pdf_path,
+            "domain": cfg.pilot_domain,
+            "subject": cfg.pilot_subject,
+        },
+        timeout=900,
+    )
+    if res.get("error") or res.get("ok") is False:
+        raise CutoverError(f"pilot import: {res.get('error') or res}")
+
+
+def _cmd_qdrant_snapshot(cfg: "CutoverConfig") -> None:
+    dest = cfg.backup_dir / "qdrant-snapshots"
+    dest.mkdir(parents=True, exist_ok=True)
+    for name in cfg.qdrant_collections:
+        res = _http_json("POST", f"{cfg.qdrant_url}/collections/{name}/snapshots")
+        sname = ((res.get("result") or {}) if isinstance(res, dict) else {}).get("name")
+        if not sname:
+            raise CutoverError(f"qdrant snapshot: нет name для {name}: {res}")
+        _download(
+            f"{cfg.qdrant_url}/collections/{name}/snapshots/{sname}",
+            dest / f"{name}-{sname}",
+        )
+
+
+def _cmd_qdrant_clear_legacy(cfg: "CutoverConfig") -> None:
+    info = _http_json("GET", f"{cfg.qdrant_url}/collections")
+    names = [c.get("name") for c in ((info.get("result") or {}).get("collections") or [])]
+    aim = _http_json("GET", f"{cfg.qdrant_url}/aliases")
+    aliased = {
+        a.get("collection_name")
+        for a in ((aim.get("result") or {}).get("aliases") or [])
+    }
+    prefixes = cfg.legacy_collection_prefixes or ()
+    targets = [
+        n for n in names
+        if n and (n in cfg.legacy_collections or (prefixes and n.startswith(prefixes)))
+        and n not in aliased
+    ]
+    for n in targets:
+        _http_json("DELETE", f"{cfg.qdrant_url}/collections/{n}")
+
+
 class CutoverDriver:
     """Шаги 2-8 плана §6. Каждый шаг: probe → action → marker."""
 
@@ -328,6 +620,14 @@ class CutoverDriver:
 
     def _snapshot_marker_valid(self) -> bool:
         return marker_valid(self._marker(2), self._snapshot_input_hash())
+
+    def apply_snapshot_ok(self, pre_input_hash: Optional[str]) -> bool:
+        """True, если снапшот (шаг 2) валиден относительно предусловия прогона.
+
+        Снос меняет дерево, поэтому сверяем маркер шага 2 с хешем на СТАРТЕ apply,
+        а не с текущим состоянием (иначе гейт ложно срабатывал бы после teardown).
+        """
+        return pre_input_hash is not None and marker_valid(self._marker(2), pre_input_hash)
 
     def _snapshot_input_hash(self) -> str:
         return sha256_text(
@@ -381,7 +681,8 @@ class CutoverDriver:
         (cfg.backup_dir / "checksums.sha256").write_text("\n".join(lines) + "\n")
 
     def _probe_stop(self):
-        return sha256_text("stop-v1"), "make prod-down (остановка стека)"
+        services = ", ".join(self.cfg.services_to_stop)
+        return sha256_text("stop-v1"), f"docker compose stop {services} (остановка стека)"
 
     def _action_stop(self):
         self._cmd("stop_cmd", self.cfg.stop_cmd)()
@@ -402,8 +703,8 @@ class CutoverDriver:
         ih = self._teardown_input_hash()
         plan = (
             f"снос legacy-корпуса: (к) {len(teardown)} SSOT-записей на удаление "
-            f"(битые Source + non-Source legacy); сохранить {len(keep)} Source "
-            f"(живой blob ∧ зелёный integrity); "
+            f"(битые Source + non-Source legacy); сохранить {len(keep)} записей "
+            f"(Source + зависимые секции + корень); "
             f"(к2) поверхности: Qdrant-коллекции {self.cfg.qdrant_collections} + "
             f"алиасы {self.cfg.qdrant_aliases} + _v1-остатки; "
             f"pdf_cache {self.cfg.pdf_cache_dir}; quality-issues/DLQ"
@@ -423,7 +724,13 @@ class CutoverDriver:
         if teardown:
             import asyncio
 
-            asyncio.run(store.delete_many(sorted(teardown), commit_message="cutover: legacy corpus teardown"))
+            deleted = asyncio.run(
+                store.delete_many(sorted(teardown), commit_message="cutover: legacy corpus teardown")
+            )
+            if deleted != len(teardown):
+                raise CutoverError(
+                    f"частичный снос: удалено {deleted} из {len(teardown)} SSOT-записей"
+                )
         self._cmd("clear_qdrant", self.cfg.clear_qdrant)(self.cfg)
         for d in (self.cfg.pdf_cache_dir, self.cfg.quality_dir, self.cfg.dlq_dir):
             if d.exists():
@@ -467,6 +774,36 @@ class CutoverDriver:
     def _action_pilot(self):
         self._cmd("import_pilot_cmd", self.cfg.import_pilot_cmd)()
 
+    def _probe_preflight(self):
+        return sha256_text("preflight-v1"), (
+            "git-доступ к knowledge-репо (sudo safe.directory при need) + "
+            f"остановка стека: {', '.join(self.cfg.services_to_stop)}"
+        )
+
+    def _action_preflight(self):
+        kd = self.cfg.knowledge_dir
+        if not (kd / ".git").exists():
+            # Не git-репозиторий (напр. tmp-фикстура теста) — проверка не применима.
+            return
+        proc = subprocess.run(
+            ["git", "-C", str(kd), "rev-parse", "--verify", "HEAD"],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            raise CutoverError(
+                "git недоступен для knowledge-репо (dubious ownership?). Выполните: "
+                f"sudo git config --global --add safe.directory {kd}"
+            )
+
+    def _probe_post_chown(self):
+        targets = " ".join(str(p) for p in self.cfg.chown_targets) or "<none>"
+        return sha256_text("chown-v1"), f"chown -R {self.cfg.chown_owner} {targets}"
+
+    def _action_post_chown(self):
+        targets = [p for p in self.cfg.chown_targets if p.exists()]
+        if targets:
+            _run(["chown", "-R", self.cfg.chown_owner, *[str(p) for p in targets]])
+
     # -- orchestration -------------------------------------------
 
     def run(
@@ -478,9 +815,13 @@ class CutoverDriver:
     ) -> dict:
         """Прогон шагов 2-8. dry-run: план без изменений; apply: реальные действия."""
         results: list[dict] = []
+        # Fail-closed база: хеш «входа» на момент СТАРТА apply. Снос меняет дерево,
+        # поэтому сверяем снапшот с предусловием прогона, а не с текущим состоянием.
+        pre_snapshot_hash = self._snapshot_input_hash() if apply else None
 
         def step_defs():
             return [
+                (1, "preflight", False, self._probe_preflight, self._action_preflight),
                 (2, "snapshot", False, self._probe_snapshot, self._action_snapshot),
                 (3, "stop", False, self._probe_stop, self._action_stop),
                 (4, "teardown", True, self._probe_teardown, self._action_teardown),
@@ -488,6 +829,7 @@ class CutoverDriver:
                 (6, "reindex_smoke", False, self._probe_reindex_smoke, self._action_reindex_smoke),
                 (7, "gc", False, self._probe_gc, self._action_gc),
                 (8, "pilot", False, self._probe_pilot, self._action_pilot),
+                (9, "post_chown", False, self._probe_post_chown, self._action_post_chown),
             ]
 
         for step_no, name, destructive, probe, action in step_defs():
@@ -511,6 +853,17 @@ class CutoverDriver:
                 entry["detail"] = "marker valid — пропуск"
                 results.append(entry)
                 continue
+
+            # 1b) fail-closed: любой apply после снапшота требует валидный шаг 2
+            # относительно предусловия прогона (см. pre_snapshot_hash).
+            if apply and step_no > 2 and not self.apply_snapshot_ok(pre_snapshot_hash):
+                entry["status"] = "refused"
+                entry["detail"] = (
+                    "apply запрещён: снапшот шага 2 не валиден относительно старта "
+                    "(отсутствует/расхождение CHECKSUMS)"
+                )
+                results.append(entry)
+                raise CutoverRefusal(entry["detail"])
 
             # 2) деструктивный шаг: гейты снапшота и confirm
             if destructive:
@@ -593,6 +946,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--qdrant-url", default=None)
     p.add_argument("--collections", default=None, help="csv Qdrant-коллекций")
     p.add_argument("--aliases", default=None, help="csv Qdrant-алиасов")
+    p.add_argument("--env-file", default=None, help="путь к .env (ключи читает сам скрипт)")
+    p.add_argument("--pilot-pdf", default=None, help="PDF пилотного импорта (шаг 8)")
     return p
 
 
@@ -601,22 +956,40 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     import os
 
-    root = Path(__file__).resolve().parents[1]
-    data_root = Path(os.environ.get("DATA_ROOT", root / "data"))
+    repo = Path(__file__).resolve().parents[1]          # <repo>/mcp-knowledge/mcp-knowledge
+    base = repo.parent                                   # <repo>/mcp-knowledge
+    env = os.environ
+    data_root = Path(env.get("DATA_ROOT", base / "data"))
 
     cfg = CutoverConfig(
-        knowledge_dir=args.knowledge_dir or root / "knowledge",
+        knowledge_dir=args.knowledge_dir or Path(env.get("MCP_KNOWLEDGE_DIR", base / "knowledge")),
         documents_dir=args.documents_dir or data_root / "documents",
         backup_dir=args.backup_dir or data_root / "backups" / "cutover",
         run_dir=args.run_dir or data_root / "cutover-run",
         pdf_cache_dir=args.pdf_cache_dir or data_root / "pdf_cache",
         quality_dir=args.quality_dir or data_root / "quality",
         dlq_dir=args.dlq_dir or data_root / "dlq",
-        qdrant_url=args.qdrant_url or "http://localhost:6333",
-        qdrant_collections=[c.strip() for c in (args.collections or "knowledge,knowledge_public").split(",") if c.strip()],
-        qdrant_aliases=[a.strip() for a in (args.aliases or "knowledge_private").split(",") if a.strip()],
-        destructive_token=os.environ.get("CUTOVER_DESTRUCTIVE_TOKEN", DEFAULT_DESTRUCTIVE_TOKEN),
+        qdrant_url=args.qdrant_url or env.get("QDRANT_URL", "http://localhost:6333"),
+        qdrant_collections=[c.strip() for c in (args.collections or "knowledge_public,knowledge_private").split(",") if c.strip()],
+        qdrant_aliases=[a.strip() for a in (args.aliases or "").split(",") if a.strip()],
+        destructive_token=env.get("CUTOVER_DESTRUCTIVE_TOKEN", DEFAULT_DESTRUCTIVE_TOKEN),
+        env_file=Path(args.env_file) if args.env_file else (repo / ".env"),
+        pilot_pdf=Path(args.pilot_pdf) if args.pilot_pdf else Path(
+            env.get("CUTOVER_PILOT_PDF", str(repo / ".trash" / "2026-10-04-f6c-acc" / "rfc9111.pdf"))
+        ),
+        chown_targets=[
+            base / "knowledge" / ".git",
+            base / "knowledge" / ".trash",
+            data_root / "documents",
+        ],
     )
+    cfg.stop_cmd = lambda: _cmd_docker_stop(cfg)
+    cfg.deploy_cmd = lambda: _cmd_deploy(cfg)
+    cfg.reindex_cmd = lambda: _cmd_reindex(cfg)
+    cfg.smoke_cmd = lambda: _cmd_smoke(cfg)
+    cfg.import_pilot_cmd = lambda: _cmd_pilot_import(cfg)
+    cfg.snapshot_qdrant = _cmd_qdrant_snapshot
+    cfg.clear_qdrant = _cmd_qdrant_clear_legacy
 
     dry_run = not args.apply
     driver = CutoverDriver(cfg)
