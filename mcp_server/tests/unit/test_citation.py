@@ -24,6 +24,7 @@ SHA_CANON = "b" * 64
 
 SUBSCRIBER = {"level": "subscriber"}
 READ = {"level": "read"}
+WRITE = {"level": "write"}
 
 CSL = {
     "type": "book",
@@ -146,13 +147,20 @@ def test_level_b_public_licensed_with_canonical():
     assert citation["viewer_url"] == f"/documents/{SHA_CANON}"
 
 
-def test_level_b_private_read_key():
-    """private + read-ключ → зона доступна → citation с viewer."""
+def test_level_b_private_admin_key():
+    """private + admin (write) → зона доступна → citation с viewer."""
     fm = _fm(zone="private", license=None, public_allowed=None)
-    citation = build_citation(fm, None, READ, exists_fn=_exists_all, index=_index(_ref(SHA_CANON, zone="private")))
+    citation = build_citation(fm, None, WRITE, exists_fn=_exists_all, index=_index(_ref(SHA_CANON, zone="private")))
     assert citation is not None
     assert citation["viewer_url"] == f"/documents/{SHA_CANON}"
     assert citation["zone"] == "private"
+
+
+def test_level_b_private_read_key_omitted():
+    """private + read-ключ (ниже admin) → citation ОТСУТСТВУЕТ целиком (P2-1)."""
+    fm = _fm(zone="private", license=None, public_allowed=None)
+    citation = build_citation(fm, None, READ, exists_fn=_exists_all, index=_index(_ref(SHA_CANON, zone="private")))
+    assert citation is None
 
 
 def test_subscriber_private_omitted():
@@ -305,7 +313,7 @@ def test_zone_read_time_field_both_levels():
     assert cite_a is not None and cite_a["zone"] == "public"
     fm_priv = _fm(zone="private", license=None, public_allowed=None)
     cite_priv = build_citation(
-        fm_priv, None, READ, exists_fn=_exists_all, index=_index(_ref(SHA_CANON, zone="private"))
+        fm_priv, None, WRITE, exists_fn=_exists_all, index=_index(_ref(SHA_CANON, zone="private"))
     )
     assert cite_priv is not None and cite_priv["zone"] == "private"
 

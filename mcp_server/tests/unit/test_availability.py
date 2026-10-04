@@ -80,7 +80,9 @@ def test_canonical_present_no_canonical():
 
 def test_auth_zones():
     assert auth_zones({"level": "subscriber"}) == {"public"}
-    assert auth_zones({"level": "read"}) == {"public", "private"}
+    assert auth_zones({"level": "read"}) == {"public"}  # P2-1: ниже admin → public
+    assert auth_zones({"level": "editor"}) == {"public"}
+    assert auth_zones({"level": "import"}) == {"public"}
     assert auth_zones({"level": "write"}) == {"public", "private"}
     assert auth_zones({}) == {"public"}  # без ключа → public only
 
@@ -90,7 +92,8 @@ def test_source_accessible_zone_and_status():
     priv = {"zone": "private", "status": "published"}
     assert source_accessible(pub, {"level": "subscriber"}) is True
     assert source_accessible(priv, {"level": "subscriber"}) is False
-    assert source_accessible(priv, {"level": "read"}) is True
+    assert source_accessible(priv, {"level": "read"}) is False  # P2-1: ниже admin
+    assert source_accessible(priv, {"level": "write"}) is True
     assert source_accessible({"zone": "public", "status": "deprecated"}, {"level": "read"}) is False
 
 
@@ -228,7 +231,7 @@ def test_indexed_private_only_blob_denied_for_subscriber():
     priv = _src_entry("src-" + "c" * 16, zone="private", license_value="own", shas=(_sha("c"),))
     index = SourceRefIndex.build([priv])
     assert blob_available_indexed(_sha("c"), SUBSCRIBER, exists_fn=_exists, index=index) is False
-    assert blob_available_indexed(_sha("c"), READ, exists_fn=_exists, index=index) is True
+    assert blob_available_indexed(_sha("c"), WRITE, exists_fn=_exists, index=index) is True
 
 
 def test_indexed_license_unknown_fail_closed():

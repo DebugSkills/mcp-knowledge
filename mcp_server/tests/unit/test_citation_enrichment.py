@@ -35,6 +35,7 @@ SID = "src-3f2a9c01b74d25e6"
 SID2 = "src-aa11bb22cc33dd44"
 CANON_SHA = "ab" * 32
 READ_AUTH = {"level": "read"}
+WRITE_AUTH = {"level": "write"}  # P2-1: private-источники читает только admin-эквивалент
 SUBSCRIBER_AUTH = {"level": "subscriber"}
 
 CSL = {
@@ -188,7 +189,7 @@ def _hit_payload(kid: str, source_id: str | None = SID, *, with_locator: bool = 
     return payload
 
 
-async def _search(state, auth=READ_AUTH, query="тестирование"):
+async def _search(state, auth=WRITE_AUTH, query="тестирование"):
     from mcp_server.tools.search import search_knowledge
 
     return await search_knowledge({"query": query, "_auth": auth}, state)
@@ -295,7 +296,7 @@ class TestSearchEnrichment:
         state = _app_state(
             store, _DocStore({CANON_SHA}), _index_with(SID, zone="public"), _SearchQdrant([_hit_payload("sec-1")])
         )
-        result = await _search(state, auth=READ_AUTH)
+        result = await _search(state, auth=WRITE_AUTH)
         assert "citation" not in result["results"][0]
 
     async def test_csl_never_in_qdrant_payload(self):
@@ -318,7 +319,7 @@ class TestSearchEnrichment:
         state = _app_state(store, _DocStore({CANON_SHA}), _index_with(SID), _SearchQdrant([_hit_payload("sec-1")]))
         from mcp_server.tools.search import search_by_tags
 
-        result = await search_by_tags({"tags": ["test"], "_auth": READ_AUTH}, state)
+        result = await search_by_tags({"tags": ["test"], "_auth": WRITE_AUTH}, state)
         assert result["results"][0]["citation"]["source_id"] == SID
 
 
@@ -479,7 +480,7 @@ class TestFindFragmentEnrichment:
         from mcp_server.tools.fragments import find_fragment
 
         result = await find_fragment(
-            {"collection_id": "book-root", "query": "секция", "_auth": READ_AUTH},
+            {"collection_id": "book-root", "query": "секция", "_auth": WRITE_AUTH},
             state,
         )
         assert result["total"] == 2
@@ -499,7 +500,7 @@ class TestFindFragmentEnrichment:
         from mcp_server.tools.fragments import find_fragment
 
         result = await find_fragment(
-            {"collection_id": "book-root", "query": "секция", "_auth": READ_AUTH},
+            {"collection_id": "book-root", "query": "секция", "_auth": WRITE_AUTH},
             state,
         )
         assert "citation" not in result["fragments"][0]
@@ -529,7 +530,7 @@ class TestGetEntryEnrichment:
         state = _app_state(store, _DocStore({CANON_SHA}), _index_with(SID))
         from mcp_server.tools.read import get_entry
 
-        resp = await get_entry({"knowledge_id": "book-sec-42", "_auth": READ_AUTH}, state)
+        resp = await get_entry({"knowledge_id": "book-sec-42", "_auth": WRITE_AUTH}, state)
         assert resp["citation"]["source_id"] == SID
         assert "citation_reason" not in resp
         assert store.read_calls.count(SID) == 1
@@ -560,7 +561,7 @@ class TestGetEntryEnrichment:
         state = _app_state(store, _DocStore({CANON_SHA}), _index_with(SID))
         from mcp_server.tools.read import get_entry
 
-        resp = await get_entry({"knowledge_id": "handmade-note", "_auth": READ_AUTH}, state)
+        resp = await get_entry({"knowledge_id": "handmade-note", "_auth": WRITE_AUTH}, state)
         assert "citation" not in resp
         citations = resp["citations"]
         assert [c["source_id"] for c in citations] == [SID, SID2]
@@ -580,7 +581,7 @@ class TestGetEntryEnrichment:
         state = _app_state(_CountingStore({"plain-entry": plain}), _DocStore(), SourceRefIndex())
         from mcp_server.tools.read import get_entry
 
-        resp = await get_entry({"knowledge_id": "plain-entry", "_auth": READ_AUTH}, state)
+        resp = await get_entry({"knowledge_id": "plain-entry", "_auth": WRITE_AUTH}, state)
         assert "citation" not in resp
         assert "citations" not in resp
 

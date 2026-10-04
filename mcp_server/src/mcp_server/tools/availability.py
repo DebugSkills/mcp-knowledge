@@ -16,10 +16,13 @@ AuthInfo или dict с key_level.
 from __future__ import annotations
 
 from ..content.source import is_public_license
+from .auth_zone import ADMIN_LEVELS
 from .source_ref_index import SourceRef, SourceRefIndex
 
-# Уровни ключей с доступом к обеим зонам (subscriber — только public).
-_FULL_ZONE_LEVELS = {"read", "editor", "write", "import"}
+# Уровни ключей с доступом к обеим зонам при ЧТЕНИИ (P2-1: private = admin-only).
+# admin-эквивалент = write (ADMIN_LEVELS из auth_zone — единая точка истины).
+# Запись не затрагивается: write-пути используют auth-free canonical_present.
+_FULL_ZONE_LEVELS = ADMIN_LEVELS
 
 
 def _auth_level(auth) -> str:
@@ -29,7 +32,7 @@ def _auth_level(auth) -> str:
 
 
 def auth_zones(auth) -> set[str]:
-    """Зоны, доступные аутентифицированному ключу (subscriber → {public})."""
+    """Зоны, доступные аутентифицированному ключу (P2-1: ниже admin → {public})."""
     level = _auth_level(auth)
     if level == "subscriber":
         return {"public"}

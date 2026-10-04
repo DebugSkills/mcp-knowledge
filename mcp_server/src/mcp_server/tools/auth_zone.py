@@ -13,6 +13,14 @@ from __future__ import annotations
 
 VALID_ZONES: tuple[str, str] = ("public", "private")
 
+# P2-1 (bibliography): уровни ключей, которым доступны ОБЕ зоны при ЧТЕНИИ.
+# admin-эквивалент = "write" (auth.check_tool_permission: write -> всё; legacy
+# master-ключ MCP_API_KEY/MCP_WRITE_KEYS — write-уровень). Все прочие уровни
+# (subscriber/read/import/editor/none) → public-only при чтении (private =
+# admin-only). Запись политикой НЕ затрагивается (import/write/editor пишут
+# private через auth-free пути).
+ADMIN_LEVELS: frozenset[str] = frozenset({"write"})
+
 
 def _auth_level(params: dict) -> str:
     """Уровень ключа из служебного _auth (dict или AuthInfo)."""
@@ -27,19 +35,25 @@ def is_subscriber(params: dict) -> bool:
     return _auth_level(params) == "subscriber"
 
 
+def is_admin(params: dict) -> bool:
+    """admin-эквивалент (write/master-ключ) → полный доступ к обеим зонам."""
+    return _auth_level(params) in ADMIN_LEVELS
+
+
 def zone_from_auth(params: dict, default: str = "both") -> str:
-    """Резолв целевой зоны read-тула.
+    """Резолв целевой зоны read-тула (P2-1: private = admin-only).
 
     Приоритет:
-    1. subscriber → "public" (явный параметр zone игнорируется);
-    2. явный zone ∈ (public, private) → он;
-    3. zone ∈ ("both", "auto") → default (команда, auto-merge);
-    4. иначе → ValueError (fail loud, зона не размывается).
+    1. уровень НЕ в ADMIN_LEVELS (subscriber/read/import/editor/none) →
+       "public" безусловно — явный параметр `zone` НЕ переопределяет политику;
+    2. admin (write) + явный zone ∈ (public, private) → он;
+    3. admin + zone ∈ ("both", "auto") → default (команда, auto-merge);
+    4. admin + иначе → ValueError (fail loud, зона не размывается).
 
     Returns:
         "public" | "private" | "both".
     """
-    if is_subscriber(params):
+    if _auth_level(params) not in ADMIN_LEVELS:
         return "public"
     zone = params.get("zone")
     if zone in VALID_ZONES:

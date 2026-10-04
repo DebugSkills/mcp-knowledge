@@ -34,6 +34,7 @@ from mcp_server.tools.source_ref_index import SourceRef, SourceRefIndex
 
 READ = {"level": "read"}
 SUB = {"level": "subscriber"}
+WRITE = {"level": "write"}
 
 
 def _source_entry(source_id, *, zone="public", status="published",
@@ -202,7 +203,7 @@ async def test_source_get_sparse_no_canonical_returns_canonical_error(tmp_path):
     entry = _source_entry(sid, zone="private", license_value="own", blobs=blobs)
 
     result = await source_get(
-        {"source_id": sid, "_auth": READ}, _app_state(entry=entry, document_store=ds)
+        {"source_id": sid, "_auth": WRITE}, _app_state(entry=entry, document_store=ds)
     )
 
     assert "error" not in result

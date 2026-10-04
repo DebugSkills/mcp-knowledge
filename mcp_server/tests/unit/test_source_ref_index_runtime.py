@@ -27,7 +27,7 @@ from mcp_server.tools.availability import blob_available_indexed
 from mcp_server.tools.source_ref_index import SourceRefIndex
 
 SUBSCRIBER = {"level": "subscriber"}   # только public-зона
-READ = {"level": "read"}               # public + private
+WRITE = {"level": "write"}             # P2-1: private читает только admin-эквивалент
 
 
 # ── Fixtures ──────────────────────────────────────────────────
@@ -131,7 +131,7 @@ class TestStartupScan:
         # предикаты уже работают на стартовом индексе
         assert blob_available_indexed(_sha(1), SUBSCRIBER, exists_fn=_exists_true, index=index)
         assert not blob_available_indexed(_sha(2), SUBSCRIBER, exists_fn=_exists_true, index=index)
-        assert blob_available_indexed(_sha(2), READ, exists_fn=_exists_true, index=index)
+        assert blob_available_indexed(_sha(2), WRITE, exists_fn=_exists_true, index=index)
 
     async def test_empty_ssot_empty_index(self, store):
         from mcp_server.tools.source_ref_runtime import init_source_ref_index
@@ -159,7 +159,7 @@ class TestStartupScan:
     def test_fail_closed_empty_index_never_true(self):
         """Пустой индекс + blob физически есть → False для ЛЮБОГО auth."""
         index = SourceRefIndex()
-        for auth in (SUBSCRIBER, READ, {"level": "write"}, {}):
+        for auth in (SUBSCRIBER, WRITE, {"level": "write"}, {}):
             assert blob_available_indexed(
                 _sha(1), auth, exists_fn=_exists_true, index=index
             ) is False
@@ -254,7 +254,7 @@ class TestSetZoneHook:
         # public-auth теряет доступ НЕМЕДЛЕННО (без рестарта)
         assert blob_available_indexed(_sha(1), SUBSCRIBER, exists_fn=_exists_true, index=index) is False
         # full-auth сохраняет: private-зона доступна read-уровню
-        assert blob_available_indexed(_sha(1), READ, exists_fn=_exists_true, index=index)
+        assert blob_available_indexed(_sha(1), WRITE, exists_fn=_exists_true, index=index)
 
 
 # ── 5. update_source: license → fail-closed немедленно ───────
@@ -331,18 +331,18 @@ class TestDeleteHook:
 
         shared = _sha(9)
         assert blob_available_indexed(shared, SUBSCRIBER, exists_fn=_exists_true, index=index)
-        assert blob_available_indexed(shared, READ, exists_fn=_exists_true, index=index)
+        assert blob_available_indexed(shared, WRITE, exists_fn=_exists_true, index=index)
 
         # Удаляем PUBLIC-ref → blob остаётся доступен full-auth (least-strict)
         result = await delete_entry({"knowledge_id": sid_pub}, app)
         assert result.get("deleted") is True, result
         assert blob_available_indexed(shared, SUBSCRIBER, exists_fn=_exists_true, index=index) is False
-        assert blob_available_indexed(shared, READ, exists_fn=_exists_true, index=index)
+        assert blob_available_indexed(shared, WRITE, exists_fn=_exists_true, index=index)
 
         # Удаляем ПОСЛЕДНИЙ ref → недоступен всем
         result = await delete_entry({"knowledge_id": sid_priv}, app)
         assert result.get("deleted") is True, result
-        assert blob_available_indexed(shared, READ, exists_fn=_exists_true, index=index) is False
+        assert blob_available_indexed(shared, WRITE, exists_fn=_exists_true, index=index) is False
 
     async def test_update_entry_keeps_source_ref_fresh(self, quality_tempdir, store):
         from mcp_server.tools.crud import update_entry

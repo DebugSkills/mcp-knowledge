@@ -75,3 +75,19 @@ class TestApiKeyForRequest:
 
     def test_identity_role_fallback_to_base(self):
         assert api_key_for_request({"role": "admin"}, base="k", has_users=True) == "k"
+
+    def test_no_identity_with_users_uses_contributor_key(self):
+        """P2-1: непустой стор без identity → contributor-ключ (НЕ base admin-эквивалент)."""
+        key = api_key_for_request(
+            None, base="k-base", has_users=True,
+            admin="k-adm", editor="k-ed", contributor="k-contr",
+        )
+        assert key == "k-contr"
+
+    def test_no_identity_with_users_fallback_to_base_when_no_contributor(self):
+        """Legacy single-key: contributor-ключ пуст → fallback на base (бит-в-бит 002)."""
+        key = api_key_for_request(
+            None, base="k-base", has_users=True,
+            admin="", editor="", contributor="",
+        )
+        assert key == "k-base"

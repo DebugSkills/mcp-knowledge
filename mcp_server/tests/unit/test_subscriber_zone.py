@@ -164,13 +164,14 @@ async def test_subscriber_get_entry_private_not_found(private_only_app):
     assert "not found" in result["error"].lower()
 
 
-async def test_read_get_entry_private_ok(private_only_app):
-    """Команда (read) private-запись видит — регрессия."""
+async def test_read_get_entry_private_not_found(private_only_app):
+    """P2-1: ниже admin (read) private-запись НЕ видит — fail-closed."""
     from mcp_server.tools.read import get_entry
 
     params = {"knowledge_id": "priv-1", "_auth": _read_auth()}
     result = await get_entry(params, private_only_app)
-    assert "error" not in result
+    assert "error" in result
+    assert "not found" in result["error"].lower()
 
 
 # ── 3. find_fragment на private-книгу → Collection not found ─

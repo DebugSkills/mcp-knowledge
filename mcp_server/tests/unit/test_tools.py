@@ -174,7 +174,7 @@ async def test_search_by_tags_truncated(app_state):
 async def test_get_entry_happy_path(app_state):
     """A3: get_entry returns full record."""
     result = await get_entry(
-        {"knowledge_id": "ru-test-entry"},
+        {"knowledge_id": "ru-test-entry", "_auth": {"level": "write"}},
         app_state,
     )
     assert "error" not in result
@@ -189,7 +189,7 @@ async def test_get_entry_includes_zone(app_state):
     Additive-поле для kb-console (бейдж зоны в диалоге книги).
     """
     result = await get_entry(
-        {"knowledge_id": "ru-test-entry"},
+        {"knowledge_id": "ru-test-entry", "_auth": {"level": "write"}},
         app_state,
     )
     assert "error" not in result
@@ -288,7 +288,7 @@ async def test_update_entry_not_found(app_state):
 async def test_delete_entry_happy_path(app_state):
     """A6: delete entry returns success."""
     result = await delete_entry(
-        {"knowledge_id": "ru-test-entry"},
+        {"knowledge_id": "ru-test-entry", "_auth": {"level": "write"}},
         app_state,
     )
     assert "error" not in result
@@ -394,7 +394,7 @@ async def test_reindex_happy_path(app_state):
 async def test_get_entry_collection_has_toc(app_state):
     """get_entry for collection returns children TOC, title, content_type."""
     result = await get_entry(
-        {"knowledge_id": "eng-testing-book-collection"},
+        {"knowledge_id": "eng-testing-book-collection", "_auth": {"level": "write"}},
         app_state,
     )
     assert "error" not in result
@@ -415,7 +415,7 @@ async def test_get_entry_collection_has_toc(app_state):
 async def test_get_entry_title_fallback(app_state):
     """get_entry: title fallback when no markdown heading."""
     result = await get_entry(
-        {"knowledge_id": "ru-test-entry"},
+        {"knowledge_id": "ru-test-entry", "_auth": {"level": "write"}},
         app_state,
     )
     assert "error" not in result

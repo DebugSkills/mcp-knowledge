@@ -124,10 +124,23 @@ def api_key_for_request(
     editor: str = "",
     contributor: str = "",
 ) -> str:
-    """MCP-ключ текущего запроса: legacy → base, identity → по роли (Ф3.1)."""
+    """MCP-ключ текущего запроса (P2-1: base-фолбэк закрыт).
+
+    - identity есть → ключ по роли (Ф3.1);
+    - непустой стор БЕЗ identity → contributor-ключ (fail-closed, НЕ base:
+      base = admin-эквивалент → утечка private ниже admin на сервере);
+    - legacy (пустой стор) → base (бит-в-бит 002, admin-эквивалент —
+      обратная совместимость, документируется).
+    """
     if identity is not None:
         return api_key_for_role(
             identity["role"], base=base, admin=admin, editor=editor,
+            contributor=contributor,
+        )
+    if has_users:
+        # fail-closed: непустой users-стор без identity → роль contributor.
+        return api_key_for_role(
+            "contributor", base=base, admin=admin, editor=editor,
             contributor=contributor,
         )
     return base

@@ -18,7 +18,7 @@ import re
 import time
 
 from ..storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
-from .auth_zone import is_subscriber
+from .auth_zone import is_admin, is_subscriber
 from .citation_enrich import citations_for_refs
 
 logger = logging.getLogger("mcp_knowledge.tools.read")
@@ -169,16 +169,16 @@ async def get_entry(params: dict, app_state) -> dict:
         return {"error": f"Knowledge entry not found: '{knowledge_id}'"}
 
     fm = entry.frontmatter
-    # Fail-closed (W3 C5): subscriber не видит даже существования private-записей
-    if is_subscriber(params) and getattr(fm, "zone", ZONE_PRIVATE) != ZONE_PUBLIC:
+    # Fail-closed (P2-1): ниже admin не видит даже существования private-записей
+    if not is_admin(params) and getattr(fm, "zone", ZONE_PRIVATE) != ZONE_PUBLIC:
         return {"error": f"Knowledge entry not found: '{knowledge_id}'"}
     children: list[dict] = []
     if getattr(fm, "content_type", None) == "collection":
         # M2: on-the-fly TOC из Qdrant (frontmatter.children — legacy)
         try:
             zone = getattr(fm, "zone", ZONE_PRIVATE)
-            if is_subscriber(params):
-                zone = ZONE_PUBLIC  # TOC для subscriber строится только по public-зоне
+            if not is_admin(params):
+                zone = ZONE_PUBLIC  # TOC ниже admin строится только по public-зоне
             children = await _build_toc(knowledge_id, app_state, zone=zone)
         except Exception as exc:
             logger.warning("get_entry: _build_toc failed for %s: %s", knowledge_id, exc)

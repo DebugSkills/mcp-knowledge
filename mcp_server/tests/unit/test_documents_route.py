@@ -126,16 +126,16 @@ def _ref(
 
 class TestValidation400:
     def test_short_id_rejected(self, client):
-        resp = client.get(f"/documents/{'a' * 63}", headers=READ_HEADERS)
+        resp = client.get(f"/documents/{'a' * 63}", headers=WRITE_HEADERS)
         assert resp.status_code == 400
 
     def test_nonhex_id_rejected(self, client):
-        resp = client.get(f"/documents/{'z' * 64}", headers=READ_HEADERS)
+        resp = client.get(f"/documents/{'z' * 64}", headers=WRITE_HEADERS)
         assert resp.status_code == 400
 
     def test_uppercase_id_rejected(self, client):
         sha = hashlib.sha256(b"upper").hexdigest().upper()
-        resp = client.get(f"/documents/{sha}", headers=READ_HEADERS)
+        resp = client.get(f"/documents/{sha}", headers=WRITE_HEADERS)
         assert resp.status_code == 400
 
     def test_malformed_precedes_auth(self, client):
@@ -144,7 +144,7 @@ class TestValidation400:
         assert resp.status_code == 400
 
     def test_head_malformed_rejected(self, client):
-        resp = client.head(f"/documents/{'a' * 63}", headers=READ_HEADERS)
+        resp = client.head(f"/documents/{'a' * 63}", headers=WRITE_HEADERS)
         assert resp.status_code == 400
 
 
@@ -172,19 +172,19 @@ class TestAuth401:
 
 class TestNotFound404:
     def test_unknown_valid_sha_404(self, client):
-        resp = client.get(f"/documents/{UNKNOWN_SHA}", headers=READ_HEADERS)
+        resp = client.get(f"/documents/{UNKNOWN_SHA}", headers=WRITE_HEADERS)
         assert resp.status_code == 404
 
     def test_blob_missing_404(self, client, kb):
         """Ref есть, blob физически отсутствует → 404."""
         _ref(kb, MISSING_BLOB_SHA)
-        resp = client.get(f"/documents/{MISSING_BLOB_SHA}", headers=READ_HEADERS)
+        resp = client.get(f"/documents/{MISSING_BLOB_SHA}", headers=WRITE_HEADERS)
         assert resp.status_code == 404
 
     def test_blob_without_refs_404(self, client, kb):
         """Blob есть, ∄ Source-ref → least-strict отказ → 404."""
         sha = _put(kb)
-        resp = client.get(f"/documents/{sha}", headers=READ_HEADERS)
+        resp = client.get(f"/documents/{sha}", headers=WRITE_HEADERS)
         assert resp.status_code == 404
 
     def test_subscriber_private_404(self, client, kb):
@@ -232,19 +232,19 @@ class TestNotFound404:
         """status=deprecated (SSOT) → недоступен даже полным ключом."""
         sha = _put(kb)
         _ref(kb, sha, zone="private", status="deprecated")
-        resp = client.get(f"/documents/{sha}", headers=READ_HEADERS)
+        resp = client.get(f"/documents/{sha}", headers=WRITE_HEADERS)
         assert resp.status_code == 404
 
     def test_read_public_only_restricted_404(self, client, kb):
         """License-гейт public-refs не зависит от уровня ключа (§3.4:169)."""
         sha = _put(kb)
         _ref(kb, sha, zone="public", license_value="restricted")
-        resp = client.get(f"/documents/{sha}", headers=READ_HEADERS)
+        resp = client.get(f"/documents/{sha}", headers=WRITE_HEADERS)
         assert resp.status_code == 404
 
     def test_detail_is_generic_no_oracle(self, client, kb):
         """404-detail одинаков для «не существует» и «нет доступа»."""
-        unknown = client.get(f"/documents/{UNKNOWN_SHA}", headers=READ_HEADERS)
+        unknown = client.get(f"/documents/{UNKNOWN_SHA}", headers=WRITE_HEADERS)
         sha = _put(kb)
         _ref(kb, sha, zone="private")
         denied = client.get(f"/documents/{sha}", headers=SUB_HEADERS)
@@ -252,7 +252,7 @@ class TestNotFound404:
         assert unknown.json()["detail"] == denied.json()["detail"]
 
     def test_head_unknown_404(self, client):
-        resp = client.head(f"/documents/{UNKNOWN_SHA}", headers=READ_HEADERS)
+        resp = client.head(f"/documents/{UNKNOWN_SHA}", headers=WRITE_HEADERS)
         assert resp.status_code == 404
 
 
@@ -260,12 +260,12 @@ class TestNotFound404:
 
 
 class TestAccess200:
-    def test_read_private_200(self, client, kb):
+    def test_read_private_404(self, client, kb):
+        """P2-1: private-блоб read-ключу недоступен (admin-only) → 404 no-oracle."""
         sha = _put(kb)
         _ref(kb, sha, zone="private")
-        resp = client.get(f"/documents/{sha}", headers=READ_HEADERS)
-        assert resp.status_code == 200
-        assert resp.content == PAYLOAD
+        assert client.get(f"/documents/{sha}", headers=READ_HEADERS).status_code == 404
+        assert client.get(f"/documents/{sha}", headers=WRITE_HEADERS).status_code == 200
 
     def test_subscriber_public_licensed_200(self, client, kb):
         sha = _put(kb)
@@ -287,7 +287,9 @@ class TestAccess200:
         sha = _put(kb)
         _ref(kb, sha, zone="private", source_id="src-ls-priv")
         _ref(kb, sha, zone="public", license_value="restricted", source_id="src-ls-pub")
-        resp = client.get(f"/documents/{sha}", headers=READ_HEADERS)
+        # P2-1: read больше не видит private (только admin-эквивалент)
+        assert client.get(f"/documents/{sha}", headers=READ_HEADERS).status_code == 404
+        resp = client.get(f"/documents/{sha}", headers=WRITE_HEADERS)
         assert resp.status_code == 200
         # subscriber по тем же refs — только public(restricted) → 404
         resp_sub = client.get(f"/documents/{sha}", headers=SUB_HEADERS)
@@ -308,7 +310,7 @@ class TestResponseHeaders:
     def test_security_and_range_headers(self, client, kb):
         sha = _put(kb)
         _ref(kb, sha, zone="private")
-        resp = client.get(f"/documents/{sha}", headers=READ_HEADERS)
+        resp = client.get(f"/documents/{sha}", headers=WRITE_HEADERS)
         assert resp.status_code == 200
         assert resp.headers["x-content-type-options"] == "nosniff"
         assert resp.headers["accept-ranges"] == "bytes"
@@ -320,7 +322,7 @@ class TestResponseHeaders:
         hostile = 'report";\r\nSet-Cookie: pwn=1; filename="x.pdf'
         sha = _put(kb, filename=hostile)
         _ref(kb, sha, zone="private")
-        resp = client.get(f"/documents/{sha}", headers=READ_HEADERS)
+        resp = client.get(f"/documents/{sha}", headers=WRITE_HEADERS)
         assert resp.status_code == 200
         cd = resp.headers["content-disposition"]
         assert "\r" not in cd and "\n" not in cd
@@ -335,7 +337,7 @@ class TestResponseHeaders:
     def test_content_disposition_fallback_sha(self, client, kb):
         sha = _put(kb, filename=None)
         _ref(kb, sha, zone="private")
-        resp = client.get(f"/documents/{sha}", headers=READ_HEADERS)
+        resp = client.get(f"/documents/{sha}", headers=WRITE_HEADERS)
         assert resp.status_code == 200
         cd = resp.headers["content-disposition"]
         assert f"{sha}.pdf" in cd  # ASCII-fallback <sha256><ext>
@@ -345,20 +347,20 @@ class TestResponseHeaders:
         """text/html вне whitelist → octet-stream (нет inline-исполнения)."""
         sha = _put(kb, mime="text/html", filename="page.html")
         _ref(kb, sha, zone="private")
-        resp = client.get(f"/documents/{sha}", headers=READ_HEADERS)
+        resp = client.get(f"/documents/{sha}", headers=WRITE_HEADERS)
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "application/octet-stream"
 
     def test_content_type_params_stripped(self, client, kb):
         sha = _put(kb, mime="application/pdf; charset=utf-8")
         _ref(kb, sha, zone="private")
-        resp = client.get(f"/documents/{sha}", headers=READ_HEADERS)
+        resp = client.get(f"/documents/{sha}", headers=WRITE_HEADERS)
         assert resp.headers["content-type"] == "application/pdf"
 
     def test_content_type_missing_default(self, client, kb):
         sha = _put(kb, mime=None)
         _ref(kb, sha, zone="private")
-        resp = client.get(f"/documents/{sha}", headers=READ_HEADERS)
+        resp = client.get(f"/documents/{sha}", headers=WRITE_HEADERS)
         assert resp.headers["content-type"] == "application/octet-stream"
 
 
@@ -373,7 +375,7 @@ class TestRangeRequests:
 
     def test_range_prefix_206(self, client):
         resp = client.get(
-            f"/documents/{self.sha}", headers={**READ_HEADERS, "Range": "bytes=0-4"}
+            f"/documents/{self.sha}", headers={**WRITE_HEADERS, "Range": "bytes=0-4"}
         )
         assert resp.status_code == 206
         assert resp.headers["content-range"] == f"bytes 0-4/{SIZE}"
@@ -382,7 +384,7 @@ class TestRangeRequests:
 
     def test_range_open_end_206(self, client):
         resp = client.get(
-            f"/documents/{self.sha}", headers={**READ_HEADERS, "Range": "bytes=100-"}
+            f"/documents/{self.sha}", headers={**WRITE_HEADERS, "Range": "bytes=100-"}
         )
         assert resp.status_code == 206
         assert resp.headers["content-range"] == f"bytes 100-{SIZE - 1}/{SIZE}"
@@ -390,7 +392,7 @@ class TestRangeRequests:
 
     def test_range_suffix_206(self, client):
         resp = client.get(
-            f"/documents/{self.sha}", headers={**READ_HEADERS, "Range": "bytes=-16"}
+            f"/documents/{self.sha}", headers={**WRITE_HEADERS, "Range": "bytes=-16"}
         )
         assert resp.status_code == 206
         assert resp.headers["content-range"] == f"bytes {SIZE - 16}-{SIZE - 1}/{SIZE}"
@@ -398,7 +400,7 @@ class TestRangeRequests:
 
     def test_range_end_clamped_206(self, client):
         resp = client.get(
-            f"/documents/{self.sha}", headers={**READ_HEADERS, "Range": "bytes=0-99999"}
+            f"/documents/{self.sha}", headers={**WRITE_HEADERS, "Range": "bytes=0-99999"}
         )
         assert resp.status_code == 206
         assert resp.headers["content-range"] == f"bytes 0-{SIZE - 1}/{SIZE}"
@@ -406,7 +408,7 @@ class TestRangeRequests:
 
     def test_range_start_at_size_416(self, client):
         resp = client.get(
-            f"/documents/{self.sha}", headers={**READ_HEADERS, "Range": f"bytes={SIZE}-"}
+            f"/documents/{self.sha}", headers={**WRITE_HEADERS, "Range": f"bytes={SIZE}-"}
         )
         assert resp.status_code == 416
         assert resp.headers["content-range"] == f"bytes */{SIZE}"
@@ -414,40 +416,40 @@ class TestRangeRequests:
     def test_range_beyond_size_416(self, client):
         resp = client.get(
             f"/documents/{self.sha}",
-            headers={**READ_HEADERS, "Range": "bytes=99999-99999"},
+            headers={**WRITE_HEADERS, "Range": "bytes=99999-99999"},
         )
         assert resp.status_code == 416
         assert resp.headers["content-range"] == f"bytes */{SIZE}"
 
     def test_range_malformed_416(self, client):
         resp = client.get(
-            f"/documents/{self.sha}", headers={**READ_HEADERS, "Range": "bytes=zz-yy"}
+            f"/documents/{self.sha}", headers={**WRITE_HEADERS, "Range": "bytes=zz-yy"}
         )
         assert resp.status_code == 416
         assert resp.headers["content-range"] == f"bytes */{SIZE}"
 
     def test_range_start_gt_end_416(self, client):
         resp = client.get(
-            f"/documents/{self.sha}", headers={**READ_HEADERS, "Range": "bytes=5-2"}
+            f"/documents/{self.sha}", headers={**WRITE_HEADERS, "Range": "bytes=5-2"}
         )
         assert resp.status_code == 416
 
     def test_range_multi_416(self, client):
         """Multi-range не поддерживается → невалидный → 416 (не частичная ложь)."""
         resp = client.get(
-            f"/documents/{self.sha}", headers={**READ_HEADERS, "Range": "bytes=0-1,3-4"}
+            f"/documents/{self.sha}", headers={**WRITE_HEADERS, "Range": "bytes=0-1,3-4"}
         )
         assert resp.status_code == 416
 
     def test_range_non_bytes_unit_416(self, client):
         resp = client.get(
-            f"/documents/{self.sha}", headers={**READ_HEADERS, "Range": "items=0-1"}
+            f"/documents/{self.sha}", headers={**WRITE_HEADERS, "Range": "items=0-1"}
         )
         assert resp.status_code == 416
 
     def test_range_suffix_zero_416(self, client):
         resp = client.get(
-            f"/documents/{self.sha}", headers={**READ_HEADERS, "Range": "bytes=-0"}
+            f"/documents/{self.sha}", headers={**WRITE_HEADERS, "Range": "bytes=-0"}
         )
         assert resp.status_code == 416
 
@@ -462,7 +464,7 @@ class TestHeadRequests:
         _ref(kb, self.sha, zone="private")
 
     def test_head_200_headers_no_body(self, client):
-        resp = client.head(f"/documents/{self.sha}", headers=READ_HEADERS)
+        resp = client.head(f"/documents/{self.sha}", headers=WRITE_HEADERS)
         assert resp.status_code == 200
         assert resp.content == b""
         assert resp.headers["content-length"] == str(SIZE)
@@ -473,7 +475,7 @@ class TestHeadRequests:
 
     def test_head_range_206(self, client):
         resp = client.head(
-            f"/documents/{self.sha}", headers={**READ_HEADERS, "Range": "bytes=0-4"}
+            f"/documents/{self.sha}", headers={**WRITE_HEADERS, "Range": "bytes=0-4"}
         )
         assert resp.status_code == 206
         assert resp.content == b""
@@ -482,7 +484,7 @@ class TestHeadRequests:
 
     def test_head_range_416(self, client):
         resp = client.head(
-            f"/documents/{self.sha}", headers={**READ_HEADERS, "Range": f"bytes={SIZE}-"}
+            f"/documents/{self.sha}", headers={**WRITE_HEADERS, "Range": f"bytes={SIZE}-"}
         )
         assert resp.status_code == 416
         assert resp.headers["content-range"] == f"bytes */{SIZE}"
