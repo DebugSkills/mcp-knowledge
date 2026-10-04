@@ -635,13 +635,32 @@ class CutoverDriver:
     def _snapshot_marker_valid(self) -> bool:
         return marker_valid(self._marker(2), self._snapshot_input_hash())
 
+    def _basis_path(self) -> Path:
+        return self.cfg.run_dir / "basis.json"
+
+    def _record_basis(self, pre_input_hash: Optional[str]) -> None:
+        """Зафиксировать базис apply (вход на старте ПЕРВОГО apply-прогона).
+
+        Нужен для resume: частично применённый необратимый шаг меняет вход, и
+        сверка снапшота с живым состоянием дала бы ложный отказ. Базис пишется
+        один раз — когда маркер шага 2 совпал с живым входом.
+        """
+        if pre_input_hash is None or not marker_valid(self._marker(2), pre_input_hash):
+            return
+        if read_marker(self._basis_path()) is None:
+            write_marker(self._basis_path(), pre_input_hash, kind="preapply-basis")
+
     def apply_snapshot_ok(self, pre_input_hash: Optional[str]) -> bool:
         """True, если снапшот (шаг 2) валиден относительно предусловия прогона.
 
         Снос меняет дерево, поэтому сверяем маркер шага 2 с хешем на СТАРТЕ apply,
         а не с текущим состоянием (иначе гейт ложно срабатывал бы после teardown).
         """
-        return pre_input_hash is not None and marker_valid(self._marker(2), pre_input_hash)
+        if pre_input_hash is not None and marker_valid(self._marker(2), pre_input_hash):
+            return True
+        basis = read_marker(self._basis_path()) or {}
+        basis_hash = basis.get("input_hash")
+        return bool(basis_hash) and marker_valid(self._marker(2), basis_hash)
 
     def _snapshot_input_hash(self) -> str:
         return sha256_text(
@@ -735,22 +754,42 @@ class CutoverDriver:
         return plan_teardown(entries, document_store)
 
     def _action_teardown(self):
-        keep, teardown, _report = self._load_sources_and_plan()
+        import asyncio
+
         from mcp_server.storage.markdown_store import MarkdownStore
 
+        keep, teardown, _report = self._load_sources_and_plan()
         store = MarkdownStore(knowledge_root=self.cfg.knowledge_dir)
-        if teardown:
-            import asyncio
-
-            deleted = asyncio.run(
-                store.delete_many(sorted(teardown), commit_message="cutover: legacy corpus teardown")
+        # Записи без файла (напр. корневой README.md, чей knowledge_id не
+        # находится _find_by_id) — уже отсутствуют в SSOT: не валят assert,
+        # но перечисляются в выводе (честный отчёт).
+        resolvable = sorted(kid for kid in teardown if store._find_by_id(kid) is not None)
+        unresolved = sorted(set(teardown) - set(resolvable))
+        if unresolved:
+            print(
+                f"[4] teardown: без файла — {len(unresolved)}: "
+                + ", ".join(unresolved[:5]),
+                file=sys.stderr,
             )
-            if deleted != len(teardown):
+        if resolvable:
+            deleted = asyncio.run(
+                store.delete_many(
+                    resolvable, commit_message="cutover: legacy corpus teardown"
+                )
+            )
+            if deleted != len(resolvable):
                 raise CutoverError(
-                    f"частичный снос: удалено {deleted} из {len(teardown)} SSOT-записей"
+                    f"частичный снос: удалено {deleted} из {len(resolvable)} SSOT-записей"
                 )
         self._cmd("clear_qdrant", self.cfg.clear_qdrant)(self.cfg)
-        for d in (self.cfg.pdf_cache_dir, self.cfg.quality_dir, self.cfg.dlq_dir):
+        # pdf_cache — кэш секций; при сохранённых записях (keep) не чистим,
+        # иначе теряем сегментацию для оставшихся книг (кэш пересоберётся).
+        surfaces = [self.cfg.quality_dir, self.cfg.dlq_dir]
+        if keep:
+            print(f"[4] teardown: pdf_cache сохранён (keep={len(keep)})", file=sys.stderr)
+        else:
+            surfaces.append(self.cfg.pdf_cache_dir)
+        for d in surfaces:
             if d.exists():
                 for child in d.iterdir():
                     if child.is_file():
@@ -881,6 +920,8 @@ class CutoverDriver:
 
             # 1b) fail-closed: любой apply после снапшота требует валидный шаг 2
             # относительно предусловия прогона (см. pre_snapshot_hash).
+            if apply and step_no > 2:
+                self._record_basis(pre_snapshot_hash)
             if apply and step_no > 2 and not self.apply_snapshot_ok(pre_snapshot_hash):
                 entry["status"] = "refused"
                 entry["detail"] = (

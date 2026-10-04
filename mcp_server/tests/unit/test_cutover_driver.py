@@ -713,3 +713,49 @@ class TestWiring:
         (kd / "networking" / "a.md").write_text("content changed\n")
         assert cutover.checksum_knowledge(kd) != h1   # контент — вход
 
+    def test_teardown_tolerates_missing_file_and_keeps_pdf_cache(self, tmp_path, monkeypatch):
+        cfg = _cfg(tmp_path)
+        cfg.knowledge_dir.mkdir(parents=True)
+        calls = []
+        cfg.clear_qdrant = lambda _c: calls.append("clear_qdrant")
+        driver = CutoverDriver(cfg)
+        # план с «призраком» (нет файла) и без keep
+        monkeypatch.setattr(driver, "_load_sources_and_plan", lambda: (set(), {"ghost-id"}, {}))
+        (cfg.quality_dir).mkdir(parents=True, exist_ok=True)
+        (cfg.quality_dir / "q.json").write_text("{}")
+        (cfg.dlq_dir).mkdir(parents=True, exist_ok=True)
+        (cfg.dlq_dir / "d.json").write_text("{}")
+        cfg.pdf_cache_dir.mkdir(parents=True, exist_ok=True)
+        (cfg.pdf_cache_dir / "seg.json").write_text("{}")
+        driver._action_teardown()  # не должно бросать
+        assert calls == ["clear_qdrant"]
+        assert list(cfg.quality_dir.iterdir()) == []
+        assert list(cfg.dlq_dir.iterdir()) == []
+        # keep пуст → pdf_cache очищается
+        assert list(cfg.pdf_cache_dir.iterdir()) == []
+        # keep непуст → pdf_cache сохраняется
+        (cfg.pdf_cache_dir / "seg2.json").write_text("{}")
+        monkeypatch.setattr(driver, "_load_sources_and_plan", lambda: ({"keep-1"}, set(), {}))
+        driver._action_teardown()
+        assert (cfg.pdf_cache_dir / "seg2.json").exists()
+
+    def test_basis_allows_resume_after_partial_apply(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        cfg.knowledge_dir.mkdir(parents=True)
+        driver = CutoverDriver(cfg)
+        write_marker(driver._marker(2), "H1", step=2, name="snapshot")
+        assert driver.apply_snapshot_ok("H2") is False      # базиса нет → отказ
+        driver._record_basis("H1")                          # базис зафиксирован на старте apply
+        assert driver.apply_snapshot_ok("H2") is True       # resume: сверка с базисом
+        assert driver.apply_snapshot_ok("H1") is True       # нет дрейфа
+        write_marker(driver._marker(2), "H3", step=2, name="snapshot")
+        assert driver.apply_snapshot_ok("H2") is False      # базис не совпал с маркером
+
+    def test_record_basis_noop_when_marker_mismatch(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        cfg.knowledge_dir.mkdir(parents=True)
+        driver = CutoverDriver(cfg)
+        write_marker(driver._marker(2), "H1", step=2, name="snapshot")
+        driver._record_basis("OTHER")
+        assert read_marker(driver._basis_path()) is None
+
