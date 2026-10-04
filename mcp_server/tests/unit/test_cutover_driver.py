@@ -601,7 +601,9 @@ class TestWiring:
             "import_pilot_cmd", "snapshot_qdrant", "clear_qdrant",
         ):
             assert getattr(cfg, name) is not None, name
-        assert (base / "knowledge" / ".git") in cfg.chown_targets
+        assert base / "knowledge" in cfg.chown_targets      # всё дерево (root-файлы)
+        assert base / "data" / "documents" in cfg.chown_targets
+        assert cfg.pilot_bibliography and cfg.pilot_bibliography["title"] == "HTTP Caching"
         assert cfg.env_file == ROOT / ".env"
 
     def test_main_cli_overrides(self, monkeypatch):

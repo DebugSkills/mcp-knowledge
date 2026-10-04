@@ -196,6 +196,19 @@ class CutoverConfig:
     pilot_domain: str = "networking"
     pilot_subject: str = "http3"
     pilot_license: str = "licensed"
+    # CSL-метаданные Source пилота (иначе citation не строится — проверено на Ф6c:
+    # Source без bibliography → секции без ссылок). По умолчанию — RFC 9111 «HTTP Caching».
+    pilot_bibliography: Optional[dict] = field(
+        default_factory=lambda: {
+            "title": "HTTP Caching",
+            "author": [
+                {"literal": "R. Fielding"},
+                {"literal": "M. Nottingham"},
+                {"literal": "J. Reschke"},
+            ],
+            "issued": 2022,
+        }
+    )
     chown_owner: str = "ladmin:ladmin"
     chown_targets: list[Path] = field(default_factory=list)
 
@@ -609,6 +622,7 @@ def _cmd_pilot_import(cfg: "CutoverConfig") -> None:
             "domain": cfg.pilot_domain,
             "subject": cfg.pilot_subject,
             "license": cfg.pilot_license,
+            **({"bibliography": cfg.pilot_bibliography} if cfg.pilot_bibliography else {}),
         },
         timeout=900,
     )
@@ -1076,11 +1090,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         pilot_pdf=Path(args.pilot_pdf) if args.pilot_pdf else Path(
             env.get("CUTOVER_PILOT_PDF", str(repo / ".trash" / "2026-10-04-f6c-acc" / "rfc9111.pdf"))
         ),
-        chown_targets=[
-            base / "knowledge" / ".git",
-            base / "knowledge" / ".trash",
-            data_root / "documents",
-        ],
+        # Всё дерево knowledge: контейнер (root) пишет в bind-mount, поэтому после
+        # bulk-операций файлы становятся root:root — возвращаем владение ladmin
+        # (иначе оператор/скрипты не могут править/коммитить SSOT).
+        chown_targets=[base / "knowledge", data_root / "documents"],
     )
     cfg.stop_cmd = lambda: _cmd_docker_stop(cfg)
     cfg.deploy_cmd = lambda: _cmd_deploy(cfg)
