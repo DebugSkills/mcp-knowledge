@@ -172,7 +172,8 @@ _LIST_SCHEMA: dict[str, Any] = {
 _REINDEX_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "domain": {"type": "string", "description": "Опционально: переиндексировать только один домен"},
+        "domain": {"type": "string", "description": "DEPRECATED: не поддерживается — fail-loud error"},
+        "blue_green": {"type": "boolean", "description": "DEPRECATED: no-op — reindex всегда zone-aware (обе зоны)"},
     },
 }
 

@@ -334,7 +334,17 @@ def mock_pipeline() -> MagicMock:
     pipeline.enqueue = _enqueue
 
     async def _reindex_all():
-        return {"total_docs": 1, "total_chunks": 3, "failed": 0}
+        # P2-2 (bibliography): reindex теперь zone-aware — ответ несёт zones
+        # (какие зоны/алиасы пересобраны) для проверяемого acceptance.
+        return {
+            "total_docs": 1,
+            "total_chunks": 3,
+            "failed": 0,
+            "zones": {
+                "private": {"total_docs": 1, "total_chunks": 3, "failed": 0, "alias_swapped": True},
+                "public": {"total_docs": 0, "total_chunks": 0, "failed": 0, "alias_swapped": True},
+            },
+        }
 
     pipeline.reindex_all = _reindex_all
 

@@ -433,11 +433,47 @@ async def update_entry(params: dict, app_state) -> dict:
     }
 
 
+def _scroll_child_ids(qdrant, parent_id: str, collection_name: str) -> list[str]:
+    """Собрать дочерние knowledge_id по parent_knowledge_id (scroll, все страницы).
+
+    P2-3 (bibliography): общий scroll-цикл для cascade-delete — работает по
+    любой коллекции (передаётся вызывающим), зону резолвит вызывающий.
+    """
+    from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+    child_ids: list[str] = []
+    offset = None
+    while True:
+        points, next_offset = qdrant.scroll(
+            scroll_filter=Filter(
+                must=[FieldCondition(key="parent_knowledge_id", match=MatchValue(value=parent_id))]
+            ),
+            limit=1000,
+            offset=offset,
+            with_payload=["knowledge_id"],
+            with_vectors=False,
+            collection_name=collection_name,
+        )
+        for point in points:
+            kid = point.payload.get("knowledge_id") if point.payload else None
+            if kid:
+                child_ids.append(kid)
+        if next_offset is None or len(points) == 0:
+            break
+        offset = next_offset
+    return child_ids
+
+
 async def delete_entry(params: dict, app_state) -> dict:
     """Удалить запись: soft-delete (→ .trash/) + удаление из Qdrant.
 
     Фаза 13.14: +cascade param — при cascade=True удалить также все
     дочерние секции по parent_knowledge_id (рекурсивно через scroll).
+
+    P2-3 (bibliography): порядок Qdrant-delete → SSOT-delete (import-first):
+    ошибка удаления точек в Qdrant → возврат {"error": ...}, Markdown SSOT
+    НЕ трогаем. Точки удаляются во ВСЕХ зонах (public + private, wait=true),
+    id-списки dedupe; исключения не глушатся (fail-loud).
     """
     knowledge_id = params.get("knowledge_id", "")
     cascade = params.get("cascade", False)
@@ -445,105 +481,78 @@ async def delete_entry(params: dict, app_state) -> dict:
     if not knowledge_id:
         return {"error": "Missing required parameter: 'knowledge_id'"}
 
-    cascade_deleted = 0
-
-    # Получаем зависимости (до cascade — нужны для удаления детей)
     store = app_state.store
-    qdrant = app_state.qdrant
+    qdrant = _get_qdrant(app_state)
     loop = asyncio.get_running_loop()
 
-    # W2: зона записи определяется ДО cascade — scroll и delete_by_knowledge_id
-    # идут в зональную коллекцию (collection_for_zone).
+    # Домен нужен для INDEX update; существование проверяется store.delete ниже.
     entry = await store.read(knowledge_id)
-    zone = getattr(entry.frontmatter, "zone", None) or ZONE_PRIVATE if entry else ZONE_PRIVATE
     domain = entry.frontmatter.domain if entry else None
 
-    # Шаг 0 (cascade): найти и удалить дочерние секции
+    # P2-3: удаляем во всех зонах (обе коллекции доступа), wait=true.
+    collections = [collection_for_zone(ZONE_PUBLIC), collection_for_zone(ZONE_PRIVATE)]
+
+    # Шаг 0 (cascade): собрать дочерние knowledge_id по parent_knowledge_id
+    # во всех зонах (dedupe — одна секция может лежать в обеих зонах).
+    child_ids: list[str] = []
     if cascade:
-        try:
-            from qdrant_client.models import FieldCondition, Filter, MatchValue
+        seen: set[str] = set()
+        for collection in collections:
+            for kid in _scroll_child_ids(qdrant, knowledge_id, collection):
+                if kid and kid not in seen:
+                    seen.add(kid)
+                    child_ids.append(kid)
 
-            qdrant_raw = _get_qdrant(app_state)
-            # Scroll все точки где parent_knowledge_id = knowledge_id
-            child_ids: list[str] = []
-            offset = None
-            while True:
-                points, next_offset = qdrant_raw.scroll(
-                    scroll_filter=Filter(
-                        must=[FieldCondition(key="parent_knowledge_id", match=MatchValue(value=knowledge_id))]
-                    ),
-                    limit=1000,
-                    offset=offset,
-                    with_payload=["knowledge_id"],
-                    with_vectors=False,
-                    collection_name=collection_for_zone(zone),
+    # Все id для удаления из Qdrant: parent + children (dedupe).
+    all_ids: list[str] = list(dict.fromkeys([knowledge_id, *child_ids]))
+
+    # Шаг 1 (Qdrant-delete FIRST, fail-loud): удалить точки всех id во всех
+    # зонах. Ошибка → {"error": ...}, SSOT остаётся цел (import-first).
+    try:
+        for collection in collections:
+            for kid in all_ids:
+                await loop.run_in_executor(
+                    None, qdrant.delete_by_knowledge_id, kid, collection
                 )
-                for point in points:
-                    kid = point.payload.get("knowledge_id") if point.payload else None
-                    if kid:
-                        child_ids.append(kid)
-                if next_offset is None or len(points) == 0:
-                    break
-                offset = next_offset
+    except Exception as exc:
+        logger.error("[DELETE] Qdrant delete failed for %s: %s", knowledge_id, exc)
+        return {"error": f"Qdrant delete failed: {exc}"}
 
-            # Удаляем секции пачкой: store.delete_many (→ .trash/) с ОДНИМ git-коммитом
-            # (Фаза 13.22 P1: раньше N+1 git-коммитов блокировали event loop).
-            if child_ids:
-                try:
-                    cascade_deleted = await store.delete_many(
-                        child_ids,
-                        commit_message=f"cascade delete: {knowledge_id} ({len(child_ids)} sections)",
-                    )
-                except Exception as exc:
-                    logger.warning("[DELETE] cascade: store.delete_many failed: %s", exc)
-                # Qdrant-точки удаляем по одной (не git-операция, не блокирует)
-                for child_id in child_ids:
-                    try:
-                        # run_in_executor НЕ принимает kwargs → ПОЗИЦИОННО
-                        await loop.run_in_executor(
-                            None, qdrant.delete_by_knowledge_id, child_id,
-                            collection_for_zone(zone),
-                        )
-                    except Exception as exc:
-                        logger.warning("[DELETE] cascade: failed to delete qdrant point %s: %s", child_id, exc)
-
-            logger.info("[DELETE] cascade: %d child sections deleted for book %s", cascade_deleted, knowledge_id)
-            # Ф3b2: снять refs удалённых секций (идемпотентно; Source-секций не
-            # бывает — но инвариант «нет stale-refs» поддержан глобально).
-            from .source_ref_runtime import index_remove_id
-
-            for child_id in child_ids:
-                index_remove_id(app_state, child_id)
-        except Exception as exc:
-            logger.error("[DELETE] cascade scroll failed for %s: %s", knowledge_id, exc)
-
-    # Шаг 1: Soft-delete Markdown SSOT
+    # Шаг 2 (SSOT-delete): soft-delete родителя → .trash/.
     deleted = await store.delete(knowledge_id)
     if not deleted:
         return {"error": f"Knowledge entry not found: '{knowledge_id}'"}
 
-    # Шаг 1b (Ф3b2): снять Source-ref удалённой записи из availability-индекса.
-    # Least-strict: пока на blob ссылается ДРУГОЙ ref — он остаётся доступен.
+    # Шаг 2b (cascade): soft-delete дочерних секций пачкой (один git-коммит,
+    # Фаза 13.22 P1). Qdrant-точки детей уже удалены на Шаге 1.
+    cascade_deleted = 0
+    if cascade and child_ids:
+        try:
+            cascade_deleted = await store.delete_many(
+                child_ids,
+                commit_message=f"cascade delete: {knowledge_id} ({len(child_ids)} sections)",
+            )
+        except Exception as exc:
+            logger.error("[DELETE] cascade store.delete_many failed: %s", exc)
+
+    # Шаг 3 (Ф3b2): снять Source-refs удалённых записей из availability-индекса
+    # (идемпотентно; least-strict — пока на blob ссылается другой ref, он жив).
     from .source_ref_runtime import index_remove_id
 
     removed_refs = index_remove_id(app_state, knowledge_id)
+    for child_id in child_ids:
+        index_remove_id(app_state, child_id)
 
-    # Шаг 2: Удаление из Qdrant (позиционно — run_in_executor не принимает kwargs)
-    await loop.run_in_executor(
-        None, qdrant.delete_by_knowledge_id, knowledge_id, collection_for_zone(zone)
-    )
-
-    # Шаг 3: INDEX update (best-effort)
+    # Шаг 4: INDEX update (best-effort)
     if domain:
         try:
-            knowledge_index = app_state.knowledge_index
-            knowledge_index.update_section(domain)
+            app_state.knowledge_index.update_section(domain)
         except Exception as exc:
             logger.warning("INDEX update failed for domain=%s: %s", domain, exc)
 
     logger.info(
-        "[DELETE] delete_entry: %s → .trash/ + Qdrant removed (cascade_deleted=%d, source_refs_removed=%d)",
-        knowledge_id, cascade_deleted, removed_refs,
+        "[DELETE] delete_entry: %s → .trash/ + Qdrant removed in %d zones (cascade_deleted=%d, source_refs_removed=%d)",
+        knowledge_id, len(collections), cascade_deleted, removed_refs,
     )
     # Task 1: инкремент data_version после мутации
     try:

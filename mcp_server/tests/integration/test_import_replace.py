@@ -691,7 +691,8 @@ class TestR9CascadeScrollWrapper:
                 f"Child {cid} should be deleted (→ .trash/)"
             )
         # delete_by_knowledge_id вызывался для каждого ребёнка + root (N+1)
-        assert wrapper.delete_by_knowledge_id.call_count == len(child_ids) + 1
+        # P2-3: удаление во ВСЕХ зонах (public+private) → x2
+        assert wrapper.delete_by_knowledge_id.call_count == (len(child_ids) + 1) * 2
 
 
 # ═══════════════════════════════════════════════════════════

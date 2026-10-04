@@ -36,6 +36,7 @@ from ..content.registry import get as get_preprocessor
 from ..content.source_refs import merge_source_refs, refs_from_section_meta
 from ..models import KnowledgeEntry, KnowledgeFrontmatter
 from .zone_utils import resolve_zone
+from ..storage.schema import collection_for_zone
 
 logger = logging.getLogger("mcp_knowledge.tools.content")
 
@@ -1570,27 +1571,32 @@ async def import_content(params: dict, app_state) -> dict:
             failed,
         )
         qdrant = getattr(app_state, "qdrant", None)
+        # P2-3 (bibliography): явная коллекция по зоне — иначе _require_collection
+        # бросал ValueError (collection_name=None), который глотался → «тихий
+        # успех» + stale-точка в Qdrant.
+        orphan_collection = collection_for_zone(zone)
         # Map failed sequence_numbers to their knowledge_ids
         failed_seqs = {fs["sequence_number"] for fs in failed_sections}
         for i, sid in enumerate(section_ids):
             seq = i + 1  # sequence_number = index + 1
             if seq in failed_seqs:
                 try:
-                    # Soft-delete: Markdown → .trash/
-                    await store.delete(sid)
-                    # Удаление из Qdrant
+                    # Qdrant-first (fail-loud): точку удаляем ДО SSOT; исключение
+                    # НЕ глотаем в warning — фиксируем error, счётчик не растёт.
                     if qdrant:
                         loop = asyncio.get_running_loop()
                         await loop.run_in_executor(
-                            None, qdrant.delete_by_knowledge_id, sid
+                            None, qdrant.delete_by_knowledge_id, sid, orphan_collection
                         )
+                    # Soft-delete: Markdown → .trash/
+                    await store.delete(sid)
                     orphan_cleanup_count += 1
                     logger.info(
                         "import_content: soft-deleted orphan child %s (seq=%d)",
                         sid, seq,
                     )
                 except Exception as e:
-                    logger.warning(
+                    logger.error(
                         "import_content: failed to cleanup orphan %s: %s", sid, e
                     )
         logger.info("import_content: cleanup_orphans removed %d children", orphan_cleanup_count)

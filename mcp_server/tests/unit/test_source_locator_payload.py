@@ -170,6 +170,12 @@ class TestPointPayload:
 class _QdrantRecorder:
     def __init__(self):
         self.points = []
+        self.deletes = []
+
+    def delete_by_knowledge_id(self, knowledge_id, collection_name=None):
+        """P2-3: delete-before-upsert — фиксируем и эмулируем удаление."""
+        self.deletes.append((knowledge_id, collection_name))
+        self.points = [p for p in self.points if p.payload.get("knowledge_id") != knowledge_id]
 
     def upsert_points(self, pts, collection_name=None):
         self.points.extend(pts)

@@ -7,9 +7,17 @@
 
 from __future__ import annotations
 
+import uuid
+
 from qdrant_client.http import models as qmodels
 
 # W2: двухконтурная модель доступа (public/private зоны)
+
+# P2-3 (bibliography): детерминированный point_id — uuid5(NAMESPACE, ...).
+# Один namespace на сервис: id точки стабилен между импортами; зона входит
+# в суффикс (f"{zone}:{knowledge_id}:{chunk_id}"), поэтому private/public
+# не конфликтуют. Значение фиксировано (RFC 4122 UUID).
+POINT_ID_NAMESPACE = uuid.UUID("9a5e1f4c-2b7d-4e8a-a3c1-6d0b8e5f7a21")
 COLLECTION_PUBLIC  = "knowledge_public"
 COLLECTION_PRIVATE = "knowledge_private"
 PUBLIC_V1, PUBLIC_V2   = "knowledge_public_v1",  "knowledge_public_v2"

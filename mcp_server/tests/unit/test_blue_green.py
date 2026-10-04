@@ -36,50 +36,51 @@ from mcp_server.tools.admin import reindex
 pytestmark = pytest.mark.asyncio
 
 
-# ── Blue-green reindex via admin tool ──────────────────────
+# ── Zone-aware reindex via admin tool (P2-2) ────────────────
 
-async def test_reindex_blue_green_happy_path(app_state):
-    """F1: reindex(blue_green=True) uses pipeline.reindex_blue_green()."""
-    result = await reindex({"blue_green": True}, app_state)
+async def test_reindex_zone_aware_happy_path(app_state):
+    """P2-2: reindex always zone-aware via pipeline.reindex_all()."""
+    result = await reindex({}, app_state)
     assert "error" not in result
-    assert result["blue_green"] is True
     assert result["total_docs"] == 1
     assert result["total_chunks"] == 3
     assert result["failed"] == 0
-    assert result["collection_active"] == "knowledge_v1"
-    assert result["collection_target"] == "knowledge_v2"
-    assert result["alias_swapped"] is True
+    assert set(result["zones"]) == {"private", "public"}
+    assert result["zones"]["private"]["failed"] == 0
     assert result["index_total_entries"] == 3
 
 
-async def test_reindex_blue_green_default(app_state):
-    """F1: reindex() without blue_green param defaults to True."""
-    result = await reindex({}, app_state)
-    assert result["blue_green"] is True
-    assert result["collection_active"] == "knowledge_v1"
-    assert result["collection_target"] == "knowledge_v2"
+async def test_reindex_blue_green_true_is_noop(app_state):
+    """P2-2: blue_green=True — deprecated no-op, reindex всё равно zone-aware."""
+    result = await reindex({"blue_green": True}, app_state)
+    assert "error" not in result
+    assert "blue_green" not in result
+    assert "collection_active" not in result
+    assert "alias_swapped" not in result
+    assert result["total_docs"] == 1
+    assert set(result["zones"]) == {"private", "public"}
 
 
-async def test_reindex_legacy_delete_all(app_state):
-    """F1: reindex(blue_green=False) falls back to legacy reindex_all()."""
+async def test_reindex_blue_green_false_same_zone_aware_path(app_state):
+    """P2-2: blue_green=False — тот же zone-aware путь (легаси-контура больше нет)."""
     result = await reindex({"blue_green": False}, app_state)
-    assert result["blue_green"] is False
+    assert "error" not in result
+    assert "blue_green" not in result
+    assert "collection_active" not in result
     assert result["total_docs"] == 1
     assert result["total_chunks"] == 3
-    # Legacy path doesn't include collection metadata
-    assert "collection_active" not in result
 
 
-async def test_reindex_blue_green_with_domain(app_state):
-    """F1: reindex with domain filter + blue-green."""
-    result = await reindex({"blue_green": True, "domain": "engineering"}, app_state)
-    assert result["blue_green"] is True
-    assert result["domain"] == "engineering"
+async def test_reindex_domain_fails_loud(app_state):
+    """P2-2: domain-фильтр не реализован → fail-loud error."""
+    result = await reindex({"domain": "engineering"}, app_state)
+    assert "error" in result
+    assert "domain" in result["error"]
 
 
-async def test_reindex_blue_green_has_index_info(app_state):
-    """F1: blue-green reindex includes index rebuilding info."""
-    result = await reindex({"blue_green": True}, app_state)
+async def test_reindex_has_index_info(app_state):
+    """P2-2: reindex включает info о перестроенном INDEX."""
+    result = await reindex({}, app_state)
     assert result["index_sections"] >= 0
     assert result["index_total_entries"] == 3
 

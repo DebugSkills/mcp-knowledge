@@ -349,7 +349,8 @@ async def test_delete_entry_cascade_no_children(app_state):
     )
     assert result["deleted"] is True
     assert result["cascade_deleted"] == 0
-    assert app_state.qdrant.delete_by_knowledge_id.call_count == 1
+    # P2-3: delete_entry удаляет запись во ВСЕХ зонах (public+private) → 2 вызова
+    assert app_state.qdrant.delete_by_knowledge_id.call_count == 2
 
 
 # ── Browse tools ────────────────────────────────────────────

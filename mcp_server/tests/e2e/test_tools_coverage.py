@@ -234,11 +234,18 @@ S15_KNOWLEDGE_ID = "e2e-s15-reindex"
 
 @pytest.mark.e2e
 async def test_s15_reindex_blue_green_false_via_http(e2e_http_app):
-    """S15: write(e2e-s15) → tools/call reindex (blue_green=false) → verify total_docs≥1, failed=0.
+    """S15: write(e2e-s15) → tools/call reindex → zone-aware ответ (zones/total_docs/failed=0).
 
-    КРИТИЧНО: blue_green=False (иначе blue-green разрушит session-scoped knowledge_e2e).
+    P2-2 (bibliography): reindex ВСЕГДА zone-aware (reindex_all, своп зонных алиасов);
+    легаси-контур knowledge_v1/v2 больше НЕ создаётся (blue_green — deprecated no-op).
+    Тест проверяет, что новых легаси-коллекций не появилось (старые могут существовать
+    в среде от прежних прогонов) и что зонные коллекции/алиасы используются.
     """
     headers_write = {"X-API-Key": "e2e-write-key"}
+    import httpx
+    async with httpx.AsyncClient(trust_env=False) as _c:
+        r0 = await _c.get("http://localhost:6333/collections", timeout=5.0)
+        before_collections = {col["name"] for col in r0.json().get("result", {}).get("collections", [])}
 
     # Step 1: Write entry (чтобы коллекция не была пустой)
     write_payload = {
@@ -267,7 +274,7 @@ async def test_s15_reindex_blue_green_false_via_http(e2e_http_app):
         "method": "tools/call",
         "params": {
             "name": "reindex",
-            "arguments": {"blue_green": False},
+            "arguments": {},
         },
         "id": 2,
     }
@@ -280,7 +287,7 @@ async def test_s15_reindex_blue_green_false_via_http(e2e_http_app):
     # Verify response fields (admin.py:58-67)
     assert reindex_data["total_docs"] >= 1, f"Expected total_docs≥1, got: {reindex_data}"
     assert reindex_data["failed"] == 0, f"Expected failed=0, got: {reindex_data}"
-    assert reindex_data["blue_green"] is False, f"Expected blue_green=false, got: {reindex_data}"
+    assert "zones" in reindex_data, f"Expected zone-aware reindex response with zones, got: {reindex_data}"
     assert "total_chunks" in reindex_data
     assert "index_sections" in reindex_data
 
@@ -298,21 +305,16 @@ async def test_s15_reindex_blue_green_false_via_http(e2e_http_app):
     resp = await e2e_http_app.post("/mcp", json=get_payload, headers=headers_write)
     assert resp.status_code == 200
 
-    # Step 4: Verify НЕТ knowledge_v1/v2 коллекций (blue_green=false не должен создавать)
-    import httpx
+    # Step 4: reindex НЕ создаёт НОВЫХ легаси-коллекций (knowledge_v1/v2);
+    # зонные коллекции/алиасы используются (P2-2 zone-aware).
     async with httpx.AsyncClient(trust_env=False) as c:  # 021: без env-прокси
         r = await c.get("http://localhost:6333/collections", timeout=5.0)
-        collections_data = r.json()
-        collection_names = [col["name"] for col in collections_data.get("result", {}).get("collections", [])]
-        # knowledge_e2e — наша тестовая коллекция (OK)
-        # knowledge — продакшн коллекция (OK)
-        # knowledge_v1 / knowledge_v2 — НЕ должны появиться
-        assert "knowledge_v1" not in collection_names, (
-            f"knowledge_v1 found after reindex blue_green=False! Collections: {collection_names}"
-        )
-        assert "knowledge_v2" not in collection_names, (
-            f"knowledge_v2 found after reindex blue_green=False! Collections: {collection_names}"
-        )
+        collection_names = {col["name"] for col in r.json().get("result", {}).get("collections", [])}
+    appeared = collection_names - before_collections
+    legacy_new = {n for n in appeared if n in {"knowledge_v1", "knowledge_v2"}}
+    assert not legacy_new, f"reindex создал легаси-коллекции: {legacy_new} (всего новых: {appeared})"
+    assert reindex_data["zones"], f"zones пусты: {reindex_data}"
+    assert "knowledge_e2e" in " ".join(collection_names), "session-scoped e2e-коллекции исчезли после reindex"
 
 
 # ═══════════════════════════════════════════════════════════════

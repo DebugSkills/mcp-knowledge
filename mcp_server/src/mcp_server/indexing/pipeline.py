@@ -31,6 +31,7 @@ from ..storage.schema import (
     COLLECTION_ALIAS,
     COLLECTION_V1,
     COLLECTION_V2,
+    POINT_ID_NAMESPACE,
     ZONE_PRIVATE,
     ZONE_PUBLIC,
     blue_green_names_for_zone,
@@ -657,14 +658,16 @@ class IndexingPipeline:
         # Собираем Qdrant points, группируя по зональным коллекциям (W2.9):
         # батч может содержать записи разных зон → upsert по группам
         points_by_collection: dict[str, list] = {}
+        kids_by_collection: dict[str, set] = {}
         for (item, ch), vector in zip(chunk_map, vectors):
             entry: KnowledgeEntry = item["entry"]
             fm = entry.frontmatter
             zone = getattr(fm, "zone", ZONE_PRIVATE)
             collection = collection_for_zone(zone)
+            kids_by_collection.setdefault(collection, set()).add(fm.knowledge_id)
 
             point = build_payload_point(
-                point_id=str(uuid.uuid4()),
+                point_id=str(uuid.uuid5(POINT_ID_NAMESPACE, f"{zone}:{fm.knowledge_id}:{ch.chunk_id}")),
                 vector=vector,
                 knowledge_id=fm.knowledge_id,
                 chunk_id=ch.chunk_id,
@@ -686,9 +689,17 @@ class IndexingPipeline:
             )
             points_by_collection.setdefault(collection, []).append(point)
 
-        # Upsert в Qdrant — по группам зон
+        # Upsert в Qdrant — по группам зон.
+        # P2-3 (bibliography): delete-before-upsert — прежние точки записи
+        # (по knowledge_id + коллекция зоны, wait=true) удаляются ДО вставки
+        # новых, иначе при укорочении записи (меньше чанков) старые точки
+        # остаются stale-дублями с тем же chunk_id.
         try:
             for collection, points in points_by_collection.items():
+                for kid in kids_by_collection.get(collection, ()):
+                    await loop.run_in_executor(
+                        None, self._qdrant.delete_by_knowledge_id, kid, collection
+                    )
                 await loop.run_in_executor(
                     None,
                     lambda c=collection, pts=points: self._qdrant.upsert_points(
@@ -778,7 +789,7 @@ class IndexingPipeline:
             points = []
             for ch, vector in zip(batch, vectors):
                 point = build_payload_point(
-                    point_id=str(uuid.uuid4()),
+                    point_id=str(uuid.uuid5(POINT_ID_NAMESPACE, f"{zone}:{fm.knowledge_id}:{ch.chunk_id}")),
                     vector=vector,
                     knowledge_id=fm.knowledge_id,
                     chunk_id=ch.chunk_id,
