@@ -42,6 +42,11 @@ class TestEditorToolsetDefinition:
             "set_zone",
             "bulk_resolve_issues",
             "bulk_deprecate_duplicates",
+            "review_queue",
+            "review_queue_books",
+            "list_quality_issues",
+            "review_duplicate_pairs",
+            "list_audit_log",
             "errors_query",
             "documents_stats",
             "documents_check",
@@ -81,8 +86,18 @@ class TestEditorPermissions:
         auth = AuthInfo(authenticated=True, key_level="editor")
         check_tool_permission(auth, "search_knowledge")
         check_tool_permission(auth, "get_knowledge_map")
-        check_tool_permission(auth, "list_quality_issues")
-        check_tool_permission(auth, "review_queue")
+
+    @pytest.mark.parametrize(
+        "tool",
+        ["list_quality_issues", "review_queue", "review_queue_books",
+         "review_duplicate_pairs", "list_audit_log"],
+    )
+    def test_editor_blocks_quality_reads(self, tool):
+        """P2-1 B2: quality-семейство ЧТЕНИЕ — admin-only (editor → 403)."""
+        auth = AuthInfo(authenticated=True, key_level="editor")
+        with pytest.raises(HTTPException) as exc:
+            check_tool_permission(auth, tool)
+        assert exc.value.status_code == 403
 
     def test_editor_grants_editor_tools(self):
         auth = AuthInfo(authenticated=True, key_level="editor")

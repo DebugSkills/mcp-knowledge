@@ -36,11 +36,8 @@ READ_TOOLS: set[str] = {
     "list_projects",
     "list_collections",  # read-only: список книг/коллекций (Фаза 13.10)
     "analyze_content",  # read-only: LLM/TF-IDF анализ без записи в хранилище (Фаза 13.8)
-    "review_queue",  # read-only: топ устаревших секций (Фаза 13.14)
-    "review_queue_books",  # read-only: агрегат книг (Фаза 13.14)
-    "list_quality_issues",  # read-only: список quality issues (Фаза 13.14)
-    "review_duplicate_pairs",  # Фаза 2 dedup: read-only ревью-очередь dup-пар (ранжирование R1-R6)
-    "list_audit_log",  # Фаза 3: read-only журнал действий (аудит) + статус авто-гейта
+    # P2-1 (bibliography B2): quality-семейство ЧТЕНИЕ — admin-only (issues.jsonl/
+    # audit.jsonl + контентные сниппеты private) → переехали в WRITE_TOOLS.
     "resources/list",
     "resources/read",
     "prompts/list",
@@ -63,6 +60,14 @@ WRITE_TOOLS: set[str] = {
     "update_fragment",  # Фаза 13.23: обновление секции книги
     "delete_fragment",  # Фаза 13.23: удаление секции книги
     "set_zone",  # W4: перекладка записи между зонами (курирование public-слоя)
+    # P2-1 (bibliography B2): quality-семейство ЧТЕНИЕ — admin-only (не EDITOR):
+    # issues.jsonl/audit.jsonl + контентные сниппеты private-записей. Мутации
+    # resolve_quality_issue/run_quality_scan остаются editor (политика зон записи не сужается).
+    "review_queue",
+    "review_queue_books",
+    "list_quality_issues",
+    "review_duplicate_pairs",
+    "list_audit_log",
     # 006: read-only доступ к sink ошибок Error→Rule. Инфраструктурный тул
     # (не контентный): sink содержит чувствительные данные → admin-only.
     "errors_query",
@@ -99,6 +104,11 @@ EDITOR_TOOLS: set[str] = WRITE_TOOLS - {
     "set_zone",
     "bulk_resolve_issues",
     "bulk_deprecate_duplicates",
+    "review_queue",  # P2-1 B2: quality-чтение admin-only (issues.jsonl, private-сниппеты)
+    "review_queue_books",  # P2-1 B2: quality-чтение admin-only
+    "list_quality_issues",  # P2-1 B2: quality-чтение admin-only
+    "review_duplicate_pairs",  # P2-1 B2: quality-чтение admin-only (private-сниппеты)
+    "list_audit_log",  # P2-1 B2: quality-чтение admin-only (audit.jsonl)
     "errors_query",  # 006: read-only sink, admin-only (отклонение E7, спека §0)
     "documents_stats",  # Ф5b1: read-only агрегаты стора, admin-only (паттерн errors_query)
     "documents_check",  # Ф5b2: integrity-проверка стора, admin-only

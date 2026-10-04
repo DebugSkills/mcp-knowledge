@@ -315,7 +315,7 @@ async def _handle_resources_read(params: dict, request_id: Any, request: Request
         )
     try:
         app_state = request.app.state
-        contents = await get_kb_resource(uri, app_state)
+        contents = await get_kb_resource(uri, app_state, auth=get_auth(request))
         return _jsonrpc_result({"contents": [{"uri": uri, "text": json.dumps(contents, ensure_ascii=False), "mimeType": "application/json"}]}, request_id)
     except Exception as exc:
         logger.exception("resources/read failed for uri=%s", uri)

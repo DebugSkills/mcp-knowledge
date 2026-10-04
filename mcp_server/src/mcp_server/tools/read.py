@@ -18,7 +18,7 @@ import re
 import time
 
 from ..storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
-from .auth_zone import is_admin, is_subscriber
+from .auth_zone import is_admin
 from .citation_enrich import citations_for_refs
 
 logger = logging.getLogger("mcp_knowledge.tools.read")
@@ -321,11 +321,12 @@ async def get_knowledge_map(params: dict, app_state) -> dict:
     Без domain → root INDEX.gen.yaml (все секции).
     С domain → per-section _INDEX.gen.yaml (файлы секции).
     In-memory cache (<5ms при попадании).
-    Subscriber → _public_knowledge_map (только public-зона, из Qdrant).
+    Не-admin → _public_knowledge_map (только public-зона, из Qdrant);
+    admin → полная карта (root INDEX.gen.yaml / per-section).
     """
     domain = params.get("domain")
 
-    if is_subscriber(params):
+    if not is_admin(params):
         return await _public_knowledge_map(domain, app_state)
 
     knowledge_index = app_state.knowledge_index

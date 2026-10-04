@@ -19,7 +19,7 @@ import re
 from ..content.linking import make_knowledge_id
 from ..models import KnowledgeEntry, KnowledgeFrontmatter, VersionConflictError
 from ..storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
-from .auth_zone import is_subscriber
+from .auth_zone import is_admin
 from .read import _HEADING_RE, _build_toc, _get_qdrant
 from .search import search_knowledge
 from .zone_utils import emit_zone_violation, is_partial_public, resolve_zone
@@ -435,8 +435,9 @@ async def find_fragment(params: dict, app_state) -> dict:
     if root is None or getattr(root.frontmatter, "content_type", None) != "collection":
         return {"error": f"Collection not found: '{collection_id}'"}
 
-    # W3 C5 fail-closed: subscriber видит только public-коллекции (оракул по Qdrant)
-    if is_subscriber(params) and not await _collection_in_public(collection_id, app_state):
+    # P2-1 fail-closed: ниже admin — только public-коллекции (no-oracle по Qdrant,
+    # без признака существования private-книги). admin — как раньше.
+    if not is_admin(params) and not await _collection_in_public(collection_id, app_state):
         return {"error": f"Collection not found: '{collection_id}'"}
 
     # Делегирование в search_knowledge с collection_id-фильтром.
