@@ -21,13 +21,32 @@ VALID_ZONES: tuple[str, str] = ("public", "private")
 # private через auth-free пути).
 ADMIN_LEVELS: frozenset[str] = frozenset({"write"})
 
+# Системный (внутренний) вызов: `_auth` вообще отсутствует — так тулы вызывают
+# server-side джобы (reconcile, GC, source-ref runtime, CLI, тесты). HTTP-путь
+# ВСЕГДА инжектит `_auth` (mcp_handler.py:186, даже для неаутентифицированного
+# ключа → level "none") → внешний вызов политикой ограничен. Отсутствие `_auth`
+# трактуется как system (полный доступ), чтобы внутренние синхронизации не
+# теряли private-контент.
+SYSTEM_LEVEL: str = "system"
+
 
 def _auth_level(params: dict) -> str:
-    """Уровень ключа из служебного _auth (dict или AuthInfo)."""
+    """Уровень ключа из служебного _auth (dict или AuthInfo).
+
+    Отсутствие `_auth` → SYSTEM_LEVEL (внутренний вызов, полный доступ).
+    HTTP-путь всегда инжектит `_auth` (в т.ч. level "none") → политика активна.
+    """
     auth = params.get("_auth")
+    if auth is None:
+        return SYSTEM_LEVEL
     if isinstance(auth, dict):
         return auth.get("level") or ""
     return getattr(auth, "key_level", "") or ""
+
+
+def _full_access(level: str) -> bool:
+    """Полный зонный доступ: admin-уровень или внутренний system-вызов."""
+    return level in ADMIN_LEVELS or level == SYSTEM_LEVEL
 
 
 def is_subscriber(params: dict) -> bool:
@@ -37,7 +56,7 @@ def is_subscriber(params: dict) -> bool:
 
 def is_admin(params: dict) -> bool:
     """admin-эквивалент (write/master-ключ) → полный доступ к обеим зонам."""
-    return _auth_level(params) in ADMIN_LEVELS
+    return _full_access(_auth_level(params))
 
 
 def zone_from_auth(params: dict, default: str = "both") -> str:
@@ -53,7 +72,7 @@ def zone_from_auth(params: dict, default: str = "both") -> str:
     Returns:
         "public" | "private" | "both".
     """
-    if _auth_level(params) not in ADMIN_LEVELS:
+    if not _full_access(_auth_level(params)):
         return "public"
     zone = params.get("zone")
     if zone in VALID_ZONES:

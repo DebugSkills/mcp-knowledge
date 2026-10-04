@@ -56,12 +56,15 @@ def test_is_admin():
     assert is_admin({"_auth": {"level": "read"}}) is False
     assert is_admin({"_auth": {"level": "editor"}}) is False
     assert is_admin({"_auth": {"level": "import"}}) is False
-    assert is_admin({}) is False
+    # Внутренний вызов (нет `_auth`) = system → полный доступ (server-side джобы);
+    # HTTP всегда инжектит `_auth` (в т.ч. level "none"), поэтому политика активна.
+    assert is_admin({}) is True
+    assert is_admin({"_auth": {"level": "none"}}) is False
 
 
 def test_auth_zones_non_admin_public_only():
     """availability.auth_zones: ниже admin → только public (мутационный детектор)."""
-    for level in ("subscriber", "read", "import", "editor"):
+    for level in ("subscriber", "read", "import", "editor", "none", ""):
         assert auth_zones({"level": level}) == {"public"}, level
     assert auth_zones({"level": "write"}) == {"public", "private"}
     assert auth_zones({}) == {"public"}

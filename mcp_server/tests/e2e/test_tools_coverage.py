@@ -463,7 +463,6 @@ async def test_s18_resources_read_kb_uri_via_http(e2e_http_app):
     Требует Ш10a: resources.py fix (COLLECTION_NAME import) + conftest patch.
     """
     headers_write = {"X-API-Key": "e2e-write-key"}
-    headers_read = {"X-API-Key": "e2e-read-key"}
 
     # Step 1: Write entry
     write_payload = {
@@ -493,7 +492,7 @@ async def test_s18_resources_read_kb_uri_via_http(e2e_http_app):
         "params": {"uri": "kb://"},
         "id": 2,
     }
-    resp = await e2e_http_app.post("/mcp", json=kb_root_payload, headers=headers_read)
+    resp = await e2e_http_app.post("/mcp", json=kb_root_payload, headers=headers_write)
     assert resp.status_code == 200
     root_body = resp.json()
     assert "result" in root_body, f"resources/read kb:// failed: {root_body}"
@@ -512,7 +511,7 @@ async def test_s18_resources_read_kb_uri_via_http(e2e_http_app):
         "params": {"uri": f"kb://{S18_DOMAIN}"},
         "id": 3,
     }
-    resp = await e2e_http_app.post("/mcp", json=kb_domain_payload, headers=headers_read)
+    resp = await e2e_http_app.post("/mcp", json=kb_domain_payload, headers=headers_write)
     assert resp.status_code == 200
     domain_body = resp.json()
     assert "result" in domain_body, f"resources/read kb://{S18_DOMAIN} failed: {domain_body}"
@@ -530,7 +529,7 @@ async def test_s18_resources_read_kb_uri_via_http(e2e_http_app):
         "params": {"uri": f"kb://{S18_DOMAIN}/{S18_SUBJECT}"},
         "id": 4,
     }
-    resp = await e2e_http_app.post("/mcp", json=kb_subject_payload, headers=headers_read)
+    resp = await e2e_http_app.post("/mcp", json=kb_subject_payload, headers=headers_write)
     assert resp.status_code == 200
     subject_body = resp.json()
     assert "result" in subject_body, f"resources/read kb://{S18_DOMAIN}/{S18_SUBJECT} failed: {subject_body}"
@@ -630,7 +629,6 @@ async def test_s20_list_collections_via_http(e2e_http_app):
       3. get_entry(collection_id) → TOC with children
     """
     headers_write = {"X-API-Key": "e2e-write-key"}
-    headers_read = {"X-API-Key": "e2e-read-key"}
 
     # Step 1: Import a small book
     import_payload = {
@@ -668,7 +666,7 @@ async def test_s20_list_collections_via_http(e2e_http_app):
         },
         "id": 2,
     }
-    resp = await e2e_http_app.post("/mcp", json=list_payload, headers=headers_read)
+    resp = await e2e_http_app.post("/mcp", json=list_payload, headers=headers_write)
     assert resp.status_code == 200
     list_result = json.loads(resp.json()["result"]["content"][0]["text"])
     assert "error" not in list_result, f"list_collections failed: {list_result}"
@@ -691,7 +689,7 @@ async def test_s20_list_collections_via_http(e2e_http_app):
         },
         "id": 3,
     }
-    resp = await e2e_http_app.post("/mcp", json=get_payload, headers=headers_read)
+    resp = await e2e_http_app.post("/mcp", json=get_payload, headers=headers_write)
     assert resp.status_code == 200
     get_result = json.loads(resp.json()["result"]["content"][0]["text"])
     assert "error" not in get_result, f"get_entry failed: {get_result}"
@@ -728,7 +726,11 @@ async def test_s21_fragment_lifecycle_via_http(e2e_http_app):
     register(BookPreprocessor(embedder=e2e_http_app.app.state.embedder, token_counter=token_counter))
 
     headers_write = {"X-API-Key": "e2e-write-key"}
-    headers_read = {"X-API-Key": "e2e-read-key"}
+
+    # P2-1: private-данные читаются write-ключом → плотная admin-последовательность;
+    # расширяем write-бакет в рамках теста (иначе 429; e2e-конвенция — retry/бакеты).
+    e2e_http_app.app.state.rate_limiter_write.burst_size = 10_000
+    e2e_http_app.app.state.rate_limiter_write._buckets.clear()
 
     # Step 1: import_content — создать книгу с 2 главами
     import_payload = {
@@ -814,7 +816,7 @@ async def test_s21_fragment_lifecycle_via_http(e2e_http_app):
         "method": "tools/call",
         "params": {"name": "get_entry", "arguments": {"knowledge_id": collection_id}},
     }
-    resp = await e2e_http_app.post("/mcp", json=get_payload, headers=headers_read)
+    resp = await e2e_http_app.post("/mcp", json=get_payload, headers=headers_write)
     assert resp.status_code == 200
     get_result = json.loads(resp.json()["result"]["content"][0]["text"])
     children = get_result.get("children", [])
@@ -838,7 +840,7 @@ async def test_s21_fragment_lifecycle_via_http(e2e_http_app):
             "arguments": {"collection_id": collection_id, "query": "Docker Compose мониторинг"},
         },
     }
-    resp = await e2e_http_app.post("/mcp", json=find_payload, headers=headers_read)
+    resp = await e2e_http_app.post("/mcp", json=find_payload, headers=headers_write)
     assert resp.status_code == 200
     find_result = json.loads(resp.json()["result"]["content"][0]["text"])
     assert find_result["total"] >= 1, f"find_fragment should find at least 1 result: {find_result}"
@@ -892,7 +894,7 @@ async def test_s21_fragment_lifecycle_via_http(e2e_http_app):
     assert delete_result["fragment_id"] == frag1_id
 
     # Step 8: get_entry → frag1 отсутствует, frag2 остаётся
-    resp = await e2e_http_app.post("/mcp", json=get_payload, headers=headers_read)
+    resp = await e2e_http_app.post("/mcp", json=get_payload, headers=headers_write)
     assert resp.status_code == 200
     get_result2 = json.loads(resp.json()["result"]["content"][0]["text"])
     children2 = get_result2.get("children", [])
