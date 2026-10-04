@@ -191,7 +191,7 @@ class CutoverConfig:
     reindex_cmd: Optional[Callable[[], None]] = None
     smoke_cmd: Optional[Callable[[], dict]] = None
     import_pilot_cmd: Optional[Callable[[], None]] = None
-    snapshot_qdrant: Optional[Callable[["CutoverConfig"], None]] = None
+    snapshot_qdrant: Optional[Callable[["CutoverConfig"], Optional[list[Path]]]] = None
     clear_qdrant: Optional[Callable[["CutoverConfig"], None]] = None
 
 
@@ -575,18 +575,19 @@ def _cmd_pilot_import(cfg: "CutoverConfig") -> None:
         raise CutoverError(f"pilot import: {res.get('error') or res}")
 
 
-def _cmd_qdrant_snapshot(cfg: "CutoverConfig") -> None:
+def _cmd_qdrant_snapshot(cfg: "CutoverConfig") -> list[Path]:
     dest = cfg.backup_dir / "qdrant-snapshots"
     dest.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
     for name in cfg.qdrant_collections:
         res = _http_json("POST", f"{cfg.qdrant_url}/collections/{name}/snapshots")
         sname = ((res.get("result") or {}) if isinstance(res, dict) else {}).get("name")
         if not sname:
             raise CutoverError(f"qdrant snapshot: нет name для {name}: {res}")
-        _download(
-            f"{cfg.qdrant_url}/collections/{name}/snapshots/{sname}",
-            dest / f"{name}-{sname}",
-        )
+        target = dest / f"{name}-{sname}"
+        _download(f"{cfg.qdrant_url}/collections/{name}/snapshots/{sname}", target)
+        written.append(target)
+    return written
 
 
 def _cmd_qdrant_clear_legacy(cfg: "CutoverConfig") -> None:
@@ -676,8 +677,12 @@ class CutoverDriver:
                 check=True,
             )
             artifacts.append(dtar)
-        self._cmd("snapshot_qdrant", cfg.snapshot_qdrant)(cfg)
-        lines = [f"{_hash_file(a)}  {a.name}" for a in sorted(artifacts, key=lambda p: p.name)]
+        extra = self._cmd("snapshot_qdrant", cfg.snapshot_qdrant)(cfg) or []
+        artifacts.extend(Path(e) for e in extra)
+        lines = [
+            f"{_hash_file(a)}  {a.relative_to(cfg.backup_dir)}"
+            for a in sorted(artifacts, key=lambda p: str(p))
+        ]
         (cfg.backup_dir / "checksums.sha256").write_text("\n".join(lines) + "\n")
 
     def _probe_stop(self):
