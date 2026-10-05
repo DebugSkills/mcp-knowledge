@@ -432,3 +432,33 @@ push-fast:  ## Пуш+деплой config/docs-правок (fail-safe: код-�
 	  echo "    Диагностика: make logs / make dev-latest-log / skill mcp-knowledge-prod-ops."; \
 	  exit 1; \
 	fi
+
+# ── AI-workspace Ф1 (arch-2026-10-05-ai-workspace): LLM-шлюз LiteLLM ──────────
+# Порт 4000 НЕ публикуется (I1/I6 — только внутренняя сеть mcp-knowledge_default).
+# Конфиг по умолчанию — обе полки (local+ext); local_only: GATEWAY_CONFIG=litellm.local_only.config.yaml
+GATEWAY_COMPOSE := compose.gateway.yml
+GATEWAY_CONTAINER := mcp-knowledge-litellm
+GATEWAY_CONFIG ?= litellm.config.yaml
+GATEWAY_K ?= 1
+
+.PHONY: gateway-up gateway-down gateway-logs gateway-health gateway-canary
+gateway-up: ## Ф1: поднять LLM-шлюз (start_period до 120s → проверь make gateway-health)
+	docker compose -f $(GATEWAY_COMPOSE) up -d
+
+gateway-down: ## Ф1: остановить LLM-шлюз
+	docker compose -f $(GATEWAY_COMPOSE) down
+
+gateway-logs: ## Ф1: логи LLM-шлюза (follow)
+	docker compose -f $(GATEWAY_COMPOSE) logs -f --tail=100
+
+gateway-health: ## Ф1: liveliness + per-deployment /health (изнутри контейнера; ext без ключа → partial, допустимо)
+	@docker exec $(GATEWAY_CONTAINER) python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=10); print('liveliness: OK')" \
+	  && echo "liveliness: OK" || { echo "❌ liveliness: FAIL"; exit 1; }
+	@key=$$(grep -m1 '^LITELLM_MASTER_KEY=' .env | cut -d= -f2-); \
+	docker exec -e LITELLM_MASTER_KEY="$$key" $(GATEWAY_CONTAINER) python3 -c \
+	  "import os,urllib.request; req=urllib.request.Request('http://localhost:4000/health',headers={'Authorization':'Bearer '+os.environ['LITELLM_MASTER_KEY']}); print(urllib.request.urlopen(req,timeout=120).read().decode()[:800])" \
+	  || echo "⚠️  /health partial (ext unhealthy без DEEPSEEK_API_KEY — допустимо, Ф1.E-i)"
+
+gateway-canary: ## Ф1: K+1-проба → 429 throttling_error (fail-closed W==1). K: make gateway-canary K=2
+	docker exec -i $(GATEWAY_CONTAINER) python3 - --k $(GATEWAY_K) --model local \
+	  --base-url http://127.0.0.1:4000 < scripts/gateway_canary.py
