@@ -1,0 +1,19 @@
+# Ф1, local_only-вариант (план Ф1 TODO #7): ext-полка отсутствует в конфиге.
+# Зонная изоляция этим НЕ доказывается (→ Ф3); smoke-критерий: в /v1/models только local.
+# Использование: GATEWAY_CONFIG=litellm.local_only.config.yaml make gateway-up
+# Тест «egress-регресс зоны» (на узле, Ф1.E-ii): запрос model=ext через этот конфиг → 404 даже с ключом.
+
+model_list:
+  - model_name: local
+    litellm_params:
+      model: ollama/qwen2.5:7b
+      api_base: http://mcp-knowledge-ollama:11434
+      max_parallel_requests: 1   # = K (бенч K — см. litellm.config.yaml)
+      timeout: 600
+
+router_settings:
+  num_retries: 0
+  routing_strategy: simple-shuffle
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

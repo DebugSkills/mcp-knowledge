@@ -1,0 +1,37 @@
+# Ф1 (arch-2026-10-05-ai-workspace): LLM-шлюз LiteLLM. Порт 4000 НЕ публикуется (I1/I6).
+#
+# PIN (I12, «pinned on node»): тег main-stable плавающий → реальный pin = digest:
+#   ghcr.io/berriai/litellm:main-stable@sha256:625981c83410a3ea68eb0697590a57ec1d764d634514d54fa5db0591077ee839
+#   LiteLLM 1.104.0 (revision 79645770, image created 2026-09-16,Chainguard wolfi-base).
+#   Air-gap: bundle-pack несёт этот образ; verify на узле = RepoDigests == digest выше.
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable@sha256:625981c83410a3ea68eb0697590a57ec1d764d634514d54fa5db0591077ee839
+    container_name: mcp-knowledge-litellm
+    restart: unless-stopped
+    # W=1 обязателен: max_parallel_requests — cap PER-WORKER (Ф1-спека B);
+    # флаг поддержан в 1.104.0 (проверено `litellm --help`).
+    command: --config /app/litellm.config.yaml --port 4000 --num_workers 1
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    volumes:
+      # переключение полок: GATEWAY_CONFIG=litellm.local_only.config.yaml make gateway-up
+      - ./${GATEWAY_CONFIG:-litellm.config.yaml}:/app/litellm.config.yaml:ro
+    networks:
+      - mcp-knowledge
+    healthcheck:
+      # P2-1: контейнерный health = liveliness (без похода в провайдеров);
+      # /health (real-запрос в каждый deployment) — цель make gateway-health.
+      # ⚠️ curl/busybox-wget в chainguard-образе НЕТ → python3-urllib (отклонение от Ф1-спеки C,
+      # семантика та же: GET liveliness, неуспех → exit 1).
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+networks:
+  mcp-knowledge:
+    name: mcp-knowledge_default   # та же external-сеть, что у mcp-knowledge-ollama (docker inspect)
+    external: true

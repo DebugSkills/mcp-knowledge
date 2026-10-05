@@ -1,0 +1,31 @@
+# Ф1 (arch-2026-10-05-ai-workspace): 2 полки LiteLLM — local (ollama) + ext (deepseek).
+# Инварианты: I5 — fallbacks НЕТ (private не должен уехать на ext); I12 — pin образа в compose.gateway.yml.
+#
+# K-параметризация (max_parallel_requests = K для полки local):
+#   сейчас K=1 (консервативно). Повышение — после бенча (план Ф1 TODO #6):
+#   бенч 1→2 → max_parallel_requests: 2 → канарейка `make gateway-canary K=2`
+#   → reconcile с OLLAMA_NUM_PARALLEL (unified ws:gpu — Ф3, I7).
+#   ⚠️ Cap действует per-worker → в compose.gateway.yml обязан оставаться --num_workers 1.
+
+model_list:
+  # ── Полка local: ollama/qwen2.5:7b (внутренний контур) ──
+  - model_name: local
+    litellm_params:
+      model: ollama/qwen2.5:7b
+      api_base: http://mcp-knowledge-ollama:11434
+      max_parallel_requests: 1   # = K
+      timeout: 600
+
+  # ── Полка ext: DeepSeek flash (внешний контур; ключ НЕ коммитится) ──
+  - model_name: ext
+    litellm_params:
+      model: deepseek/deepseek-flash   # V4.1-Flash; лимит аккаунта = concurrency 2500 (НЕ RPM/TPM)
+      api_key: os.environ/DEEPSEEK_API_KEY
+      timeout: 300
+
+router_settings:
+  num_retries: 0            # 429 отдаём сразу; retry-политика — наш scheduler (Ф1-спека B.5)
+  routing_strategy: simple-shuffle
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
