@@ -222,6 +222,7 @@ def _run_hermetic(args, qdrant_url="http://127.0.0.1:1"):
             text=True,
             env=env,
             timeout=120,
+            check=False,
         )
         return proc
     finally:
@@ -238,8 +239,8 @@ class TestBehavioralHermetic:
         proc = _run_hermetic(["--no-ssot"])
         out = proc.stdout + proc.stderr
         assert proc.returncode == 1, (
-            "ожидался итоговый rc=1 (qdrant недоступен), получен %s; вывод:\n%s"
-            % (proc.returncode, out)
+            f"ожидался итоговый rc=1 (qdrant недоступен), получен {proc.returncode}; "
+            f"вывод:\n{out}"
         )
         assert "WARN: Qdrant snapshot failed" in out, "не отработала ветка «сервер не запущен»"
         assert "Backing up console state" in out, (
@@ -259,6 +260,6 @@ class TestBehavioralHermetic:
         proc = _run_hermetic(["--no-ssot", "--no-qdrant"])
         out = proc.stdout + proc.stderr
         assert proc.returncode == 0, (
-            "ожидался rc=0, получен %s; вывод:\n%s" % (proc.returncode, out)
+            f"ожидался rc=0, получен {proc.returncode}; вывод:\n{out}"
         )
         assert "=== Backup completed:" in out, "нет финальной строки успеха"
