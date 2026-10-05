@@ -4,6 +4,13 @@
 # Использование: ./backup.sh [--no-ssot] [--no-qdrant] [--no-documents] [--test-restore]
 #   --test-restore  Проверить полный цикл: snapshot → restore → verify → cleanup
 # Cron: ежедневно в 3:00
+#
+# Контракт exit-кодов (Н10, code-2026-10-05-deploy-host-mechanism):
+#   0 — все шаги ок (или осознанные skip: нет .env / нет данных / не воскресенье);
+#   1 — один или несколько шагов провалились: прогон доведён до конца (провал
+#       шага НЕ прерывает остальные), провалившиеся шаги перечислены в финальной
+#       строке «Backup completed WITH ERRORS (…)». Потребитель: preflight-бэкап
+#       ansible/playbooks/update.yml — rc=1 => STOP до мутаций.
 
 set -euo pipefail
 
@@ -46,7 +53,11 @@ create_qdrant_snapshot() {
         return 1
     fi
     echo "    Collections: ${collections}"
-    local c ok=1
+    # Н10 (code-2026-10-05-deploy-host-mechanism): ПРЯМАЯ rc-семантика —
+    # rc=0 = полный успех (раньше был ok=1 + `return $ok`: успех → rc=1, а провал
+    # создания снапшота → rc=0, т.е. инверсия). Ранний return 1 (сервер не
+    # запущен / нет коллекций) выше — сохранён намеренно.
+    local c rc=0
     for c in $collections; do
         local resp actual
         resp=$(curl -s -X POST "${QDDRANT_URL}/collections/${c}/snapshots" \
@@ -57,13 +68,13 @@ create_qdrant_snapshot() {
         actual=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['name'])" 2>/dev/null)
         if [ -n "$actual" ]; then
             echo "    ✔ ${c}: ${actual}"
-            validate_snapshot "${c}" "${actual}" || ok=0
+            validate_snapshot "${c}" "${actual}" || rc=1
         else
             echo "    ✖ ${c}: ${resp}"
-            ok=0
+            rc=1
         fi
     done
-    return $ok
+    return "$rc"
 }
 
 # --- Snapshot validation (G1.1) ---
@@ -752,7 +763,13 @@ if [ "$VERIFY" = true ]; then
 fi
 
 # Regular backup flow
-[ "$NO_QDRANT" = false ] && create_qdrant_snapshot
+# Н10: провал qdrant-шага НЕ прерывает прогон — rc аккумулируется (паттерн
+# CONSOLE_RC ниже), остальные бэкапы выполняются всегда, итоговый exit
+# отдаётся ПОСЛЕ полного прогона. { … || QDRANT_RC=1; } гасит set -e внутри
+# AND-списка: без braces функция — последняя команда списка, её не-0 статус
+# молча убивал скрипт сразу после успешной валидации снапшота.
+QDRANT_RC=0
+[ "$NO_QDRANT" = false ] && { create_qdrant_snapshot || QDRANT_RC=1; }
 [ "$NO_SSOT" = false ] && backup_ssot_git
 # P2-1 (code-2026-10-02-bibliography): documents ДО weekly — иначе воскресный
 # weekly-тар забирает прошлый прогон (backup_documents шёл после weekly).
@@ -768,8 +785,13 @@ backup_secrets         # code-2026-09-22-002 P1-4: .env (guard P2-9 — skip б�
 backup_errors_state    # Error→Rule Ф4: config/aggregates/alert_state (без notify.json)
 rotate_backups
 
-if [ "$CONSOLE_RC" -ne 0 ]; then
-    echo "=== Backup completed WITH ERRORS (console state — см. ✖ выше): ${TIMESTAMP} ==="
+# Н10: итоговый rc — по аккумуляции провалов (qdrant / console); финальная
+# строка называет провалившиеся шаги одной строкой.
+if [ "$QDRANT_RC" -ne 0 ] || [ "$CONSOLE_RC" -ne 0 ]; then
+    failed_steps=""
+    if [ "$QDRANT_RC" -ne 0 ]; then failed_steps="qdrant-snapshot"; fi
+    if [ "$CONSOLE_RC" -ne 0 ]; then failed_steps="${failed_steps:+${failed_steps}, }console-state"; fi
+    echo "=== Backup completed WITH ERRORS (${failed_steps} — см. ✖ выше): ${TIMESTAMP} ==="
     exit 1
 fi
 echo "=== Backup completed: ${TIMESTAMP} ==="

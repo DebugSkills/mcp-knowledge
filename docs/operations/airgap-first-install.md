@@ -194,6 +194,10 @@ make -C ansible update-local BUNDLE=/media/…/mcp-kb-update-<ISO>.tar.gz
 
 Стор моделей уже не пуст ⇒ deadlock (Шаг 4) не возникает.
 
+Дефолт делает полный preflight-бэкап (после фикса Н10 — с корректным rc); для air-gap по
+решению оператора (фуллбек-промежутки не нужны) рекомендуется `SKIP_BACKUP=1` — как в
+«Весь поток — через таргеты make», шаг 3 ниже.
+
 ## Диагностика и грабли
 
 Логи: `/kvm/update-bundles/bundle-pack-<TS>.log`, `pack.log`, `ship-<TS>.log`, `ship-net.log`.
@@ -315,17 +319,18 @@ make airgap-update BUNDLE=/var/tmp/update-bundle/mcp-kb-update-<ISO>.tar.gz SKIP
 `environment: DATA_ROOT: "{{ data_root }}"`. Тот же контракт — у `deploy.yml` (cron-env)
 и `ansible/playbooks/backup.yml`.
 
-### Н10 — тихий выход полного `backup.sh` (открытый пункт; трасса code-2026-10-02-bibliography)
+### Н10 — тихий выход полного `backup.sh` — ИСПРАВЛЕНО (2026-10-05, трасса code-2026-10-05-deploy-host-mechanism)
 
-Симптом: полный `bash scripts/backup.sh` завершается **RC=1 молча** сразу после блока
-Qdrant-снапшотов: stdout обрывается на «OK: Snapshot validated …», stderr пуст, до
-SSOT-шага не доходит. Причина-класс: `set -euo pipefail` + диспетчер вида
-`[ "$NO_QDRANT" = false ] && create_qdrant_snapshot` (`backup.sh:755`) — не-0 из функции
-делает не-0 весь AND-список и убивает скрипт. Проверено: `backup.sh --no-qdrant` → RC=0
-(SSOT уходит в tar-fallback при отсутствии remote `backup` — штатно для air-gap;
-console/secrets/errors-тары создаются в `$DATA_ROOT/backups`). Правильный паттерн — как у
-console-state: фиксировать RC шага и отдавать его в `exit` в конце, а не прерывать прогон.
-Файл правит другая трасса — здесь только фиксация.
+Симптом (история): полный `bash scripts/backup.sh` завершался **RC=1 молча** сразу после
+блока Qdrant-снапшотов — stdout обрывался на «OK: Snapshot validated …», до SSOT-шага
+не доходило. Корень: **инверсия rc** в `create_qdrant_snapshot` (успех → rc=1, провал
+валидации → rc=0) плюс голый `[ "$NO_QDRANT" = false ] && create_qdrant_snapshot` под
+`set -e`: не-0 успешной функции убивал скрипт, а провал валидации маскировался rc=0 —
+дефолтный air-gap апдейт падал до мутаций. Фикс: `rc=0` на успехе; вызов аккумулирует
+`QDRANT_RC` (`{ … || QDRANT_RC=1; }` — паттерн console-state), прогон идёт до конца,
+итоговый `exit 0/1` называет провалившиеся шаги; провал валидации снапшота больше НЕ
+маскируется (rc=1 preflight-бэкапа `update.yml` → STOP до мутаций). Смотреть:
+`scripts/backup.sh` (контракт exit-кодов в шапке), тест `tests/test_backup_rc_semantics.py`.
 
 ### Dirty-гейт `update.yml` — защита, не баг
 
