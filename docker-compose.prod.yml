@@ -102,9 +102,6 @@ services:
   # (bibliography Ф1, план §4.3). Bridge-сеть (как qdrant/ollama): внутри 0.0.0.0:8660,
   # наружу — ТОЛЬКО loopback хоста 127.0.0.1:8660 (host-net mcp-server → localhost:8660).
   kb-converter:
-    build:
-      context: ./kb-converter
-      dockerfile: Dockerfile
     image: mcp-knowledge-kb-converter:latest   # явное имя (анти-дрейф; air-gap)
     container_name: mcp-knowledge-converter
     ports:
@@ -135,7 +132,7 @@ services:
         max-file: "3"
 
   mcp-server:
-    image: mcp-knowledge-server:prod
+    image: mcp-knowledge-mcp-server:latest
     container_name: mcp-knowledge-server
     # host-сеть: доступ к loopback-ПОРТАМ хоста, куда публикуют свои порты
     # bridge-контейнеры этого compose: ollama → 127.0.0.1:11435, qdrant → 6333

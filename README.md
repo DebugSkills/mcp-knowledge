@@ -117,7 +117,11 @@ docker run -d --name kb-console \
 
 ## 📦 Продовый деплой (air-gap, одноархивный bundle)
 
-> ⚠️ **Legacy-путь:** `offline-deploy.sh` готовит модели в **host-ollama** (системный сервис, 11434). После миграции 2026-09 прод-топология — ollama-КОНТЕЙНЕР compose (:11435). Для новых развёртываний используйте `docker compose -f docker-compose.prod.yml up -d` + `ansible/` (перенос). Air-gap скрипт будет доработан под контейнерную топологию отдельной задачей.
+**Канонический путь обновления существующего узла (038):** `make bundle-pack` → `make bundle-ship-usb | bundle-ship-net` → на узле `make airgap-update BUNDLE=… [SKIP_BACKUP=1]` (альтернатива — `make prod-update-local BUNDLE=…`). Полный ранбук (первичная установка + обновление): `docs/operations/airgap-first-install.md`, печать — `make airgap-runbook`.
+
+> ⚠️ **Legacy-путь** (`make bundle` + `offline-deploy.sh` ниже): модели в **host-ollama** (системный сервис, 11434); после миграции 2026-09 прод-топология — ollama-КОНТЕЙНЕР compose (:11435). `docker-compose.prod.yml` нужен только этому legacy-бандлу — НЕ используйте его для новых развёртываний (новые узлы и обновления — 038-пакетом, см. ранбук выше). Имена образов унифицированы (2026-10-05, трасса `code-2026-10-05-deploy-host-mechanism`): `mcp-knowledge-mcp-server:latest` / `kb-console:prod` / `mcp-knowledge-kb-converter:latest`.
+
+> 🔁 **Миграция legacy-узлов (однократно):** если `docker image ls` ещё содержит `mcp-knowledge-server:prod` (установка старым бандлом) — выполните `docker tag mcp-knowledge-server:prod mcp-knowledge-mcp-server:latest`, иначе `:prev`-ретег при 038-апдейте не сработает для серверного образа.
 
 ```bash
 make bundle                          # машина с интернетом → mcp-kb-airgap-bundle.tar.gz (~1.2 GB)

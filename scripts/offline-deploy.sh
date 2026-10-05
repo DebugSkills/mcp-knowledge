@@ -26,7 +26,7 @@ GIT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"   # git-корень (при prepare)
 STAGING_DIR="$GIT_ROOT/artifacts/staging"  # каталог, который уходит в bundle (prepare)
 BUNDLE="$GIT_ROOT/mcp-kb-airgap-bundle.tar.gz"
 
-MCP_IMAGE="mcp-knowledge-server:prod"
+MCP_IMAGE="mcp-knowledge-mcp-server:latest"
 QDRANT_IMAGE="qdrant/qdrant:v1.13.4"
 KB_CONSOLE_IMAGE="kb-console:prod"
 KB_CONVERTER_IMAGE="mcp-knowledge-kb-converter:latest"
