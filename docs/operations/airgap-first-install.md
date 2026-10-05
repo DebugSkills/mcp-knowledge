@@ -119,6 +119,7 @@ make bundle-ship-net ARGS="--host $JUMP --rsync-path 'ssh -o BatchMode=yes aikb 
    между ними едут только **код и модели**. На узле — собственный git-репозиторий `/opt/mcp-knowledge/knowledge`,
    ветка `main`, **≥1 коммит** (иначе mcp-server не стартует), наполняется своим содержимым.
 3. Vault (Э4): значения в `inventory/group_vars/all/vault.yml` (связка console/cron).
+4. Маркер air-gap узла: `install -D /dev/null /etc/mcp-knowledge/airgap-node` (`AIRGAP_NODE_MARKER` в `Makefile`) — включает guard, запрещающий `make push`/`make deploy` на узле (сборка из исходников там недопустима).
 
 ## Шаг 4 — распаковка (aikb, root)
 
@@ -196,7 +197,16 @@ make -C ansible update-local BUNDLE=/media/…/mcp-kb-update-<ISO>.tar.gz
 
 Дефолт делает полный preflight-бэкап (после фикса Н10 — с корректным rc); для air-gap по
 решению оператора (фуллбек-промежутки не нужны) рекомендуется `SKIP_BACKUP=1` — как в
-«Весь поток — через таргеты make», шаг 3 ниже.
+«Весь поток — через таргеты make», шаг 3 ниже; ⚠️ данные при этом не откатываются —
+см. Rollback-hint прогона / Шаг 8.
+
+## Шаг 8 — пост-апдейт проверка на узле (aikb)
+
+Канонический прогон — `make verify-deploy` (`scripts/verify-deploy.sh`: 7 проверок,
+exit-код = число упавших; ожидаемо `7 passed / 0 failed`) или автоматически
+`VERIFY=1 make airgap-update BUNDLE=…` (см. `Makefile`, таргеты `verify-deploy` /
+`airgap-update`). Fallback-минимум: `make -C ansible health`, grep `'[ERROR]|Traceback'`
+в `docker logs mcp-knowledge-server`, MCP `tools/list` ≥ 30.
 
 ## Диагностика и грабли
 

@@ -71,6 +71,13 @@ AIRGAP_WORK ?= /var/tmp/airgap-make
 # задаётся явно: make ... INVENTORY_DIR=/root/mcp-knowledge/ansible/inventory/
 INVENTORY_DIR ?= $(CURDIR)/inventory/
 update-airgap:
+	@set -e; missing=""; for b in git python3 ansible-playbook tar docker; do \
+		command -v "$$b" >/dev/null 2>&1 || missing="$$missing $$b"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "✋ air-gap апдейт требует на узле:$$missing (установите и повторите)"; \
+		exit 1; \
+	fi
 	@test -n "$(BUNDLE)" || { echo 'usage: make update-airgap BUNDLE=<пакет.tar.gz|каталог> [SKIP_BACKUP=1] [CHECK=1]'; exit 1; }
 	@set -e; \
 	rm -rf "$(AIRGAP_WORK)"; mkdir -p "$(AIRGAP_WORK)"; \

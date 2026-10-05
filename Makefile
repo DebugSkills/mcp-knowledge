@@ -3,6 +3,10 @@ DATA_DIR := ../data
 KNOWLEDGE_DIR := ../knowledge
 MODELS_DIR := ../models_cache
 
+# Маркер air-gap узла: файл есть → deploy/push запрещены (сборка из
+# исходников требует интернета; обновление узла — только пакетом).
+AIRGAP_NODE_MARKER ?= /etc/mcp-knowledge/airgap-node
+
 .PHONY: dev deploy down logs test lint clean dlq-replay reindex backup prereq-dirs errors-view errors-report errors-alert errors-notify-import errors-cron-install errors-cron-remove errors-cron-status errors-cron-cleanup prod-errors-cron-cleanup help
 
 # help: self-documenting список команд (docstring через `##` попадает сюда)
@@ -52,8 +56,13 @@ dev-follow-console:
 dev-resources:
 	@docker stats --format "table {{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.CPUPerc}}"
 
-# deploy: сборка образов (mcp-server + kb-console) и запуск стека в фоне
-deploy: prereq-dirs
+# deploy: сборка образов (mcp-server + kb-console) и запуск стека в фоне.
+# На air-gap узле (маркер AIRGAP_NODE_MARKER) запрещено — обновление пакетом.
+deploy: prereq-dirs  ## Сборка+запуск стека в фоне (НЕ для air-gap узла — маркер-гвард)
+	@if [ -f "$(AIRGAP_NODE_MARKER)" ]; then \
+		echo "✋ Это air-gap узел (маркер $(AIRGAP_NODE_MARKER)): обновление — только пакетом (make bundle-pack → перенос → на узле make airgap-update BUNDLE=…), сборка из исходников на узле недопустима"; \
+		exit 1; \
+	fi
 	$(DOCKER_COMPOSE) up -d --build --force-recreate
 
 down:
@@ -146,12 +155,17 @@ airgap-pack:  ## Air-gap: пакет-подмножество (код + лока
 # ─── Air-gap апдейт узла ОДНОЙ командой: playbook берётся ИЗ ПАКЕТА (O24-proof) ───
 #   make airgap-update BUNDLE=/var/tmp/update-bundle/mcp-kb-update-<ISO>.tar.gz SKIP_BACKUP=1
 # Сам распаковывает пакет, тянет СВЕЖИЕ ansible/ + playbook из пакета, играет от
-# inventory узла; SKIP_BACKUP=1 → -e update_skip_backup=true; CHECK=1 → --check --diff.
+# inventory узла; SKIP_BACKUP=1 → -e update_skip_backup=true; CHECK=1 → --check --diff;
+# VERIFY=1 → пост-апдейтный verify (scripts/verify-deploy.sh из каталога узла).
 airgap-inventory ?= /root/mcp-knowledge/ansible/inventory/
-airgap-update:  ## Air-gap: апдейт узла одной командой (BUNDLE=… [SKIP_BACKUP=1] [CHECK=1])
-	@test -n "$(BUNDLE)" || { echo 'usage: make airgap-update BUNDLE=<пакет.tar.gz|каталог> [SKIP_BACKUP=1] [CHECK=1]'; exit 1; }
+airgap-update:  ## Air-gap: апдейт узла одной командой (BUNDLE=… [SKIP_BACKUP=1] [CHECK=1] [VERIFY=1])
+	@test -n "$(BUNDLE)" || { echo 'usage: make airgap-update BUNDLE=<пакет.tar.gz|каталог> [SKIP_BACKUP=1] [CHECK=1] [VERIFY=1]'; exit 1; }
 	$(MAKE) -C ansible update-airgap BUNDLE="$(BUNDLE)" INVENTORY_DIR="$(airgap-inventory)" \
 	  SKIP_BACKUP=$(SKIP_BACKUP) CHECK=$(CHECK)
+	@if [ "$(VERIFY)" = "1" ]; then \
+		echo "~~~ post-update verify…"; \
+		bash scripts/verify-deploy.sh || exit $$?; \
+	fi
 
 bundle-pack:  ## 038: полный офлайн-бандл (образы+код+модели+carrier+python-база) — прогресс и лог (ARGS=…)
 	./scripts/airgap-bundle-pack.sh $(ARGS)
@@ -360,7 +374,11 @@ verify-deploy:  ## Post-deploy проверки стека: /health + логи +
 # --no-verify — иначе pre-push hook (.git/hooks/pre-push → preflight.sh)
 # погнал бы гейт ВТОРОЙ раз (~4-5 мин). Штатный escape задокументирован
 # в README («git push --no-verify — escape-hatch»).
-push: preflight  ## Пуш+деплой стека: preflight → git push --no-verify → deploy → verify-deploy
+push: preflight  ## Пуш+деплой стека: preflight → git push --no-verify → deploy → verify-deploy (НЕ для air-gap узла)
+	@if [ -f "$(AIRGAP_NODE_MARKER)" ]; then \
+		echo "✋ Это air-gap узел (маркер $(AIRGAP_NODE_MARKER)): обновление — только пакетом (make bundle-pack → перенос → на узле make airgap-update BUNDLE=…), сборка из исходников на узле недопустима"; \
+		exit 1; \
+	fi
 	@echo ""
 	@echo "1/4 ✔ preflight пройден → git push --no-verify (гейт уже прогнан выше)"
 	@git push --no-verify
