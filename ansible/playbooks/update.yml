@@ -652,5 +652,7 @@
           - "     выполните шаги 1-3 выше (новый образ без миграций = риск)."
           - "Проверка после отката: make prod-health + git -C {{ clone_dir }} rev-parse HEAD == {{ prev_head.stdout }}"
           - "  + docker image inspect -f '{% raw %}{{.Id}}{% endraw %}' mcp-knowledge-mcp-server:latest == Id тега :prev"
-          - "  ⚠️ ДАННЫЕ (knowledge/, data/documents, qdrant-сторадж) при SKIP_BACKUP=1 этим прогоном не бэкапились и НЕ откатываются — откатывается только КОД; при обычном прогоне данные восстанавливайте из preflight-бэкапа $DATA_ROOT/backups."
+          - "  ⚠️ ДАННЫЕ (knowledge/, data/documents, qdrant) при SKIP_BACKUP=1 этим прогоном"
+          - "     не бэкапились и НЕ откатываются — откатывается только КОД; при обычном"
+          - "     прогоне восстанавливайте данные из preflight-бэкапа $DATA_ROOT/backups."
           - "Крайняя мера — restore из фуллбека: RUNBOOK §10 / docs/restore-runbook.md (Сценарий 3)."
