@@ -51,6 +51,11 @@ SUPPRESSION_FILE = "suppression.json"
 AUDIT_FILE = "audit.jsonl"
 
 
+def _sig_source(sig: str) -> str:
+    """Источник сигнатуры — префикс до первого '|' (формат: source|marker|message)."""
+    return (sig or "").split("|", 1)[0]
+
+
 def _is_4xx_with_actor(ev) -> bool:
     """user-impact (§13.3:190): 4xx-ответ конкретному актору."""
     st = ev.get("status")
@@ -263,6 +268,20 @@ audit_event = _audit
 
 
 def cli_add(sink, sig, reason, until, actor) -> int:
+    # Immune-источники (host/health/docker_events) suppression-лист НЕ глушит
+    # (`_is_suppression_immune`) ⇒ запись была бы no-op и создавала ложную
+    # уверенность: оператор думает «заглушил», а сигнатура продолжает идти P0.
+    # Фикс такого класса — в классификации/дедупе источника, не в suppression
+    # (канон §11.3: «сначала фикс источника, потом гвард»). Инцидент 2026-10-05:
+    # 12 записей orchestrator-033 для docker_events/health были инертны (sup=0).
+    src = _sig_source(sig)
+    if src in GUARD_IMMUNE_SOURCES:
+        print(
+            f"отказ: источник '{src}' иммунен (GUARD_IMMUNE_SOURCES) — "
+            "suppression-лист его НЕ глушит, запись была бы no-op. "
+            "Фикс — в классификации/дедупе источника, не в suppression (канон §11.3)."
+        )
+        return 2
     data = load_suppression(sink)
     data[sig] = {"reason": reason, "until": until, "added_at": now_iso(),
                  "added_by": actor}

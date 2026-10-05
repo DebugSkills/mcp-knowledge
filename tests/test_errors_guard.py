@@ -444,3 +444,35 @@ def test_19_from_env_contract(tmp_path, monkeypatch):
     # remove без сигнатуры вовсе → exit 2
     monkeypatch.delenv("SIG", raising=False)
     assert eg.main(["--sink", str(tmp_path), "remove", "--from-env"]) == 2
+
+
+# ── 20. Durable-инвариант: immune-источники нельзя добавить в suppression ──
+
+def test_20_immune_source_add_refused(tmp_path, monkeypatch):
+    """guard-add для host/health/docker_events → exit 2, файл НЕ создаётся.
+
+    Иначе оператор получает no-op запись и ложную уверенность: suppression-лист
+    эти источники не глушит (`_is_suppression_immune`), а сигнатура продолжает
+    идти P0. Инцидент 2026-10-05: 12 записей orchestrator-033 (docker_events/
+    health) были инертны — `sup=0` при активном until."""
+    immune = [
+        "host|DISK|disk / <n>% used",
+        "health|HEALTH|health http://localhost:<n>/health → degraded:http_503",
+        "docker_events|LIFECYCLE|docker event: die container=x exit=<n>",
+    ]
+    for sig in immune:
+        assert eg.main(["--sink", str(tmp_path), "add", sig, "--reason", "r"]) == 2, sig
+    assert not (tmp_path / "suppression.json").exists(), "no-op записи не создаются"
+    # не-immune источник — по-прежнему разрешён (фильтр не сломал рабочий путь)
+    assert eg.main(["--sink", str(tmp_path), "add", "docker_logs|REQ|noise <n>",
+                    "--reason", "r"]) == 0
+    assert list(json.loads((tmp_path / "suppression.json").read_text())) == \
+        ["docker_logs|REQ|noise <n>"]
+    # remove ранее созданной immune-записи не блокируется (чистка legacy-листа)
+    tmp2 = tmp_path / "cleanup"
+    tmp2.mkdir()
+    immune_sig = immune[2]
+    (tmp2 / "suppression.json").write_text(
+        json.dumps({immune_sig: {"reason": "legacy no-op"}}))
+    assert eg.main(["--sink", str(tmp2), "remove", immune_sig]) == 0
+    assert json.loads((tmp2 / "suppression.json").read_text()) == {}
