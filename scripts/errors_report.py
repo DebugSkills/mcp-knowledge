@@ -576,7 +576,8 @@ def cmd_weekly(sink, send_tg):
     raw = raw_stats_7d(sink, aggs)
     met = metrics(aggs, alert, raw)
 
-    p0 = sorted([(s, a) for s, a in aggs.items() if a.get("priority") == "P0"],
+    p0 = sorted([(s, a) for s, a in aggs.items() if a.get("priority") == "P0"
+                 and a.get("status") != "resolved"],
                 key=lambda kv: -kv[1].get("count_7d", 0))
     p12 = sorted([(s, a) for s, a in aggs.items() if a.get("priority") in ("P1", "P2")
                   and a.get("status") != "resolved"],

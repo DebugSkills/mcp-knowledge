@@ -90,3 +90,19 @@ def test_suppress_candidates_skips_resolved(tmp_path, capsys):
     er.cmd_weekly(sink, send_tg=False)
     out = capsys.readouterr().out.split("## 8.")[1]
     assert "- (пусто)" in out
+
+
+def test_p0_section_skips_resolved(tmp_path, capsys):
+    """§2: resolved-P0 не печатается (паритет с §3/§8) — иначе errors-resolve не разгружает полку."""
+    aggs = {
+        "sig|resolved-p0": _agg(priority="P0", status="resolved", fixed_at=_iso(1),
+                                last_seen=_iso(10), count_7d=30,
+                                last_example={"message": "RESOLVED_P0_MARKER"}),
+        "sig|active-p0": _agg(priority="P0", status="active", last_seen=_iso(1),
+                              count_7d=9, last_example={"message": "ACTIVE_P0_MARKER"}),
+    }
+    sink = _sink(tmp_path, aggs)
+    er.cmd_weekly(sink, send_tg=False)
+    sec2 = capsys.readouterr().out.split("## 2.")[1].split("## 3.")[0]
+    assert "ACTIVE_P0_MARKER" in sec2
+    assert "RESOLVED_P0_MARKER" not in sec2
