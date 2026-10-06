@@ -18,7 +18,7 @@ import re
 import time
 
 from ..storage.schema import ZONE_PRIVATE, ZONE_PUBLIC, collection_for_zone
-from .auth_zone import is_admin
+from .auth_zone import auth_zone_scope, is_admin
 from .citation_enrich import citations_for_refs
 
 logger = logging.getLogger("mcp_knowledge.tools.read")
@@ -169,16 +169,20 @@ async def get_entry(params: dict, app_state) -> dict:
         return {"error": f"Knowledge entry not found: '{knowledge_id}'"}
 
     fm = entry.frontmatter
-    # Fail-closed (P2-1): ниже admin не видит даже существования private-записей
-    if not is_admin(params) and getattr(fm, "zone", ZONE_PRIVATE) != ZONE_PUBLIC:
+    # Fail-closed (P2-1 + Ф2.0): зона записи должна входить в скоуп ключа
+    # (write/system: обе; zone_explicit-ключ: свой скоуп; legacy/env: public).
+    # Ниже скоупа запись «не существует» — без утечки факта её существования.
+    scope = auth_zone_scope(params)
+    entry_zone = getattr(fm, "zone", ZONE_PRIVATE)
+    if entry_zone not in scope:
         return {"error": f"Knowledge entry not found: '{knowledge_id}'"}
     children: list[dict] = []
     if getattr(fm, "content_type", None) == "collection":
-        # M2: on-the-fly TOC из Qdrant (frontmatter.children — legacy)
+        # M2: on-the-fly TOC из Qdrant (frontmatter.children — legacy).
+        # Ф2.0: TOC строится по зоне записи — она уже в скоупе ключа
+        # (сервисный read+both видит private-оглавление private-книги).
         try:
-            zone = getattr(fm, "zone", ZONE_PRIVATE)
-            if not is_admin(params):
-                zone = ZONE_PUBLIC  # TOC ниже admin строится только по public-зоне
+            zone = entry_zone if entry_zone in scope else ZONE_PUBLIC
             children = await _build_toc(knowledge_id, app_state, zone=zone)
         except Exception as exc:
             logger.warning("get_entry: _build_toc failed for %s: %s", knowledge_id, exc)

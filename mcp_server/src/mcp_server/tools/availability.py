@@ -16,30 +16,17 @@ AuthInfo или dict с key_level.
 from __future__ import annotations
 
 from ..content.source import is_public_license
-from .auth_zone import ADMIN_LEVELS
+from .auth_zone import zones_for_auth
 from .source_ref_index import SourceRef, SourceRefIndex
-
-# Уровни ключей с доступом к обеим зонам при ЧТЕНИИ (P2-1: private = admin-only).
-# admin-эквивалент = write (ADMIN_LEVELS из auth_zone — единая точка истины).
-# Запись не затрагивается: write-пути используют auth-free canonical_present.
-_FULL_ZONE_LEVELS = ADMIN_LEVELS
-
-
-def _auth_level(auth) -> str:
-    if isinstance(auth, dict):
-        return auth.get("level") or auth.get("key_level") or ""
-    return getattr(auth, "key_level", "") or ""
 
 
 def auth_zones(auth) -> set[str]:
-    """Зоны, доступные аутентифицированному ключу (P2-1: ниже admin → {public})."""
-    level = _auth_level(auth)
-    if level == "subscriber":
-        return {"public"}
-    if level in _FULL_ZONE_LEVELS:
-        return {"public", "private"}
-    # Без ключа/неизвестный уровень — только public (fail-closed).
-    return {"public"}
+    """Зоны, доступные ключу (Ф2.0): делегирует единой точке политики
+    auth_zone.zones_for_auth (parity by construction, R1 — дубль ликвидирован).
+
+    P2-1: ниже admin → {public}; Ф2.0: zone_explicit-ключ → скоуп из носителя.
+    """
+    return zones_for_auth(auth)
 
 
 def canonical_present(blobs: dict | None, exists_fn) -> bool:

@@ -28,6 +28,7 @@ from .config import settings
 from .prompts import PROMPTS, get_prompt
 from .resources import RESOURCES, get_kb_resource
 from .tools import TOOL_HANDLERS, TOOLS
+from .tools.auth_zone import ZoneAccessError
 
 logger = logging.getLogger("mcp_knowledge.mcp")
 
@@ -237,6 +238,21 @@ async def _handle_tools_call(params: dict, request_id: Any, request: Request) ->
         from .metrics import tool_requests
         tool_requests.labels(tool=tool_name, status="success").inc()
         return _jsonrpc_result({"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}, request_id)
+    except ZoneAccessError as exc:
+        # Ф2.0 (C1′/P1-2/R3): зонный отказ = auth-семантика (как 403 из
+        # check_tool_permission) → MCP_AUTH_FAILED, НЕ -32603 и БЕЗ
+        # ERROR-traceback (warning-строка — observability без шума в sink).
+        from .metrics import tool_requests
+        tool_requests.labels(tool=tool_name, status="forbidden").inc()
+        logger.warning(
+            "[MCP] tool=%s zone access denied: %s key=%s",
+            tool_name, exc, auth_info.key_hash or "none",
+        )
+        return _jsonrpc_error(
+            MCP_AUTH_FAILED,
+            f"Forbidden: {exc}",
+            request_id,
+        )
     except ResponseHandlingException as exc:
         # 033-F1: Qdrant REST (прод-путь, QDRANT_PREFER_GRPC=false) заворачивает любой
         # сбой send_inner в ResponseHandlingException(source=...) — api_client.py:127-130.
