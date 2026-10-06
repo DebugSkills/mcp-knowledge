@@ -43,6 +43,16 @@ def main() -> int:
         default=str(REPO_ROOT / "ai_workspace" / "registry"),
         help="каталог YAML-реестров (по умолчанию — ai_workspace/registry репо)",
     )
+    parser.add_argument(
+        "--max-downward-micro",
+        type=int,
+        default=None,
+        help=(
+            "гейт корректировки ВНИЗ глобального счётчика, микро-₽ (P2-3): "
+            "большая корректировка = подозрение на потерю журнала — отказ "
+            "вместо молчаливого «возврата» бюджета; None = без гейта"
+        ),
+    )
     args = parser.parse_args()
 
     registry = Registry(Path(args.registry_dir))
@@ -50,11 +60,18 @@ def main() -> int:
     redis = make_ws_redis()
 
     try:
-        report = reconcile_budget(redis=redis)
+        report = reconcile_budget(
+            redis=redis, max_downward_micro=args.max_downward_micro
+        )
     except QuotaRedisUnavailable as exc:
         print(json.dumps({"error": "ws-redis недоступен (fail-closed)", "detail": str(exc)},
                          ensure_ascii=False))
         return 2
+    except ValueError as exc:
+        # гейт корректировки ВНИЗ (P2-3): отказ осознанный, счётчики не тронуты
+        print(json.dumps({"error": "reconcile отказан (гейт вниз)", "detail": str(exc)},
+                         ensure_ascii=False))
+        return 3
     print(
         json.dumps(
             {

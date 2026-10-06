@@ -98,6 +98,16 @@ class Budget:
     per_user_mirror: bool
     reconcile: str
 
+    @property
+    def limit_micro(self) -> int:
+        """Лимит в микро-единицах валюты (int, P0-1): ``limit`` ₽ x 10^6.
+
+        ЕДИНИЦА бюджет-счётчиков ``ws:budget:*`` — микро-₽ (целое, INCRBY);
+        admission сравнивает счётчик именно с ``limit_micro`` (конверсия
+        здесь, при загрузке — единственная точка согласования единиц).
+        """
+        return round(self.limit * 1_000_000)
+
 
 def _err(code: str, message: str, path: str) -> Finding:
     return Finding(code=code, severity=SEVERITY_ERROR, message=message, path=path)

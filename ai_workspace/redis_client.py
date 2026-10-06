@@ -20,16 +20,30 @@ from typing import Any
 
 ENV_WS_REDIS_URL = "WS_REDIS_URL"
 
+DEFAULT_SOCKET_CONNECT_TIMEOUT = 2.0
+DEFAULT_SOCKET_TIMEOUT = 2.0
+"""Таймауты ws-клиента (P1-4 критики Ф4): «чёрная дыра» (порт открыт,
+ответа нет) не вешает вызов навсегда — соединение и каждая команда
+обрываются отказом, который контуры ws (квоты — admission.py) переводят
+в понятный fail-closed + ALARM, а не в зависание/трейс."""
+
 _client: Any = None
 """Кэш singleton (лениво; ``reset_ws_redis()`` — тесты/смена конфига)."""
 
 
-def make_ws_redis(url: str | None = None) -> Any:
+def make_ws_redis(
+    url: str | None = None,
+    *,
+    socket_connect_timeout: float = DEFAULT_SOCKET_CONNECT_TIMEOUT,
+    socket_timeout: float = DEFAULT_SOCKET_TIMEOUT,
+) -> Any:
     """Новый redis-клиент ws-контура (``decode_responses=True``).
 
     ``url=None`` → env ``WS_REDIS_URL`` (compose: ``redis://ws-redis:6379/0``);
     отсутствует → ``RuntimeError`` (fail-closed). Подключение ленивое:
-    реального I/O нет до первой команды.
+    реального I/O нет до первой команды. ``socket_connect_timeout`` /
+    ``socket_timeout`` — явные таймауты (P1-4: деградация = быстрый отказ,
+    не зависание; политика реакции — на контурах, напр. admission.py).
     """
     resolved = url or os.environ.get(ENV_WS_REDIS_URL)
     if not resolved:
@@ -39,7 +53,12 @@ def make_ws_redis(url: str | None = None) -> Any:
         )
     import redis  # лениво — модуль импортируется без установленного пакета
 
-    return redis.Redis.from_url(resolved, decode_responses=True)
+    return redis.Redis.from_url(
+        resolved,
+        decode_responses=True,
+        socket_connect_timeout=socket_connect_timeout,
+        socket_timeout=socket_timeout,
+    )
 
 
 def get_ws_redis(url: str | None = None) -> Any:
