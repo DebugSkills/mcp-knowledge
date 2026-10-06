@@ -1,0 +1,80 @@
+# Режим «статья» (приватный вариант) — Ф3.10: тот же граф, ВСЕ узлы на local-only.
+# Зонный гейт движка отказывает private-задаче на любой внешней полке, поэтому
+# приватный прогон обязан быть полностью локальным (L7: zone=private → local-only).
+# Схема: спека mode-engine §1; самопроверка: `make modes-validate` (S1–S8 + L1–L10).
+#
+# Два human-gate (HITL-first):
+#   structure — утверждение структуры: approve → critic, edit → analyst (правка → переработка);
+#   publish   — утверждение публикации: approve → финал, edit → editor (правка текста).
+# Ревизионная петля критика: critic->analyst разрешена ТОЛЬКО как on_revise (max_iterations: 3).
+id: statya-private
+version: 1
+shape: analyst-critic-editor
+contract: document
+zone: private
+output: {type: article, citation_policy: required, sections: [document, document+refs]}
+board: {buffer: board.md, store: job}
+nodes:
+  - id: analyst
+    kind: llm-step
+    role: analyst
+    model_class: local-only
+    inputs: [brief]
+    outputs: [draft]
+    writes: [draft]
+    retry: 2
+  - id: structure
+    kind: human-gate
+    actor: operator
+    prompt: "Утвердить структуру статьи?"
+    timeout: 24h
+    on_timeout: sleep
+    on_approve: critic
+    on_edit: analyst
+    writes: [structure]
+  - id: critic
+    kind: critic-gate
+    role: critic
+    model_class: local-only
+    inputs: [draft]
+    verdicts: [PASS, REVISE]
+    threshold: 0.80
+    max_iterations: 3
+    on_max_iter: fail
+    on_revise: analyst
+    writes: [verdict]
+  - id: editor
+    kind: llm-step
+    role: editor
+    model_class: local-only
+    inputs: [draft, verdict]
+    outputs: [document]
+    writes: [document]
+    retry: 2
+  - id: citer
+    kind: tool-step
+    tool: mcp.citation_attach
+    policy: strict
+    inputs: [document]
+    outputs: [document+refs]
+    writes: [document+refs]
+  - id: publish
+    kind: human-gate
+    actor: operator
+    prompt: "Утвердить статью к публикации?"
+    timeout: 24h
+    on_timeout: sleep
+    on_approve: null
+    on_edit: editor
+    writes: [publish]
+edges:
+  - analyst->structure
+  - structure->critic
+  - critic|PASS->editor
+  - critic->analyst
+  - editor->citer
+  - citer->publish
+gates:
+  structure: {type: human, blocks_output: false}
+  publish: {type: human, blocks_output: true}
+tools: [mcp.search_knowledge, mcp.get_entry, mcp.citation_attach]

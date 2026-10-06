@@ -35,6 +35,7 @@ from ai_workspace.orchestrator.job import JobRecord, JobState, compute_effect_id
 from ai_workspace.orchestrator.ledger import Ledger, MemoryLedger, RedisLedger
 
 __all__ = [
+    "EgressBlocked",
     "EngineError",
     "EngineResult",
     "LLMClient",
@@ -62,6 +63,15 @@ class TokenInvalid(EngineError):
     """resume_token не найден или уже использован (single-use)."""
 
 
+class EgressBlocked(EngineError):
+    """Зонный гейт сработал на границе вызова LLM: private не уходит в ext.
+
+    Hardening паттерна Local-First (Ф3.10, P1 критика): зонный предикат живёт
+    в ДВИЖКЕ, а не только в тестовом примитиве — иначе реальный маршрут
+    zone→egress не покрыт.
+    """
+
+
 # ── порты (инъектируемые зависимости) ────────────────────────────────────
 
 
@@ -69,7 +79,13 @@ class LLMClient(Protocol):
     """Шлюз LiteLLM (минимальный контракт движка)."""
 
     def complete(
-        self, *, role: str, model_class: str, prompt: str, inputs: Mapping[str, str]
+        self,
+        *,
+        role: str,
+        model_class: str,
+        prompt: str,
+        inputs: Mapping[str, str],
+        params: Mapping[str, Any] | None = None,
     ) -> str: ...
 
 
@@ -116,6 +132,7 @@ class ModeEngine:
         ledger: Ledger,
         registry: Any | None = None,
         artifacts: Any | None = None,
+        decoding: Any | None = None,
         seed_loader: Callable[[str], str] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -127,6 +144,7 @@ class ModeEngine:
         self.ledger = ledger
         self.registry = registry
         self.artifacts = artifacts
+        self.decoding = decoding
         self.seed_loader = seed_loader
         self.clock = clock
 
@@ -269,7 +287,7 @@ class ModeEngine:
         if cached is not None:
             output = str(cached["output"])
         else:
-            output = self._call_llm_with_retry(node, prompt, inputs)
+            output = self._call_llm_with_retry(rec, node, prompt, inputs)
             self.ledger.put(job_id, f"fx:{eff}", {"output": output})
 
         section = self._out_section(node)
@@ -304,7 +322,7 @@ class ModeEngine:
         if cached is not None:
             output = str(cached["output"])
         else:
-            output = self._call_llm_with_retry(node, prompt, inputs)
+            output = self._call_llm_with_retry(rec, node, prompt, inputs)
             self.ledger.put(job_id, f"fx:{eff}", {"output": output})
 
         verdict = self._parse_verdict(node, output)
@@ -328,16 +346,42 @@ class ModeEngine:
 
     # ── вспомогательное ──────────────────────────────────────────────────
 
-    def _call_llm_with_retry(self, node: Node, prompt: str, inputs: Mapping[str, str]) -> str:
+    def shelf_for(self, model_class: str) -> str:
+        """Полка по классу модели: реестр ``model_classes`` (heavy→ext, fast→local)."""
+        if self.registry is None:
+            return "local"
+        try:
+            classes = self.registry.get("model_classes") or {}
+        except Exception:  # noqa: BLE001 — реестр необязателен для исполнения
+            return "local"
+        spec = classes.get(model_class) or {}
+        shelf = spec.get("shelf")
+        if shelf:
+            return str(shelf)
+        return "local"  # local-only / неизвестный класс — безопасный дефолт
+
+    def _guard_zone(self, rec: JobRecord, node: Node, shelf: str) -> None:
+        """Зонный гейт ДО вызова модели: ``zone=private`` не уходит на внешнюю полку."""
+        if rec.zone == "private" and shelf != "local":
+            raise EgressBlocked(
+                f"zone=private недопустим вне local: узел {node.id!r} резолвится в полку {shelf!r} "
+                f"(model_class={node.get('model_class')!r})"
+            )
+
+    def _call_llm_with_retry(self, rec: JobRecord, node: Node, prompt: str, inputs: Mapping[str, str]) -> str:
+        model_class = str(node.get("model_class", "fast"))
+        self._guard_zone(rec, node, self.shelf_for(model_class))
+        params = self.decoding.as_params() if self.decoding is not None else {}
         attempts = int(node.get("retry", 0))
         last: Exception | None = None
         for _ in range(attempts + 1):
             try:
                 return self.llm.complete(
                     role=str(node.get("role", node.id)),
-                    model_class=str(node.get("model_class", "fast")),
+                    model_class=model_class,
                     prompt=prompt,
                     inputs=dict(inputs),
+                    params=params,
                 )
             except Exception as exc:  # noqa: BLE001 — ошибка шлюза LLM = повод для retry
                 last = exc

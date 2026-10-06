@@ -130,8 +130,10 @@ class FakeLLM:
         self.script = {k: list(v) for k, v in script.items()}
         self.calls: list[str] = []
 
-    def complete(self, *, role, model_class, prompt, inputs) -> str:
+    def complete(self, *, role, model_class, prompt, inputs, params=None) -> str:
         self.calls.append(role)
+        self.params_seen = getattr(self, "params_seen", [])
+        self.params_seen.append(dict(params or {}))
         queue = self.script.get(role)
         if not queue:
             raise AssertionError(f"нет скриптованного ответа для роли {role!r}")
