@@ -1,0 +1,41 @@
+# Квоты participant-ролей и бюджеты AI-верстака (Ф4.1, trace_id: arch-2026-10-05-ai-workspace).
+#
+# Вариант V2: participant-роли (admin/member/guest — роль АККАУНТА) живут здесь,
+# отдельно от node-ролей режимов (roles.yaml — не трогать). Основание — решения
+# оператора D1-D8 (трасса ai-workspace): D2 пресеты приоритетов, D3 токены/день,
+# D4 глобальный ₽/мес hard + per-user зеркало, D6 conc member<=2 / guest<=1 /
+# admin — только общий K, D7 сброс 00:00 локального дня, D8 приоритет per-job +
+# per-account.
+#
+# grants — ref-целостность на КЛАССЫ моделей из model_classes.yaml
+# (heavy/fast/local-only); local/ext — это полки (shelf), а не классы.
+# Все калибруемые числа помечены PLACEHOLDER (настраиваются по данным Ф4.7).
+version: 1
+
+defaults:
+  role: guest # роль нового аккаунта (D2); должна существовать в participants
+
+participants:
+  admin:
+    priority: high # D2: маппинг на MULT-очередь (high|med|low)
+    tokens_per_day: null # null = без личного лимита, только общий GPU-бюджет K
+    conc: null # null = без личного лимита слотов, только общий K файла-очереди
+    grants: [heavy, fast, local-only] # все классы (local + ext)
+  member:
+    priority: med # D2
+    tokens_per_day: 200000 # PLACEHOLDER — калибровка по данным Ф4.7
+    conc: 2 # инвариант D6 (member <= 2)
+    grants: [heavy, fast, local-only] # local + ext
+  guest:
+    priority: low # D2
+    tokens_per_day: 50000 # PLACEHOLDER — калибровка по данным Ф4.7
+    conc: 1 # инвариант D6 (guest <= 1)
+    grants: [fast, local-only] # только local-полка: heavy (ext) не выдан
+
+budgets:
+  ext: # внешний провайдер (DeepSeek) — глобальный hard-лимит D4
+    currency: RUB
+    period: month
+    limit: 3000 # PLACEHOLDER — калибровка по данным Ф4.7 (₽/мес, глобальный hard)
+    per_user_mirror: true # зеркало per-user, сверяется с LiteLLM
+    reconcile: nightly

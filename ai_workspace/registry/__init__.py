@@ -1,4 +1,7 @@
-"""Реестры режимов AI-верстака: roles/tools/gates/model_classes/shapes.
+"""Реестры AI-верстака: roles/tools/gates/model_classes/shapes + quotas.
+
+quotas (Ф4.1) — participant-роли и квоты; node-роли режимов остаются в
+roles.yaml и квотами не управляются.
 
 Ф3.5a-1 (trace_id: arch-2026-10-05-ai-workspace). Данные — YAML-файлы в
 каталоге реестра, по одному на kind. Контракты полей проверяет валидатор
@@ -33,6 +36,7 @@ class Registry:
         "gates",
         "model_classes",
         "shapes",
+        "quotas",  # Ф4.1: participant-роли/квоты; схема — registry/quotas.py
     )
 
     def __init__(self, dir: Path) -> None:

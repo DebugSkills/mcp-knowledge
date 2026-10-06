@@ -42,7 +42,14 @@ def _copy_registry(tmp_path: Path) -> Path:
 def test_load_and_get_all_kinds() -> None:
     reg = Registry(REGISTRY_DIR)
     reg.load()
-    assert set(Registry.kinds) == {"roles", "tools", "gates", "model_classes", "shapes"}
+    assert set(Registry.kinds) == {
+        "roles",
+        "tools",
+        "gates",
+        "model_classes",
+        "shapes",
+        "quotas",
+    }
     for kind in Registry.kinds:
         data = reg.get(kind)
         assert isinstance(data, dict) and data, f"реестр {kind} пуст"
