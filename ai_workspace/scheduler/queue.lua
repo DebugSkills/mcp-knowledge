@@ -19,9 +19,12 @@
 -- KEYS[4] starve  = ws:starve:{shelf}          ZSET, score = starve_deadline
 -- ARGV[1] call — id вызова (член ZSET)
 -- ARGV[2] prio, ARGV[3] class — метаданные 3×3 (ключ vftlast приходит в KEYS;
---        в ARGV — только для журнала/отладки, скрипт их не использует)
+--        Ф3.4: пишутся в per-call HASH — источник prio/class для preempt)
 -- ARGV[4] weight = w(p,c) (посчитан в Python: policy.weight)
 -- ARGV[5] cost_est, ARGV[6] now, ARGV[7] starve_deadline = now + T_starve[class]
+-- ARGV[8] job, ARGV[9] epoch, ARGV[10] attempt (Ф3.4: per-call HASH);
+-- ARGV[11] callkey = ws:call:{shelf}:{call} ("" → HASH не пишется; ключ в
+--        ARGV, не в KEYS — паттерн lease_prefix DEQUEUE_ACQUIRE).
 -- Возвращает: vft (строка %.17g).
 -- PUBLISH ws:kick / XADD event-commit — НЕ здесь (Ф3.3).
 local function f2s(x) return string.format('%.17g', x) end
@@ -36,6 +39,14 @@ local vft = math.max(V, last) + cost / w
 redis.call('SET', KEYS[3], f2s(vft))
 redis.call('ZADD', KEYS[1], f2s(vft), ARGV[1])
 redis.call('ZADD', KEYS[4], ARGV[7], ARGV[1])  -- дедлайн уже строкой из Python
+-- per-call HASH (Ф3.4): исходное состояние для requeue/preempt — vft и
+-- starve_deadline хранятся строками %.17g (round-trip без усечения).
+if ARGV[11] and ARGV[11] ~= '' then
+  redis.call('HSET', ARGV[11],
+    'prio', ARGV[2], 'class', ARGV[3], 'job', ARGV[8],
+    'epoch', ARGV[9], 'attempt', ARGV[10],
+    'vft', f2s(vft), 'starve_deadline', ARGV[7])
+end
 return f2s(vft)
 
 -- @script dequeue
@@ -212,3 +223,49 @@ if #taken < take_limit then
   end
 end
 return taken
+
+-- @script REQUEUE
+-- Возврат снятого вызова в очередь (Ф3.4; preempt / свипер / human-gate
+-- resume — спека §3 «sweeper: re-enqueue(vft сохранить, retry++)» и §4
+-- «re-enqueue с vft-кредитом за сделанное»). Пишет в ОБА индекса — контракт,
+-- на который ориентируется fail-safe-ветка dequeue (член q без starve).
+-- ИНВАРИАНТЫ:
+--   I2 — starve-дедлайн СОХРАНЯЕТСЯ (исходный score ws:starve): aging-пол
+--        не сбрасывается вытеснением, иначе preempt-loop → livelock;
+--   I4 — epoch-fencing: stored.epoch > ARGV[3] → отказ БЕЗ записей
+--        (поздний redelivery со старым epoch не «воскресает»).
+-- KEYS[1] q, KEYS[2] starve, KEYS[3] callkey = ws:call:{shelf}:{call}.
+-- ARGV[1] call, ARGV[2] now (контракт группы; скриптом не читается — время
+--        инъектируется из Python), ARGV[3] epoch, ARGV[4] vft_override|""
+--        (preempt-кредит; "" → исходный stored vft).
+-- Возврат: 1 — requeued (ZADD q + ZADD starve СТАРЫЙ дедлайн + HSET vft +
+--          HINCRBY attempt); 0 — per-call записи нет ИЛИ stale epoch
+--          (в обоих случаях НИКАКИХ записей).
+local epoch = tonumber(ARGV[3])
+if not epoch then
+  return redis.error_reply('REQUEUE: bad ARGV epoch')
+end
+local rec = redis.call('HGETALL', KEYS[3])
+if #rec == 0 then return 0 end
+local stored = {}
+for i = 1, #rec, 2 do stored[rec[i]] = rec[i + 1] end
+if (tonumber(stored['epoch']) or 0) > epoch then
+  return 0  -- I4: stale epoch — отказ без записи
+end
+local vft_str
+if ARGV[4] ~= '' then
+  if not tonumber(ARGV[4]) then
+    return redis.error_reply('REQUEUE: bad ARGV vft_override')
+  end
+  vft_str = ARGV[4]
+else
+  vft_str = stored['vft']
+end
+local dl_str = stored['starve_deadline']
+if not vft_str or not dl_str then return 0 end  -- повреждённая запись
+-- score — СТРОКАМИ %.17g: конверсия Lua-number в redis.call усекает дробь.
+redis.call('ZADD', KEYS[1], vft_str, ARGV[1])
+redis.call('ZADD', KEYS[2], dl_str, ARGV[1])  -- I2: дедлайн КАК ЕСТЬ
+redis.call('HSET', KEYS[3], 'vft', vft_str)
+redis.call('HINCRBY', KEYS[3], 'attempt', 1)  -- retry++
+return 1

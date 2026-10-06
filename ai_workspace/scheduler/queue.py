@@ -6,8 +6,11 @@
 aging-пола); снятие из обоих индексов — одной Lua (queue.lua/dequeue).
 
 Ключи (спека §2): ``ws:q:{shelf}``, ``ws:starve:{shelf}``, ``ws:vt:{shelf}``,
-``ws:vftlast:{shelf}:{p}:{c}``. ``now`` инъектируется (clock callable) —
-детерминированные тесты; Lua время сам не читает.
+``ws:vftlast:{shelf}:{p}:{c}``; per-call запись ``ws:call:{shelf}:{call}``
+(HASH: prio/class/job/epoch/attempt/vft/starve_deadline) — пишется
+``enqueue`` (Ф3.4), читается ``requeue``/``preempt``/``call_record``.
+``now`` инъектируется (clock callable) — детерминированные тесты; Lua время
+сам не читает.
 """
 
 from __future__ import annotations
@@ -40,7 +43,7 @@ def f2s(x: float) -> str:
 
 
 class Queue:
-    """Очередь полки ``shelf``: enqueue / dequeue / complete / size."""
+    """Очередь полки ``shelf``: enqueue / dequeue / requeue / preempt / complete."""
 
     def __init__(
         self,
@@ -63,12 +66,18 @@ class Queue:
         self._dequeue_acquire = client.register_script(
             _script("DEQUEUE_ACQUIRE")
         )
+        self._requeue = client.register_script(_script("REQUEUE"))
 
     # ── API ──────────────────────────────────────────────────────────────
 
     def vftlast_key(self, prio: str, call_class: str) -> str:
         """Ключ last-VFT конкретной логической очереди (p, c) полки."""
         return f"ws:vftlast:{self.shelf}:{prio}:{call_class}"
+
+    def call_key(self, call: str) -> str:
+        """Ключ per-call записи ``ws:call:{shelf}:{call}`` (Ф3.4): исходное
+        состояние (vft/starve/epoch) для requeue/preempt."""
+        return f"ws:call:{self.shelf}:{call}"
 
     @staticmethod
     def make_call(job_id: str, step: int, attempt: int = 0) -> str:
@@ -85,11 +94,17 @@ class Queue:
         now: float | None = None,
         starve_deadline: float | None = None,
         weight: float | None = None,
+        job: str = "",
+        epoch: int = 0,
+        attempt: int = 0,
     ) -> float:
         """Поставить вызов в очередь; возвращает vft.
 
         ``starve_deadline=None`` → ``now + T_starve[call_class]`` (aging-пол);
         ``weight=None`` → ``policy.weight(prio, call_class)``.
+        ``job``/``epoch``/``attempt`` (Ф3.4) — в per-call HASH
+        ``ws:call:{shelf}:{call}``: источник метаданных для preempt-кредита
+        и epoch-fencing при requeue.
         """
         now = self.clock() if now is None else now
         w = policy.weight(prio, call_class) if weight is None else weight
@@ -110,6 +125,10 @@ class Queue:
                 f2s(cost_est),
                 f2s(now),
                 f2s(starve_deadline),
+                job,
+                epoch,
+                attempt,
+                self.call_key(call),
             ],
         )
         return float(raw)
@@ -126,6 +145,77 @@ class Queue:
             args=[f2s(now), limit],
         )
         return list(out)
+
+    def requeue(
+        self,
+        call: str,
+        *,
+        now: float | None = None,
+        epoch: int = 0,
+        vft_override: float | None = None,
+    ) -> bool:
+        """Вернуть снятый вызов в очередь (Ф3.4: preempt / свипер /
+        human-gate resume). ``True`` — вызов снова в ОБЕИХ индексах.
+
+        Инварианты (queue.lua/REQUEUE):
+        - **I2 (anti-livelock):** starve-дедлайн СОХРАНЯЕТСЯ — исходный score
+          ``ws:starve`` кладётся как есть, aging-пол не сбрасывается
+          вытеснением; ``attempt`` инкрементируется (``retry++``);
+        - **I4 (epoch-fencing):** ``stored.epoch > epoch`` → ``False`` БЕЗ
+          записей — поздний redelivery со старым epoch не «воскресает».
+
+        ``vft_override`` — новый vft (preempt-кредит ``vft − cost_done/w``);
+        ``None`` → исходный stored vft. ``False`` также при отсутствии
+        per-call записи (вызов enqueue-ился без HASH — легаси-путь).
+        """
+        now = self.clock() if now is None else now
+        raw = self._requeue(
+            keys=[self.q_key, self.starve_key, self.call_key(call)],
+            args=[
+                call,
+                f2s(now),
+                epoch,
+                "" if vft_override is None else f2s(vft_override),
+            ],
+        )
+        return bool(int(raw))
+
+    def preempt(self, call: str, *, cost_done: float, cost_est: float) -> bool:
+        """Вытеснение на границе вызова (спека §4): re-enqueue с vft-кредитом
+        за сделанное ``vft − cost_done/w(p,c)``; prio/class — из per-call
+        записи; epoch — ТЕКУЩИЙ stored (актуальный, не stale).
+
+        Слот освобождает сам воркер ДО requeue (``Slots.release``) —
+        протокол воркера, очередь здесь ни при чём. ``cost_est`` принят для
+        интерфейсной симметрии с ``enqueue`` (кредит по спеке §4 — только
+        ``cost_done``; зарезервирован для будущей EMA-валидации).
+        ``False`` — per-call записи нет (нечего вытеснять).
+        """
+        rec = self.call_record(call)
+        if not rec:
+            return False
+        w = policy.weight(rec["prio"], rec["class"])
+        return self.requeue(
+            call, epoch=rec["epoch"], vft_override=rec["vft"] - cost_done / w
+        )
+
+    def call_record(self, call: str) -> dict[str, Any]:
+        """Per-call запись ``ws:call:{shelf}:{call}`` (наблюдение/тесты).
+        Пустой dict — записи нет; числовые поля приведены к float/int,
+        отсутствующие vft/starve_deadline → KeyError (fail-closed: запись
+        без них непригодна для requeue)."""
+        raw: Any = self.client.hgetall(self.call_key(call))
+        if not raw:
+            return {}
+        return {
+            "prio": raw["prio"],
+            "class": raw["class"],
+            "job": raw.get("job", ""),
+            "epoch": int(raw.get("epoch", 0)),
+            "attempt": int(raw.get("attempt", 0)),
+            "vft": float(raw["vft"]),
+            "starve_deadline": float(raw["starve_deadline"]),
+        }
 
     def complete(
         self,

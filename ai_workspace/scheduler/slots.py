@@ -159,6 +159,26 @@ class Slots:
         )
         return bool(raw)
 
+    def sweep_expired(self) -> list[str]:
+        """Свипер мёртвых слотов (Ф3.4): ``SMEMBERS holders`` → вызов без
+        живого lease (``EXISTS lease == 0``) → ``RECLAIM_EXPIRED``.
+
+        I12: без ``SCAN``/``KEYS`` — ключи по известным именам (lease-ключ
+        выводится из имени члена holders). Возвращает список возвращённых
+        вызовов (sorted — детерминированно для наблюдения/тестов). Requeue
+        вызова — ответственность caller'а (scheduler tick): свипер только
+        возвращает слот + пишет событие ``lease_expired``. Гонка
+        «lease ожил между EXISTS и RECLAIM» закрыта в Lua: ``RECLAIM_EXPIRED``
+        сам перепроверяет ``EXISTS`` и отказывает без записей.
+        """
+        reclaimed: list[str] = []
+        for call in self.client.smembers(self.holders_key):
+            if self.client.exists(self.lease_key(call)):
+                continue  # lease жив — воркер дышит
+            if self.reclaim_expired(call):
+                reclaimed.append(call)
+        return sorted(reclaimed)
+
     # ── наблюдение ───────────────────────────────────────────────────────
 
     def used(self) -> int:
