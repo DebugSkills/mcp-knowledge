@@ -88,6 +88,7 @@ class EngineResult:
     board_version: int = 0
     resume_token: str | None = None
     verdict: str | None = None
+    artifact_id: str | None = None
     detail: str = ""
 
 
@@ -114,6 +115,7 @@ class ModeEngine:
         mcp: ToolClient,
         ledger: Ledger,
         registry: Any | None = None,
+        artifacts: Any | None = None,
         seed_loader: Callable[[str], str] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -124,6 +126,7 @@ class ModeEngine:
         self.mcp = mcp
         self.ledger = ledger
         self.registry = registry
+        self.artifacts = artifacts
         self.seed_loader = seed_loader
         self.clock = clock
 
@@ -166,7 +169,8 @@ class ModeEngine:
             if next_id is None:
                 rec = self.jobs.transition(job_id, JobState.DONE, expect_version=rec.version, epoch=epoch)
                 return EngineResult(status="done", node=node.id,
-                                    board_version=self._board_version(rec), verdict=verdict)
+                                    board_version=self._board_version(rec), verdict=verdict,
+                                    artifact_id=self._persist_artifact(job_id, rec))
             rec = self.jobs.patch(job_id, expect_version=rec.version, epoch=epoch,
                                   patch={"cursor": next_id})
         return EngineResult(status="stopped", node=rec.cursor,
@@ -229,7 +233,8 @@ class ModeEngine:
         next_id = self._gate_target(self.graph.node(node_id), decision)
         if next_id is None:
             rec = self.jobs.transition(job_id, JobState.DONE, expect_version=rec.version, epoch=epoch)
-            return EngineResult(status="done", node=node_id, board_version=self._board_version(rec))
+            return EngineResult(status="done", node=node_id, board_version=self._board_version(rec),
+                                artifact_id=self._persist_artifact(job_id, rec))
         rec = self.jobs.patch(job_id, expect_version=rec.version, epoch=epoch, patch={"cursor": next_id})
         return self.run(job_id, epoch=epoch)
 
@@ -360,6 +365,40 @@ class ModeEngine:
                 f"(есть: {sorted(sections)})"
             )
         return out
+
+    def _persist_artifact(self, job_id: str, rec: JobRecord) -> str | None:
+        """Сохранить готовый документ в artifact-store (Ф3.7, I13).
+
+        Источник — ``output.section``/``output.sections`` режима (композиция частей:
+        документ + блок цитат citer'а).
+        Нет store/секции/содержимого → ``None`` (KB не засоряется молча).
+        """
+        if self.artifacts is None:
+            return None
+        output = self.graph.doc.get("output") or {}
+        wanted: list[str] = []
+        if output.get("section"):
+            wanted.append(str(output["section"]))
+        wanted.extend(str(x) for x in (output.get("sections") or []))
+        if not wanted:
+            return None
+        _, board = self.boards.read()
+        parts = [board[name] for name in wanted if board.get(name)]
+        if not parts:
+            return None
+        # Документ + приложения (напр. документ и блок цитат citer'а): части
+        # идут отдельными секциями доски, артефакт — их композиция.
+        content = "\n\n".join(parts)
+        record = self.artifacts.save(
+            content,
+            user=rec.user,
+            job_id=job_id,
+            type=str(output.get("type", "document")),
+            zone=rec.zone,
+            mode=rec.mode,
+            title=f"{rec.mode}:{job_id}",
+        )
+        return str(record.id)
 
     def _gate_target(self, node: Node, decision: str) -> str | None:
         """Куда идти после ответа человека: ``on_approve``/``on_edit`` узла, иначе edge.

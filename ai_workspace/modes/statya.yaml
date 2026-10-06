@@ -10,7 +10,7 @@ version: 1
 shape: analyst-critic-editor
 contract: document
 zone: public
-output: {type: article, citation_policy: required}
+output: {type: article, citation_policy: required, sections: [document, document+refs]}
 board: {buffer: board.md, store: job}
 nodes:
   - id: analyst

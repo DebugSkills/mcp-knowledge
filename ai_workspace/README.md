@@ -145,3 +145,23 @@ single-writer секций доски. На каждое правило — фи
 (без записи), duplicate (`expect==current-1` и значения уже записаны) → идемпотентный no-op,
 `expect==current` → версия+1 + снапшот. `single_writer=True` — секцию пишет один узел
 (`SectionConflict`); `read_version(n)`/`diff(a,b)` — replay/аудит.
+
+## Mode engine (Ф3.5b-2, `orchestrator/engine.py` + `graph.py` + `ledger.py`)
+Исполняет декларативный граф режима: `llm-step`/`tool-step`/`critic-gate`/`human-gate`,
+курсор в job, pause/resume на human-gate (single-use `resume_token`), эффекты
+идемпотентны (`compute_effect_id` → ledger), секции пишутся через board-CAS.
+Зависимости инъектируются (`jobs`/`boards`/`llm`/`mcp`/`ledger`/`artifacts`).
+`fork`/`join` — Ф3.8+ (`UnsupportedNode`, fail-loud).
+
+## Режим «статья» (Ф3.6, `modes/statya.yaml`)
+Первый drop-in-режим: `analyst → structure(gate) → critic(on_revise) → editor →
+citer(strict) → publish(gate)`. Гейт, отвеченный `approve`, дальше pass-through
+(REVISE-петля не спрашивает человека повторно); `edit` показывает гейт снова после
+переработки, а текст правки попадает во вход адресата (`on_edit`/`on_approve`).
+
+## Artifact-store (Ф3.7, `ai_workspace/artifacts.py`)
+Готовая работа ≠ знание (I13): артефакт живёт в `ws:artifact:{user}:{id}` (retention
+30 дней, TTL), индексируется в `ws:artifacts:{user}` (ZSET по `expires_at`), дедуп по
+`sha256[:16]`. API: `save/get/list/export/delete/prune/promote`. В KB ведёт ТОЛЬКО
+явный `promote` (через `mcp.write_knowledge`, с обязательными `domain`/`subject`/`zone`).
+Движок по завершении job сохраняет композицию `output.sections` режима.
