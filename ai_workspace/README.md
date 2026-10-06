@@ -26,6 +26,9 @@ job-store; **Ф3.2** — планировщик очередей вызовов 
   детерминированные тесты.
 - `scheduler/park.py` — **Ф4.3 budget-hard-stop (I10/D5)**: `ParkControl.park/
   resume` — см. раздел «Park/resume (Ф4.3)» ниже.
+- `scheduler/budget.py` + `registry/pricing.yaml|py` — **P0-1 ревизии Ф4**:
+  денежное списание ext-полки (микро-₽, int) + ночная сверка — см. раздел
+  «Бюджет: деньги end-to-end (P0-1)» ниже.
 
 ## Scheduler (Ф3.2)
 - **9 логических очередей** = 3 приоритета аккаунта (high/med/low) × 3 класса
@@ -131,6 +134,48 @@ Mode engine, admission (Ф3.5+); human-gate `ws:gate:*` + дашборд спя�
   (fail-loud). Mode engine на parked-job отказывается исполнять (paused).
 - Отказы в сторону hard-stop: индексы/слот/conc освобождаются ДО CAS —
   проигранный CAS не оставляет вызов обслуживаемым.
+
+## Бюджет: деньги end-to-end (P0-1 ревизии Ф4, `scheduler/budget.py` + `registry/pricing.yaml`)
+Закрывает P0-1 критики Ф4 («₽-hard-stop не существует end-to-end»): до этой
+ревизии `ws:budget:*` никто не писал — park по бюджету был недостижим.
+- **Единица денег — целочисленный микро-₽** (1 ₽ = 10^6 микро-₽): прайс
+  (USD/1M токенов × курс `rate_usd_rub`) конвертируется в микро-₽/1M при
+  загрузке (`registry/pricing.py`), списание — чистая int-арифметика
+  (`ShelfPrice.cost_micro`) + Redis `INCRBY` (int-only; float в пути денег
+  нет — тест «1000 списаний без дрейфа»). Лимит согласован в той же единице:
+  `Budget.limit_micro` (₽ × 10^6, конверсия при загрузке квот) — admission
+  сравнивает счётчик с `limit_micro`.
+- **Ключи месяц-скоуп** (`period: month`, локальный `%Y-%m`):
+  `ws:budget:global:{month}` (гейтит admit) + `ws:budget:user:{u}:{month}`
+  (зеркало D4) + `ws:budget:journal` (Stream-журнал списаний — SSOT факта).
+- **`charge_budget(user, tokens_in=, tokens_out=)`** — атомарной Lua
+  (`BUDGET_CHARGE`): INCRBY global + INCRBY зеркало + XADD журнала. Точка
+  вызова — `wiring.RedisQuotaPort.charge` (рядом с `charge_tokens`, терминал
+  job через `engine._quota_finalize`); ext-wiring без прайса — fail-fast на
+  конструкции (`ValueError`). Fallback разбивки in/out ДОКУМЕНТИРОВАН: usage
+  движка — суммарная оценка без разбивки, всё списывается по ВЫХОДНОЙ цене
+  (дороже) — перерасход не занижается; точная разбивка — остаток (LLMClient
+  протокол, Ф4.7).
+- **`reconcile_budget(redis=)`** — сверка: счётчики месяца := суммы журнала
+  (`BUDGET_RECONCILE`, чинит дрейф в обе стороны; «вернувший» бюджет parked
+  job'ы могут resume). Событие `budget_reconciled` в `ws:quota:events`.
+- **GAP (честно): сверка с LiteLLM недоступна** — в `litellm.config.yaml`
+  нет `database_url` (grep — 0), а `/spend` и штатный `max_budget` LiteLLM
+  требуют proxy-БД (Prisma). Поэтому наш enforcement — ЕДИНСТВЕННЫЙ (R1),
+  SSOT факта — наш журнал (best-effort). Штатный LiteLLM `max_budget` как
+  defense-in-depth НЕ включён сознательно: без БД spend живёт in-memory
+  (теряется при рестарте контейнера — потолок исчезает), тянуть БД в пилот
+  не стали; разблокируется `DATABASE_URL` в gateway-контуре (Ф6+, остаток).
+- **Владелец/каденс сверки: оператор, nightly** (`quotas.yaml:
+  budgets.ext.reconcile: nightly`). Запуск: `make ws-budget-reconcile`
+  (`scripts/ws_budget_reconcile.py`, JSON-отчёт; `WS_REDIS_URL` — ПРОД
+  ws-redis, дефолта НЕТ — fail-closed). В cron/ansible НЕ подключено —
+  остаток с владельцем-оператором; прод-ws-redis internal-only (I6): с хоста
+  — через docker-сеть (`docker run --rm --network mcp-knowledge_default
+  -v <repo>:/repo -w /repo python:3.11-slim sh -c "pip -q install redis
+  pyyaml && WS_REDIS_URL=redis://ws-redis:6379/0 python
+  scripts/ws_budget_reconcile.py"`), штатное место reconcile-tick — wiring
+  воркер Ф4.7.
 
 ## Реестры режимов (Ф3.5a-1, `registry/`)
 - `registry/` — data-only YAML-реестры `roles`/`tools`/`gates`/`model_classes`/

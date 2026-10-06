@@ -14,7 +14,10 @@ scheduler/park.py (сквозной модуль над JobStore/Queue/admission
   путь, conc-резерв уже взят admit'ом (``job=`` per-job владение, P1-2) —
   второй раз НЕ берётся (движок только heartbeat'ит);
 - ``RedisQuotaPort`` — реализация ``engine.QuotaPort`` над живым ws-redis:
-  readmit/heartbeat/charge/release → admission (Ф4.2);
+  readmit/heartbeat/charge/release → admission (Ф4.2); на полке ``ext``
+  ``charge`` ДОПОЛНИТЕЛЬНО списывает деньги (``budget.charge_budget``:
+  микро-₽, журнал; P0-1) — та же точка, что и ``charge_tokens`` (терминал
+  job через ``engine._quota_finalize``), дубля списания нет;
 - ``QuotaWiring.sweep_all`` — глобальный свип истёкших conc-резервов
   (P1-3): пользователи перечисляются по job-store (SCAN ``ws:job:*`` →
   HGET user; SSOT пользователей — job-store, НЕ ключи квот), по каждому
@@ -48,15 +51,31 @@ from uuid import uuid4
 from ai_workspace.orchestrator.job import JobStore
 from ai_workspace.scheduler.admission import (
     DEFAULT_CONC_LEASE_TTL_MS,
+    EXT_SHELF,
     admit,
     charge_tokens,
     conc_heartbeat,
     conc_release,
     sweep_expired_conc,
 )
+from ai_workspace.scheduler.budget import charge_budget
 from ai_workspace.scheduler.park import ParkControl
 
 __all__ = ["QuotaWiring", "RedisQuotaPort"]
+
+
+def _require_pricing(shelf: str, pricing: Any) -> None:
+    """ext-полка без прайса — конструкция ЗАПРЕЩЕНА (P0-1, fail-fast).
+
+    Без прайса списание денег невозможно: молчаливый skip = fail-open по
+    бюджету (дефект, закрытый этой ревизией); честный отказ на конструкции —
+    раньше любого рантайм-списания.
+    """
+    if shelf == EXT_SHELF and pricing is None:
+        raise ValueError(
+            "ext-полка требует pricing (PricingRegistry): без прайса "
+            "бюджет-списание невозможно — fail-fast (P0-1)"
+        )
 
 
 class RedisQuotaPort:
@@ -74,11 +93,18 @@ class RedisQuotaPort:
         redis: Any,
         shelf: str = "local",
         lease_ttl_ms: int = DEFAULT_CONC_LEASE_TTL_MS,
+        pricing: Any = None,
     ) -> None:
+        """``pricing`` — ``PricingRegistry`` (Ф4-rev P0-1): обязателен для
+        полки ``ext`` (без прайса денежное списание невозможно — fail-fast на
+        конструкции, а не первый отказ в рантайме); полке ``local`` не нужен
+        (ollama — ₽0, бюджет не списывается)."""
+        _require_pricing(shelf, pricing)
         self.registry = registry
         self.redis = redis
         self.shelf = shelf
         self.lease_ttl_ms = lease_ttl_ms
+        self.pricing = pricing
 
     def readmit(self, user: str, role: str, job_id: str) -> str:
         """Резерв заново: admit(job=...) → 'allow' | 'deny' | 'park'."""
@@ -98,8 +124,25 @@ class RedisQuotaPort:
         return conc_heartbeat(user, job_id, redis=self.redis, lease_ttl_ms=self.lease_ttl_ms)
 
     def charge(self, user: str, tokens: int) -> None:
-        """Списать фактический расход токенов дня (D3/D7)."""
+        """Списать фактический расход: токены дня (D3/D7) + деньги ext (P0-1).
+
+        ext-полка: ``charge_budget`` по прайсу (микро-₽, атомарно: счётчики
+        месяца + журнал). Fallback разбивки in/out ДОКУМЕНТИРОВАН: usage
+        движка — суммарная оценка ((prompt+output)//4, ``engine.usage_of``)
+        без разбивки, поэтому ВСЁ списывается по ВЫХОДНОЙ цене (дороже
+        входной): перерасход не занижается, hard-stop срабатывает раньше,
+        а не позже. Точная разбивка (prompt_tokens/completion_tokens) —
+        остаток на расширение LLMClient-протокола (Ф4.7).
+        """
         charge_tokens(user, tokens, redis=self.redis)
+        if self.shelf == EXT_SHELF:
+            charge_budget(
+                user,
+                tokens_in=0,
+                tokens_out=tokens,
+                redis=self.redis,
+                pricing=self.pricing,
+            )
 
     def release(self, user: str, job_id: str) -> None:
         """Освободить резерв job'а по владению (идемпотентно, P1-2)."""
@@ -124,10 +167,14 @@ class QuotaWiring:
         shelf: str = "local",
         lease_ttl_ms: int = DEFAULT_CONC_LEASE_TTL_MS,
         clock: Callable[[], float] = time.time,
+        pricing: Any = None,
     ) -> None:
         """``client`` — ws-redis (decode_responses=True); ``registry`` —
         ``QuotaRegistry`` (Ф4.1); ``shelf`` — полка контура (``ext`` включает
-        бюджет D4/D5); ``lease_ttl_ms`` — TTL conc-lease резерва (P1-3)."""
+        бюджет D4/D5 + денежное списание P0-1); ``lease_ttl_ms`` — TTL
+        conc-lease резерва (P1-3); ``pricing`` — ``PricingRegistry`` (обязателен
+        для ext, см. ``RedisQuotaPort``)."""
+        _require_pricing(shelf, pricing)
         self.client = client
         self.registry = registry
         self.store = store if store is not None else JobStore(client)
@@ -137,12 +184,14 @@ class QuotaWiring:
         self.shelf = shelf
         self.lease_ttl_ms = lease_ttl_ms
         self.clock = clock
+        self.pricing = pricing
 
     def make_port(self) -> RedisQuotaPort:
         """Порт движка на том же клиенте/реестре/полке (ModeEngine(quota=...))."""
         return RedisQuotaPort(
             registry=self.registry, redis=self.client,
             shelf=self.shelf, lease_ttl_ms=self.lease_ttl_ms,
+            pricing=self.pricing,
         )
 
     def submit(

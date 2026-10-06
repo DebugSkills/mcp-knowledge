@@ -20,8 +20,10 @@ slots.py/queue.py (Ф3.2/Ф3.3).
   deny после SIGKILL нет);
 - ``ws:quota:events`` — Stream событий квот-контура (reclaim/degraded),
   ``MAXLEN ~`` (I12);
-- ``ws:budget:global`` — глобальный расход ext-контура (D4, ₽); пишет
-  reconcile-контур (Ф4.3+), admission только читает.
+- ``ws:budget:global:{month}`` — расход ext-контура за ЛОКАЛЬНЫЙ месяц
+  (D4, period: month; микро-₽ int) — admission только ЧИТАЕТ; пишет
+  ``budget.charge_budget`` (P0-1, вместе со списанием токенов на терминале
+  job), сверяет ``budget.reconcile_budget`` (nightly, журнал списаний).
 
 РЕЖИМ CONC-СЧЁТЧИКА — РЕЗЕРВ (admit = резервация на время job):
 проверка и INCR живут в ОДНОЙ Lua (иначе две параллельные гонки обе
@@ -37,11 +39,13 @@ slots.py/queue.py (Ф3.2/Ф3.3).
   при крахе воркера защищает lease + свипер (P1-3), а не TTL счётчика.
 
 Бюджет (D4/D5): при ``shelf='ext'`` (heavy-класс, conformance: local|ext)
-``ws:budget:global >= budgets.ext.limit`` → ``park`` (НЕ deny: парк/resume
-реализует Ф4.3; парк — сигнал вызывающему). Enforcement только глобальный:
-per-user зеркало ``ws:budget:{user}`` ведёт reconcile-контур (сверка с
-LiteLLM, ``budgets.ext.reconcile``); второго hard-limit на пользователя
-в схеме Q11 нет — ключ здесь только назван (``budget_user_key``).
+``ws:budget:global:{month} >= budgets.ext.limit_micro`` → ``park`` (НЕ deny:
+парк/resume реализует Ф4.3; парк — сигнал вызывающему). ЕДИНИЦА — целочисленный
+микро-₽: ``Budget.limit_micro`` конвертирует ₽-лимит при загрузке квот
+(единственная точка согласования единиц, P0-1); списание — только INCRBY int.
+Enforcement только глобальный: per-user зеркало ``ws:budget:user:{u}:{month}``
+ведёт ``charge_budget``/reconcile (D4, per_user_mirror); второго hard-limit
+на пользователя в схеме Q11 нет. Списание денег и сверка — ``scheduler/budget.py``.
 
 Деградация ws-redis (P1-4) — FAIL-CLOSED + ALARM: короткие socket-таймауты
 (``redis_client.make_ws_redis``), Connection/Timeout → ``QuotaRedisUnavailable``
@@ -83,7 +87,7 @@ from ai_workspace.registry.quotas import QuotaRegistry
 from ai_workspace.scheduler.lua_scripts import extract_sections, section_of
 
 __all__ = [
-    "BUDGET_GLOBAL_KEY",
+    "BUDGET_GLOBAL_PREFIX",
     "DEFAULT_CONC_LEASE_TTL_MS",
     "EXT_SHELF",
     "QUOTA_EVENTS_KEY",
@@ -91,6 +95,7 @@ __all__ = [
     "Decision",
     "QuotaRedisUnavailable",
     "admit",
+    "budget_global_key",
     "budget_user_key",
     "charge_tokens",
     "conc_enter",
@@ -101,6 +106,7 @@ __all__ = [
     "conc_release",
     "conchold_key",
     "conclease_key",
+    "quota_fail_closed",
     "seconds_to_local_midnight",
     "sweep_expired_conc",
     "tok_key",
@@ -109,8 +115,8 @@ __all__ = [
 EXT_SHELF = "ext"
 """Полка внешнего провайдера (heavy-класс; conformance: полки local|ext)."""
 
-BUDGET_GLOBAL_KEY = "ws:budget:global"
-"""Глобальный расход ext-контура (D4); пишет reconcile-контур (Ф4.3+)."""
+BUDGET_GLOBAL_PREFIX = "ws:budget:global"
+"""Префикс глобального расхода ext-контура (D4); месяц — в суффиксе ключа."""
 
 QUOTA_EVENTS_KEY = "ws:quota:events"
 """Stream событий квот-контура (reclaim/degraded; MAXLEN ~, I12, P1-3/P1-4)."""
@@ -182,9 +188,11 @@ def _emit_degraded(op: str, exc: Exception, redis: Any) -> None:
         pass  # redis всё ещё недоступен — ALARM уже зафиксирован в logging
 
 
-def _fail_closed(fn: Callable[..., _T]) -> Callable[..., _T]:
+def quota_fail_closed(fn: Callable[..., _T]) -> Callable[..., _T]:
     """Декоратор политики деградации (P1-4): Connection/Timeout →
-    ``QuotaRedisUnavailable`` + ALARM; прочие исключения — наружу как есть."""
+    ``QuotaRedisUnavailable`` + ALARM; прочие исключения — наружу как есть.
+
+    Публичный: общая политика КВОТ-контура (admission + budget, P0-1)."""
 
     @wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> _T:
@@ -261,9 +269,24 @@ def conclease_key(user: str, job: str) -> str:
     return f"ws:quota:conclease:{user}:{job}"
 
 
-def budget_user_key(user: str) -> str:
-    """Per-user зеркало ext-бюджета (``per_user_mirror``, D4) для reconcile."""
-    return f"ws:budget:{user}"
+def budget_global_key(month: str | None = None) -> str:
+    """Глобальный расход ext-контура за месяц: ``ws:budget:global:{YYYY-MM}``.
+
+    Месяц — ЛОКАЛЬНЫЙ (``%Y-%m``, границы календарные — паттерн дневного
+    ключа D7); ``None`` -> текущий. Единица значения — микро-₽ (int, P0-1).
+    """
+    return f"{BUDGET_GLOBAL_PREFIX}:{month or _local_month_key()}"
+
+
+def budget_user_key(user: str, month: str | None = None) -> str:
+    """Per-user зеркало ext-бюджета месяца (``per_user_mirror``, D4):
+    ``ws:budget:user:{user}:{YYYY-MM}`` (``None`` -> текущий месяц)."""
+    return f"ws:budget:user:{user}:{month or _local_month_key()}"
+
+
+def _local_month_key() -> str:
+    """Текущий локальный месяц (для ключей-дефолтов budget_*_key)."""
+    return datetime.now(timezone.utc).astimezone().strftime("%Y-%m")
 
 
 def _local_day(now: datetime) -> str:
@@ -303,7 +326,7 @@ def seconds_to_local_midnight(now: datetime | None = None) -> int:
     return int((_next_midnight(now) - now).total_seconds())
 
 
-@_fail_closed
+@quota_fail_closed
 def admit(
     user: str,
     role: str,
@@ -339,14 +362,16 @@ def admit(
         keys=[
             tok_key(user, _local_day(now)),
             conc_key(user),
-            BUDGET_GLOBAL_KEY,
+            # бюджетный ключ — месяц-скоуп, единица микро-₽ (P0-1)
+            budget_global_key(now.strftime("%Y-%m")),
             conchold_key(user),
             conclease_key(user, job) if job else "",
         ],
         args=[
             "" if quota.tokens_per_day is None else str(quota.tokens_per_day),
             "" if quota.conc is None else str(quota.conc),
-            "" if budget is None else f"{budget.limit:.17g}",
+            # порог — limit_micro (₽ × 10^6, конверсия в QuotaRegistry.Budget)
+            "" if budget is None else str(budget.limit_micro),
             job or "",
             lease_ttl_ms if job else 0,
         ],
@@ -361,14 +386,17 @@ def admit(
     elif code == "quota_conc_exceeded":
         reason = f"личный параллелизм {detail}/{quota.conc} ({user})"
     else:  # budget_ext_exhausted
+        rub = int(detail) / 1_000_000 if detail.isdigit() else detail
         reason = (
-            f"ext-бюджет {detail}/{budget.limit if budget else '?'} "
-            f"{budget.currency if budget else ''} — парк до reconcile (D5)"
+            f"ext-бюджет {rub if isinstance(rub, str) else round(rub, 2)}/"
+            f"{budget.limit if budget else '?'} "
+            f"{budget.currency if budget else ''} (микро-₽: {detail}/"
+            f"{budget.limit_micro if budget else '?'}) — парк до reconcile (D5)"
         )
     return Decision(action=action, code=code or None, reason=reason)
 
 
-@_fail_closed
+@quota_fail_closed
 def charge_tokens(
     user: str,
     tokens: int,
@@ -398,7 +426,7 @@ def charge_tokens(
     return int(raw)
 
 
-@_fail_closed
+@quota_fail_closed
 def conc_enter(user: str, *, redis: Any) -> int:
     """Взять conc-резерв БЕЗ проверок; возвращает новый in-flight.
 
@@ -409,7 +437,7 @@ def conc_enter(user: str, *, redis: Any) -> int:
     return int(_cached_script(redis, "CONC_ENTER")(keys=[conc_key(user)], args=[]))
 
 
-@_fail_closed
+@quota_fail_closed
 def conc_exit(user: str, *, redis: Any) -> int:
     """Освободить conc-резерв АГРЕГАТОМ (легаси-путь; остаток).
 
@@ -421,7 +449,7 @@ def conc_exit(user: str, *, redis: Any) -> int:
     return int(_cached_script(redis, "CONC_EXIT")(keys=[conc_key(user)], args=[]))
 
 
-@_fail_closed
+@quota_fail_closed
 def conc_release(user: str, job: str, *, redis: Any) -> bool:
     """Освободить резерв КОНКРЕТНОГО job'а — по факту владения (P1-2).
 
@@ -438,7 +466,7 @@ def conc_release(user: str, job: str, *, redis: Any) -> bool:
     return bool(int(raw))
 
 
-@_fail_closed
+@quota_fail_closed
 def conc_heartbeat(
     user: str,
     job: str,
@@ -458,7 +486,7 @@ def conc_heartbeat(
     return bool(int(raw))
 
 
-@_fail_closed
+@quota_fail_closed
 def conc_reclaim_expired(
     user: str,
     job: str,
@@ -490,7 +518,7 @@ def conc_reclaim_expired(
     return bool(int(raw))
 
 
-@_fail_closed
+@quota_fail_closed
 def sweep_expired_conc(user: str, *, redis: Any) -> list[str]:
     """Снять ВСЕ истёкшие резервы пользователя (свипер P1-3).
 

@@ -504,7 +504,7 @@ WS_COMPOSE := compose.workspace.yml
 WS_COMPOSE_TEST := compose.workspace.test.yml
 WS_TEST_REDIS_URL := redis://127.0.0.1:6390/0
 
-.PHONY: ws-up ws-down ws-up-test ws-test ws-test-integration modes-validate golden-run
+.PHONY: ws-up ws-down ws-up-test ws-test ws-test-integration ws-budget-reconcile modes-validate golden-run
 ws-up: ## Ф3.1: поднять ws-redis (порт НЕ публикуется — I6, internal-only)
 	docker compose -f $(WS_COMPOSE) up -d ws-redis
 
@@ -519,6 +519,9 @@ ws-test: ## Ф3.1: unit-тесты ai_workspace (без Redis; integration ав�
 
 ws-test-integration: ## Ф3.1: integration-тесты (сначала make ws-up-test)
 	WS_REDIS_URL=$(WS_TEST_REDIS_URL) .venv/bin/python -m pytest ai_workspace/tests -q -m integration
+
+ws-budget-reconcile: ## Ф4-rev P0-1: ночная сверка ws:budget:* с журналом (WS_REDIS_URL — ПРОД ws-redis, дефолта НЕТ; владелец — оператор, nightly)
+	.venv/bin/python scripts/ws_budget_reconcile.py
 
 modes-validate: ## Ф3.5: валидация режимов ai_workspace/modes/*.yaml
 	.venv/bin/python -m ai_workspace.tools.modes_validate

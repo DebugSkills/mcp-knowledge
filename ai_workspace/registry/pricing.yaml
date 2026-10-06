@@ -1,0 +1,28 @@
+# Прайс внешних моделей AI-верстака (P0-1 ревизии Ф4, trace_id: arch-2026-10-05-ai-workspace).
+#
+# Назначение: конверсия фактического usage (токены) в деньги для списания
+# ws:budget:* (D4 — ₽/мес global hard). До этого реестра бюджетный ключ никто
+# не писал (критика Ф4: E1-E4) — park по бюджету был недостижим.
+#
+# Валютная политика (выбор зафиксирован, P0-1): прайс провайдера в USD +
+# фиксированный курс rate_usd_rub в ЭТОМ файле. Курс и цены — PLACEHOLDER,
+# калибрует оператор (файл в git: история правок = аудит изменений прайса).
+# Списание всегда в ЦЕЛОЧИСЛЕННЫХ микро-₽ (1 ₽ = 10^6 микро-₽): бюджет-счётчики
+# ws:budget:* и admission-порог budgets.ext.limit согласованы в микро-₽
+# (конверсия лимита — QuotaRegistry.Budget.limit_micro при загрузке).
+#
+# Ключи shelves — ПОЛКИ (shelf): ref-целостность на model_classes.yaml
+# (классы heavy/fast имеют shelf: ext|local) и на model_name litellm.config.yaml
+# (local/ext). Числа-PLACEHOLDER калибруются по данным Ф4.7 (паттерн quotas.yaml).
+version: 1
+
+currency: USD # валюта прайса провайдера; поддержан только USD (+ rate_usd_rub)
+
+rate_usd_rub: 80.0 # PLACEHOLDER — курс USD→₽, калибруется оператором при смене курса
+
+shelves:
+  ext: # внешний контур (DeepSeek; budgets.ext в quotas.yaml, D4)
+    model: deepseek/deepseek-flash # модель полки ext из litellm.config.yaml
+    input_per_1m: 0.30 # PLACEHOLDER — USD за 1M входных токенов
+    output_per_1m: 1.20 # PLACEHOLDER — USD за 1M выходных токенов
+    source: https://api-docs.deepseek.com/quick_start/pricing # публичный прайс DeepSeek

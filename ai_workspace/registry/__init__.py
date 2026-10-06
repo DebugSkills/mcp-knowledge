@@ -11,6 +11,9 @@ roles.yaml и квотами не управляются.
 кэшем и при первом изменении перечитывает каталог целиком. Отсутствующий
 или битый YAML -> RegistryError с путём и причиной (fail-closed), без
 молчаливых дефолтов и частичных состояний.
+
+pricing (P0-1 ревизии Ф4) — цены внешних моделей для бюджет-списаний
+ws:budget:* (микро-₽); схема и фасад — registry/pricing.py.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ class Registry:
         "model_classes",
         "shapes",
         "quotas",  # Ф4.1: participant-роли/квоты; схема — registry/quotas.py
+        "pricing",  # P0-1 ревизии Ф4: прайс ext-моделей; схема — registry/pricing.py
     )
 
     def __init__(self, dir: Path) -> None:
