@@ -431,6 +431,24 @@ def test_admit_same_job_idempotent_different_jobs_counted(ws):
     assert int(client.get(conc_key(user))) == 1
 
 
+def test_admit_reused_flag_marks_guard_branch_only(ws):
+    """N1 (reopen Ф4.2e): 4-й элемент ADMIT — reused: '1' только в allow
+    по SISMEMBER-гварду (резерв уже стоит), '0' — при свежем взятии и
+    в deny/park; wiring-компенсация разрешена только при reused=False."""
+    client, book, user = ws
+    fresh = admit(user, "member", registry=book, redis=client, job="job-r")
+    assert fresh.action == "allow" and fresh.reused is False
+    guard = admit(user, "member", registry=book, redis=client, job="job-r")
+    assert guard.action == "allow" and guard.reused is True  # гвард, без INCR
+    assert int(client.get(conc_key(user))) == 1
+    limit = book.quota_for("member").tokens_per_day
+    charge_tokens(user, limit, redis=client)
+    denied = admit(user, "member", registry=book, redis=client, job="job-r2")
+    assert denied.action == "deny" and denied.reused is False
+    # другие job'ы после deny тоже fresh (гвард строго per-job)
+    assert admit(user, "member", registry=book, redis=client, job="job-r3").reused is False
+
+
 def test_readmit_in_expired_unswept_window_does_not_double_count(ws):
     """Окно «lease истёк, свип ещё не прошёл»: резерв жив (маркер+счётчик),
     повторный admit того же job — refresh lease, счётчик НЕ дублируется

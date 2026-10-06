@@ -22,8 +22,12 @@
 -- бюджетная проверка выключена), ARGV[4]=job ('' → агрегатный INCR без
 -- маркера — легаси-путь; освобождение ТОЛЬКО агрегатным CONC_EXIT),
 -- ARGV[5]=lease_ttl_ms (0 → lease не ставить: маркер без auto-reclaim).
--- Возврат: {action, code, detail}; action=allow|deny|park; detail — текущее
--- значение проверяемой метрики (для reason вызывающего).
+-- Возврат: {action, code, detail, reused}; action=allow|deny|park; detail —
+-- текущее значение проверяемой метрики (для reason вызывающего); reused='1'
+-- ТОЛЬКО в allow по SISMEMBER-гварду (N1, reopen Ф4.2e): резерв по
+-- (user, job) уже взят ранее, INCR в ЭТОМ вызове не было — компенсатор
+-- (wiring.submit) не имеет права release'ить живой резерв по такому
+-- допуску (снимет владение/lease RUNNING-job'a).
 -- Идемпотентность по (user, job) — P1-B iter2: маркер владения ЭТОГО job
 -- уже стоит → allow + refresh lease БЕЗ повторного INCR (двойное взятие
 -- резерва = перманентная утечка без маркера; закрывает окно «lease истёк,
@@ -56,25 +60,25 @@ if ARGV[4] ~= '' and redis.call('SISMEMBER', KEYS[4], ARGV[4]) == 1 then
   if tonumber(ARGV[5]) > 0 then
     redis.call('SET', KEYS[5], ARGV[4], 'PX', tonumber(ARGV[5]))
   end
-  return {'allow', '', ''}
+  return {'allow', '', '', '1'}
 end
 if tok_limit ~= '' then
   local spent = numkey(KEYS[1])
   if spent >= tonumber(tok_limit) then
-    return {'deny', 'quota_tokens_exhausted', tostring(spent)}
+    return {'deny', 'quota_tokens_exhausted', tostring(spent), '0'}
   end
 end
 if budget_limit ~= '' then
   local spent = numkey(KEYS[3])
   if spent >= tonumber(budget_limit) then
-    return {'park', 'budget_ext_exhausted', tostring(spent)}
+    return {'park', 'budget_ext_exhausted', tostring(spent), '0'}
   end
 end
 local after = ''
 if conc_limit ~= '' then
   local inflight = numkey(KEYS[2])
   if inflight >= tonumber(conc_limit) then
-    return {'deny', 'quota_conc_exceeded', tostring(inflight)}
+    return {'deny', 'quota_conc_exceeded', tostring(inflight), '0'}
   end
   after = redis.call('INCR', KEYS[2])
 end
@@ -88,7 +92,7 @@ if ARGV[4] ~= '' then
     redis.call('SET', KEYS[5], ARGV[4], 'PX', tonumber(ARGV[5]))
   end
 end
-return {'allow', '', tostring(after)}
+return {'allow', '', tostring(after), '0'}
 
 -- @script CHARGE
 -- Списание токенов по факту usage. KEYS[1]=tok. ARGV[1]=tokens (int >= 0),

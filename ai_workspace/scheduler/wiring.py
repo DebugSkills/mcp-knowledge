@@ -222,7 +222,10 @@ class QuotaWiring:
           можно передать для идемпотентного ретрая постановки: повторный
           admit того же job НЕ дублирует резерв (SISMEMBER-гвард, P1-B),
           а ``JobAlreadyExists`` компенсируется release'ом здесь же
-          (P2-1) — вызывающему ничего освобождать не нужно.
+          (P2-1) — но ТОЛЬКО для резерва, взятого этим вызовом (N1
+          reopen Ф4.2e): reused-допуск ничего не резервировал, release
+          снял бы резерв/lease живого job'а; резерв живого job'а
+          принадлежит job'у и возвращается терминалом движка.
         """
         job_id = job_id or uuid4().hex
         decision = admit(
@@ -246,13 +249,18 @@ class QuotaWiring:
                 job_id=job_id,
             )
         except JobAlreadyExists:
-            # P2-1 iter2: идемпотентный ретрай постановки наткнулся на живой
-            # job — резерв компенсируем release'ом (обычно no-op: admit был
-            # идемпотентен по (user, job), P1-B; но если job на паузе БЕЗ
-            # маркера — этот вызов мог взять резерв заново, его никто не
-            # вернёт). Живой job переберёт резерв readmit'ом на старте
-            # движка; исключение — наружу (семантика create не менялась).
-            conc_release(user, job_id, redis=self.client)
+            # P2-1 iter2 + N1 (reopen Ф4.2e): ретрай постановки наткнулся на
+            # существующий job — компенсируем release'ом ТОЛЬКО резерв,
+            # взятый ЭТИМ вызовом (allow без reused: маркера не было —
+            # job на паузе/после терминала, admit взял резерв заново,
+            # кроме нас его никто не вернёт). Reused-допуск (SISMEMBER-
+            # гвард P1-B: маркер уже стоит) резерва НЕ брал — release
+            # снял бы владение+lease живого job'а (RUNNING уже мимо
+            # readmit → QuotaLeaseLost на _beat → ложный FAILED, потеря
+            # работы); резерв живого job'а вернёт его терминал (engine
+            # finally). Исключение — наружу (семантика create не менялась).
+            if decision.action == "allow" and not decision.reused:
+                conc_release(user, job_id, redis=self.client)
             raise
         if decision.action == "park":
             # Бюджетный hard-stop (D5): job жив, но не исполняется до

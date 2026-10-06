@@ -227,11 +227,18 @@ class AdmissionDenied(RuntimeError):
 
 @dataclass(frozen=True)
 class Decision:
-    """Результат admit: ``allow`` | ``deny`` (личный лимит) | ``park`` (D5)."""
+    """Результат admit: ``allow`` | ``deny`` (личный лимит) | ``park`` (D5).
+
+    ``reused`` (N1, reopen Ф4.2e): allow по SISMEMBER-гварду P1-B —
+    резерв по ``(user, job)`` уже стоит, повторного INCR в этом вызове
+    НЕ было; компенсатор (``wiring.submit``) не должен release'ить по
+    такому допуску — снимет владение/lease живого job'а.
+    """
 
     action: Literal["allow", "deny", "park"]
     code: str | None = None
     reason: str | None = None
+    reused: bool = False
 
     @property
     def allowed(self) -> bool:
@@ -352,7 +359,9 @@ def admit(
       освобождение — ``conc_release(user, job)`` ровно один раз.
       Идемпотентен по ``(user, job)`` (P1-B iter2): маркер уже стоит →
       allow + refresh lease без повторного INCR (readmit-окно «lease истёк,
-      свип не прошёл», submit-ретрай). ``None`` — легаси-агрегат без
+      свип не прошёл», submit-ретрай); такой allow помечается
+      ``Decision.reused=True`` (N1 reopen Ф4.2e — компенсация в wiring).
+      ``None`` — легаси-агрегат без
       маркера (освобождение только агрегатным ``conc_exit``);
     - ``shelf='ext'`` подключает бюджетную проверку (D4/D5), иначе — нет;
     - ``now`` инъектируется (детерминированные тесты; Lua время не читает);
@@ -362,7 +371,7 @@ def admit(
     quota = registry.quota_for(role)
     now = _now_local(now)
     budget = registry.budgets[EXT_SHELF] if shelf == EXT_SHELF else None
-    action, code, detail = _cached_script(redis, "ADMIT")(
+    action, code, detail, reused = _cached_script(redis, "ADMIT")(
         keys=[
             tok_key(user, _local_day(now)),
             conc_key(user),
@@ -381,7 +390,7 @@ def admit(
         ],
     )
     if action == "allow":
-        return Decision(action="allow")
+        return Decision(action="allow", reused=reused == "1")
     if code == "quota_tokens_exhausted":
         reason = (
             f"дневной лимит токенов {detail}/{quota.tokens_per_day} "

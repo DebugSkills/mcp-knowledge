@@ -699,11 +699,44 @@ def test_admin_conc_null_e2e_submit_run_done(ws) -> None:
 @pytest.mark.integration
 @requires_redis
 def test_submit_retry_same_job_id_no_double_count_and_released(ws) -> None:
-    """P1-B + P2-1: повторный submit с тем же job_id — admit идемпотентен
-    (счётчик НЕ удваивается), JobAlreadyExists компенсируется release'ом
-    резерва (движок переберёт его readmit'ом на старте)."""
+    """P2-1 (fresh-резерв): ретрай по job БЕЗ маркера (резерв снят паузой
+    waiting_human / терминалом, job жив в сторе) — admit берёт НОВЫЙ резерв,
+    create падает JobAlreadyExists → компенсация release'ом ОБЯЗАТЕЛЬНА
+    (иначе утеча: терминал этот резерв уже не вернёт)."""
     from ai_workspace.orchestrator.job import JobAlreadyExists
-    from ai_workspace.scheduler.admission import conc_key, conchold_key
+    from ai_workspace.scheduler.admission import conc_key, conc_release, conchold_key
+
+    client, book, user = ws
+    jid = f"{user}-j1"
+    wiring = _wiring(client, book, user)
+    wiring.submit(user=user, account_level="member", job_class="interactive",
+                  mode="statya", zone="public", job_id=jid)
+    assert int(client.get(conc_key(user))) == 1
+
+    # пауза сняла резерв, job остался в сторе (waiting_human → re-queue)
+    assert conc_release(user, jid, redis=client) is True
+    assert int(client.get(conc_key(user))) == 0
+
+    with pytest.raises(JobAlreadyExists):
+        wiring.submit(user=user, account_level="member", job_class="interactive",
+                      mode="statya", zone="public", job_id=jid)
+
+    # fresh-резерв этого вызова компенсирован (0, не 1 — утеча закрыта)
+    assert int(client.get(conc_key(user))) == 0
+    assert client.smembers(conchold_key(user)) == set()
+    assert JobStore(client).get(jid).state is JobState.QUEUED  # живой job цел
+
+
+@pytest.mark.integration
+@requires_redis
+def test_submit_retry_live_marker_keeps_reserve_for_queued_job(ws) -> None:
+    """N1 (reopen Ф4.2e), QUEUED-ветка: маркер жив (job в очереди, резерв
+    при нём) — ретрай НЕ компенсирует: reused-допуск ничего не резервировал,
+    резерв принадлежит job'у (движок возьмёт его же readmit'ом на старте —
+    без повторного INCR, терминал вернёт). Было: release снимал резерв
+    ожидающего job'а."""
+    from ai_workspace.orchestrator.job import JobAlreadyExists
+    from ai_workspace.scheduler.admission import conc_key, conchold_key, conclease_key
 
     client, book, user = ws
     jid = f"{user}-j1"
@@ -716,10 +749,51 @@ def test_submit_retry_same_job_id_no_double_count_and_released(ws) -> None:
         wiring.submit(user=user, account_level="member", job_class="interactive",
                       mode="statya", zone="public", job_id=jid)
 
-    # ретрай не удвоил счётчик (1→2→1 закрыто) И резерв компенсирован
-    assert int(client.get(conc_key(user))) == 0
-    assert client.smembers(conchold_key(user)) == set()
+    # ретрай не удвоил счётчик И НЕ снял резерв ожидающего job'а
+    assert int(client.get(conc_key(user))) == 1
+    assert client.sismember(conchold_key(user), jid)
+    assert client.exists(conclease_key(user, jid))
     assert JobStore(client).get(jid).state is JobState.QUEUED  # живой job цел
+
+
+@pytest.mark.integration
+@requires_redis
+def test_submit_retry_running_job_keeps_reserve_and_finishes(ws) -> None:
+    """N1 (reopen Ф4.2e), точный сценарий пробника критика: submit →
+    RUNNING → повторный submit тем же job_id. Было: компенсация release
+    снимала резерв/lease ЖИВОГО job'а (conc 1→0, marker=[], lease=0) →
+    первый же _beat = QuotaLeaseLost → ложный FAILED (потеря работы).
+    Стало: reused-допуск не компенсируется — job дорабатывает до DONE."""
+    from ai_workspace.orchestrator.job import JobAlreadyExists
+    from ai_workspace.scheduler.admission import conc_key, conchold_key, conclease_key
+
+    client, book, user = ws
+    jid = f"{user}-j1"
+    wiring = _wiring(client, book, user)
+    wiring.submit(user=user, account_level="member", job_class="interactive",
+                  mode="statya", zone="public", job_id=jid)
+    store = JobStore(client)
+    rec = store.get(jid)
+    store.transition(jid, JobState.RUNNING, expect_version=rec.version, epoch=EPOCH)
+    assert int(client.get(conc_key(user))) == 1  # резерв живого job'а
+
+    with pytest.raises(JobAlreadyExists):  # ретрай постановки тем же job_id
+        wiring.submit(user=user, account_level="member", job_class="interactive",
+                      mode="statya", zone="public", job_id=jid)
+
+    # резерв/владение/lease ЖИВОГО job'а не тронуты (было: 0/пусто/нет)
+    assert int(client.get(conc_key(user))) == 1
+    assert client.sismember(conchold_key(user), jid)
+    assert client.exists(conclease_key(user, jid))
+    assert wiring.make_port().heartbeat(user, jid) is True  # _beat пройдёт
+
+    engine = _engine(client, jid, wiring.make_port())
+    engine.seed(jid, {"brief": "тема"}, epoch=EPOCH)
+    paused = engine.run(jid, epoch=EPOCH)  # RUNNING → шаги → гейт (НЕ failed)
+    assert paused.status == "paused" and paused.resume_token
+    done = engine.resume(jid, epoch=EPOCH, token=paused.resume_token)
+    assert done.status == "done"  # НЕ failed «conc-lease утерян»
+    assert store.get(jid).state is JobState.DONE
 
 
 @pytest.mark.integration
