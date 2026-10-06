@@ -120,3 +120,11 @@ Mode engine, admission (Ф3.5+); human-gate `ws:gate:*` + дашборд спя�
 - Hot-reload по mtime каждого файла; битый/отсутствующий YAML → `RegistryError`
   (fail-closed: путь + причина, без молчаливых дефолтов).
 - Валидатор реестров — Ф3.5a-2; движок режимов — Ф3.5b.
+
+## Режимы: линт L1–L10 (Ф3.5a-3)
+
+`make modes-validate` гоняет ДВА контура: схему (S1–S8, `orchestrator/mode_schema.py`) и
+рантайм-линт (L1–L10, `orchestrator/mode_lint.py`): DAG/циклы критика, роли+seed-скиллы,
+инструменты, покрытие вход/выход (транзитивно), human-gate для strategic/brainstorm,
+citation-политика, резолв `model_class` (+private→local-only), терминируемость, fork/join,
+single-writer секций доски. На каждое правило — фикстур-нарушитель в `tests/fixtures/modes/`.

@@ -14,12 +14,14 @@ from pathlib import Path
 
 import yaml
 
+from ai_workspace.orchestrator.mode_lint import validate_lint
 from ai_workspace.orchestrator.mode_schema import Finding, validate_schema
 from ai_workspace.registry import Registry
 
 AI_WORKSPACE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_MODES_DIR = AI_WORKSPACE_DIR / "modes"
 DEFAULT_REGISTRY_DIR = AI_WORKSPACE_DIR / "registry"
+REPO_ROOT = AI_WORKSPACE_DIR.parent
 
 
 def _validate_file(path: Path, registry: Registry) -> bool:
@@ -30,6 +32,7 @@ def _validate_file(path: Path, registry: Registry) -> bool:
         print(f"❌ {path}: не читается или битый YAML: {exc}")
         return True
     findings: list[Finding] = validate_schema(doc, registry)
+    findings.extend(validate_lint(doc, registry, base_dir=REPO_ROOT))
     if not findings:
         print(f"✅ {path}: ok")
         return False
@@ -42,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     """Точка входа CLI; возвращает код выхода (0/1)."""
     parser = argparse.ArgumentParser(
         prog="modes-validate",
-        description="Схема-валидация YAML-режимов AI-верстака (Ф3.5a-2)",
+        description="Валидация YAML-режимов AI-верстака: схема (S) + линт (L) — Ф3.5a",
     )
     target = parser.add_mutually_exclusive_group()
     target.add_argument("--file", type=Path, help="один YAML-файл режима")
