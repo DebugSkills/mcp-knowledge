@@ -7,7 +7,7 @@ MODELS_DIR := ../models_cache
 # исходников требует интернета; обновление узла — только пакетом).
 AIRGAP_NODE_MARKER ?= /etc/mcp-knowledge/airgap-node
 
-.PHONY: dev deploy down logs test lint clean dlq-replay reindex backup prereq-dirs errors-view errors-report errors-alert errors-notify-import errors-cron-install errors-cron-remove errors-cron-status errors-cron-cleanup prod-errors-cron-cleanup help
+.PHONY: dev deploy down deploy-latest-log deploy-follow logs test lint clean dlq-replay reindex backup prereq-dirs errors-view errors-report errors-alert errors-notify-import errors-cron-install errors-cron-remove errors-cron-status errors-cron-cleanup prod-errors-cron-cleanup help
 
 # help: self-documenting список команд (docstring через `##` попадает сюда)
 help:  ## Список команд (docstring через ##)
@@ -23,6 +23,15 @@ prereq-dirs:
 # Логи ДУБЛИРУЮТСЯ в .trash/dev-<timestamp>.log — агент/разбор инцидентов
 # читают файл, а не консоль. Требуются собранные образы: `make deploy` один раз.
 DEV_LOG := .trash/dev-$(shell date +%Y%m%d-%H%M%S).log
+
+# ── Уровни вывода deploy (verbosity) ──────────────────────────────────────
+# V=0 (по умолчанию): в терминал — только фазы + компактный статус контейнеров;
+#                     полный вывод docker build → лог-файл (как dev-*.log).
+# V=1: полный поток в терминал (и дубль в лог).
+# Провал всегда печатает хвост лога (тихий режим не скрывает ошибку).
+# Просмотр: make deploy-latest-log / make deploy-follow
+V ?= 0
+DEPLOY_LOG := .trash/deploy-$(shell date +%Y%m%d-%H%M%S).log
 dev: prereq-dirs
 	@echo ""
 	@echo "🚀 Поднимается стек (живые логи, Ctrl+C — стоп):"
@@ -44,6 +53,16 @@ dev-follow:
 	if [ -z "$$LOG" ]; then echo "нет логов .trash/dev-*.log — запустите make dev"; exit 1; fi; \
 	echo "📡 follow: $$LOG (Ctrl+C — выход)"; tail -f "$$LOG"
 
+# deploy-latest-log: путь к последнему лог-файлу make deploy (для агента/диагностики)
+deploy-latest-log:
+	@ls -t .trash/deploy-*.log 2>/dev/null | head -1 || echo "нет логов .trash/deploy-*.log"
+
+# deploy-follow: следить за свежим логом deploy в реальном времени (Ctrl+C — выход)
+deploy-follow:
+	@LOG=$$(ls -t .trash/deploy-*.log 2>/dev/null | head -1); \
+	if [ -z "$$LOG" ]; then echo "нет логов .trash/deploy-*.log — запустите make deploy"; exit 1; fi; \
+	echo "📡 follow: $$LOG (Ctrl+C — выход)"; tail -f "$$LOG"
+
 # dev-follow-server: live-логи контейнера mcp-knowledge-server (docker logs -f)
 dev-follow-server:
 	@docker logs -f --tail 100 mcp-knowledge-server
@@ -63,7 +82,22 @@ deploy: prereq-dirs  ## Сборка+запуск стека в фоне (НЕ �
 		echo "✋ Это air-gap узел (маркер $(AIRGAP_NODE_MARKER)): обновление — только пакетом (make bundle-pack → перенос → на узле make airgap-update BUNDLE=…), сборка из исходников на узле недопустима"; \
 		exit 1; \
 	fi
-	$(DOCKER_COMPOSE) up -d --build --force-recreate
+	@mkdir -p .trash
+	@if [ "$(V)" = "1" ]; then \
+		echo "🏗  deploy: V=1 — полный вывод (дубль в $(DEPLOY_LOG))"; \
+		$(DOCKER_COMPOSE) up -d --build --force-recreate 2>&1 | tee $(DEPLOY_LOG); \
+	else \
+		echo "🏗  deploy: сборка/перезапуск (тихий режим; детали → $(DEPLOY_LOG); полный вывод: make deploy V=1)"; \
+		if $(DOCKER_COMPOSE) --progress quiet up -d --build --force-recreate >$(DEPLOY_LOG) 2>&1; then \
+			echo "✔ deploy ok"; \
+			$(DOCKER_COMPOSE) ps --format 'table {{.Name}}\t{{.Status}}'; \
+		else \
+			code=$$?; \
+			echo "✖ deploy FAILED (exit $$code) — хвост $(DEPLOY_LOG):"; \
+			tail -n 40 $(DEPLOY_LOG); \
+			exit $$code; \
+		fi; \
+	fi
 
 down:
 	$(DOCKER_COMPOSE) down
@@ -393,7 +427,7 @@ push: preflight  ## Пуш+деплой стека: preflight → git push --no-
 	else \
 		echo ""; \
 		echo "⚠️  ВНИМАНИЕ: код УЖЕ запушен, но стек требует разбора — verify-deploy нашёл проблемы."; \
-		echo "    Диагностика: make logs / make dev-latest-log / skill mcp-knowledge-prod-ops."; \
+		echo "    Диагностика: make logs / make deploy-latest-log / make dev-latest-log / skill mcp-knowledge-prod-ops."; \
 		exit 1; \
 	fi
 
@@ -429,7 +463,7 @@ push-fast:  ## Пуш+деплой config/docs-правок (fail-safe: код-�
 	else \
 	  echo ""; \
 	  echo "⚠️  ВНИМАНИЕ: код УЖЕ запушен, но стек требует разбора — verify-deploy нашёл проблемы."; \
-	  echo "    Диагностика: make logs / make dev-latest-log / skill mcp-knowledge-prod-ops."; \
+	  echo "    Диагностика: make logs / make deploy-latest-log / make dev-latest-log / skill mcp-knowledge-prod-ops."; \
 	  exit 1; \
 	fi
 
