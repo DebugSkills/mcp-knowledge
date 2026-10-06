@@ -165,3 +165,13 @@ citer(strict) → publish(gate)`. Гейт, отвеченный `approve`, да
 `sha256[:16]`. API: `save/get/list/export/delete/prune/promote`. В KB ведёт ТОЛЬКО
 явный `promote` (через `mcp.write_knowledge`, с обязательными `domain`/`subject`/`zone`).
 Движок по завершении job сохраняет композицию `output.sections` режима.
+
+## Unified GPU-контур (Ф3.8, `ai_workspace/gpu.py`)
+Один контур на все GPU-работы: верстак (эмбеддинги артефактов, vision) и mcp-knowledge
+(reindex/embed) ходят через общую полку `gpu` — иначе процессы переподпишут VRAM.
+Реализация — переиспользование семафора полок (Ф3.3): `Slots(client, shelf="gpu", k=K)`.
+Виды работ: `embed` / `vision` / `reindex`; **K общий** → сверх K отказ `GpuBusy`
+(не очередь, I1). API: `acquire/release/heartbeat/try_acquire/status/reconcile` и
+контекст `with gpu.lease("embed", ref):`. Ключи `ws:slots:gpu`, `ws:lease:gpu:{kind}:{ref}`,
+`ws:events:gpu`; K — env `WS_GPU_K` (dev 8 ГБ → 1). `reconcile()` снимает слоты с мёртвыми
+lease и отчитывается по видам — упавший воркер не держит GPU вечно.
