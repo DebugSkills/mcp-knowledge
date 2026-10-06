@@ -12,6 +12,14 @@
 
 Зависимости инъектируются (jobs/boards/llm/mcp/ledger/registry) → граф исполним на
 фейках в юнит-тестах и на ws-redis + LiteLLM + MCP в проде.
+
+Квот-контур (P1-5 ревизии Ф4, wiring): порт ``QuotaPort`` опционален (``None`` →
+контур выключен — юнит-тесты на фейках/локальные прогоны). При подключении движок
+продлевает conc-lease на каждом шаге и LLM-вызове (``heartbeat``), re-admit'ит
+резерв на старте исполнения и на resume из ``waiting_human`` (пауза резерв
+ОСВОБОЖДАЕТ — см. докстроку QuotaPort), списывает фактический usage и возвращает
+резерв на КАЖДОМ терминале (done/failed/cancel/gate-timeout). Постановка
+(admission ДО создания job) — ``scheduler/wiring.py`` (вне движка: job ещё нет).
 """
 
 from __future__ import annotations
@@ -43,6 +51,8 @@ __all__ = [
     "ModeEngine",
     "ModeGraph",
     "NodeFailure",
+    "QuotaLeaseLost",
+    "QuotaPort",
     "RedisLedger",
     "TokenInvalid",
     "ToolClient",
@@ -72,6 +82,28 @@ class EgressBlocked(EngineError):
     """
 
 
+class QuotaLeaseLost(EngineError):
+    """conc-lease резерва квоты утерян: истёк и снят свипером (P1-3/P1-5).
+
+    ``conc_heartbeat → False``: воркер ОБЯЗАН остановить работу — место в
+    conc уже отдано другому job'у пользователя, продолжение списывало бы
+    чужой резерв. Job → failed (fail-loud); повторный запуск — через
+    FAILED→queued: эффекты идемпотентны (I4), повторный прогон переиспользует
+    кэш ledger и докручивает только незакэшированные шаги.
+    """
+
+
+def _chars4_usage(prompt: str, output: str) -> int:
+    """Оценка токенов по измеримому факту вызова: ~4 символа/токен.
+
+    Placeholder-источник usage до контура реального списания (LiteLLM
+    usage-json — задача reconcile P0-1): списание идёт по факту объёма
+    текста вызова (prompt+output), а не по выдуманным числам; инъекция
+    ``usage_of`` в ModeEngine заменяет оценку без правки движка.
+    """
+    return (len(prompt) + len(output) + 3) // 4
+
+
 # ── порты (инъектируемые зависимости) ────────────────────────────────────
 
 
@@ -93,6 +125,48 @@ class ToolClient(Protocol):
     """MCP-клиент (mcp-knowledge или другой сервер)."""
 
     def call(self, *, tool: str, args: Mapping[str, Any]) -> Any: ...
+
+
+class QuotaPort(Protocol):
+    """Порт квот-контура движка (P1-5: wiring admission ↔ engine, Ф4.2).
+
+    Реализация над живым ws-redis — ``scheduler.wiring.RedisQuotaPort``;
+    ``None`` в конструкторе движка выключает контур. Все операции — над
+    per-job владением (``conc_release`` по маркеру, P1-2), не агрегатом.
+
+    ПОЛИТИКА ПАУЗ ``waiting_human`` (выбрана и зафиксирована, P1-5):
+    резерв ОСВОБОЖДАЕТСЯ на входе в паузу, resume берёт заново
+    (``readmit``). Обоснование: (а) время ответа человека не ограничено
+    (gate-timeout — отдельная политика), а продление lease требует живого
+    воркера — «держать» значило бы держать личный слот сутками (гость с
+    conc=1 блокировал бы сам себя и все свои job'ы на время раздумий);
+    (б) exempt от свипера реинкарнировал бы утечку P1-3 (брошенный
+    waiting_human держал бы слот вечно); (в) симметрия с parked (Ф4.3):
+    обе паузы освобождают, оба resume делают re-admit — одно правило без
+    особых случаев. Диспропорция критика («waiting_human держит, parked —
+    нет», E11) закрыта в сторону «не держит никто».
+    """
+
+    def readmit(self, user: str, role: str, job_id: str) -> str:
+        """Взять conc-резерв job'а заново (после паузы/утраты lease).
+
+        Возврат: ``allow`` (резерв взят admit'ом — второй раз НЕ берётся)
+        | ``deny`` | ``park``; при не-allow резерв не берётся — решение о
+        судьбе job за вызывающим (движок: paused, состояние не меняется).
+        """
+        ...
+
+    def heartbeat(self, user: str, job_id: str) -> bool:
+        """Продлить conc-lease (воркер жив; P1-3). ``False`` — резерва нет."""
+        ...
+
+    def charge(self, user: str, tokens: int) -> None:
+        """Списать фактический расход токенов дня (терминал job; D3/D7)."""
+        ...
+
+    def release(self, user: str, job_id: str) -> None:
+        """Освободить резерв job'а по владению (идемпотентно, P1-2)."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -135,6 +209,8 @@ class ModeEngine:
         decoding: Any | None = None,
         seed_loader: Callable[[str], str] | None = None,
         clock: Callable[[], float] = time.time,
+        quota: QuotaPort | None = None,
+        usage_of: Callable[[str, str], int] | None = None,
     ) -> None:
         self.jobs = jobs
         self.boards = boards
@@ -147,6 +223,8 @@ class ModeEngine:
         self.decoding = decoding
         self.seed_loader = seed_loader
         self.clock = clock
+        self.quota = quota
+        self.usage_of = usage_of if usage_of is not None else _chars4_usage
 
     # ── публичный API ────────────────────────────────────────────────────
 
@@ -168,11 +246,22 @@ class ModeEngine:
                                 detail="job в парке (бюджет D5 / команда) — требуется resume (Ф4.3)")
 
         if rec.state in (JobState.QUEUED, JobState.SLEEPING, JobState.PREEMPTED):
+            if self.quota is not None and not self.quota.heartbeat(rec.user, job_id):
+                # Lease постановки истёк (долгая очередь) либо резерва нет:
+                # re-admit ДО старта. Двойного INCR нет — lease-ключ у резерва
+                # один, свипер снимает резерв только вместе с маркером (т.е.
+                # при живом lease снимать нечего, а без lease резерва уже нет).
+                action = self.quota.readmit(rec.user, rec.account_level, job_id)
+                if action != "allow":
+                    return EngineResult(status="paused", node=rec.cursor,
+                                        board_version=self._board_version(rec),
+                                        detail=f"исполнение отложено: admission={action} — квота/бюджет, job остаётся в очереди")
             rec = self.jobs.transition(job_id, JobState.RUNNING, expect_version=rec.version, epoch=epoch)
 
         for _ in range(max_steps):
             node = self.graph.node(rec.cursor or self.graph.start())
             try:
+                self._beat(rec)
                 rec, verdict, next_id = self._run_node(job_id, rec, node, epoch)
             except _Pause as pause:
                 cur = self.jobs.get(job_id)  # версия могла сдвинуться внутри узла
@@ -180,6 +269,9 @@ class ModeEngine:
                     job_id, JobState.WAITING_HUMAN, expect_version=cur.version, epoch=epoch,
                     patch={"cursor": pause.node_id},
                 )
+                # Политика паузы (P1-5, см. QuotaPort): слот не держим —
+                # ожидание человека не занимает личный параллелизм (D6).
+                self._quota_release(rec)
                 return EngineResult(status="paused", node=pause.node_id,
                                     board_version=self._board_version(rec),
                                     resume_token=pause.token, detail=pause.prompt)
@@ -187,11 +279,13 @@ class ModeEngine:
                 cur = self.jobs.get(job_id)  # секция/версия могли обновиться до провала
                 rec = self.jobs.transition(job_id, JobState.FAILED, expect_version=cur.version,
                                            epoch=epoch, patch={"cursor": node.id})
+                self._quota_finalize(rec)
                 return EngineResult(status="failed", node=node.id,
                                     board_version=self._board_version(rec), detail=str(exc))
 
             if next_id is None:
                 rec = self.jobs.transition(job_id, JobState.DONE, expect_version=rec.version, epoch=epoch)
+                self._quota_finalize(rec)
                 return EngineResult(status="done", node=node.id,
                                     board_version=self._board_version(rec), verdict=verdict,
                                     artifact_id=self._persist_artifact(job_id, rec))
@@ -229,6 +323,15 @@ class ModeEngine:
 
         ``edit`` пишется секцией gate-узла через board CAS (single-writer).
         Токен single-use: повторное предъявление → ``TokenInvalid``.
+
+        Квоты (P1-5): пауза резерв не держит (см. QuotaPort) → перед
+        исполнением делается ``readmit`` (резерв заново). ``deny``/``park`` →
+        paused: состояние не меняется, предъявленный токен отработан
+        (single-use честно расходуется), а гейт ПРОДОЛЖАЕТ ЖИТЬ — выдаётся
+        свежий resume-токен того же узла (человек повторит позже им).
+        Порядок: токен (исходная семантика сохранена — повторное
+        предъявление на терминальном job даёт TokenInvalid) → состояние →
+        readmit.
         """
         consumed = self.ledger.consume_token(job_id, token)
         if consumed is None:
@@ -237,6 +340,14 @@ class ModeEngine:
         rec = self.jobs.get(job_id)
         if rec.state is not JobState.WAITING_HUMAN:
             raise EngineError(f"job {job_id!r} не в waiting_human (state={rec.state.value})")
+        if self.quota is not None:
+            action = self.quota.readmit(rec.user, rec.account_level, job_id)
+            if action != "allow":
+                fresh = self.ledger.issue_token(job_id, node_id)
+                return EngineResult(status="paused", node=node_id,
+                                    board_version=self._board_version(rec),
+                                    resume_token=fresh,
+                                    detail=f"resume отложен: admission={action} — квота/бюджет; выдан свежий токен")
         # Durable-ответ гейта: approve делает его pass-through при повторном входе
         # (REVISE-петля), edit — показать снова после переработки.
         self.ledger.put(job_id, f"gate:{node_id}", {"decision": decision})
@@ -244,6 +355,7 @@ class ModeEngine:
         if decision == "reject":
             rec = self.jobs.transition(job_id, JobState.FAILED, expect_version=rec.version,
                                        epoch=epoch, patch={"cursor": node_id})
+            self._quota_finalize(rec)
             return EngineResult(status="failed", node=node_id,
                                 board_version=self._board_version(rec), detail="человек отклонил")
 
@@ -257,10 +369,43 @@ class ModeEngine:
         next_id = self._gate_target(self.graph.node(node_id), decision)
         if next_id is None:
             rec = self.jobs.transition(job_id, JobState.DONE, expect_version=rec.version, epoch=epoch)
+            self._quota_finalize(rec)
             return EngineResult(status="done", node=node_id, board_version=self._board_version(rec),
                                 artifact_id=self._persist_artifact(job_id, rec))
         rec = self.jobs.patch(job_id, expect_version=rec.version, epoch=epoch, patch={"cursor": next_id})
         return self.run(job_id, epoch=epoch)
+
+    def cancel(self, job_id: str, *, epoch: int, reason: str = "command") -> EngineResult:
+        """Отмена job — терминал ``cancelled`` с финализацией квот (P1-5).
+
+        Фактический usage списывается (charge), резерв возвращается
+        (release): отмена не дарит списанные токены и не держит слот.
+        Статус ответа ``failed`` — терминальное отображение CANCELLED
+        (как ``_terminal_status``; отдельного literal в EngineResult нет).
+        Нелегальный переход (уже терминал) — ``IllegalTransition`` наружу.
+        """
+        rec = self.jobs.get(job_id)
+        rec = self.jobs.transition(job_id, JobState.CANCELLED,
+                                   expect_version=rec.version, epoch=epoch)
+        self._quota_finalize(rec)
+        return EngineResult(status="failed", node=rec.cursor,
+                            board_version=self._board_version(rec),
+                            detail=f"cancel: {reason}")
+
+    def gate_timeout(self, job_id: str, *, epoch: int) -> EngineResult:
+        """Таймаут ожидания человека: ``waiting_human → failed`` (P1-5).
+
+        Отдельный вход (не cancel): политика таймаута гейта из таблицы
+        переходов (job.py: WAITING_HUMAN → FAILED). Квоты финализируются
+        как на любом терминале — usage по факту + возврат резерва.
+        """
+        rec = self.jobs.get(job_id)
+        rec = self.jobs.transition(job_id, JobState.FAILED,
+                                   expect_version=rec.version, epoch=epoch)
+        self._quota_finalize(rec)
+        return EngineResult(status="failed", node=rec.cursor,
+                            board_version=self._board_version(rec),
+                            detail="gate-timeout: человек не ответил за отведённое время")
 
     # ── шаг узла ─────────────────────────────────────────────────────────
 
@@ -294,6 +439,7 @@ class ModeEngine:
             output = str(cached["output"])
         else:
             output = self._call_llm_with_retry(rec, node, prompt, inputs)
+            self._bump_usage(job_id, prompt, output)
             self.ledger.put(job_id, f"fx:{eff}", {"output": output})
 
         section = self._out_section(node)
@@ -329,6 +475,7 @@ class ModeEngine:
             output = str(cached["output"])
         else:
             output = self._call_llm_with_retry(rec, node, prompt, inputs)
+            self._bump_usage(job_id, prompt, output)
             self.ledger.put(job_id, f"fx:{eff}", {"output": output})
 
         verdict = self._parse_verdict(node, output)
@@ -349,6 +496,59 @@ class ModeEngine:
             )
         self.ledger.put(job_id, it_key, {"n": n})
         return rec, verdict, node.get("on_revise", self.graph.start())
+
+    # ── квот-контур (P1-5) ────────────────────────────────────────────────
+
+    def _beat(self, rec: JobRecord) -> None:
+        """Продлить conc-lease перед шагом/вызовом; утрата → fail-loud.
+
+        ``QuotaLeaseLost`` — EngineError: ловится общим обработчиком run()
+        → job failed + finalize (usage по факту; release — no-op, резерв
+        уже снят свипером). Мид-ран утерю lease НЕ компенсируем re-admit'ом:
+        место мог занять другой job пользователя, а масштаб взятия уже
+        неконтролируем — честный терминал дешевле тихого двойного списания.
+        """
+        if self.quota is not None and not self.quota.heartbeat(rec.user, rec.id):
+            raise QuotaLeaseLost(
+                f"conc-lease job {rec.id!r} (user {rec.user!r}) истёк/утерян — "
+                "резерв снят свипером; исполнение остановлено (чужой резерв не списываем)"
+            )
+
+    def _quota_release(self, rec: JobRecord) -> None:
+        """Вернуть резерв job'а (пауза waiting_human; идемпотентно, P1-2)."""
+        if self.quota is not None:
+            self.quota.release(rec.user, rec.id)
+
+    def _quota_finalize(self, rec: JobRecord) -> None:
+        """Терминал job: списать фактический usage + вернуть резерв (P1-5).
+
+        Usage — durable-счётчик ledger (ключ ``usage``), пополняется на
+        каждом реальном LLM-вызове (кэш-попадания бесплатны, I4). Заряд
+        идёт один раз — только в момент перехода в терминал; повторный
+        вход в run() для терминального job возвращается раньше (без
+        повторного finalize). Заряд НЕ идемпотентен — потому ровно один
+        вызов на терминальный переход.
+        """
+        if self.quota is None:
+            return
+        used = self.ledger.get(rec.id, "usage") or {}
+        tokens = int(used.get("tokens", 0))
+        if tokens > 0:
+            self.quota.charge(rec.user, tokens)
+        self.quota.release(rec.user, rec.id)
+
+    def _bump_usage(self, job_id: str, prompt: str, output: str) -> None:
+        """Учесть фактический расход LLM-вызова (durable, ключ ``usage``).
+
+        Вызывается только при реальном вызове модели (мимо кэша эффектов).
+        Контур выключен (``quota is None``) — счётчик не ведётся: старые
+        прогоны не платят накладные расходы и не меняют ledger-контракт.
+        """
+        if self.quota is None:
+            return
+        used = self.ledger.get(job_id, "usage") or {"tokens": 0}
+        used["tokens"] = int(used.get("tokens", 0)) + self.usage_of(prompt, output)
+        self.ledger.put(job_id, "usage", used)
 
     # ── вспомогательное ──────────────────────────────────────────────────
 
@@ -381,6 +581,7 @@ class ModeEngine:
         attempts = int(node.get("retry", 0))
         last: Exception | None = None
         for _ in range(attempts + 1):
+            self._beat(rec)  # lease жив перед КАЖДОЙ попыткой (P1-3/P1-5)
             try:
                 return self.llm.complete(
                     role=str(node.get("role", node.id)),
