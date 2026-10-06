@@ -42,8 +42,8 @@ from ai_workspace.registry import Registry
 from ai_workspace.registry.quotas import QuotaRegistry
 from ai_workspace.scheduler import policy
 from ai_workspace.scheduler.admission import (
-    BUDGET_GLOBAL_KEY,
     admit,
+    budget_global_key,
     conc_exit,
     conc_key,
     conchold_key,
@@ -108,14 +108,15 @@ def ws():
 
 @pytest.fixture()
 def budget_global(ws):
-    """Снапшот/восстановление ws:budget:global (общий ключ тестового redis)."""
+    """Снапшот/восстановление бюджетного счётчика месяца (микро-₽, P0-1)."""
+    key = budget_global_key()
     client = ws[0]
-    prev = client.get(BUDGET_GLOBAL_KEY)
+    prev = client.get(key)
     yield client
     if prev is None:
-        client.delete(BUDGET_GLOBAL_KEY)
+        client.delete(key)
     else:
-        client.set(BUDGET_GLOBAL_KEY, prev)
+        client.set(key, prev)
 
 
 def _mk_job(store: JobStore, user: str, *, level: str = "member", epoch: int = 0):
@@ -277,9 +278,9 @@ def test_resume_with_budget_still_exhausted_stays_parked(ws, budget_global):
     в очереди нет, conc-резерв НЕ взят, resumed-события нет."""
     client, store, book, _ = ws
     pc, q, user, job, call = _ext_setup(client, store)
-    limit = book.budgets["ext"].limit
+    limit_micro = book.budgets["ext"].limit_micro
     try:
-        client.set(BUDGET_GLOBAL_KEY, limit)
+        client.set(budget_global_key(), limit_micro)
         assert pc.park(job.id, call=call, reason="budget_ext_exhausted") is True
 
         assert pc.resume(job.id, registry=book, call=call) is False
@@ -301,13 +302,13 @@ def test_resume_after_budget_restored_requeues_with_single_conc(ws, budget_globa
     второго conc_enter); вызов сервируется следующим dequeue."""
     client, store, book, _ = ws
     pc, q, user, job, call = _ext_setup(client, store)
-    limit = book.budgets["ext"].limit
+    limit_micro = book.budgets["ext"].limit_micro
     try:
-        client.set(BUDGET_GLOBAL_KEY, limit)
+        client.set(budget_global_key(), limit_micro)
         assert pc.park(job.id, call=call, reason="budget_ext_exhausted") is True
         vft = q.call_record(call)["vft"]
 
-        client.set(BUDGET_GLOBAL_KEY, limit - 1)  # nightly reconcile вернул
+        client.set(budget_global_key(), limit_micro - 1)  # nightly reconcile вернул
         assert pc.resume(job.id, registry=book, call=call) is True
 
         assert store.get(job.id).state is JobState.QUEUED

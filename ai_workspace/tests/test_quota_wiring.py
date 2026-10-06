@@ -269,21 +269,31 @@ def ws():
 
 @pytest.fixture()
 def budget_global(ws):
-    from ai_workspace.scheduler.admission import BUDGET_GLOBAL_KEY
+    from ai_workspace.scheduler.admission import budget_global_key
 
+    key = budget_global_key()
     client = ws[0]
-    prev = client.get(BUDGET_GLOBAL_KEY)
+    prev = client.get(key)
     yield client
     if prev is None:
-        client.delete(BUDGET_GLOBAL_KEY)
+        client.delete(key)
     else:
-        client.set(BUDGET_GLOBAL_KEY, prev)
+        client.set(key, prev)
 
 
-def _wiring(client, book, user, *, shelf="local", lease_ttl_ms=90_000):
+def _wiring(client, book, user, *, shelf="local", lease_ttl_ms=90_000, pricing=None):
     from ai_workspace.scheduler.wiring import QuotaWiring
 
-    return QuotaWiring(client, registry=book, shelf=shelf, lease_ttl_ms=lease_ttl_ms)
+    return QuotaWiring(
+        client, registry=book, shelf=shelf, lease_ttl_ms=lease_ttl_ms, pricing=pricing,
+    )
+
+
+def _pricing():
+    from ai_workspace.registry import Registry
+    from ai_workspace.registry.pricing import PricingRegistry
+
+    return PricingRegistry(Registry(REGISTRY_DIR))
 
 
 def _engine(client, job_id, port):
@@ -302,8 +312,10 @@ def _engine(client, job_id, port):
 
 
 def _submit(client, book, user, job_id, *, account_level="member", shelf="local",
-            lease_ttl_ms=90_000, zone="public"):
-    return _wiring(client, book, user, shelf=shelf, lease_ttl_ms=lease_ttl_ms).submit(
+            lease_ttl_ms=90_000, zone="public", pricing=None):
+    return _wiring(
+        client, book, user, shelf=shelf, lease_ttl_ms=lease_ttl_ms, pricing=pricing,
+    ).submit(
         user=user, account_level=account_level, job_class="interactive",
         mode="statya", zone=zone, job_id=job_id,
     )
@@ -371,16 +383,18 @@ def test_submit_deny_conc_holds_personal_slot(ws) -> None:
 @requires_redis
 def test_submit_budget_park_parks_job_without_reserve(ws, budget_global) -> None:
     from ai_workspace.scheduler.admission import (
-        BUDGET_GLOBAL_KEY,
+        budget_global_key,
         conc_key,
         conchold_key,
     )
 
     client, book, user = ws
-    limit = book.budgets["ext"].limit
-    client.set(BUDGET_GLOBAL_KEY, limit)  # бюджет исчерпан (D4/D5)
+    limit_micro = book.budgets["ext"].limit_micro  # микро-₽ (P0-1)
+    client.set(budget_global_key(), limit_micro)  # бюджет исчерпан (D4/D5)
 
-    rec = _submit(client, book, user, f"{user}-j1", shelf="ext")
+    rec = _submit(
+        client, book, user, f"{user}-j1", shelf="ext", pricing=_pricing()
+    )
 
     assert rec.state is JobState.PARKED  # создан и СРАЗУ запаркован (Ф4.3)
     assert client.get(conc_key(user)) is None  # park ничего не резервирует
@@ -549,3 +563,188 @@ def test_submit_fail_closed_when_ws_redis_down(ws, caplog) -> None:
     assert isinstance(ei.value.__cause__, redis.exceptions.ConnectionError)
     degraded = [r for r in caplog.records if "quota_degraded" in r.getMessage()]
     assert degraded and "admit" in degraded[0].getMessage()
+
+
+# ── offline: P1-C1 iter2 — finalize crash/repeat-safe ───────────────────
+
+
+class _ChargeBoomQuota(FakeQuota):
+    """Charge отказал (деградация redis на терминале) — порт поднять нельзя."""
+
+    def charge(self, user: str, tokens: int) -> None:
+        raise RuntimeError("ws-redis упал на charge")
+
+
+def test_finalize_charge_failure_still_releases_reserve() -> None:
+    """Отказ charge на терминале НЕ съедает резерв: release выполняется
+    ВСЕГДА (try/finally); сам отказ — fail-loud наружу (терминал уже
+    зафиксирован в сторе)."""
+    quota = _ChargeBoomQuota()
+    engine, _ = make_quoted_engine(quota)
+    paused = run_to_pause(engine)
+    releases_at_pause = len(quota.releases)  # релиз паузы НЕ считаем
+
+    with pytest.raises(RuntimeError, match="charge"):
+        engine.resume("j1", epoch=EPOCH, token=paused.resume_token)
+
+    # резерв возвращён ИМЕННО финализацией, несмотря на отказ charge
+    assert len(quota.releases) == releases_at_pause + 1
+    assert engine.jobs.get("j1").state is JobState.DONE  # терминал зафиксирован
+    assert quota.charges == []  # заряд не прошёл — маркер не поставлен
+
+
+def test_failed_requeued_terminal_charges_usage_once() -> None:
+    """Легальный retry-путь FAILED→QUEUED→terminal (эффекты из кэша, 0 новых
+    токенов) — суммарно ОДИН заряд: пробник критика списывал 50 токенов
+    дважды (50 → 100). Маркер ``usage.charged`` доводится до факта."""
+    quota = FakeQuota()
+    engine, ledger = make_quoted_engine(quota, mcp=_BoomMCP())
+    failed = engine.run("j1", epoch=EPOCH)
+    assert failed.status == "failed"
+    used = ledger.get("j1", "usage")
+    assert used and used["tokens"] > 0
+    assert quota.charges == [("u1", used["tokens"])]  # первый терминал списал
+
+    rec = engine.jobs.get("j1")
+    engine.jobs.transition("j1", JobState.QUEUED, expect_version=rec.version, epoch=EPOCH)
+    engine.mcp = FakeMCP()  # причина сбоя устранена — retry
+    paused = engine.run("j1", epoch=EPOCH)
+    assert paused.status == "paused" and paused.resume_token
+    done = engine.resume("j1", epoch=EPOCH, token=paused.resume_token)
+    assert done.status == "done"
+
+    assert quota.charges == [("u1", used["tokens"])]  # НЕТ второго заряда
+    final = ledger.get("j1", "usage")
+    assert final["charged"] == final["tokens"]  # маркер == факт
+    assert ("u1", "j1") in quota.releases
+
+
+# ── offline: P2-5 iter2 — гонка cancel() с живым воркером ───────────────
+
+
+def test_cancel_race_store_error_returns_terminal_status() -> None:
+    """Воркер проиграл CAS параллельному cancel/gate_timeout: run() ПЕРЕЖИВАЕТ
+    JobStoreError (VersionConflict/IllegalTransition), перечитывает job и
+    возвращает терминальный статус — вместо необработанного исключения в
+    воркер-цикле. Квоты финализированы параллельным вызовом (без дубля)."""
+    from dataclasses import replace as _replace
+
+    from ai_workspace.orchestrator.job import VersionConflict
+
+    class _RacingCancelJobs(FakeJobs):
+        """Первый patch курсора сталкивается с параллельным cancel:
+        store поднял VersionConflict, актуальное состояние — cancelled."""
+
+        def patch(self, job_id, *, expect_version, epoch, patch=None):
+            if patch is not None and "cursor" in patch and "board_versions" not in patch:
+                rec = self.records[job_id]
+                self.records[job_id] = _replace(
+                    rec, state=JobState.CANCELLED, version=rec.version + 1
+                )
+                raise VersionConflict("race: cancel выиграл CAS")
+            return super().patch(
+                job_id, expect_version=expect_version, epoch=epoch, patch=patch
+            )
+
+    quota = FakeQuota()
+    engine = ModeEngine(
+        jobs=_RacingCancelJobs(), boards=FakeBoards(), graph=load_mode(VALID),
+        llm=FakeLLM(dict(SCRIPT)), mcp=FakeMCP(), ledger=MemoryLedger(), quota=quota,
+    )
+    engine.jobs.create("j1")
+    engine.seed("j1", {"brief": "т"}, epoch=EPOCH)
+
+    res = engine.run("j1", epoch=EPOCH)  # без фикса: VersionConflict наружу
+
+    assert res.status == "failed"  # терминальное отображение CANCELLED
+    assert "параллельным" in res.detail
+    assert engine.jobs.get("j1").state is JobState.CANCELLED
+
+
+# ── integration: P1-A/P1-B/P2-1/P1-3 iter2 ──────────────────────────────
+
+
+@pytest.mark.integration
+@requires_redis
+def test_admin_conc_null_e2e_submit_run_done(ws) -> None:
+    """P1-A: admin (conc=null, tokens_per_day=null) — полный цикл
+    submit→run→done: lease жив на heartbeat (QuotaLeaseLost не возникает),
+    usage списан (личного лимита нет — charge не гейтится), владение
+    возвращено на терминале. Пробник критика: run падал «conc-lease утерян»."""
+    from ai_workspace.scheduler.admission import conc_key, conchold_key, tok_key
+
+    client, book, user = ws
+    jid = f"{user}-j1"
+    wiring = _wiring(client, book, user)
+    rec = wiring.submit(user=user, account_level="admin", job_class="interactive",
+                        mode="statya", zone="public", job_id=jid)
+    assert rec.state is JobState.QUEUED
+    assert client.get(conc_key(user)) is None  # счётчика нет (conc=null)
+    assert client.sismember(conchold_key(user), jid)  # но владение есть
+    assert client.exists(f"ws:quota:conclease:{user}:{jid}")  # и lease
+
+    engine = _engine(client, jid, wiring.make_port())
+    engine.seed(jid, {"brief": "тема"}, epoch=EPOCH)
+    paused = engine.run(jid, epoch=EPOCH)
+    assert paused.status == "paused" and paused.resume_token  # дошёл до гейта
+    done = engine.resume(jid, epoch=EPOCH, token=paused.resume_token)
+    assert done.status == "done"  # НЕ failed «conc-lease истёк/утерян»
+
+    day = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+    assert int(client.get(tok_key(user, day)) or 0) > 0  # usage списан
+    assert client.get(conc_key(user)) is None  # декремента не было и не нужно
+    assert client.smembers(conchold_key(user)) == set()  # владение возвращено
+
+
+@pytest.mark.integration
+@requires_redis
+def test_submit_retry_same_job_id_no_double_count_and_released(ws) -> None:
+    """P1-B + P2-1: повторный submit с тем же job_id — admit идемпотентен
+    (счётчик НЕ удваивается), JobAlreadyExists компенсируется release'ом
+    резерва (движок переберёт его readmit'ом на старте)."""
+    from ai_workspace.orchestrator.job import JobAlreadyExists
+    from ai_workspace.scheduler.admission import conc_key, conchold_key
+
+    client, book, user = ws
+    jid = f"{user}-j1"
+    wiring = _wiring(client, book, user)
+    wiring.submit(user=user, account_level="member", job_class="interactive",
+                  mode="statya", zone="public", job_id=jid)
+    assert int(client.get(conc_key(user))) == 1
+
+    with pytest.raises(JobAlreadyExists):
+        wiring.submit(user=user, account_level="member", job_class="interactive",
+                      mode="statya", zone="public", job_id=jid)
+
+    # ретрай не удвоил счётчик (1→2→1 закрыто) И резерв компенсирован
+    assert int(client.get(conc_key(user))) == 0
+    assert client.smembers(conchold_key(user)) == set()
+    assert JobStore(client).get(jid).state is JobState.QUEUED  # живой job цел
+
+
+@pytest.mark.integration
+@requires_redis
+def test_ws_quota_sweep_script_reclaims_dead_reserve(ws) -> None:
+    """P1-3 (остаток): у sweep_all есть реальный вызов — запуск СКРИПТА
+    scripts/ws_quota_sweep.py (make ws-quota-sweep): мёртвый резерв снят
+    именно этим вызовом, JSON-отчёт называет снятый job."""
+    import os
+    import subprocess
+    import sys
+    import time as time_mod
+    from pathlib import Path
+
+    client, book, user = ws
+    jid = f"{user}-j1"
+    _submit(client, book, user, jid, lease_ttl_ms=150)  # резерв с коротким lease
+    time_mod.sleep(0.25)  # воркер «умер», свип ещё не ходил
+
+    proc = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve().parents[2] / "scripts" / "ws_quota_sweep.py")],
+        capture_output=True, text=True, env=dict(os.environ), timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    assert report["reclaimed"].get(user) == [jid]
+    assert int(client.get(f"ws:quota:conc:{user}") or 0) == 0
+    assert client.smembers(f"ws:quota:conchold:{user}") == set()

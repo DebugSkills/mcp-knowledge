@@ -48,7 +48,7 @@ from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
-from ai_workspace.orchestrator.job import JobStore
+from ai_workspace.orchestrator.job import JobAlreadyExists, JobStore
 from ai_workspace.scheduler.admission import (
     DEFAULT_CONC_LEASE_TTL_MS,
     EXT_SHELF,
@@ -219,9 +219,10 @@ class QuotaWiring:
           терминал возвращает (``engine.ModeEngine(quota=port)``).
 
         ``account_level`` — participant-роль (quotas.yaml); ``job_id``
-          можно передать для идемпотентного ретрая постановки (create
-          упадёт ``JobAlreadyExists``, резерв admit при этом уже взят —
-          вызывающий обязан освободить через ``conc_release``).
+          можно передать для идемпотентного ретрая постановки: повторный
+          admit того же job НЕ дублирует резерв (SISMEMBER-гвард, P1-B),
+          а ``JobAlreadyExists`` компенсируется release'ом здесь же
+          (P2-1) — вызывающему ничего освобождать не нужно.
         """
         job_id = job_id or uuid4().hex
         decision = admit(
@@ -234,15 +235,25 @@ class QuotaWiring:
             lease_ttl_ms=self.lease_ttl_ms,
         )
         decision.raise_if_denied()  # deny → AdmissionDenied ДО создания job
-        self.store.create(
-            user=user,
-            account_level=account_level,
-            job_class=job_class,
-            mode=mode,
-            zone=zone,
-            vft=vft,
-            job_id=job_id,
-        )
+        try:
+            self.store.create(
+                user=user,
+                account_level=account_level,
+                job_class=job_class,
+                mode=mode,
+                zone=zone,
+                vft=vft,
+                job_id=job_id,
+            )
+        except JobAlreadyExists:
+            # P2-1 iter2: идемпотентный ретрай постановки наткнулся на живой
+            # job — резерв компенсируем release'ом (обычно no-op: admit был
+            # идемпотентен по (user, job), P1-B; но если job на паузе БЕЗ
+            # маркера — этот вызов мог взять резерв заново, его никто не
+            # вернёт). Живой job переберёт резерв readmit'ом на старте
+            # движка; исключение — наружу (семантика create не менялась).
+            conc_release(user, job_id, redis=self.client)
+            raise
         if decision.action == "park":
             # Бюджетный hard-stop (D5): job жив, но не исполняется до
             # reconcile/resume (Ф4.3). call=None — очереди ещё не касались.
@@ -259,6 +270,13 @@ class QuotaWiring:
         истёкших; события ``conc_reservation_reclaimed`` в ws:quota:events).
         Возврат: {user: [job_id]} — только у кого что-то снялось
         (наблюдение reconcile-tick'а; пустой словарь = чисто).
+
+        РЕАЛЬНЫЙ ВЫЗОВ (P1-3 iter2): ``scripts/ws_quota_sweep.py`` /
+        ``make ws-quota-sweep`` (JSON-отчёт, ``WS_REDIS_URL`` — ПРОД
+        ws-redis, дефолта НЕТ — fail-closed). ВЛАДЕЛЕЦ/КАДЕНС: оператор —
+        периодически, пока lease TTL = 90 c (рекомендация ≤ 60 c; cron НЕ
+        подключён — остаток с владельцем-оператором); штатное место —
+        reconcile-tick wiring-воркера (Ф4.7), куда этот вызов переедет.
         """
         users: set[str] = set()
         for key in self.client.scan_iter(match="ws:job:*"):

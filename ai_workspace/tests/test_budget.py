@@ -369,3 +369,53 @@ class TestBudgetIntegration:
             assert store.get(job.id).state is JobState.QUEUED  # job едет
         finally:
             client.delete("ws:events:ext")
+
+
+# ── integration: P2-3 iter2 — гейт корректировки ВНИЗ ──────────────────
+
+
+@pytest.mark.integration
+@requires_redis
+class TestBudgetReconcileGate:
+    """Сверка — counter↔journal (наши списания), НЕ audit провайдера:
+    подозрительно большая корректировка ВНИЗ (счётчик ≫ журнала — признак
+    потери/усечения журнала) без явного порога НЕ применяется (fail-closed:
+    бюджет не «возвращается» молча)."""
+
+    @pytest.fixture()
+    def isolated(self):
+        from ai_workspace.redis_client import make_ws_redis
+        from ai_workspace.scheduler.admission import budget_user_key
+        from ai_workspace.scheduler.budget import BUDGET_JOURNAL_KEY
+
+        client = make_ws_redis()
+        user = f"{WS_TEST_ID_PREFIX}p23-{uuid4().hex[:8]}"
+        client.delete(BUDGET_JOURNAL_KEY, *list(client.scan_iter(match="ws:budget:user:*")))
+        yield client, user
+        from ai_workspace.scheduler.admission import budget_global_key
+
+        keys = [budget_global_key(), budget_user_key(user)]
+        keys += list(client.scan_iter(match=f"ws:quota:*{user}*"))
+        keys += list(client.scan_iter(match=f"ws:job:{user}-*"))
+        keys += [BUDGET_JOURNAL_KEY]
+        keys += list(client.scan_iter(match="ws:budget:user:*"))
+        client.delete(*keys)
+
+    def test_reconcile_downward_gate_blocks_suspicious_correction(self, isolated):
+        from ai_workspace.scheduler.admission import budget_global_key
+        from ai_workspace.scheduler.budget import charge_budget, reconcile_budget
+
+        client, user = isolated
+        pricing = PricingRegistry(Registry(REGISTRY_DIR))
+        truth = charge_budget(
+            user, tokens_in=0, tokens_out=1_000, redis=client, pricing=pricing
+        )
+        client.set(budget_global_key(), truth + 10**9)  # «дрейф» на 1000 ₽ вверх
+
+        with pytest.raises(ValueError, match="вниз"):
+            reconcile_budget(redis=client, max_downward_micro=1_000_000)
+        assert int(client.get(budget_global_key())) == truth + 10**9  # НЕ тронут
+
+        report = reconcile_budget(redis=client, max_downward_micro=2 * 10**9)
+        assert report.global_after_micro == truth  # в пределах порога — применено
+        assert int(client.get(budget_global_key())) == truth

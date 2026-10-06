@@ -39,7 +39,12 @@ from ai_workspace.orchestrator.graph import (
     UnsupportedNode,
     load_mode,
 )
-from ai_workspace.orchestrator.job import JobRecord, JobState, compute_effect_id
+from ai_workspace.orchestrator.job import (
+    JobRecord,
+    JobState,
+    JobStoreError,
+    compute_effect_id,
+)
 from ai_workspace.orchestrator.ledger import Ledger, MemoryLedger, RedisLedger
 
 __all__ = [
@@ -245,12 +250,38 @@ class ModeEngine:
                                 board_version=self._board_version(rec),
                                 detail="job в парке (бюджет D5 / команда) — требуется resume (Ф4.3)")
 
+        try:
+            return self._run_admitted(job_id, rec, epoch, max_steps)
+        except JobStoreError:
+            # Гонка с cancel()/gate_timeout() (P2-5 iter2): наш write в сторе
+            # проиграл CAS — терминал зафиксирован параллельным вызовом, квоты
+            # финализированы ТАМ. Прокидывать VersionConflict/IllegalTransition
+            # в воркер-цикл нельзя — возвращаем фактический терминальный
+            # статус (эффекты идемпотентны, I4). Нетерминальная ошибка стора
+            # (напр. StaleEpoch) — наружу как есть (fail-loud).
+            cur = self.jobs.get(job_id)
+            if cur.state in (JobState.DONE, JobState.FAILED, JobState.CANCELLED):
+                return EngineResult(
+                    status=self._terminal_status(cur.state), node=cur.cursor,
+                    board_version=self._board_version(cur),
+                    detail="терминал зафиксирован параллельным вызовом (cancel/gate-timeout): CAS проигран, повторной финализации квот нет",
+                )
+            raise
+
+    def _run_admitted(
+        self, job_id: str, rec: JobRecord, epoch: int, max_steps: int
+    ) -> EngineResult:
+        """Тело run() после нетерминальных early-return'ов: стартовый
+        re-admit/переход в running + цикл шагов (вызывается из run(), где
+        живёт JobStoreError-обработка гонок, P2-5)."""
         if rec.state in (JobState.QUEUED, JobState.SLEEPING, JobState.PREEMPTED):
             if self.quota is not None and not self.quota.heartbeat(rec.user, job_id):
                 # Lease постановки истёк (долгая очередь) либо резерва нет:
-                # re-admit ДО старта. Двойного INCR нет — lease-ключ у резерва
-                # один, свипер снимает резерв только вместе с маркером (т.е.
-                # при живом lease снимать нечего, а без lease резерва уже нет).
+                # re-admit ДО старта. ADMIT идемпотентен по (user, job)
+                # (SISMEMBER-гвард, P1-B iter2): в окне «lease истёк, свип не
+                # прошёл» маркер владения ещё жив → повторного INCR нет
+                # (только refresh lease); снятый свипером резерв берётся
+                # заново честно (через проверки).
                 action = self.quota.readmit(rec.user, rec.account_level, job_id)
                 if action != "allow":
                     return EngineResult(status="paused", node=rec.cursor,
@@ -522,20 +553,38 @@ class ModeEngine:
     def _quota_finalize(self, rec: JobRecord) -> None:
         """Терминал job: списать фактический usage + вернуть резерв (P1-5).
 
+        Crash/repeat-safe (P1-C1 iter2):
+
+        - ``release`` — в ``finally``: резерв возвращается ВСЕГДА, даже
+          когда charge отказал (отказ redis на терминале не должен течь
+          слотом); отказ charge — fail-loud наружу (терминал в сторе уже
+          зафиксирован).
+        - ровно один заряд на терминал: ledger-маркер ``usage.charged`` —
+          сколько УЖЕ списано за этот job. Повторный терминал списывает
+          только дельту ``tokens − charged`` (обычно 0: FAILED→QUEUED→
+          terminal — легальный путь, эффекты из кэша I4, новых токенов
+          нет); прирост usage после requeue досписывается честно.
+          Маркер пишется ПОСЛЕ успешного charge (подтверждение, не
+          намерение): краш между charge и маркером недосписывает
+          (fail-open по деньгам) — остаток c2 (pending-flag + retry на
+          reconcile-tick) — Ф6.
+
         Usage — durable-счётчик ledger (ключ ``usage``), пополняется на
-        каждом реальном LLM-вызове (кэш-попадания бесплатны, I4). Заряд
-        идёт один раз — только в момент перехода в терминал; повторный
-        вход в run() для терминального job возвращается раньше (без
-        повторного finalize). Заряд НЕ идемпотентен — потому ровно один
-        вызов на терминальный переход.
+        каждом реальном LLM-вызове (кэш-попадания бесплатны, I4).
         """
         if self.quota is None:
             return
         used = self.ledger.get(rec.id, "usage") or {}
         tokens = int(used.get("tokens", 0))
-        if tokens > 0:
-            self.quota.charge(rec.user, tokens)
-        self.quota.release(rec.user, rec.id)
+        charged = int(used.get("charged", 0))
+        try:
+            delta = tokens - charged
+            if delta > 0:
+                self.quota.charge(rec.user, delta)
+                used["charged"] = tokens
+                self.ledger.put(rec.id, "usage", used)
+        finally:
+            self.quota.release(rec.user, rec.id)
 
     def _bump_usage(self, job_id: str, prompt: str, output: str) -> None:
         """Учесть фактический расход LLM-вызова (durable, ключ ``usage``).

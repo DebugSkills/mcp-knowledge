@@ -176,8 +176,15 @@ def reconcile_budget(
     redis: Any,
     now: datetime | None = None,
     stream_maxlen: int = 10_000,
+    max_downward_micro: int | None = None,
 ) -> BudgetReconcileReport:
     """Ночная сверка: счётчики месяца := суммы журнала (best-effort, P0-1).
+
+    Это сверка counter↔journal НАШИХ списаний, НЕ audit провайдера
+    (P2-3 iter2): журнал пишется тем же контуром, семантический дубль
+    charge попадает в журнал дважды и сверки не виден; реальный перерасход
+    на стороне LiteLLM не проверяется (GAP R1). Полезность — ловля дрейфа
+    от частично применённых операций и ручных правок ключей.
 
     Читает ``ws:budget:journal`` батчами (XREAD, без полного XRANGE),
     суммирует rub_micro записей ТЕКУЩЕГО месяца (глобально + per-user) и
@@ -187,10 +194,19 @@ def reconcile_budget(
     журнальных записей не трогаются (их дельта неизвестна; направление
     безопасное — зеркало гейт не читает).
 
-    Семантика доверия: журнал — SSOT факта. Потеря журнала (усечение/
-    FLUSHDB) привела бы к занижению — событие ``budget_reconciled`` с
-    дельтой публикуется в ``ws:quota:events`` для наблюдения (отрицательная
-    дельта = сигнал разбора).
+    Гейт корректировки ВНИЗ (P2-3 iter2): ``max_downward_micro`` —
+    максимально допустимое УМЕНЬШЕНИЕ глобального счётчика за один прогон
+    (``None`` — без гейта, легитимные «дрейф вверх → починить к журналу»
+    не ограничиваются). Корректировка вниз — это «возврат бюджета»; её
+    большая величина — признак потери/усечения журнала, а не честного
+    дрейфа: молчаливый fail-open по деньгам запрещён — ``ValueError``,
+    счётчики не тронуты. Порог для nightly — ``--max-downward-micro``
+    CLI (scripts/ws_budget_reconcile.py), значение — из эксплуатационного разбора.
+
+    Семантика доверия: журнал — SSOT НАШИХ списаний (не счёт провайдера).
+    Потеря журнала (усечение/FLUSHDB) «вернула» бы бюджет — закрыта
+    гейтом выше; событие ``budget_reconciled`` с дельтой публикуется в
+    ``ws:quota:events`` (отрицательная дельта = сигнал разбора).
 
     ВЛАДЕЛЕЦ/КАДЕНС: оператор — cron (пока НЕ подключен: строка запуска —
     ``make ws-budget-reconcile``, см. ai_workspace/README.md; подключение
@@ -227,14 +243,23 @@ def reconcile_budget(
     ]
     args = [total] + [per_user[u] for u in sorted(per_user)]
     before_raw = redis.mget(keys)
+    global_before = int(before_raw[0] or 0)
+    if max_downward_micro is not None and global_before - total > max_downward_micro:
+        # P2-3 iter2: подозрительно большая корректировка ВНИЗ — вероятна
+        # потеря/усечение журнала; молча «возвращать» бюджет нельзя.
+        raise ValueError(
+            f"reconcile: корректировка вниз {total - global_before} микро-₽ "
+            f"превышает порог {max_downward_micro} — журнал подозрительно меньше "
+            "счётчика (потеря/усечение?); запускайте с осознанным --max-downward-micro"
+        )
     deltas = _cached_script(redis, "BUDGET_RECONCILE")(keys=keys, args=args)
 
     report = BudgetReconcileReport(
         month=month,
         journal_entries=entries,
         journal_total_micro=total,
-        global_before_micro=int(before_raw[0] or 0),
-        global_after_micro=int(before_raw[0] or 0) + int(deltas[0]),
+        global_before_micro=global_before,
+        global_after_micro=global_before + int(deltas[0]),
         per_user=per_user,
     )
     redis.xadd(

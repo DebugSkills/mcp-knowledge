@@ -162,14 +162,24 @@ Mode engine, admission (Ф3.5+); human-gate `ws:gate:*` + дашборд спя�
 - **GAP (честно): сверка с LiteLLM недоступна** — в `litellm.config.yaml`
   нет `database_url` (grep — 0), а `/spend` и штатный `max_budget` LiteLLM
   требуют proxy-БД (Prisma). Поэтому наш enforcement — ЕДИНСТВЕННЫЙ (R1),
-  SSOT факта — наш журнал (best-effort). Штатный LiteLLM `max_budget` как
+  а reconcile — сверка counter↔journal НАШИХ списаний, НЕ audit провайдера
+  (P2-3): семантический дубль charge журналируется дважды и сверки не
+  виден; гейт корректировки ВНИЗ — `--max-downward-micro` (большая
+  корректировка = подозрение на потерю журнала → отказ, не молчаливый
+  «возврат» бюджета). Штатный LiteLLM `max_budget` как
   defense-in-depth НЕ включён сознательно: без БД spend живёт in-memory
   (теряется при рестарте контейнера — потолок исчезает), тянуть БД в пилот
   не стали; разблокируется `DATABASE_URL` в gateway-контуре (Ф6+, остаток).
 - **Владелец/каденс сверки: оператор, nightly** (`quotas.yaml:
   budgets.ext.reconcile: nightly`). Запуск: `make ws-budget-reconcile`
   (`scripts/ws_budget_reconcile.py`, JSON-отчёт; `WS_REDIS_URL` — ПРОД
-  ws-redis, дефолта НЕТ — fail-closed). В cron/ansible НЕ подключено —
+  ws-redis, дефолта НЕТ — fail-closed).
+- **Владелец/каденс свипа conc-резервов (P1-3): оператор — периодически
+  ≤60 c** (пока conc-lease TTL = 90 c; `make ws-quota-sweep` =
+  `scripts/ws_quota_sweep.py`, JSON-отчёт снятых резервов; снимает
+  мёртвые `ws:quota:conchold` — события `conc_reservation_reclaimed`).
+  Штатное место обоих вызовов — reconcile-tick wiring-воркера (Ф4.7).
+  В cron/ansible НЕ подключено —
   остаток с владельцем-оператором; прод-ws-redis internal-only (I6): с хоста
   — через docker-сеть (`docker run --rm --network mcp-knowledge_default
   -v <repo>:/repo -w /repo python:3.11-slim sh -c "pip -q install redis

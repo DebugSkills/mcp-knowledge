@@ -49,6 +49,7 @@ def test_load_and_get_all_kinds() -> None:
         "model_classes",
         "shapes",
         "quotas",
+        "pricing",  # P0-1 ревизии Ф4: прайс ext-моделей (registry/pricing.py)
     }
     for kind in Registry.kinds:
         data = reg.get(kind)

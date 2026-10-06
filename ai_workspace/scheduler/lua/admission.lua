@@ -7,7 +7,8 @@
 --        ws:quota:conchold:{user} (SET job-маркеров владения резервом, P1-2),
 --        ws:quota:conclease:{user}:{job} (TTL-lease резерва, P1-3),
 --        ws:quota:events (Stream событий квот-контура: reclaim/degraded),
---        ws:budget:global (расход ext-контура; пишет reconcile, Ф4.3+).
+--        ws:budget:global:{month} (расход ext-контура за месяц, микро-₽ int;
+--        пишет budget.charge_budget / сверяет reconcile_budget, P0-1).
 -- Режим conc — РЕЗЕРВ: проверка и INCR в ОДНОЙ Lua (иначе две гонки обе
 -- пройдут); мутация ТОЛЬКО при финальном allow (deny/park ничего не пишут).
 -- Времени Lua сам не читает — границы дня/полночь инъектирует Python.
@@ -23,6 +24,14 @@
 -- ARGV[5]=lease_ttl_ms (0 → lease не ставить: маркер без auto-reclaim).
 -- Возврат: {action, code, detail}; action=allow|deny|park; detail — текущее
 -- значение проверяемой метрики (для reason вызывающего).
+-- Идемпотентность по (user, job) — P1-B iter2: маркер владения ЭТОГО job
+-- уже стоит → allow + refresh lease БЕЗ повторного INCR (двойное взятие
+-- резерва = перманентная утечка без маркера; закрывает окно «lease истёк,
+-- свип ещё не прошёл» и submit-ретрай между admit и create).
+-- Владение+lease при job≠'' ставятся БЕЗУСЛОВНО — P1-A iter2: conc=null
+-- (admin) не должен отключать lease, иначе heartbeat воркера немедленно
+-- валит живой job; счётчик INCR — только при личном лимите (симметрия с
+-- CONC_RELEASE: DECR под гвардом inflight > 0).
 local function numkey(key)
   -- GET с валидацией (P2-9): отсутствует → 0; НЕчисловое значение →
   -- понятный отказ (error), а не runtime-error на сравнении nil.
@@ -40,6 +49,15 @@ if (tok_limit ~= '' and not tonumber(tok_limit))
   or (budget_limit ~= '' and not tonumber(budget_limit)) then
   return redis.error_reply('ADMIT: bad ARGV limits')
 end
+-- P1-B iter2: идемпотентность по (user, job) — ГВАРД ДО всех проверок:
+-- свой протухший (несвипнутый) резерв не должен self-deny гостя, а уже
+-- взятый резерв — дублироваться. Refresh lease = «воркер ожил».
+if ARGV[4] ~= '' and redis.call('SISMEMBER', KEYS[4], ARGV[4]) == 1 then
+  if tonumber(ARGV[5]) > 0 then
+    redis.call('SET', KEYS[5], ARGV[4], 'PX', tonumber(ARGV[5]))
+  end
+  return {'allow', '', ''}
+end
 if tok_limit ~= '' then
   local spent = numkey(KEYS[1])
   if spent >= tonumber(tok_limit) then
@@ -52,23 +70,25 @@ if budget_limit ~= '' then
     return {'park', 'budget_ext_exhausted', tostring(spent)}
   end
 end
+local after = ''
 if conc_limit ~= '' then
   local inflight = numkey(KEYS[2])
   if inflight >= tonumber(conc_limit) then
     return {'deny', 'quota_conc_exceeded', tostring(inflight)}
   end
-  local after = redis.call('INCR', KEYS[2])
-  -- per-job владение (P1-2): резерв снимается conc_release(user, job)
-  -- ровно один раз — по маркеру, а не «ещё одним DECR» агрегата.
-  if ARGV[4] ~= '' then
-    redis.call('SADD', KEYS[4], ARGV[4])
-    if tonumber(ARGV[5]) > 0 then
-      redis.call('SET', KEYS[5], ARGV[4], 'PX', tonumber(ARGV[5]))
-    end
-  end
-  return {'allow', '', tostring(after)}
+  after = redis.call('INCR', KEYS[2])
 end
-return {'allow', '', ''}
+-- per-job владение (P1-2 + P1-A iter2): маркер+lease — БЕЗУСЛОВНО при
+-- job≠'' (роль без личного лимита тоже владеет резервом и живёт под
+-- heartbeat); резерв снимается conc_release(user, job) ровно один раз —
+-- по маркеру, а не «ещё одним DECR» агрегата.
+if ARGV[4] ~= '' then
+  redis.call('SADD', KEYS[4], ARGV[4])
+  if tonumber(ARGV[5]) > 0 then
+    redis.call('SET', KEYS[5], ARGV[4], 'PX', tonumber(ARGV[5]))
+  end
+end
+return {'allow', '', tostring(after)}
 
 -- @script CHARGE
 -- Списание токенов по факту usage. KEYS[1]=tok. ARGV[1]=tokens (int >= 0),

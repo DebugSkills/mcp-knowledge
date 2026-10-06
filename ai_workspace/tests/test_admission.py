@@ -37,12 +37,12 @@ import redis
 from ai_workspace.registry import Registry
 from ai_workspace.registry.quotas import QuotaRegistry
 from ai_workspace.scheduler.admission import (
-    BUDGET_GLOBAL_KEY,
     QUOTA_EVENTS_KEY,
     AdmissionDenied,
     Decision,
     QuotaRedisUnavailable,
     admit,
+    budget_global_key,
     charge_tokens,
     conc_exit,
     conc_heartbeat,
@@ -50,6 +50,7 @@ from ai_workspace.scheduler.admission import (
     conc_reclaim_expired,
     conc_release,
     conchold_key,
+    conclease_key,
     seconds_to_local_midnight,
     sweep_expired_conc,
     tok_key,
@@ -70,21 +71,23 @@ def ws():
     user = f"{WS_TEST_ID_PREFIX}f42-{uuid4().hex[:8]}"
     yield client, QuotaRegistry(Registry(REGISTRY_DIR)), user
     keys = list(client.scan_iter(match=f"ws:quota:*{user}*"))
-    keys += list(client.scan_iter(match=f"ws:budget:{user}"))
+    keys += list(client.scan_iter(match=f"ws:budget:user:{user}:*"))
     if keys:
         client.delete(*keys)
 
 
 @pytest.fixture()
 def budget_global(ws):
-    """Снапшот/восстановление ws:budget:global (общий ключ тестового redis)."""
+    """Снапшот/восстановление бюджетного счётчика месяца (общий ключ
+    тестового redis; месяц-скоуп + микро-₽ — P0-1)."""
+    key = budget_global_key()
     client = ws[0]
-    prev = client.get(BUDGET_GLOBAL_KEY)
+    prev = client.get(key)
     yield client
     if prev is None:
-        client.delete(BUDGET_GLOBAL_KEY)
+        client.delete(key)
     else:
-        client.set(BUDGET_GLOBAL_KEY, prev)
+        client.set(key, prev)
 
 def _naive(y: int, mo: int, d: int, h: int = 0, mi: int = 0, s: int = 0) -> datetime:
     """Naive-локальный datetime без DTZ001 (datetime.combine не флагается)."""
@@ -213,8 +216,9 @@ def test_seconds_to_local_midnight_edges():
 
 def test_ext_budget_exhausted_parks_not_denies(ws, budget_global):
     client, book, user = ws
-    limit = book.budgets["ext"].limit
-    client.set(BUDGET_GLOBAL_KEY, limit)  # ровно лимит → исчерпан (>=)
+    limit_micro = book.budgets["ext"].limit_micro  # единица счётчика (P0-1)
+    assert limit_micro == book.budgets["ext"].limit * 1_000_000  # ₽ → микро-₽
+    client.set(budget_global_key(), limit_micro)  # ровно лимит → исчерпан (>=)
     d = admit(user, "member", registry=book, redis=client, shelf="ext")
     assert d.action == "park"
     assert d.code == "budget_ext_exhausted"
@@ -226,11 +230,17 @@ def test_ext_budget_exhausted_parks_not_denies(ws, budget_global):
         admit(user, "member", registry=book, redis=client, shelf="local").action
         == "allow"
     )
-    # ниже лимита ext пропускает
-    client.set(BUDGET_GLOBAL_KEY, limit - 1)
+    # ниже лимита ext пропускает (микро-₽: −1 от порога)
+    client.set(budget_global_key(), limit_micro - 1)
     assert (
         admit(user, "member", registry=book, redis=client, shelf="ext").action
         == "allow"
+    )
+    # за лимитом — тоже парк (жёсткий стоп в обе стороны от порога)
+    client.set(budget_global_key(), limit_micro + 1_000_000)
+    assert (
+        admit(user, "member", registry=book, redis=client, shelf="ext").action
+        == "park"
     )
 
 
@@ -382,3 +392,71 @@ def test_corrupt_conc_value_fails_readable_not_runtime(ws):
     client.set(conc_key(user), "not-a-number")
     with pytest.raises(redis.exceptions.ResponseError, match="нечисловое"):
         admit(user, "guest", registry=book, redis=client)
+
+
+# ── 14. P1-A iter2: conc=null (admin) — владение/lease безусловны ──────
+
+
+def test_admin_job_admit_sets_ownership_and_lease_without_counter(ws):
+    """admin (conc=null) с job=: маркер владения + lease ставятся БЕЗУСЛОВНО
+    (heartbeat воркера жив — _beat не валит job), счётчик conc НЕ
+    инкрементируется (личного лимита нет); release снимает владение без
+    декремента (симметрия: роль без лимита счётчик не трогает ни при взятии,
+    ни при возврате)."""
+    client, book, user = ws
+    assert admit(user, "admin", registry=book, redis=client, job="job-adm").action == "allow"
+    assert client.get(conc_key(user)) is None  # счётчик не тронут (P1-A)
+    assert client.sismember(conchold_key(user), "job-adm")  # владение есть
+    assert client.exists(conclease_key(user, "job-adm"))  # lease есть
+    assert conc_heartbeat(user, "job-adm", redis=client) is True  # _beat жив
+    assert conc_release(user, "job-adm", redis=client) is True
+    assert client.get(conc_key(user)) is None  # декремента не было (и не надо)
+    assert client.smembers(conchold_key(user)) == set()
+
+
+# ── 15. P1-B iter2: admit идемпотентен по (user, job) ──────────────────
+
+
+def test_admit_same_job_idempotent_different_jobs_counted(ws):
+    """Повторный admit того же job — allow БЕЗ повторного INCR (двойное
+    взятие = перманентная утечка без маркера — свипер не снимет); разные
+    job'ы считаются раздельно."""
+    client, book, user = ws
+    assert admit(user, "member", registry=book, redis=client, job="job-1").action == "allow"
+    assert admit(user, "member", registry=book, redis=client, job="job-1").action == "allow"
+    assert int(client.get(conc_key(user))) == 1  # НЕ 2 (идемпотентность)
+    assert admit(user, "member", registry=book, redis=client, job="job-2").action == "allow"
+    assert int(client.get(conc_key(user))) == 2  # разные job — раздельно
+    assert conc_release(user, "job-1", redis=client) is True
+    assert int(client.get(conc_key(user))) == 1
+
+
+def test_readmit_in_expired_unswept_window_does_not_double_count(ws):
+    """Окно «lease истёк, свип ещё не прошёл»: резерв жив (маркер+счётчик),
+    повторный admit того же job — refresh lease, счётчик НЕ дублируется
+    (пробник критика iter2: member 1→2 — перманентная утечка)."""
+    client, book, user = ws
+    assert (
+        admit(user, "member", registry=book, redis=client, job="job-w", lease_ttl_ms=150).action
+        == "allow"
+    )
+    time_mod.sleep(0.25)  # lease истёк, свип НЕ зван
+    assert conc_heartbeat(user, "job-w", redis=client) is False  # lease мёртв
+    assert admit(user, "member", registry=book, redis=client, job="job-w").action == "allow"
+    assert int(client.get(conc_key(user))) == 1  # было 2 (утечка iter2-пробника)
+    assert conc_heartbeat(user, "job-w", redis=client) is True  # lease ожил
+
+
+def test_guest_readmit_in_expired_unswept_window_not_self_denied(ws):
+    """Гость (conc=1): свой протухший (несвипнутый) резерв НЕ блокирует
+    re-admit того же job — было deny quota_conc_exceeded (self-deny,
+    стоп до ручной правки)."""
+    client, book, user = ws
+    assert (
+        admit(user, "guest", registry=book, redis=client, job="job-g", lease_ttl_ms=150).action
+        == "allow"
+    )
+    time_mod.sleep(0.25)
+    d = admit(user, "guest", registry=book, redis=client, job="job-g")
+    assert d.action == "allow"  # было deny (пробник критика)
+    assert int(client.get(conc_key(user))) == 1
