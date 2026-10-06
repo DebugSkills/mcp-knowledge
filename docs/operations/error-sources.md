@@ -131,6 +131,10 @@
 | script:errors_guard.py | write-side гвард (cap/burst) + suppression-CLI | sink: — | gap: self — сам не источник; решения оператора → sink/suppression.json + audit.jsonl |
 | script:gateway_canary.py | Ф1 K+1 канарейка LiteLLM-шлюза, инвариант I1 (arch-2026-10-05-ai-workspace; ручной read-only probe) | sink: — | gap: self — read-only probe, [canary]-диагностика только в stdout, не в sink; FAIL → exit≠0 (3=W, 4=барьер, 5=не-429) |
 | script:ingress_probe.sh | Ф2 #4 ingress-probe internal-only (arch-2026-10-05-ai-workspace; ручной read-only probe) | sink: — | gap: self — read-only probe, вывод PASS/FAIL/WARN/INFO в stdout, не в sink; FAIL → exit 1 |
+| script:quotas_set.py | Ф4.5c-1 (arch-2026-10-05-ai-workspace): точечная правка registry/quotas.yaml (per-account квоты/приоритеты), ручной запуск на хосте (make quotas-set / quotas-show) | sink: — | gap: ручной; бэкап в .trash/, пост-валидация с откатом; fail → exit≠0 (2 usage/IO, 3 валидация+откат, 4 нет изменений) |
+| script:ws_prio.py | Ф4.5a (arch-2026-10-05-ai-workspace): per-job приоритет ws:prio:{job} в ws-redis, ручной (make ws-prio set/clear/show) | sink: — | gap: ручной; события job_priority_* → ws:quota:events; fail → exit≠0 |
+| script:ws_quota_sweep.py | Ф4.2e (arch-2026-10-05-ai-workspace): свип истёкших conc-резервов (QuotaWiring.sweep_all), ручной каденс оператора (make ws-quota-sweep) | sink: — | gap: ручной (каденс ≤60 c на операторе); авто-тик — Ф6; fail → exit≠0 |
+| script:ws_budget_reconcile.py | Ф4.2d (arch-2026-10-05-ai-workspace): сверка ₽-бюджета контура с журналом, nightly ручной (make ws-budget-reconcile) | sink: — | gap: ручной (nightly на операторе); сверка с LiteLLM /spend — GAP R1; fail → exit 3 при просадке > --max-downward-micro |
 
 ## Pull-источники внешних систем (Wave 2, трек G)
 
