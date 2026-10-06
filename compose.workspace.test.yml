@@ -1,0 +1,12 @@
+# TEST-ONLY, loopback (arch-2026-10-05-ai-workspace, Ф3.1): публикация ws-redis
+# на 127.0.0.1:6390 — ТОЛЬКО для локальных интеграционных тестов job-store
+# (make ws-up-test / make ws-test-integration).
+#
+# В проде порт НЕ публикуется (I6: compose.workspace.yml — internal-only).
+# Применять ТОЛЬКО явным overlay:
+#   docker compose -f compose.workspace.yml -f compose.workspace.test.yml up -d ws-redis
+# НЕ включать в deploy/push-цепочки (make deploy/push этот файл не видят).
+services:
+  ws-redis:
+    ports:
+      - "127.0.0.1:6390:6379"

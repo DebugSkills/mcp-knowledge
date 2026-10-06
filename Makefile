@@ -462,3 +462,26 @@ gateway-health: ## Ф1: liveliness + per-deployment /health (изнутри ко
 gateway-canary: ## Ф1: K+1-проба → 429 throttling_error (fail-closed W==1). K: make gateway-canary K=2
 	docker exec -i $(GATEWAY_CONTAINER) python3 - --k $(GATEWAY_K) --model local \
 	  --base-url http://127.0.0.1:4000 < scripts/gateway_canary.py
+
+# ── AI-workspace Ф3.1 (arch-2026-10-05-ai-workspace): каркас + job-store ──────
+# Job-store ws:job:{id} (статус-машина, CAS по version, epoch-fencing) —
+# см. ai_workspace/README.md. Порт 6390 — ТОЛЬКО test-only overlay (I6).
+WS_COMPOSE := compose.workspace.yml
+WS_COMPOSE_TEST := compose.workspace.test.yml
+WS_TEST_REDIS_URL := redis://127.0.0.1:6390/0
+
+.PHONY: ws-up ws-down ws-up-test ws-test ws-test-integration
+ws-up: ## Ф3.1: поднять ws-redis (порт НЕ публикуется — I6, internal-only)
+	docker compose -f $(WS_COMPOSE) up -d ws-redis
+
+ws-down: ## Ф3.1: остановить ws-redis (только его, не workspace-консоль)
+	docker compose -f $(WS_COMPOSE) stop ws-redis
+
+ws-up-test: ## Ф3.1: ws-redis с test-only overlay (127.0.0.1:6390, loopback)
+	docker compose -f $(WS_COMPOSE) -f $(WS_COMPOSE_TEST) up -d ws-redis
+
+ws-test: ## Ф3.1: unit-тесты ai_workspace (без Redis; integration авто-skip)
+	.venv/bin/python -m pytest ai_workspace/tests -q
+
+ws-test-integration: ## Ф3.1: integration-тесты (сначала make ws-up-test)
+	WS_REDIS_URL=$(WS_TEST_REDIS_URL) .venv/bin/python -m pytest ai_workspace/tests -q -m integration
