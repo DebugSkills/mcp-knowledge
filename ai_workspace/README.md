@@ -56,6 +56,7 @@ job-store; **Ф3.2** — планировщик очередей вызовов 
 | `ws:call:{shelf}:{call}` | HASH | scheduler (Ф3.4) |
 | `ws:slots:*`, `ws:lease:*`, `ws:events:*` | SET/TTL/Stream | scheduler (Ф3.3) |
 | `ws:gate:*`, `ws:pos:*` | — | Ф3.5+ |
+| `ws:prio:{job}` | STRING (TTL) | scheduler/prio.py (Ф4.5a) |
 
 ## Тесты
 - unit (без Redis): `make ws-test` (все зелёные; integration авто-skip).
@@ -186,6 +187,22 @@ Mode engine, admission (Ф3.5+); human-gate `ws:gate:*` + дашборд спя�
   pyyaml && WS_REDIS_URL=redis://ws-redis:6379/0 python
   scripts/ws_budget_reconcile.py"`), штатное место reconcile-tick — wiring
   воркер Ф4.7.
+
+## Per-job приоритет (Ф4.5a, `scheduler/prio.py` + решение D8 «разово»)
+- **`ws:prio:{job}`** (STRING `high|med|low`, TTL, владелец — `prio.py`):
+  операционный override приоритета аккаунта. Читается `QuotaWiring.submit`
+  ДО admit ПОСЛЕДУЮЩИХ вызовов job'а → `Decision.prio/prio_source`
+  (`"job"|"account"`) + событие `job_priority_applied` (только при
+  source=job). **Очередь НЕ реордерится**: стоящие в `ws:q` вызовы живут с
+  исходным vft/starve (никакого requeue(vft_override)).
+- TTL: `SET EX`, дефолт 24 ч («разово» — забытый буст не живёт вечно),
+  повторный set продлевает. Валидация fail-closed, SSOT — `policy.MULT`
+  (значение протекает в `policy.weight`); мусор в ключе (ручная правка
+  мимо API) → fallback на аккаунт + warning + `job_priority_invalid`
+  (availability > strictness). События `job_priority_set/cleared/invalid/
+  applied` — в `ws:quota:events` (хвост `XREVRANGE`).
+- CLI: `make ws-prio ARGS="set --job J --prio high"` (`scripts/ws_prio.py`,
+  JSON-first; `WS_REDIS_URL` — ПРОД, дефолта НЕТ; exit 0/2=redis/3=валидация).
 
 ## Реестры режимов (Ф3.5a-1, `registry/`)
 - `registry/` — data-only YAML-реестры `roles`/`tools`/`gates`/`model_classes`/

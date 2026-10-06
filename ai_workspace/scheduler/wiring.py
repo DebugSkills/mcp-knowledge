@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
@@ -62,6 +63,11 @@ from ai_workspace.scheduler.budget import charge_budget
 from ai_workspace.scheduler.eta import ETAStore
 from ai_workspace.scheduler.park import ParkControl
 from ai_workspace.scheduler.position import PositionStore
+from ai_workspace.scheduler.prio import (
+    effective_priority,
+    emit_event,
+    get_job_priority,
+)
 
 __all__ = [
     "QuotaWiring",
@@ -270,6 +276,13 @@ class QuotaWiring:
           принадлежит job'у и возвращается терминалом движка.
         """
         job_id = job_id or uuid4().hex
+        # Ф4.5a (D8 «разово»): per-job override читается ДО admit — отказ
+        # чтения при деградации ws-redis происходит ДО взятия conc-резерва
+        # (модель отказа постановки не меняется: admit следом так же
+        # fail-closed). Очередь НЕ трогается: override действует только на
+        # ПОСЛЕДУЮЩИЕ admit/enqueue вызовов этого job'а, стоящие вызовы не
+        # реордерятся (никакого requeue(vft_override)).
+        job_prio = get_job_priority(self.client, job_id)
         decision = admit(
             user,
             account_level,
@@ -280,6 +293,7 @@ class QuotaWiring:
             lease_ttl_ms=self.lease_ttl_ms,
         )
         decision.raise_if_denied()  # deny → AdmissionDenied ДО создания job
+        decision = self._resolve_priority(decision, user, account_level, job_id, job_prio)
         try:
             self.store.create(
                 user=user,
@@ -309,6 +323,34 @@ class QuotaWiring:
             # reconcile/resume (Ф4.3). call=None — очереди ещё не касались.
             self.park.park(job_id, call=None, reason="budget")
         return self.store.get(job_id)
+
+    def _resolve_priority(
+        self,
+        decision: Any,
+        user: str,
+        account_level: str,
+        job_id: str,
+        job_prio: str | None,
+    ) -> Any:
+        """Ф4.5a: эффективный приоритет = override ``ws:prio:{job}`` →
+        приоритет аккаунта (``registry.quota_for`` — уже вычислен реестром).
+
+        Результат — в ``Decision.prio``/``Decision.prio_source`` (потребитель
+        — enqueue вызовов Ф4.7) и событием ``job_priority_applied`` — только
+        при ``source="job"`` (низкий шум: без override стрим не растёт).
+        Событие best-effort: наблюдение не имеет права валить постановку.
+        """
+        account_prio = self.registry.quota_for(account_level).priority
+        prio, source = effective_priority(
+            account_prio, job_prio, redis=self.client, job=job_id
+        )
+        if source == "job":
+            emit_event(
+                self.client, "job_priority_applied",
+                job=job_id, user=user, prio=prio, source=source,
+                account_prio=account_prio,
+            )
+        return replace(decision, prio=prio, prio_source=source)
 
     def sweep_all(self) -> dict[str, list[str]]:
         """Свип истёкших conc-резервов всех пользователей (P1-3, reconcile).

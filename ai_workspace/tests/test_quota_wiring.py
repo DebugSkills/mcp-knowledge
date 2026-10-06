@@ -543,8 +543,23 @@ def test_submit_fail_closed_when_ws_redis_down(ws, caplog) -> None:
             raise self._exc
 
     class _DeadRedis:
+        """Мёртвый клиент: ЛЮБАЯ команда → ConnectionError (как реальный
+        недоступный redis). Ф4.5a: submit читает ws:prio ДО admit, поэтому
+        заглушка обязана отвечать на любую команду, а не только на старый набор.
+        """
+
         def __init__(self, exc):
             self._exc = exc
+
+        def __getattr__(self, name):
+            # dunder-и (__deepcopy__, __repr__ и пр.) не трогаем — их зовёт pytest.
+            if name.startswith("_"):
+                raise AttributeError(name)
+
+            def _dead(*a, **k):
+                raise self._exc
+
+            return _dead
 
         def register_script(self, _s):
             return _DeadCall(self._exc)
@@ -568,7 +583,14 @@ def test_submit_fail_closed_when_ws_redis_down(ws, caplog) -> None:
                       mode="statya", zone="public", job_id=f"{user}-j1")
     assert isinstance(ei.value.__cause__, redis.exceptions.ConnectionError)
     degraded = [r for r in caplog.records if "quota_degraded" in r.getMessage()]
-    assert degraded and "admit" in degraded[0].getMessage()
+    # Ф4.5a: submit читает ws:prio ДО admit → первым падает get_job_priority
+    # (тоже fail-closed + ALARM). Проверяем факт ALARM и имя операции, а не
+    # конкретно «admit»: набор fail-closed-операций submit'а расширяем.
+    assert degraded, "ожидался ALARM quota_degraded (fail-closed)"
+    assert any(
+        op in degraded[0].getMessage()
+        for op in ("admit", "get_job_priority", "charge")
+    ), degraded[0].getMessage()
 
 
 # ── offline: P1-C1 iter2 — finalize crash/repeat-safe ───────────────────

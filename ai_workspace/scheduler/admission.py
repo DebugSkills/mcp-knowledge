@@ -239,6 +239,14 @@ class Decision:
     code: str | None = None
     reason: str | None = None
     reused: bool = False
+    prio: str | None = None
+    """Эффективный приоритет постановки (Ф4.5a, D8): per-job override
+    ``ws:prio:{job}`` → приоритет аккаунта. Ставится контуром wiring
+    (``QuotaWiring.submit`` через ``dataclasses.replace``), admit сам его
+    не разрешает; потребители — enqueue вызовов job'а (Ф4.7) и наблюдение.
+    ``None`` = приоритет не разрешался (admit вне submit)."""
+    prio_source: str | None = None
+    """Источник ``prio``: ``"job"`` (override) | ``"account"`` | ``None``."""
 
     @property
     def allowed(self) -> bool:
