@@ -1,0 +1,100 @@
+# Ф2 (arch-2026-10-05-ai-workspace) шаг #5b: session-store-инфраструктура верстака.
+#
+# I11: per-user чат-сессии верстака — только в отдельном ws-redis (не в
+# UI-cookie, не в процессе). I12: отдельный инстанс redis для ws:*-ключей,
+# noeviction + AOF, образ pinned по digest. I6: НИ ОДИН порт не публикуется —
+# оба сервиса internal-only в сети mcp-knowledge_default (ingress — Ф3, не здесь).
+#
+# PIN (I12, «pinned on node»): redis:7-alpine = Redis server 7.4.5,
+#   digest sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+#   (RepoDigest локального образа; air-gap Ф6: bundle-pack несёт образ,
+#   verify на узле = RepoDigests == digest выше).
+#
+# MCP-адрес (I6): mcp-server работает в host-сети (docker-compose.yml) → из
+# bridge-сети имя сервиса НЕ резолвится; адрес = host.docker.internal:8000
+# (extra_hosts host-gateway; порт 8000 слушает 0.0.0.0). Публикации порта нет.
+#
+# НЕ входит (Ф3+): litellm/queue-режимы, admission/очередь, ingress/TLS-фасад.
+services:
+  ws-redis:
+    image: redis:7-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    container_name: mcp-knowledge-ws-redis
+    restart: unless-stopped
+    # I12: AOF-персистентность + noeviction (вытеснение ws:*-сессий недопустимо;
+    # при исчерпании памяти контейнера — отказ, а не тихая потеря сессий).
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - ws-redis-data:/data   # AOF переживает пересоздание контейнера
+    networks:
+      - mcp-knowledge
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # workspace — верстак сообщества на базе kb-console (тот же образ/сборка,
+  # что и операторская консоль). Учётки верстака — в ОТДЕЛЬНОМ каталоге
+  # data/workspace/console: один users.jsonl на две консоли = два процесса-
+  # писателя в один файл (гонка) — не делить.
+  workspace:
+    build:
+      context: ./kb-console
+      dockerfile: Dockerfile
+    image: kb-console:prod
+    container_name: mcp-knowledge-workspace
+    restart: unless-stopped
+    environment:
+      # MCP internal-only (I6): host-сеть mcp-server через host-gateway.
+      - MCP_SERVER_URL=http://host.docker.internal:8000
+      # Ф2 #5b: session-store (I11/I12) — отдельный ws-redis, internal-only.
+      - WS_REDIS_URL=redis://ws-redis:6379/0
+      # Сервисные ключи верстака (Ф2 #2 tool-loop / #6 import-вложения).
+      - WS_MCP_KEY=${WS_MCP_KEY:-}
+      - WS_MCP_IMPORT_KEY=${WS_MCP_IMPORT_KEY:-}
+      # Auth верстака (Ф2 #7): свои учётки в отдельном volume.
+      - CONSOLE_USERS_FILE=/app/data/console/users.jsonl
+      - CONSOLE_ADMIN_USER=${CONSOLE_ADMIN_USER:-}
+      - CONSOLE_ADMIN_PASSWORD=${CONSOLE_ADMIN_PASSWORD:-}
+      - CONSOLE_PORT=8085
+      # 0.0.0.0 только ВНУТРИ bridge-контейнера без published ports (контур
+      # internal-only); loopback внутри контейнера закрыл бы будущий
+      # TLS-фасад/ingress (Ф3) — audit-паттерн «0.0.0.0 — только bridge».
+      - CONSOLE_HOST=0.0.0.0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${DATA_ROOT:-./data}/workspace/console:/app/data/console   # users.jsonl верстака (отдельно от операторской консоли)
+    depends_on:
+      ws-redis:
+        condition: service_healthy
+    networks:
+      - mcp-knowledge
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8085/healthz',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    mem_limit: 512m
+    cpus: 1
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ws-redis-data:
+
+networks:
+  mcp-knowledge:
+    name: mcp-knowledge_default   # та же external-сеть, что у основного compose (паттерн compose.gateway.yml)
+    external: true
