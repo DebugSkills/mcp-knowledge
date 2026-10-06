@@ -16,7 +16,13 @@ from kb_console.pages.users_page import is_last_active_admin
 class TestRoutesMatrix:
     def test_min_role_admin_pages(self):
         admin_pages = {p for p, _, _, mr in ROUTES if mr == "admin"}
-        assert admin_pages == {"/tokens", "/users", "/requests", "/documents"}  # 036 Ф2 + Ф5c1
+        assert admin_pages == {
+            "/tokens",
+            "/users",
+            "/requests",
+            "/documents",
+            "/quotas",  # Ф4.5c-2 ai-workspace
+        }  # 036 Ф2 + Ф5c1 + Ф4.5c-2
 
     def test_common_pages_contributor(self):
         common = {p for p, _, _, mr in ROUTES if mr == "contributor"}

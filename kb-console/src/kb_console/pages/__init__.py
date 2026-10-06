@@ -20,6 +20,7 @@ from . import (
     import_page,
     quality,
     queue,
+    quotas,
     requests_page,
     search,
     status,
@@ -41,6 +42,7 @@ ROUTES: list[tuple[str, str, Callable[[], None], str]] = [
     ("/users", "Пользователи", users_page.build_users, "admin"),  # Ф3.2
     ("/requests", "Заявки", requests_page.build_requests, "admin"),  # 036 Ф2
     ("/documents", "Документы", documents.build_documents, "admin"),  # bibliography Ф5c1
+    ("/quotas", "Квоты", quotas.build_quotas, "admin"),  # Ф4.5c-2 ai-workspace
 ]
 
 # PAGES оставлен для обратной совместимости (если где-то ещё используется).

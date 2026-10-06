@@ -145,6 +145,14 @@ def page_documents() -> None:
     build_documents()
 
 
+@ui.page("/quotas")
+def page_quotas() -> None:
+    """Страница «Квоты» — генератор host-команды/патча правки квот (Ф4.5c-2, admin-only)."""
+    render_header("quotas")
+    from .pages.quotas import build_quotas
+    build_quotas()
+
+
 # ── Start ───────────────────────────────────────────────────
 
 # kb-console-roles Ф2: users-стор + bootstrap админа из env (идемпотентно).
