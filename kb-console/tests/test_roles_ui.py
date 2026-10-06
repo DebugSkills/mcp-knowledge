@@ -20,7 +20,10 @@ class TestRoutesMatrix:
 
     def test_common_pages_contributor(self):
         common = {p for p, _, _, mr in ROUTES if mr == "contributor"}
-        assert common == {"/status", "/books", "/import", "/search", "/quality"}
+        assert common == {
+            "/status", "/books", "/import", "/search", "/quality",
+            "/chat",  # Ф2 ai-workspace #1
+        }
 
     def test_all_roles_valid(self):
         from kb_console.core.identity import ROLE_LEVEL

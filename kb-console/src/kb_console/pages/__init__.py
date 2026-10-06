@@ -15,6 +15,7 @@ from collections.abc import Callable
 
 from . import (
     books,
+    chat,
     documents,
     import_page,
     quality,
@@ -32,6 +33,7 @@ ROUTES: list[tuple[str, str, Callable[[], None], str]] = [
     ("/books", "Книги", books.build_books, "contributor"),
     ("/import", "Импорт", import_page.build_import, "contributor"),
     ("/search", "Поиск", search.build_search, "contributor"),
+    ("/chat", "Чат", chat.build_chat, "contributor"),  # Ф2 ai-workspace #1
     ("/quality", "Качество", quality.build_quality, "contributor"),  # Фаза 13.14
     ("/tokens", "Токены", tokens.build_tokens, "admin"),  # W5; admin-only — У-3/Ф3.2
     ("/users", "Пользователи", users_page.build_users, "admin"),  # Ф3.2

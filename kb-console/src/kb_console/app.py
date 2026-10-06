@@ -85,6 +85,14 @@ def page_search() -> None:
     build_search()
 
 
+@ui.page("/chat")
+def page_chat() -> None:
+    """Страница «Чат» — стриминг ответов LLM через LiteLLM (Ф2 ai-workspace #1)."""
+    render_header("chat")
+    from .pages.chat import build_chat
+    build_chat()
+
+
 @ui.page("/quality")
 def page_quality() -> None:
     """Страница «Качество» — review-очередь книг, каскадные действия, удаление."""
