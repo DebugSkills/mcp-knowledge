@@ -97,14 +97,19 @@ class ParkControl:
         store: JobStore | None = None,
         stream_maxlen: int = DEFAULT_STREAM_MAXLEN,
         clock: Callable[[], float] = time.time,
+        on_queue_change: Callable[[str], None] | None = None,
     ) -> None:
         """``client`` — ws-redis (decode_responses=True); ``store`` — job-store
         (по умолчанию свой ``JobStore(client)``); ``clock`` — источник ``now``
-        (инъекция для детерминированных тестов, паттерн queue.py)."""
+        (инъекция для детерминированных тестов, паттерн queue.py);
+        ``on_queue_change`` — best-effort хук панели очереди (Ф4.4a),
+        прокидывается во внутреннюю ``Queue``."""
         self.client = client
         self.shelf = shelf
         self.store = store if store is not None else JobStore(client)
-        self.queue = Queue(client, shelf=shelf, clock=clock)
+        self.queue = Queue(
+            client, shelf=shelf, clock=clock, on_queue_change=on_queue_change
+        )
         self.slots = Slots(client, shelf=shelf, clock=clock)
         self.stream_maxlen = stream_maxlen
         self.clock = clock

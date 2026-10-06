@@ -26,9 +26,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal, Protocol
 
 from ai_workspace.orchestrator.graph import (
@@ -68,6 +70,9 @@ __all__ = [
 
 MAX_STEPS = 64
 """Предохранитель от бесконечного графа (не заменяет max_iterations критика)."""
+
+logger = logging.getLogger(__name__)
+"""Лог движка: best-effort предупреждения ETA-хука терминала (Ф4.4a)."""
 
 
 class NodeFailure(EngineError):
@@ -216,6 +221,7 @@ class ModeEngine:
         clock: Callable[[], float] = time.time,
         quota: QuotaPort | None = None,
         usage_of: Callable[[str, str], int] | None = None,
+        on_job_terminal: Callable[[str, float], None] | None = None,
     ) -> None:
         self.jobs = jobs
         self.boards = boards
@@ -230,6 +236,7 @@ class ModeEngine:
         self.clock = clock
         self.quota = quota
         self.usage_of = usage_of if usage_of is not None else _chars4_usage
+        self.on_job_terminal = on_job_terminal
 
     # ── публичный API ────────────────────────────────────────────────────
 
@@ -571,7 +578,12 @@ class ModeEngine:
 
         Usage — durable-счётчик ledger (ключ ``usage``), пополняется на
         каждом реальном LLM-вызове (кэш-попадания бесплатны, I4).
+
+        Ф4.4a: ДО квот-ветки — ``_observe_duration`` (ETA-панель не зависит
+        от включённости квот-контура; терминал — единственная точка, где
+        wall-длительность job уже известна и записи уже позади).
         """
+        self._observe_duration(rec)
         if self.quota is None:
             return
         used = self.ledger.get(rec.id, "usage") or {}
@@ -585,6 +597,36 @@ class ModeEngine:
                 self.ledger.put(rec.id, "usage", used)
         finally:
             self.quota.release(rec.user, rec.id)
+
+    def _observe_duration(self, rec: JobRecord) -> None:
+        """Терминал job -> wall-длительность в хук ``on_job_terminal(job_id,
+        seconds)`` (Ф4.4a; прод-проводка — ``wiring.make_on_job_terminal`` ->
+        ``ETAStore.observe``).
+
+        Длительность = ``rec.updated − rec.created`` (оба ISO-UTC из
+        job-store: ``created`` — постановка, ``updated`` — штамп
+        терминального transition). Включает ожидание в очереди, исполнение
+        и паузы waiting_human -> оценка сверху-смещённая; R5-диапазон
+        (ema/p95) это покрывает честно. Пустые/битые штампы и отрицательная
+        дельта (часовой сдвиг) -> ПРОПУСК без выдумывания. Сбой хука —
+        warning, терминал не ломается (display-only).
+        """
+        if self.on_job_terminal is None:
+            return
+        try:
+            if not rec.created or not rec.updated:
+                return
+            started = datetime.fromisoformat(rec.created)
+            ended = datetime.fromisoformat(rec.updated)
+            seconds = (ended - started).total_seconds()
+            if seconds < 0:
+                return
+            self.on_job_terminal(rec.id, seconds)
+        except Exception:  # display-only: панель не валит терминал
+            logger.warning(
+                "on_job_terminal(%s) упал (best-effort, игнор)",
+                rec.id, exc_info=True,
+            )
 
     def _bump_usage(self, job_id: str, prompt: str, output: str) -> None:
         """Учесть фактический расход LLM-вызова (durable, ключ ``usage``).

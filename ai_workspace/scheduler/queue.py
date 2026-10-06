@@ -11,12 +11,20 @@ aging-пола); снятие из обоих индексов — одной Lu
 ``enqueue`` (Ф3.4), читается ``requeue``/``preempt``/``call_record``.
 ``now`` инъектируется (clock callable) — детерминированные тесты; Lua время
 сам не читает.
+
+Панель очереди (Ф4.4a): опциональный хук ``on_queue_change(shelf)`` стреляет
+после изменения состава очереди (enqueue/requeue/preempt-через-requeue/park);
+снятие (dequeue/dequeue_and_acquire/complete(call=...)/park_call) ДОПОЛНИТЕЛЬНО
+гасит ``ws:pos:{call}`` изъятого вызова. Хук best-effort: панель — display-only,
+любой её сбой глотается с warning и не пробрасывается (позиция не входит в
+критический путь планирования). Прод-проводка — ``wiring.make_on_queue_change``.
 """
 
 from __future__ import annotations
 
+import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +36,9 @@ _LUA_SOURCE = Path(__file__).with_name("queue.lua").read_text(encoding="utf-8")
 
 _SECTIONS = extract_sections(_LUA_SOURCE, source_name="queue.lua")
 """Секции ``-- @script`` (общий загрузчик lua_scripts, P2-5 критики Ф4)."""
+
+logger = logging.getLogger(__name__)
+"""Лог обёрток очереди: предупреждения best-effort хука панели (Ф4.4a)."""
 
 
 def _script(name: str) -> str:
@@ -48,13 +59,17 @@ class Queue:
         client: Any,
         shelf: str = "local",
         clock: Callable[[], float] = time.time,
+        on_queue_change: Callable[[str], None] | None = None,
     ) -> None:
         """``client`` — redis-клиент с decode_responses=True (redis_client);
         ``clock`` — источник ``now`` (по умолчанию time.time; монотонность
-        обеспечивает caller — wall-clock нужен для starve-дедлайнов)."""
+        обеспечивает caller — wall-clock нужен для starve-дедлайнов);
+        ``on_queue_change`` — best-effort хук панели очереди (Ф4.4a):
+        ``None`` -> панель не подключена (юнит-тесты без Redis-зависимостей)."""
         self.client = client
         self.shelf = shelf
         self.clock = clock
+        self.on_queue_change = on_queue_change
         self.q_key = f"ws:q:{shelf}"
         self.starve_key = f"ws:starve:{shelf}"
         self.vt_key = f"ws:vt:{shelf}"
@@ -66,6 +81,43 @@ class Queue:
         )
         self._requeue = client.register_script(_script("REQUEUE"))
         self._park = client.register_script(_script("PARK"))
+
+    def _notify_queue_change(self, removed: Sequence[str] = ()) -> None:
+        """Панель очереди (Ф4.4a): позвать ``on_queue_change(shelf)`` + ПОСЛЕ
+        него снять ``ws:pos:{call}`` изъятых вызовов. Best-effort — ЛЮБОЙ
+        сбой глотается с warning и НЕ пробрасывается: панель display-only,
+        её отказ не имеет права ломать постановку/снятие вызовов (тест
+        «сломанный хук не валит enqueue»). ``removed`` — вызовы, покинувшие
+        очередь: ранг гасится сразу, не дожидаясь пересчёта хуком.
+
+        ПОРЯДОК «хук → DEL» осознан (контракт complete: «ранг не должен
+        пережить завершение вызова»): хук пересчитывает ранги по ws:q и
+        может МАТЕРИАЛИЗОВАТЬ ранг вызову с устаревшим членством в очереди
+        (снятие мимо хука, half-removed); DEL ПОСЛЕ хука гасит ранг в любом
+        случае — снятие побеждает пересчёт. Обратный порядок (DEL → хук)
+        «воскрешал» бы ранг завершённого вызова (дефект Ф4.4a-добивка).
+        """
+        if self.on_queue_change is not None:
+            try:
+                self.on_queue_change(self.shelf)
+            except Exception:  # display-only: сбой хука не пробрасывается
+                logger.warning(
+                    "queue[%s]: on_queue_change упал (best-effort, игнор)",
+                    self.shelf, exc_info=True,
+                )
+        if not removed:
+            return
+        try:
+            pipe = self.client.pipeline()
+            for call in removed:
+                pipe.delete(f"ws:pos:{call}")
+                pipe.srem(f"ws:posidx:{self.shelf}", call)
+            pipe.execute()
+        except Exception:  # display-only: панель не валит очередь
+            logger.warning(
+                "queue[%s]: гашение ws:pos упало (best-effort, игнор)",
+                self.shelf, exc_info=True,
+            )
 
     # ── API ──────────────────────────────────────────────────────────────
 
@@ -130,6 +182,7 @@ class Queue:
                 self.call_key(call),
             ],
         )
+        self._notify_queue_change()  # Ф4.4a: панель (сбой — best-effort)
         return float(raw)
 
     def dequeue(self, *, now: float | None = None, limit: int = 1) -> list[str]:
@@ -143,7 +196,9 @@ class Queue:
             keys=[self.q_key, self.starve_key, self.vt_key, ""],
             args=[f2s(now), limit],
         )
-        return list(out)
+        taken = list(out)
+        self._notify_queue_change(removed=taken)  # Ф4.4a: снял — погаси ранги
+        return taken
 
     def requeue(
         self,
@@ -177,7 +232,10 @@ class Queue:
                 "" if vft_override is None else f2s(vft_override),
             ],
         )
-        return bool(int(raw))
+        ok = bool(int(raw))
+        if ok:
+            self._notify_queue_change()  # Ф4.4a (preempt стреляет здесь же)
+        return ok
 
     def preempt(self, call: str, *, cost_done: float, cost_est: float) -> bool:
         """Вытеснение на границе вызова (спека §4): re-enqueue с vft-кредитом
@@ -188,7 +246,8 @@ class Queue:
         протокол воркера, очередь здесь ни при чём. ``cost_est`` принят для
         интерфейсной симметрии с ``enqueue`` (кредит по спеке §4 — только
         ``cost_done``; зарезервирован для будущей EMA-валидации).
-        ``False`` — per-call записи нет (нечего вытеснять).
+        ``False`` — per-call записи нет (нечего вытеснять). Хук панели
+        (Ф4.4a) стреляет внутри ``requeue`` — одна операция, один выстрел.
         """
         rec = self.call_record(call)
         if not rec:
@@ -231,6 +290,9 @@ class Queue:
             ],
             args=[call, event_json, stream_maxlen],
         )
+        # Ф4.4a: погасить пер-вызовный ранг (Lua выше гасит только
+        # legacy ws:pos:{job}) + хук пересчёта панели.
+        self._notify_queue_change(removed=[call])
         return int(raw)
 
     def call_record(self, call: str) -> dict[str, Any]:
@@ -258,15 +320,20 @@ class Queue:
         call_class: str,
         cost_actual: float,
         weight: float | None = None,
+        call: str | None = None,
     ) -> float:
         """on_complete: ``ws:vt += cost_actual/w`` (атомарно); возвращает
-        новый vt."""
+        новый vt. ``call`` (Ф4.4a, опционально) — какой вызов завершён:
+        его ``ws:pos:{call}`` гасится + хук панели (снятие мог случиться
+        мимо хука — ранг не должен пережить завершение вызова)."""
         w = policy.weight(prio, call_class) if weight is None else weight
         vftlast = self.vftlast_key(prio, call_class)
         raw = self._complete(
             keys=[self.vt_key, vftlast],
             args=[vftlast, f2s(w), f2s(cost_actual)],
         )
+        if call is not None:
+            self._notify_queue_change(removed=[call])
         return float(raw)
 
     def dequeue_and_acquire(
@@ -303,7 +370,9 @@ class Queue:
                 f2s(now),
             ],
         )
-        return list(out)
+        taken = list(out)
+        self._notify_queue_change(removed=taken)  # Ф4.4a: панель
+        return taken
 
     def size(self) -> int:
         """Число ожидающих вызовов полки (ZCARD ws:q:{shelf})."""

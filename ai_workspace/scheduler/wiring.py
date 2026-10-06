@@ -59,9 +59,47 @@ from ai_workspace.scheduler.admission import (
     sweep_expired_conc,
 )
 from ai_workspace.scheduler.budget import charge_budget
+from ai_workspace.scheduler.eta import ETAStore
 from ai_workspace.scheduler.park import ParkControl
+from ai_workspace.scheduler.position import PositionStore
 
-__all__ = ["QuotaWiring", "RedisQuotaPort"]
+__all__ = [
+    "QuotaWiring",
+    "RedisQuotaPort",
+    "make_on_job_terminal",
+    "make_on_queue_change",
+]
+
+
+def make_on_queue_change(client: Any) -> Callable[[str], None]:
+    """Прод-проводка панели позиций (Ф4.4a): ``Queue(on_queue_change=...)`` ->
+    ``PositionStore(client).update_pos(shelf)``.
+
+    Глотание отказов живёт В Queue (display-only: одно место ответственности,
+    повторной обёртки здесь нет) — фабрика только связывает компоненты.
+    """
+    positions = PositionStore(client)
+
+    def _on_queue_change(shelf: str) -> None:
+        positions.update_pos(shelf)
+
+    return _on_queue_change
+
+
+def make_on_job_terminal(client: Any, shelf: str) -> Callable[[str, float], None]:
+    """Прод-проводка ETA (Ф4.4a): ``ModeEngine(on_job_terminal=...)`` ->
+    ``ETAStore(client).observe(shelf, seconds)``.
+
+    Полку знает проводка (контур строится на своей полке), а не движок:
+    ``ModeEngine`` остаётся свободен от scheduler-зависимостей. Глотание
+    отказов — в engine (``_observe_duration``, best-effort).
+    """
+    eta = ETAStore(client)
+
+    def _on_job_terminal(job_id: str, seconds: float) -> None:
+        eta.observe(shelf, seconds)
+
+    return _on_job_terminal
 
 
 def _require_pricing(shelf: str, pricing: Any) -> None:
@@ -168,18 +206,22 @@ class QuotaWiring:
         lease_ttl_ms: int = DEFAULT_CONC_LEASE_TTL_MS,
         clock: Callable[[], float] = time.time,
         pricing: Any = None,
+        on_queue_change: Callable[[str], None] | None = None,
     ) -> None:
         """``client`` — ws-redis (decode_responses=True); ``registry`` —
         ``QuotaRegistry`` (Ф4.1); ``shelf`` — полка контура (``ext`` включает
         бюджет D4/D5 + денежное списание P0-1); ``lease_ttl_ms`` — TTL
         conc-lease резерва (P1-3); ``pricing`` — ``PricingRegistry`` (обязателен
-        для ext, см. ``RedisQuotaPort``)."""
+        для ext, см. ``RedisQuotaPort``); ``on_queue_change`` — best-effort
+        хук панели очереди (Ф4.4a) в ParkControl/Queue (прод-проводка —
+        ``make_on_queue_change``)."""
         _require_pricing(shelf, pricing)
         self.client = client
         self.registry = registry
         self.store = store if store is not None else JobStore(client)
         self.park = park if park is not None else ParkControl(
-            client, shelf=shelf, store=self.store, clock=clock
+            client, shelf=shelf, store=self.store, clock=clock,
+            on_queue_change=on_queue_change,
         )
         self.shelf = shelf
         self.lease_ttl_ms = lease_ttl_ms
