@@ -205,7 +205,8 @@ class TestDeactivateStale:
 
 
 class TestSeedFromEnv:
-    """Bootstrap R2: env-ключи → store (zone=both, source=env)."""
+    """Bootstrap R2: env-ключи → store (source=env). Ф2.0 (P0-3): read/import
+    → zone=public (env без эскалации зон), write → both (не сужается)."""
 
     def test_seed_creates_env_records(self, store):
         added = store.seed_from_env(
@@ -214,8 +215,11 @@ class TestSeedFromEnv:
         assert added == 3
         read_rec = store.get_by_key("rk1")
         assert read_rec.level == "read"
-        assert read_rec.zone == "both"
+        assert read_rec.zone == "public"  # Ф2.0 (P0-3): env-read не эскалируется
+        assert read_rec.zone_explicit is False
         assert read_rec.source == "env"
+        write_rec = store.get_by_key("wk1")
+        assert write_rec.zone == "both"  # write не сужается
 
     def test_seed_idempotent_by_key_hash(self, store):
         assert store.seed_from_env({"read": ["rk1"], "write": ["wk1"]}) == 2

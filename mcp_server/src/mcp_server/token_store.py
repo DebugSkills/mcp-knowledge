@@ -82,6 +82,14 @@ class TokenRecord(BaseModel):
     key_hash: str = Field(..., description="sha256(plaintext).hexdigest()")
     level: str = Field(..., description="subscriber | read | import | editor | write")
     zone: str = Field(..., description="public | private | both (subscriber → public)")
+    zone_explicit: bool = Field(
+        default=False,
+        description=(
+            "Ф2.0 (C1′): True — зона задана осознанно при create() → зонная "
+            "политика honour-ит record.zone; False (legacy/env-записи) → "
+            "public-only при чтении (миграции нет, старые строки парсятся)"
+        ),
+    )
     scope: list[str] | None = Field(
         default=None, description="knowledge_id/collection_id grants (W6)",
     )
@@ -271,6 +279,7 @@ class TokenStore:
             key_hash=_hash_key(plaintext),
             level=level,
             zone=zone,
+            zone_explicit=True,  # Ф2.0: create = осознанный zone-scope
             scope=list(scope) if scope else None,
             active=True,
             expires_at=expires_at,
@@ -446,7 +455,9 @@ class TokenStore:
 
         env_keys: {"read": [...], "import": [...], "write": [...]}
         (config.py MCP_READ_KEYS / MCP_IMPORT_KEYS / MCP_WRITE_KEYS).
-        Запись: level=<уровень>, zone="both", source="env".
+        Запись: level=<уровень>, source="env". Зона (Ф2.0, P0-3): read/import →
+        "public" (env-ключи НЕ получают эскалацию зон), write → "both" (не
+        сужается). zone_explicit=False — env не создаёт zone-scope ключей.
         Пустые/повторные ключи пропускаются. Возвращает число добавленных.
         """
         added = 0
@@ -469,7 +480,10 @@ class TokenStore:
                         id="tok_" + secrets.token_hex(8),
                         key_hash=key_hash,
                         level=level,
-                        zone="both",
+                        # Ф2.0 (P0-3): read/import → public (без эскалации),
+                        # write → both (не сужается); zone_explicit=False.
+                        zone="both" if level == "write" else "public",
+                        zone_explicit=False,
                         source="env",
                         created_at=created_at,
                     ))

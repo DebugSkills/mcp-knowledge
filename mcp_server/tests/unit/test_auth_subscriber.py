@@ -144,7 +144,9 @@ class TestAuthStoreFirst:
         auth = authenticate_key("env-read-key-123", app_state=_app_state_with(store))
         assert auth.authenticated is True
         assert auth.key_level == "read"
-        assert auth.zone == "both"
+        # Ф2.0 (C1′/P0-3): env-fallback read → зона public (без эскалации)
+        assert auth.zone == "public"
+        assert auth.zone_explicit is False
 
     def test_authenticated_touches_last_used(self, tmp_path):
         store = TokenStore(tokens_dir=str(tmp_path / "tokens"))

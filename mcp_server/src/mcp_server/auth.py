@@ -150,6 +150,7 @@ class AuthInfo:
     key_level: str = "none"  # "subscriber" | "read" | "import" | "editor" | "write" | "none"
     key_hash: str = ""  # sha256 первых 8 символов для аудита
     zone: str = "both"  # W3.4: "public" | "private" | "both"
+    zone_explicit: bool = False  # Ф2.0 (C1′): True → политика honour-ит zone
     scope: set[str] = field(default_factory=set)  # W3.4: scope-grants (W6)
     token_id: str = ""  # W3.4: id записи токен-стора
 
@@ -218,6 +219,7 @@ def authenticate_key(provided_key: str, app_state=None) -> AuthInfo:
                 authenticated=True,
                 key_level="import",
                 key_hash=hashlib.sha256(provided_key.encode()).hexdigest()[:16],
+                zone="public",  # Ф2.0 (P0-3): env-fallback без эскалации зон
             )
 
     # Проверяем read-ключи
@@ -231,6 +233,7 @@ def authenticate_key(provided_key: str, app_state=None) -> AuthInfo:
                 authenticated=True,
                 key_level="read",
                 key_hash=hashlib.sha256(provided_key.encode()).hexdigest()[:16],
+                zone="public",  # Ф2.0 (P0-3): env-fallback без эскалации зон
             )
 
     logger.warning(
@@ -299,6 +302,8 @@ def _auth_from_store_record(provided_key: str, record, store) -> AuthInfo:
         key_level=record.level,
         key_hash=hashlib.sha256(provided_key.encode()).hexdigest()[:16],
         zone=zone,
+        # Ф2.0 (C1′): флаг из SSOT-записи (legacy-строки без поля → False)
+        zone_explicit=bool(getattr(record, "zone_explicit", False)),
         scope=set(record.scope or []),
         token_id=record.id,
     )
