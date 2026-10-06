@@ -37,6 +37,8 @@
 | marker:EXTRACT_PDF | mcp-server, 1 сайт | sink: docker logs mcp-knowledge-server → errors_collect.py | covered |
 | marker:EMBED | mcp-server, 1 сайт | sink: docker logs mcp-knowledge-server → errors_collect.py | covered |
 | marker:REQ | kb-console app.py (каждый запрос) | sink: docker logs kb-console → errors_collect.py | covered |
+| marker:DONE | kb-console llm_stream.py (SSE-терминатор data: [DONE]) | sink: docker logs kb-console → errors_collect.py | covered |
+| marker:SEARCH_TOOL_SCHEMA | kb-console tool_loop.py (tools=[SEARCH_TOOL_SCHEMA]) | sink: docker logs kb-console → errors_collect.py | covered |
 | marker:DOCUMENTS_CHECK | mcp-server, 4 сайта (documents_integrity.py) | sink: docker logs mcp-knowledge-server → errors_collect.py (source=docker_logs) | covered |
 | marker:REIMPORT | mcp-server, 2 сайта (content.py) | sink: docker logs mcp-knowledge-server → errors_collect.py (source=docker_logs) | covered |
 | marker:SOURCE_REF_INDEX | mcp-server, 4 сайта (source_ref_runtime.py) | sink: docker logs mcp-knowledge-server → errors_collect.py (source=docker_logs) | covered |
@@ -127,6 +129,8 @@
 | script:errors_migrate_keys_027.py | key-migration merge 027 (ручной, dry-run-first; требует остановки cron коллектора) | sink: — | gap: self — вывод только в stdout/stderr; бэкапы+манифест в .trash/ |
 | script:errors_cleanup_cron_legacy.py | 018: one-shot миграция legacy cron-ключей exit=0 (make errors-cron-cleanup / prod-errors-cron-cleanup) | sink: — | gap: self — ручной пост-деплой шаг; backup в .trash/, dry-run по умолчанию |
 | script:errors_guard.py | write-side гвард (cap/burst) + suppression-CLI | sink: — | gap: self — сам не источник; решения оператора → sink/suppression.json + audit.jsonl |
+| script:gateway_canary.py | Ф1 K+1 канарейка LiteLLM-шлюза, инвариант I1 (arch-2026-10-05-ai-workspace; ручной read-only probe) | sink: — | gap: self — read-only probe, [canary]-диагностика только в stdout, не в sink; FAIL → exit≠0 (3=W, 4=барьер, 5=не-429) |
+| script:ingress_probe.sh | Ф2 #4 ingress-probe internal-only (arch-2026-10-05-ai-workspace; ручной read-only probe) | sink: — | gap: self — read-only probe, вывод PASS/FAIL/WARN/INFO в stdout, не в sink; FAIL → exit 1 |
 
 ## Pull-источники внешних систем (Wave 2, трек G)
 

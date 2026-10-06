@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     CONSOLE_LAN_CIDR: str = ""
     CONSOLE_ADMIN_USER: str = ""
     CONSOLE_ADMIN_PASSWORD: str = ""
+    # LLM-шлюз (arch-2026-10-05-ai-workspace): LITELLM_MASTER_KEY — мастер-ключ
+    # litellm-шлюза (сам шлюз + scripts/gateway_canary.py), DEEPSEEK_API_KEY —
+    # ключ апстрим-провайдера шлюза; оба лежат в общем .env. Сервер их НЕ
+    # использует — поля нужны, чтобы pydantic не падал на extra_forbidden
+    # (паттерн MCP_API_KEY/CONSOLE_* выше). Значения НЕ логируются.
+    LITELLM_MASTER_KEY: str = ""
+    DEEPSEEK_API_KEY: str = ""
 
     # Git audit (#21) + SSOT
     GIT_AUDIT: bool = True

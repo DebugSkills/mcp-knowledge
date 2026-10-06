@@ -222,7 +222,7 @@ def test_subscriber_resources_list_forbidden():
 # ── 6. инъекция _auth в тул ──────────────────────────────────
 
 
-def test_auth_injection_into_tool_call():
+def test_auth_injection_into_tool_call(monkeypatch):
     import asyncio
 
     from mcp_server.mcp_handler import TOOL_HANDLERS, _handle_tools_call
@@ -233,13 +233,10 @@ def test_auth_injection_into_tool_call():
         captured["auth"] = params.get("_auth")
         return {"results": []}
 
-    TOOL_HANDLERS["search_knowledge"] = fake_search
-    try:
-        request = MagicMock()
-        request.state.auth = _subscriber_auth()
-        request.app = MagicMock()
-        asyncio.run(_handle_tools_call({"name": "search_knowledge", "arguments": {"query": "x"}}, "req-1", request))
-        assert captured.get("auth") is not None
-        assert captured["auth"].key_level == "subscriber"
-    finally:
-        TOOL_HANDLERS.pop("search_knowledge", None)
+    monkeypatch.setitem(TOOL_HANDLERS, "search_knowledge", fake_search)
+    request = MagicMock()
+    request.state.auth = _subscriber_auth()
+    request.app = MagicMock()
+    asyncio.run(_handle_tools_call({"name": "search_knowledge", "arguments": {"query": "x"}}, "req-1", request))
+    assert captured.get("auth") is not None
+    assert captured["auth"].key_level == "subscriber"
