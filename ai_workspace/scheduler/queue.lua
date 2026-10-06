@@ -130,3 +130,85 @@ end
 local vt = (tonumber(redis.call('GET', KEYS[1])) or 0.0) + cost / w
 redis.call('SET', KEYS[1], f2s(vt))
 return f2s(vt)
+
+-- @script DEQUEUE_ACQUIRE
+-- АТОМАРНО: выбрать вызовы (правило dequeue) + ВЗЯТЬ слот + XADD событие —
+-- одной Lua (инварианты I2 «снятие из двух индексов + выдача слота — одной
+-- Lua» и I3 «XADD в той же Lua, что слот-операция»).
+-- Логика выбора ДУБЛИРУЕТ dequeue осознанно: `take` здесь имеет побочные
+-- эффекты (holders/lease/event), а секции регистрируются отдельными чанками.
+-- Синхронность правил обязательна → parity-тест (test_dequeue_acquire.py).
+-- KEYS[1] q, KEYS[2] starve, KEYS[3] holders = ws:slots:{shelf},
+-- KEYS[4] stream = ws:events:{shelf}.
+-- ARGV[1] now, ARGV[2] limit, ARGV[3] k_max, ARGV[4] lease_ttl_ms,
+-- ARGV[5] stream_maxlen, ARGV[6] lease_prefix = "ws:lease:{shelf}:",
+-- ARGV[7] shelf (для event-json), ARGV[8] ts.
+-- Возврат: array имён взятых вызовов (в порядке обслуживания).
+--   ПУСТОЙ массив, если слотов нет — при этом очередь НЕ изменяется
+--   (отказ ДО любого снятия — не вакуумный инвариант).
+local function f2s(x) return string.format('%.17g', x) end
+local now = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+local k_max = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+if not now or not limit or limit < 1 then
+  return redis.error_reply('DEQUEUE_ACQUIRE: bad ARGV now/limit')
+end
+if not k_max or k_max < 1 or not ttl or ttl < 1 then
+  return redis.error_reply('DEQUEUE_ACQUIRE: bad ARGV k_max/lease_ttl_ms')
+end
+local used = redis.call('SCARD', KEYS[3])
+local take_limit = math.min(limit, k_max - used)
+if take_limit < 1 then return {} end  -- слотов нет: НИЧЕГО не снимаем
+
+local taken = {}
+local taken_set = {}
+local function take(call)
+  -- ДВУХ-ИНДЕКСНОЕ снятие + слот + событие — одной Lua.
+  redis.call('ZREM', KEYS[1], call)
+  redis.call('ZREM', KEYS[2], call)
+  redis.call('SADD', KEYS[3], call)
+  redis.call('SET', ARGV[6] .. call, call, 'PX', ttl)
+  local ev = string.format(
+    '{"type":"acquired","shelf":"%s","call":"%s","ts":%s,"state":"running"}',
+    ARGV[7], call, ARGV[8])
+  redis.call('XADD', KEYS[4], 'MAXLEN', '~', ARGV[5], '*', 'event', ev)
+  taken_set[call] = true
+  taken[#taken + 1] = call
+end
+-- 1) просроченные (aging-пол = абсолютное право) — прямо из starve.
+local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', f2s(now),
+                           'LIMIT', 0, take_limit)
+for i = 1, #expired do
+  if #taken >= take_limit then break end
+  take(expired[i])
+end
+-- 2) добор из WFQ-окна 32 младших VFT.
+if #taken < take_limit then
+  local cands = redis.call('ZRANGE', KEYS[1], 0, 31, 'WITHSCORES')
+  local entries = {}
+  for i = 1, #cands, 2 do
+    local call = cands[i]
+    if not taken_set[call] then
+      local dl_raw = redis.call('ZSCORE', KEYS[2], call)
+      entries[#entries + 1] = { call, tonumber(cands[i + 1]),
+                                dl_raw and tonumber(dl_raw) or nil }
+    end
+  end
+  table.sort(entries, function(a, b)
+    local ae = a[3] ~= nil and a[3] <= now
+    local be = b[3] ~= nil and b[3] <= now
+    if ae ~= be then return ae end
+    if ae then
+      if a[3] ~= b[3] then return a[3] < b[3] end
+    else
+      if a[2] ~= b[2] then return a[2] < b[2] end
+    end
+    return a[1] < b[1]
+  end)
+  for i = 1, #entries do
+    if #taken >= take_limit then break end
+    take(entries[i][1])
+  end
+end
+return taken

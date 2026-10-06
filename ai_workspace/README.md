@@ -66,3 +66,23 @@ ai_workspace (control-plane), не наоборот. Осознанный огр
 Slot-семафор `ws:slots:*` (K_local/M_ext) + `XADD` event-commit +
 `PUBLISH ws:kick` (Ф3.3); requeue/lease/sweeper с СОХРАНЁМ starve-дедлайна
 (иначе preempt-livelock, Ф3.4); Mode engine, admission (Ф3.5+).
+
+## Слоты + события (Ф3.3, `scheduler/slots.lua` + `queue.py:dequeue_and_acquire`)
+
+- **Ключи:** `ws:slots:{shelf}` (SET занятых), `ws:lease:{shelf}:{call}` (TTL 90 c),
+  `ws:events:{shelf}` (Redis Stream, поле `event` = JSON).
+- **Инвариант I1 «отказ, не очередь»:** попытка сверх `k` → `acquire() -> False`
+  БЕЗ побочных эффектов (holders/lease/event не меняются). Ожидание живёт только
+  в `ws:q:{shelf}`. `k == max_parallel_requests` полки (сверка с шлюзом — Ф1/I1).
+- **Инварианты I2/I3:** `dequeue_and_acquire(k_max=…)` — ОДНА Lua: снятие из двух
+  индексов + `SADD`/`SET lease` + `XADD`; слотов нет → `[]` и очередь не тронута.
+- **I12:** `XADD MAXLEN ~ stream_maxlen` (обрезка приблизительная, по макро-узлам).
+- **События:** `acquired` / `released` / `lease_expired`; потребитель — Mode engine
+  (Ф3.5) через `XGROUP CREATE` + `XREADGROUP` + `XACK` (совместимость покрыта тестом).
+- **Lua-хелперы:** `lua/_common.lua` предваряется к секциям `slots.lua`
+  (только `local`, иначе Redis 7 «readonly table script»). `queue.lua` остаётся
+  самодостаточным (секционные хелперы, Ф3.2).
+- **Тесты:** `test_slots_lua.py` (K-инвариант, ровно 1 событие, heartbeat, reclaim,
+  consumer-group), `test_dequeue_acquire.py` (атомарный отказ без снятия из очереди,
+  parity с `Queue.dequeue`, lease читается `Slots.heartbeat`).
+- **Дальше:** Ф3.4 — `requeue(vft+starve)` + lease-sweeper + preempt; Ф3.8 — полка `gpu`.

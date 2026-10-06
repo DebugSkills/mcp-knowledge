@@ -60,6 +60,9 @@ class Queue:
         self._enqueue = client.register_script(_script("enqueue"))
         self._dequeue = client.register_script(_script("dequeue"))
         self._complete = client.register_script(_script("complete"))
+        self._dequeue_acquire = client.register_script(
+            _script("DEQUEUE_ACQUIRE")
+        )
 
     # ── API ──────────────────────────────────────────────────────────────
 
@@ -141,6 +144,42 @@ class Queue:
             args=[vftlast, f2s(w), f2s(cost_actual)],
         )
         return float(raw)
+
+    def dequeue_and_acquire(
+        self,
+        *,
+        k_max: int,
+        now: float | None = None,
+        limit: int = 1,
+        lease_ttl_ms: int = 90_000,
+        stream_maxlen: int = 10_000,
+    ) -> list[str]:
+        """АТОМАРНО: снять до ``limit`` вызовов + взять слот + ``XADD`` событие
+        одной Lua (I2/I3). Слотов нет → ``[]`` и очередь НЕ изменена.
+
+        ``k_max`` — число слотов полки (== ``max_parallel_requests``, I1).
+        Возвращает список взятых вызовов в порядке обслуживания.
+        """
+        now = self.clock() if now is None else now
+        out: Any = self._dequeue_acquire(
+            keys=[
+                self.q_key,
+                self.starve_key,
+                f"ws:slots:{self.shelf}",
+                f"ws:events:{self.shelf}",
+            ],
+            args=[
+                f2s(now),
+                limit,
+                k_max,
+                lease_ttl_ms,
+                stream_maxlen,
+                f"ws:lease:{self.shelf}:",
+                self.shelf,
+                f2s(now),
+            ],
+        )
+        return list(out)
 
     def size(self) -> int:
         """Число ожидающих вызовов полки (ZCARD ws:q:{shelf})."""
