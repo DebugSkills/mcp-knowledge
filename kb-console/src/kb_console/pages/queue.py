@@ -4,7 +4,13 @@ Read-only витрина планировщика AI-верстака: конс�
 ``ai_workspace`` — читает ws-redis напрямую (прецедент Ф2:
 ``core/redis_client.make_ws_redis``, как ``pages/chat.py:_build_store``).
 
-Контракт ключей (Ф4.4a, только чтение):
+Ф4.5b: страница остаётся contributor-видимой на чтение, но admin получает
+UI-контроль per-job приоритета — селектор + «Применить»/«Сбросить» для
+``ws:prio:{job}`` (гейт роли — на КОНТРОЛЕ, не на странице; запись —
+намеренное дублирование ~5 строк контракта SSOT, см.
+``set_job_priority_ui``).
+
+Контракт ключей (Ф4.4a, чтение; ``ws:prio`` — чтение+запись):
 - ``ws:q:{shelf}`` — ZSET call→raw VFT (ожидающие);
 - ``ws:call:{shelf}:{call}`` — HASH (prio, class, job, epoch, attempt,
   vft, starve_deadline);
@@ -13,6 +19,8 @@ Read-only витрина планировщика AI-верстака: конс�
 - ``ws:starve:{shelf}`` — ZSET call→starve_deadline (просроченные =
   aging-пол, приоритетнее всех — инвариант I2);
 - ``ws:eta:{shelf}`` — JSON {"ema_s","p95_s","n","updated_at"};
+- ``ws:prio:{job}`` — STRING high|med|low (override приоритета job'а,
+  TTL 24 ч; SSOT — ai_workspace/scheduler/prio.py);
 - исполняющиеся: ``ws:lease:{shelf}:{call}``, ``ws:job:{id}`` — в этой
   итерации НЕ читаются (панель показывает ожидающих; остаток — см. отчёт).
 
@@ -23,7 +31,8 @@ Fail-soft: у операторской консоли ``WS_REDIS_URL`` НЕ за
 сервису workspace, compose.workspace.yml) → ``RuntimeError``/сетевые сбои
 гасятся в баннер «ws-redis недоступен» с КЛАССОМ ошибки (str redis-ошибок
 несёт host:port — гигиена core/redis_client.py); страница не падает,
-таймер продолжает попытки.
+таймер продолжает попытки. Сбой записи приоритета → ``ui.notify`` (класс
+ошибки, без host:port), страница жива, таймер работает.
 
 R6: ``components/queue_console.py`` — витрина ИМПОРТ-очереди KB; здесь
 общего только слово «очередь» — НЕ переиспользуется и не смешивается.
@@ -33,10 +42,12 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from typing import Any
 
 from nicegui import ui
 
+from ..core.identity import current_actor, current_role
 from ..core.redis_client import make_ws_redis
 
 REFRESH_SECONDS = 2.0
@@ -45,6 +56,18 @@ REFRESH_SECONDS = 2.0
 BASE_SHELVES: tuple[str, ...] = ("local", "ext")
 GPU_SHELF = "gpu"
 
+VALID_PRIORITIES: tuple[str, ...] = ("high", "med", "low")
+"""Допустимые значения override — SSOT ``ai_workspace/scheduler/policy.MULT``
+(ключи weight-матрицы WFQ); менять синхронно с бэкендом."""
+
+PRIO_OVERRIDE_TTL_S = 86_400
+"""TTL override 24 ч — SSOT ``prio.DEFAULT_TTL_S`` (SET EX продлевает TTL)."""
+
+QUOTA_EVENTS_KEY = "ws:quota:events"
+"""Стрим событий ws-контура — SSOT ``admission.QUOTA_EVENTS_KEY``."""
+
+QUOTA_EVENTS_MAXLEN = 10_000
+"""MAXLEN ~ стрима событий — SSOT ``admission.DEFAULT_QUOTA_STREAM_MAXLEN``."""
 
 # ── Ключи ws-контура (имена — SSOT спека Scheduler §2 / scheduler/*.py) ──
 
@@ -71,6 +94,11 @@ def posq_key(shelf: str) -> str:
 
 def eta_key(shelf: str) -> str:
     return f"ws:eta:{shelf}"
+
+
+def prio_key(job: str) -> str:
+    """Ключ override приоритета job'а — SSOT ``scheduler/prio.py::prio_key``."""
+    return f"ws:prio:{job}"
 
 
 # ── Чистое ядро: snapshot (без NiceGUI, duck-typed клиент) ─────────────
@@ -160,6 +188,30 @@ def _aggregate_jobs(
     return jobs
 
 
+
+def _attach_prio_overrides(client: Any, jobs: list[dict[str, Any]]) -> None:
+    """Дописать в job-записи ``prio_override``/``prio_source`` (Ф4.5b).
+
+    Пакетное ``MGET ws:prio:{job}`` — один вызов на полку, не N GET.
+    ``prio_source`` = "job" только при ВАЛИДНОМ значении: мусор в ключе
+    (ручная правка мимо API) → "account" — семантика SSOT
+    ``prio.effective_priority`` (availability > strictness), сырое значение
+    остаётся в ``prio_override`` для витрины. Fail-soft: сбой MGET →
+    ``None``/"account" — приоритет-поля не роняют snapshot очереди.
+    """
+    if not jobs:
+        return
+    try:
+        values = client.mget([prio_key(j["job"]) for j in jobs])
+    except Exception:
+        values = None
+    for idx, job in enumerate(jobs):
+        raw = values[idx] if values is not None else None
+        override = str(raw) if raw is not None else None
+        job["prio_override"] = override
+        job["prio_source"] = "job" if override in VALID_PRIORITIES else "account"
+
+
 def fetch_queue_snapshot(client: Any, *, now: float) -> dict[str, Any]:
     """Собрать snapshot очередей ws-контура (чистое ядро, без NiceGUI).
 
@@ -176,7 +228,8 @@ def fetch_queue_snapshot(client: Any, *, now: float) -> dict[str, Any]:
              "waiting_calls": <int>, "eta": <dict|None>, "jobs": [
                 {"job": str, "position": int|None, "ahead": int|None,
                  "starved": bool, "prio": str, "call_class": str,
-                 "calls": int, "eta_range": (lower, upper)|None}]}]}
+                 "calls": int, "eta_range": (lower, upper)|None,
+                 "prio_override": str|None, "prio_source": "job"|"account"}]}]}
     """
     shelves_out: list[dict[str, Any]] = []
     for shelf in _shelves_present(client):
@@ -203,6 +256,8 @@ def fetch_queue_snapshot(client: Any, *, now: float) -> dict[str, Any]:
                 }
             )
         eta = _read_eta(client, shelf)
+        jobs = _aggregate_jobs(calls, eta)
+        _attach_prio_overrides(client, jobs)
         shelves_out.append(
             {
                 "shelf": shelf,
@@ -210,10 +265,168 @@ def fetch_queue_snapshot(client: Any, *, now: float) -> dict[str, Any]:
                 "depth_source": "posq" if raw_depth is not None else "waiting",
                 "waiting_calls": len(waiting),
                 "eta": eta,
-                "jobs": _aggregate_jobs(calls, eta),
+                "jobs": jobs,
             }
         )
     return {"ok": True, "now": float(now), "shelves": shelves_out}
+
+
+# ── Ф4.5b: per-job приоритет — запись ───────────────────────────────────
+# ⚠️ SSOT — ai_workspace/scheduler/prio.py; менять синхронно. Консоль НЕ
+# импортирует ai_workspace (прецедент Ф2/Ф4.4b) — намеренное дублирование
+# ~5 строк контракта (ключ/SET EX/TTL/событие); покрыто тестами формы.
+
+
+def can_manage_priority(role: str) -> bool:
+    """Гейт роли на приоритет-КОНТРОЛЕ: только admin.
+
+    Чистая функция (тестируется без UI): страница «Очередь» остаётся
+    contributor-видимой на чтение — роль режет именно контроль записи,
+    не витрину (ROUTES /queue: min_role contributor).
+    """
+    return role == "admin"
+
+
+def _prio_event_payload(type_: str, **fields: Any) -> str:
+    """JSON события — формат SSOT ``admission._quota_event`` (единый вид
+    стрима): ``{"type", "ts", **fields}``, компактные разделители."""
+    payload: dict[str, Any] = {"type": type_, "ts": round(time.time(), 6)}
+    payload.update(fields)
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+
+def _emit_prio_event(client: Any, type_: str, **fields: Any) -> None:
+    """XADD события в ``ws:quota:events`` (MAXLEN ~) — best-effort.
+
+    Паттерн SSOT ``prio.emit_event``: наблюдение не валит операцию; в
+    отличие от бэкенда гасим любое исключение (консоль не знает классов
+    ws-контура, а UI-мутация уже подтверждена SET/DEL).
+    """
+    try:
+        client.xadd(
+            QUOTA_EVENTS_KEY,
+            {"event": _prio_event_payload(type_, **fields)},
+            maxlen=QUOTA_EVENTS_MAXLEN,
+            approximate=True,
+        )
+    except Exception:
+        pass
+
+
+def set_job_priority_ui(
+    client: Any,
+    job: str,
+    prio: str,
+    *,
+    actor: str,
+    ttl_s: int = PRIO_OVERRIDE_TTL_S,
+    reason: str = "ui",
+) -> None:
+    """Установить override приоритета job'а из консоли (``SET EX``).
+
+    Дублирование SSOT ``prio.set_job_priority`` — менять синхронно:
+    ключ ``ws:prio:{job}``, значение ``high|med|low`` (SSOT — policy.MULT),
+    ``SET EX`` — значение и TTL атомарны, повторная установка ПРОДЛЕВАЕТ
+    TTL (24 ч по умолчанию); событие ``job_priority_set`` (job/prio/
+    ttl_s/actor/reason) — best-effort в ``ws:quota:events``. Валидация —
+    ДО любого обращения к redis (fail-closed: мусор через UI в ключ не
+    попадает). Очередь НЕ трогается: override подхватывают только
+    ПОСЛЕДУЮЩИЕ admit/enqueue вызовов job'а.
+    """
+    if not isinstance(job, str) or not job.strip():
+        raise ValueError(f"job должен быть непустой строкой, получено: {job!r}")
+    if prio not in VALID_PRIORITIES:
+        raise ValueError(
+            f"prio должен быть одним из {list(VALID_PRIORITIES)} "
+            f"(SSOT — policy.MULT), получено: {prio!r}"
+        )
+    if not isinstance(ttl_s, int) or isinstance(ttl_s, bool) or ttl_s <= 0:
+        raise ValueError(f"ttl_s должен быть целым > 0, получено: {ttl_s!r}")
+    client.set(prio_key(job), prio, ex=ttl_s)
+    _emit_prio_event(
+        client,
+        "job_priority_set",
+        job=job,
+        prio=prio,
+        ttl_s=ttl_s,
+        actor=actor,
+        reason=reason,
+    )
+
+
+def clear_job_priority_ui(client: Any, job: str, *, actor: str) -> bool:
+    """Снять override (``DEL``); событие ``job_priority_cleared`` — всегда.
+
+    Дублирование SSOT ``prio.clear_job_priority`` — менять синхронно.
+    ``True`` — ключ был, ``False`` — нет (идемпотентно; событие фиксирует
+    саму команду оператора).
+    """
+    removed = bool(client.delete(prio_key(job)))
+    _emit_prio_event(
+        client, "job_priority_cleared", job=job, actor=actor, removed=removed
+    )
+    return removed
+
+
+def _apply_priority_from_ui(
+    client: Any,
+    job: str,
+    prio: Any,
+    *,
+    actor: str,
+    on_refresh: Callable[[], None] | None = None,
+) -> None:
+    """Обработчик «Применить»: запись + notify + НЕМЕДЛЕННЫЙ пере-рендер.
+
+    Fail-soft: любая ошибка (валидация/ws-redis) → ``ui.notify`` negative
+    только с КЛАССОМ исключения (str redis-ошибок несёт host:port —
+    гигиена core/redis_client.py); страница жива, таймер работает.
+    """
+    try:
+        set_job_priority_ui(client, job, prio, actor=actor)
+    except ValueError as exc:
+        ui.notify(f"Приоритет {job} не записан: {exc}", type="negative")
+        return
+    except Exception as exc:
+        ui.notify(
+            f"Приоритет {job} не записан ({type(exc).__name__}) — "
+            "ws-redis недоступен?",
+            type="negative",
+        )
+        return
+    ui.notify(
+        f"Приоритет {job} → {prio} на 24 ч (подействует на последующие вызовы)",
+        type="positive",
+    )
+    if on_refresh is not None:
+        on_refresh()
+
+
+def _clear_priority_from_ui(
+    client: Any,
+    job: str,
+    *,
+    actor: str,
+    on_refresh: Callable[[], None] | None = None,
+) -> None:
+    """Обработчик «Сбросить»: DEL + notify + пере-рендер (fail-soft, класс
+    ошибки без host:port — см. ``_apply_priority_from_ui``)."""
+    try:
+        removed = clear_job_priority_ui(client, job, actor=actor)
+    except Exception as exc:
+        ui.notify(
+            f"Сброс приоритета {job} не выполнен ({type(exc).__name__}) — "
+            "ws-redis недоступен?",
+            type="negative",
+        )
+        return
+    note = "override снят" if removed else "override не был установлен"
+    ui.notify(
+        f"{job}: {note} (последующие вызовы — приоритет аккаунта)",
+        type="positive",
+    )
+    if on_refresh is not None:
+        on_refresh()
 
 
 # ── UI: страница ───────────────────────────────────────────────────────
@@ -232,8 +445,18 @@ def _fmt_eta(rng: tuple[float, float] | None) -> str:
     return f"≈ {_fmt_seconds(lower)}–{_fmt_seconds(upper)} (оценка, ≥{_fmt_seconds(lower)})"
 
 
-def _render(state: dict[str, Any]) -> None:
-    """Отрисовать состояние панели: баннер ошибки ЛИБО полки с очередями."""
+def _render(
+    state: dict[str, Any],
+    *,
+    can_manage: bool = False,
+    on_refresh: Callable[[], None] | None = None,
+) -> None:
+    """Отрисовать состояние панели: баннер ошибки ЛИБО полки с очередями.
+
+    ``can_manage`` — гейт роли на приоритет-КОНТРОЛЕ (только admin;
+    contributor/editor видят страницу на чтение); ``on_refresh`` —
+    немедленный пере-рендер после успешной записи приоритета.
+    """
     error = state.get("error")
     if error is not None:
         with ui.card().classes("w-full q-mb-md"):
@@ -300,11 +523,15 @@ def _render(state: dict[str, Any]) -> None:
                 )
                 if j["position"] is None and j["starved"]:
                     pos_text = "⏰ просрочен · поз. —"
+                if j["prio_source"] == "job":
+                    prio_text = f"{j['prio_override']} ⚡ (job-override)"
+                else:
+                    prio_text = j["prio"] or "—"
                 rows.append(
                     {
                         "job": j["job"]
                         + (f" ({j['calls']} вызова)" if j["calls"] > 1 else ""),
-                        "prio": j["prio"] or "—",
+                        "prio": prio_text,
                         "call_class": j["call_class"] or "—",
                         "pos": pos_text,
                         "eta": _fmt_eta(j["eta_range"]),
@@ -317,15 +544,64 @@ def _render(state: dict[str, Any]) -> None:
                 "не факт."
             ).classes("text-caption text-grey")
 
+            if can_manage and jobs:
+                ui.separator()
+                ui.label("Override приоритета job (только admin)").classes(
+                    "text-subtitle2"
+                )
+                ui.label(
+                    "Override живёт 24 ч и действует на ПОСЛЕДУЮЩИЕ вызовы "
+                    "job'а — уже стоящие в очереди вызовы не реордерятся."
+                ).classes("text-caption text-grey")
+                for j in jobs:
+                    with ui.row().classes("w-full items-center"):
+                        ui.label(j["job"]).classes("col-3 ellipsis")
+                        current = (
+                            j["prio_override"] if j["prio_source"] == "job" else None
+                        )
+                        select = ui.select(
+                            list(VALID_PRIORITIES),
+                            value=current,
+                            label="приоритет",
+                            clearable=True,
+                        )
+                        ui.button(
+                            "Применить",
+                            on_click=lambda j=j, s=select: _apply_priority_from_ui(
+                                state["client"],
+                                j["job"],
+                                s.value,
+                                actor=current_actor(),
+                                on_refresh=on_refresh,
+                            ),
+                        )
+                        ui.button(
+                            "Сбросить",
+                            on_click=lambda j=j: _clear_priority_from_ui(
+                                state["client"],
+                                j["job"],
+                                actor=current_actor(),
+                                on_refresh=on_refresh,
+                            ),
+                        ).props("flat")
+
 
 def build_queue() -> None:
-    """Построить страницу «Очередь» (панель ws-контура, read-only)."""
+    """Построить страницу «Очередь» (панель ws-контура).
+
+    Чтение — для всех ролей страницы (min_role contributor); запись
+    приоритета — только admin (гейт в render → _render can_manage).
+    """
     state: dict[str, Any] = {"client": None, "snapshot": None, "error": None}
     _refresh_timer: ui.timer | None = None
 
     @ui.refreshable
     def render() -> None:
-        _render(state)
+        _render(
+            state,
+            can_manage=can_manage_priority(current_role()),
+            on_refresh=refresh,
+        )
 
     def _refresh_data() -> None:
         """Собрать данные (sync ws-redis) в state; сбои → error-класс."""
@@ -347,8 +623,9 @@ def build_queue() -> None:
 
     ui.label("Очередь верстака (ws-контур)").classes("text-h4 q-mb-xs")
     ui.label(
-        "Read-only панель планировщика: ожидающие job-ы по полкам, позиции "
-        f"и ETA-оценка. Обновление каждые {REFRESH_SECONDS:.0f} с."
+        "Панель планировщика: ожидающие job-ы по полкам, позиции и "
+        "ETA-оценка (чтение); admin — управление приоритетами job-ов. "
+        f"Обновление каждые {REFRESH_SECONDS:.0f} с."
     ).classes("text-caption text-grey q-mb-md")
 
     _refresh_data()  # первый сбор синхронно → мгновенный баннер/данные
