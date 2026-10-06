@@ -93,6 +93,14 @@ def page_chat() -> None:
     build_chat()
 
 
+@ui.page("/queue")
+def page_queue() -> None:
+    """Страница «Очередь» — панель очередей ws-контура (Ф4.4b ai-workspace)."""
+    render_header("queue")
+    from .pages.queue import build_queue
+    build_queue()
+
+
 @ui.page("/quality")
 def page_quality() -> None:
     """Страница «Качество» — review-очередь книг, каскадные действия, удаление."""

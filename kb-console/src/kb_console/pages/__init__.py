@@ -19,6 +19,7 @@ from . import (
     documents,
     import_page,
     quality,
+    queue,
     requests_page,
     search,
     status,
@@ -34,6 +35,7 @@ ROUTES: list[tuple[str, str, Callable[[], None], str]] = [
     ("/import", "Импорт", import_page.build_import, "contributor"),
     ("/search", "Поиск", search.build_search, "contributor"),
     ("/chat", "Чат", chat.build_chat, "contributor"),  # Ф2 ai-workspace #1
+    ("/queue", "Очередь", queue.build_queue, "contributor"),  # Ф4.4b ai-workspace
     ("/quality", "Качество", quality.build_quality, "contributor"),  # Фаза 13.14
     ("/tokens", "Токены", tokens.build_tokens, "admin"),  # W5; admin-only — У-3/Ф3.2
     ("/users", "Пользователи", users_page.build_users, "admin"),  # Ф3.2

@@ -23,6 +23,7 @@ class TestRoutesMatrix:
         assert common == {
             "/status", "/books", "/import", "/search", "/quality",
             "/chat",  # Ф2 ai-workspace #1
+            "/queue",  # Ф4.4b ai-workspace (панель очередей ws-контура)
         }
 
     def test_all_roles_valid(self):

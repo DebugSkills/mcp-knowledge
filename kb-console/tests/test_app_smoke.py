@@ -45,6 +45,10 @@ def _start_console(port: int) -> subprocess.Popen:
     env.pop("MCP_API_KEY_ADMIN", None)
     env.pop("MCP_API_KEY_EDITOR", None)
     env.pop("MCP_API_KEY_CONTRIBUTOR", None)
+    # Ф4.4b: панель очереди в smoke — детерминированный fail-soft баннер
+    # (без env ws-redis; унаследованный из окружения WS_REDIS_URL даёт
+    # ConnectionError → тот же баннер, но медленнее).
+    env.pop("WS_REDIS_URL", None)
     # NiceGUI определяет запуск внутри pytest (helpers.is_pytest) и требует
     # NICEGUI_SCREEN_TEST_PORT — задаём его явно (штатный тестовый механизм).
     env["NICEGUI_SCREEN_TEST_PORT"] = str(port)
@@ -138,6 +142,14 @@ def test_search_page_200():
     """GET /search → 200 HTML."""
     _get_or_start_console()
     r = local_get(f"http://localhost:{_SMOKE_PORT}/search", timeout=5.0)
+    assert r.status_code == 200
+    assert "<html" in r.text.lower()
+
+
+def test_queue_page_200_fail_soft():
+    """Ф4.4b: GET /queue → 200 — без WS_REDIS_URL страница жива (баннер)."""
+    _get_or_start_console()
+    r = local_get(f"http://localhost:{_SMOKE_PORT}/queue", timeout=5.0)
     assert r.status_code == 200
     assert "<html" in r.text.lower()
 
