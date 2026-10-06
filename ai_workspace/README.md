@@ -128,3 +128,20 @@ Mode engine, admission (Ф3.5+); human-gate `ws:gate:*` + дашборд спя�
 инструменты, покрытие вход/выход (транзитивно), human-gate для strategic/brainstorm,
 citation-политика, резолв `model_class` (+private→local-only), терминируемость, fork/join,
 single-writer секций доски. На каждое правило — фикстур-нарушитель в `tests/fixtures/modes/`.
+
+## Board-store (Ф3.5b-1, `orchestrator/board.py`)
+- `BoardStore` (`ws:board:{job}` = `version`+`sec:*`, `:owner` = секция→узел,
+  `:v:{n}` = immutable-снапшоты): CAS одной inline-Lua — stale → `StaleBoard`
+  (без записи), duplicate (==current) → идемпотентный no-op, `current+1` →
+  запись + снапшот полного состояния.
+- Single-writer секций: чужой `writer_node` → `SectionConflict` (или перехват
+  при `single_writer=False`); `diff(v1,v2)` по снапшотам; тесты — integration
+  (`test_board_store.py`, авто-skip).
+
+## Board-store job'а (Ф3.5b-1, `orchestrator/board.py`)
+
+Ключи: `ws:board:{job}` (HASH: `version` + `sec:<name>`), `ws:board:{job}:owner` (секция→узел),
+`ws:board:{job}:v:{n}` (immutable снапшот). CAS одной Lua: `expect<current` → `StaleBoard`
+(без записи), duplicate (`expect==current-1` и значения уже записаны) → идемпотентный no-op,
+`expect==current` → версия+1 + снапшот. `single_writer=True` — секцию пишет один узел
+(`SectionConflict`); `read_version(n)`/`diff(a,b)` — replay/аудит.
