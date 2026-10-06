@@ -504,7 +504,7 @@ WS_COMPOSE := compose.workspace.yml
 WS_COMPOSE_TEST := compose.workspace.test.yml
 WS_TEST_REDIS_URL := redis://127.0.0.1:6390/0
 
-.PHONY: ws-up ws-down ws-up-test ws-test ws-test-integration ws-budget-reconcile ws-quota-sweep ws-prio quotas-set quotas-show modes-validate golden-run
+.PHONY: ws-up ws-down ws-up-test ws-test ws-test-integration ws-budget-reconcile ws-quota-sweep ws-prio quotas-set quotas-show modes-validate golden-run f47-run
 ws-up: ## Ф3.1: поднять ws-redis (порт НЕ публикуется — I6, internal-only)
 	docker compose -f $(WS_COMPOSE) up -d ws-redis
 
@@ -540,3 +540,6 @@ modes-validate: ## Ф3.5: валидация режимов ai_workspace/modes/*
 
 golden-run: ## Ф3.10: golden-run «статья» (T/I/Q) → отчёт в plans/_provenance (нужен ws-up-test или ws-up)
 	WS_REDIS_URL=$(WS_TEST_REDIS_URL) .venv/bin/python -m ai_workspace.tools.golden_run --out .trash/golden-artifacts
+
+f47-run: ## Ф4.7: приёмочный контурный прогон (нужен make ws-up-test)
+	WS_REDIS_URL=$(WS_TEST_REDIS_URL) .venv/bin/python -m ai_workspace.tools.f47_acceptance

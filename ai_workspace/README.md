@@ -291,3 +291,20 @@ lease и отчитывается по видам — упавший ворке�
   `QReport` = **отчёт-таблица** (не ассерт): порог Q-floor по зоне (`public 0.80`,
   `private 0.85`; владелец — оператор, `decide_by: Ф3.9-старт`), ниже порога → маркер
   `local-draft`, N≥2 прогонов + флаг вариативности.
+
+## Приёмочный контурный драйвер (Ф4.7, `tools/f47_acceptance.py`)
+
+Приёмочный прогон контура AI-верстака: сценарий **S1** «5 параллельных постановок +
+квоты» (D1: admin/member×2/guest×2). Конкурентная постановка через реальный
+`QuotaWiring.submit` (Lua ADMIT → D3/D6), исполнение — реальный `ModeEngine` с
+реальным портом квот (`RedisQuotaPort`: heartbeat/charge/release), приоритеты
+D2/D8 из `Decision.prio/prio_source`, пик RUNNING по job-store, deny-проба D3 с
+предзаписанным дневным расходом. Отчёт: `plans/_provenance/arch-2026-10-05-ai-workspace/
+Ф4.7-acceptance-report.md` (+ `--json` в stdout).
+
+**Граница честности:** провайдеры — стабы полок из `golden_run.py` (живые
+ollama/DeepSeek — шаг прода Ф6), arq-воркера авто-вытеснения нет; очередь/K/preempt
+и park/resume — следующие сессии (`TODO(S2)`/`TODO(S3)` в файле).
+
+Запуск: `make f47-run` (нужен `make ws-up-test`; выход 0 — ассерты пройдены,
+1 — нарушение, 2 — контур не поднят).
