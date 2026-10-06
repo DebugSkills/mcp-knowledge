@@ -741,7 +741,7 @@ def test_ws_quota_sweep_script_reclaims_dead_reserve(ws) -> None:
 
     proc = subprocess.run(
         [sys.executable, str(Path(__file__).resolve().parents[2] / "scripts" / "ws_quota_sweep.py")],
-        capture_output=True, text=True, env=dict(os.environ), timeout=60,
+        capture_output=True, text=True, env=dict(os.environ), timeout=60, check=False,
     )
     assert proc.returncode == 0, proc.stderr
     report = json.loads(proc.stdout)
