@@ -300,36 +300,42 @@ def test_sweep_reclaims_expired_reservation_leases_alive(ws):
     резерв и пишет событие conc_reservation_reclaimed; живой lease не
     трогается; после снятия admit снова проходит (вечного deny нет)."""
     client, book, user = ws
+    # уникальные job-id на прогон (аудит Ф4.4a): фиксированное имя ловило
+    # устаревший матч по событиям прошлых прогонов в общем стриме
+    dead, alive = f"{user}-job-dead", f"{user}-job-alive"
     assert (
         admit(
-            user, "member", registry=book, redis=client, job="job-dead",
+            user, "member", registry=book, redis=client, job=dead,
             lease_ttl_ms=150,
         ).action
         == "allow"
     )
     assert (
         admit(
-            user, "member", registry=book, redis=client, job="job-alive",
+            user, "member", registry=book, redis=client, job=alive,
             lease_ttl_ms=60_000,
         ).action
         == "allow"
     )
     assert int(client.get(conc_key(user))) == 2
 
-    assert conc_reclaim_expired(user, "job-alive", redis=client) is False
-    assert conc_heartbeat(user, "job-dead", redis=client, lease_ttl_ms=150) is True
+    assert conc_reclaim_expired(user, alive, redis=client) is False
+    assert conc_heartbeat(user, dead, redis=client, lease_ttl_ms=150) is True
 
     time_mod.sleep(0.25)  # lease job-dead истёк (heartbeat больше не продлевал)
-    assert sweep_expired_conc(user, redis=client) == ["job-dead"]
+    assert sweep_expired_conc(user, redis=client) == [dead]
     assert int(client.get(conc_key(user))) == 1
-    assert client.smembers(conchold_key(user)) == {"job-alive"}
-    assert conc_heartbeat(user, "job-dead", redis=client) is False  # резерва нет
+    assert client.smembers(conchold_key(user)) == {alive}
+    assert conc_heartbeat(user, dead, redis=client) is False  # резерва нет
 
+    # хвост общего стрима (аудит Ф4.4a): прежде полный xrange головы — O(n) по
+    # всем накопленным событиям; теперь окно с хвоста + уникальный dead
     events = [
-        json.loads(entry[1]["event"]) for entry in client.xrange(QUOTA_EVENTS_KEY)
+        json.loads(entry[1]["event"])
+        for entry in client.xrevrange(QUOTA_EVENTS_KEY, count=200)
     ]
     assert any(
-        e["type"] == "conc_reservation_reclaimed" and e["job"] == "job-dead"
+        e.get("type") == "conc_reservation_reclaimed" and e.get("job") == dead
         for e in events
     )
 

@@ -509,11 +509,17 @@ def test_heartbeat_extends_lease_then_sweep_reclaims_dead_reserve(ws) -> None:
     assert int(client.get(conc_key(user))) == 0
     assert client.smembers(conchold_key(user)) == set()
     events = [
+        # хвост стрима (аудит Ф4.4a): ws:quota:events общий и НЕ чистится между
+        # прогонами — чтение с головы (xrange, count=100) при накоплении >100
+        # возвращало старые события и не видело свежее; xrevrange читает
+        # последние записи, jid (= uuid-user) отсекает события чужих прогонов
         json.loads(fields["event"])
-        for _mid, fields in client.xrange(QUOTA_EVENTS_KEY, count=100)
-        if user in fields["event"]
+        for _mid, fields in client.xrevrange(QUOTA_EVENTS_KEY, count=200)
     ]
-    assert any(e["type"] == "conc_reservation_reclaimed" and e["job"] == jid for e in events)
+    assert any(
+        e.get("type") == "conc_reservation_reclaimed" and e.get("job") == jid
+        for e in events
+    )
 
 
 @pytest.mark.integration

@@ -339,7 +339,13 @@ class TestBudgetIntegration:
         assert report.global_after_micro == truth  # дрейт починен К журналу
         assert int(client.get(budget_global_key())) == truth
         assert report.per_user == {user: truth}
-        events = [json.loads(e[1]["event"]) for e in client.xrange(QUOTA_EVENTS_KEY, count=200)]
+        # хвост общего стрима (аудит Ф4.4a): xrange с головы при накоплении >200
+        # терял свежее событие; в payload budget_reconciled нет user — фильтр
+        # по type + сумме (продуктовый payload не меняем)
+        events = [
+            json.loads(e[1]["event"])
+            for e in client.xrevrange(QUOTA_EVENTS_KEY, count=200)
+        ]
         assert any(
             e["type"] == "budget_reconciled" and e["journal_total_micro"] == truth
             for e in events
