@@ -59,6 +59,11 @@ services:
       # Сервисные ключи верстака (Ф2 #2 tool-loop / #6 import-вложения).
       - WS_MCP_KEY=${WS_MCP_KEY:-}
       - WS_MCP_IMPORT_KEY=${WS_MCP_IMPORT_KEY:-}
+      # Ф2 #2b-2b: endpoint'ы верстака — llm_stream (litellm-шлюз Ф1, тот же
+      # external-сеть) и tool_loop (mcp-server в host-сети через host-gateway).
+      - WS_LLM_URL=http://litellm:4000/v1
+      - WS_MCP_URL=http://host.docker.internal:8000
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-}
       # Auth верстака (Ф2 #7): свои учётки в отдельном volume.
       - CONSOLE_USERS_FILE=/app/data/console/users.jsonl
       - CONSOLE_ADMIN_USER=${CONSOLE_ADMIN_USER:-}

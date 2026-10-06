@@ -91,6 +91,15 @@ def test_workspace_env(doc: Any) -> None:
         assert any(str(e).startswith(key) for e in env), f"нет {key}"
 
 
+def test_workspace_env_endpoints(doc: Any) -> None:
+    """Ф2 #2b-2b: WS_LLM_URL (litellm, та же сеть) / WS_MCP_URL (host-gateway)
+    / LITELLM_MASTER_KEY — прокинуты в workspace."""
+    env = doc["services"]["workspace"]["environment"]
+    assert "WS_LLM_URL=http://litellm:4000/v1" in env
+    assert "WS_MCP_URL=http://host.docker.internal:8000" in env
+    assert any(str(e).startswith("LITELLM_MASTER_KEY=") for e in env)
+
+
 def test_workspace_depends_on_ws_redis(doc: Any) -> None:
     assert "ws-redis" in doc["services"]["workspace"]["depends_on"]
 
