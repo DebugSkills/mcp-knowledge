@@ -67,6 +67,7 @@ class Queue:
             _script("DEQUEUE_ACQUIRE")
         )
         self._requeue = client.register_script(_script("REQUEUE"))
+        self._park = client.register_script(_script("PARK"))
 
     # ── API ──────────────────────────────────────────────────────────────
 
@@ -198,6 +199,39 @@ class Queue:
         return self.requeue(
             call, epoch=rec["epoch"], vft_override=rec["vft"] - cost_done / w
         )
+
+    def park_call(
+        self,
+        call: str,
+        *,
+        job: str = "",
+        event_json: str,
+        stream_maxlen: int = 10_000,
+    ) -> int:
+        """Снять вызов из ВСЕХ индексов полки + освободить слот + событие
+        ``parked`` — ОДНОЙ Lua (Ф4.3, I10/D5; бюджетный hard-stop).
+
+        Изымает из ``ws:q`` + ``ws:starve`` (двух-индексность — инвариант
+        dequeue-группы), ``SREM`` holders + ``DEL`` lease (слот возвращён),
+        ``DEL ws:pos:{job}`` (панель очереди не показывает parked как ждущего;
+        ключ Ф3.5+ — DEL отсутствующего = no-op), ``XADD`` события (I3/I12).
+        Per-call HASH не трогается: vft/starve-кредит — источник REQUEUE при
+        resume (позиция восстанавливается). Возвращает число реально
+        изъятых индексов (0..3). Повторный вызов безопасен на уровне
+        индексов, но событие пишет — дедупликацию парковки делает ParkControl.
+        """
+        raw = self._park(
+            keys=[
+                self.q_key,
+                self.starve_key,
+                f"ws:slots:{self.shelf}",
+                f"ws:lease:{self.shelf}:{call}",
+                f"ws:pos:{job}",
+                f"ws:events:{self.shelf}",
+            ],
+            args=[call, event_json, stream_maxlen],
+        )
+        return int(raw)
 
     def call_record(self, call: str) -> dict[str, Any]:
         """Per-call запись ``ws:call:{shelf}:{call}`` (наблюдение/тесты).

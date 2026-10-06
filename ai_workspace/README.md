@@ -6,7 +6,7 @@ job-store; **Ф3.2** — планировщик очередей вызовов 
 слот-семафор + события; **Ф3.4** — requeue/preempt/свипер.
 
 ## Что здесь
-- `orchestrator/job.py` — job-store `ws:job:{id}` (HASH): `JobState` (8 статусов),
+- `orchestrator/job.py` — job-store `ws:job:{id}` (HASH): `JobState` (9 статусов),
   `ALLOWED_TRANSITIONS` + `validate_transition` (чистая функция), `JobStore`
   (`create`/`get`/`transition`), CAS по `version` (hget+hset в ОДНОМ EVALSHA),
   epoch-fencing (I4: `epoch < current` → `StaleEpoch`, без записи),
@@ -24,6 +24,8 @@ job-store; **Ф3.2** — планировщик очередей вызовов 
   `preempt`/`call_record`/`complete`/`size`, `make_call(job, step, attempt)`;
   `now` инъектируется (clock callable) — Lua время сам не читает,
   детерминированные тесты.
+- `scheduler/park.py` — **Ф4.3 budget-hard-stop (I10/D5)**: `ParkControl.park/
+  resume` — см. раздел «Park/resume (Ф4.3)» ниже.
 
 ## Scheduler (Ф3.2)
 - **9 логических очередей** = 3 приоритета аккаунта (high/med/low) × 3 класса
@@ -113,6 +115,22 @@ Mode engine, admission (Ф3.5+); human-gate `ws:gate:*` + дашборд спя�
   `lease_expired`); гонку «lease ожил» закрывает сам Lua (повторный `EXISTS`).
   Requeue вызова — шаг caller'а (scheduler tick), свипер только возвращает слот.
 - **Дальше:** Ф3.5 — Mode engine (потребитель `ws:events`); Ф3.8 — полка `gpu`.
+
+## Park/resume (Ф4.3, `scheduler/park.py` + `queue.lua:PARK` + `job.py:parked`)
+- **park** (D5: `admit() -> Decision(park)` из Ф4.2, или команда): состояние →
+  `parked` (НЕ failure — `ws:fx:*` не трогаются); одна Lua `PARK` изымает вызов
+  из `ws:q`+`ws:starve`, возвращает слот (`SREM holders`+`DEL lease`), снимает
+  `ws:pos:{job}` и пишет событие `parked`; `conc_exit(user)` — резерв не течёт;
+  vft/starve-кредит зеркалится в хеш job (`vft`/`starve_deadline`); epoch+1 —
+  допарковые эффекты fenced (I4). Идемпотентен (повтор → `False`).
+- **resume** (nightly reconcile D4 / админ): перепроверка `admit()` — бюджет
+  ещё исчерпан → `False`, job остаётся `parked` без записей; иначе `requeue`
+  с исходным vft/starve из per-call HASH (приоритет НЕ теряется, I2) и CAS
+  `queued`; conc берётся ровно один раз — резервом `admit(allow)` (путь
+  «admit ИЛИ conc_enter», без двойного учёта). Не-parked → `JobNotParked`
+  (fail-loud). Mode engine на parked-job отказывается исполнять (paused).
+- Отказы в сторону hard-stop: индексы/слот/conc освобождаются ДО CAS —
+  проигранный CAS не оставляет вызов обслуживаемым.
 
 ## Реестры режимов (Ф3.5a-1, `registry/`)
 - `registry/` — data-only YAML-реестры `roles`/`tools`/`gates`/`model_classes`/

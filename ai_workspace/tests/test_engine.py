@@ -380,6 +380,23 @@ def test_paused_job_run_returns_paused_without_llm_calls() -> None:
     assert len(llm.calls) == before
 
 
+def test_parked_job_run_refuses_without_execution() -> None:
+    """Ф4.3 (I10/D5): parked-job НЕ исполняется и НЕ самопереводится в
+    running — бюджетный hard-stop держится до явного resume."""
+    engine = make_engine({"analyst": ["d"], "critic": ["PASS"], "editor": ["doc"]})
+    jobs = engine.jobs
+    jobs.transition("j1", JobState.PARKED, expect_version=jobs.get("j1").version, epoch=EPOCH)
+    _, llm, _, _, _ = engine._test  # type: ignore[attr-defined]
+    before = len(llm.calls)
+
+    res = engine.run("j1", epoch=EPOCH)
+
+    assert res.status == "paused" and res.resume_token is None
+    assert "парке" in res.detail
+    assert len(llm.calls) == before  # ни одного LLM-вызова (бюджет цел)
+    assert jobs.get("j1").state is JobState.PARKED  # статус не дрейфнул
+
+
 # ── integration: живой ws-redis (job + board + ledger) ───────────────────
 
 

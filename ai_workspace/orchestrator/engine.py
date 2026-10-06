@@ -160,6 +160,12 @@ class ModeEngine:
             return EngineResult(status="paused", node=rec.cursor,
                                 board_version=self._board_version(rec),
                                 detail="job ожидает ответа человека")
+        if rec.state is JobState.PARKED:
+            # Ф4.3 (I10/D5): бюджетный hard-stop — граф НЕ исполняется (иначе
+            # parked auto-перешёл бы в running и потратил бюджет); ждёт resume.
+            return EngineResult(status="paused", node=rec.cursor,
+                                board_version=self._board_version(rec),
+                                detail="job в парке (бюджет D5 / команда) — требуется resume (Ф4.3)")
 
         if rec.state in (JobState.QUEUED, JobState.SLEEPING, JobState.PREEMPTED):
             rec = self.jobs.transition(job_id, JobState.RUNNING, expect_version=rec.version, epoch=epoch)

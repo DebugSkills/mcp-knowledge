@@ -63,21 +63,26 @@ class StaleEpoch(JobStoreError):
 
 
 class JobState(StrEnum):
-    """Union-статус job (I3); waiting_human = human-gate, sleeping = сон/backoff."""
+    """Union-статус job (I3); waiting_human = human-gate, sleeping = сон/backoff,
+    parked = бюджетный парк (Ф4.3, D5: ext-бюджет исчерпан — НЕ failure)."""
 
     QUEUED = "queued"
     RUNNING = "running"
     WAITING_HUMAN = "waiting_human"
     SLEEPING = "sleeping"
     PREEMPTED = "preempted"
+    PARKED = "parked"
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
 
 ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
-    # admission создал job; воркер взял → running; отмена/исчерпание retry до старта
-    JobState.QUEUED: frozenset({JobState.RUNNING, JobState.CANCELLED, JobState.FAILED}),
+    # admission создал job; воркер взял → running; отмена/исчерпание retry до
+    # старта; Ф4.3: budget-hard-stop (D5) / команда оператора → parked
+    JobState.QUEUED: frozenset(
+        {JobState.RUNNING, JobState.CANCELLED, JobState.FAILED, JobState.PARKED}
+    ),
     # спека §3 (sweeper: lease истёк → re-enqueue, retry++) даёт running→queued;
     # §4: human-gate → sleeping/waiting; preempt на границе вызова; финалы
     JobState.RUNNING: frozenset(
@@ -86,21 +91,34 @@ ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
             JobState.WAITING_HUMAN,
             JobState.SLEEPING,
             JobState.PREEMPTED,
+            JobState.PARKED,
             JobState.DONE,
             JobState.FAILED,
             JobState.CANCELLED,
         }
     ),
-    # оператор ответил (resume) / отмена / таймаут-политика gate
+    # оператор ответил (resume) / отмена / таймаут-политика gate. В parked НЕ
+    # переводится: human-gate уже на паузе, бюджет не потребляет (Ф4.3).
     JobState.WAITING_HUMAN: frozenset(
         {JobState.RUNNING, JobState.CANCELLED, JobState.FAILED}
     ),
-    # проснулся → running; снятие с ожидания
-    JobState.SLEEPING: frozenset({JobState.RUNNING, JobState.CANCELLED, JobState.FAILED}),
+    # проснулся → running; снятие с ожидания; budget-hard-stop во время backoff
+    JobState.SLEEPING: frozenset(
+        {JobState.RUNNING, JobState.CANCELLED, JobState.FAILED, JobState.PARKED}
+    ),
     # слот возвращён; re-acquire → running; переклассификация → queued
     JobState.PREEMPTED: frozenset(
-        {JobState.RUNNING, JobState.QUEUED, JobState.CANCELLED, JobState.FAILED}
+        {
+            JobState.RUNNING,
+            JobState.QUEUED,
+            JobState.CANCELLED,
+            JobState.FAILED,
+            JobState.PARKED,
+        }
     ),
+    # Ф4.3: бюджет вернулся (nightly reconcile D4) / команда → queued (resume
+    # восстанавливает позицию в очереди с vft-кредитом); снятие из парка — финалы
+    JobState.PARKED: frozenset({JobState.QUEUED, JobState.CANCELLED, JobState.FAILED}),
     JobState.DONE: frozenset(),
     # retry по явному решению engine (off-cycle)
     JobState.FAILED: frozenset({JobState.QUEUED}),
@@ -148,6 +166,10 @@ class JobRecord:
     state: JobState = JobState.QUEUED
     step: int = 0
     vft: float = 0.0
+    starve_deadline: float = 0.0
+    """Aging-дедлайн-кредит вызова (Ф4.3): park зеркалит сюда per-call
+    ``starve_deadline`` — durable-копия позиции в хеше job (наблюдение +
+    резерв при потере per-call записи); 0.0 = кредита нет."""
     retry: int = 0
     epoch: int = 0
     attempt: int = 0
@@ -163,7 +185,17 @@ _HASH_TO_REC = {"class": "job_class"}  # python-имя отличается от
 _REC_TO_HASH = {"job_class": "class"}
 
 _PATCHABLE_FIELDS = frozenset(
-    {"mode", "step", "vft", "retry", "attempt", "zone", "cursor", "board_versions"}
+    {
+        "mode",
+        "step",
+        "vft",
+        "starve_deadline",
+        "retry",
+        "attempt",
+        "zone",
+        "cursor",
+        "board_versions",
+    }
 )
 """Поля, разрешённые в transition(patch=...); id/version/created/state/updated/
 epoch — под управлением хранилища (epoch ставит Lua-fencing, state — new_state)."""
@@ -198,7 +230,7 @@ def job_from_hash(data: Mapping[str, str]) -> JobRecord:
             kwargs[f.name] = JobState(raw)
         elif f.name in ("step", "retry", "epoch", "attempt", "version"):
             kwargs[f.name] = int(raw)
-        elif f.name == "vft":
+        elif f.name in ("vft", "starve_deadline"):
             kwargs[f.name] = float(raw)
         else:
             kwargs[f.name] = raw

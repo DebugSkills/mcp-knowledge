@@ -29,14 +29,15 @@ from ai_workspace.tests.conftest import requires_redis
 # Независимая фиксация контракта: если источник меняет таблицу — тест падает
 # и заставляет менять её осознанно (вместе с контрактом Mode engine).
 EXPECTED_TRANSITIONS = {
-    "queued": {"running", "cancelled", "failed"},
+    "queued": {"running", "cancelled", "failed", "parked"},
     "running": {
-        "queued", "waiting_human", "sleeping", "preempted",
+        "queued", "waiting_human", "sleeping", "preempted", "parked",
         "done", "failed", "cancelled",
     },
     "waiting_human": {"running", "cancelled", "failed"},
-    "sleeping": {"running", "cancelled", "failed"},
-    "preempted": {"running", "queued", "cancelled", "failed"},
+    "sleeping": {"running", "cancelled", "failed", "parked"},
+    "preempted": {"running", "queued", "cancelled", "failed", "parked"},
+    "parked": {"queued", "cancelled", "failed"},  # Ф4.3: resume/снятие из парка
     "done": set(),
     "failed": {"queued"},  # retry по явному решению engine
     "cancelled": set(),
@@ -54,7 +55,7 @@ def test_source_table_matches_contract():
 
 
 def test_transition_matrix_full():
-    """Каждая пара (old, new) 8×8: легальная проходит, нелегальная — отказ."""
+    """Каждая пара (old, new) 9×9: легальная проходит, нелегальная — отказ."""
     for old in ALL_STATES:
         for new in ALL_STATES:
             if new in EXPECTED_TRANSITIONS[old]:
@@ -99,7 +100,8 @@ def test_record_hash_roundtrip():
     rec = JobRecord(
         id="j1", user="u1", account_level="high", job_class="interactive",
         mode="review", zone="private", state=JobState.WAITING_HUMAN,
-        step=3, vft=12.5, retry=1, epoch=4, attempt=2, cursor="step:3",
+        step=3, vft=12.5, starve_deadline=98.5, retry=1, epoch=4, attempt=2,
+        cursor="step:3",
         board_versions={"board-a": 3, "board-b": 7},
         created="2026-10-06T00:00:00+00:00", updated="2026-10-06T00:01:00+00:00",
         version=9,
@@ -107,8 +109,8 @@ def test_record_hash_roundtrip():
     h = job_to_hash(rec)
     assert set(h) == {
         "id", "user", "account_level", "class", "mode", "zone", "state",
-        "step", "vft", "retry", "epoch", "attempt", "cursor",
-        "board_versions", "created", "updated", "version",
+        "step", "vft", "starve_deadline", "retry", "epoch", "attempt",
+        "cursor", "board_versions", "created", "updated", "version",
     }
     assert h["class"] == "interactive"  # python job_class ↔ HASH-поле "class"
     assert job_from_hash(h) == rec
@@ -123,6 +125,7 @@ def test_decode_defaults_for_partial_hash():
     assert rec.version == 1
     assert rec.board_versions == {}
     assert rec.vft == 0.0
+    assert rec.starve_deadline == 0.0  # кредита нет (Ф4.3)
 
 
 # ── INTEGRATION (живой ws-redis; авто-skip без WS_REDIS_URL) ──────────────

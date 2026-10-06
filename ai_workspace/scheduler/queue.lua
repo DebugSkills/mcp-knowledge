@@ -269,3 +269,30 @@ redis.call('ZADD', KEYS[2], dl_str, ARGV[1])  -- I2: дедлайн КАК ЕС�
 redis.call('HSET', KEYS[3], 'vft', vft_str)
 redis.call('HINCRBY', KEYS[3], 'attempt', 1)  -- retry++
 return 1
+
+-- @script PARK
+-- Budget-hard-stop Ф4.3 (I10/D5): снять вызов job'а из ВСЕХ индексов полки и
+-- освободить слот ОДНОЙ Lua — parked-вызов не может быть выдан dequeue между
+-- ZREM-ами (гонка «half-removed» — тот же инвариант, что у dequeue/REQUEUE).
+-- Паттерн ключей — DEQUEUE_ACQUIRE (q/starve/holders/events + lease в ARGV-ключе).
+-- KEYS[1] q       = ws:q:{shelf}        ZSET (score = vft)
+-- KEYS[2] starve  = ws:starve:{shelf}   ZSET (score = дедлайн aging-пола)
+-- KEYS[3] holders = ws:slots:{shelf}    SET (семафор K, Ф3.3)
+-- KEYS[4] lease   = ws:lease:{shelf}:{call}  TTL-ключ воркера
+-- KEYS[5] pos     = ws:pos:{job}        панель очереди (Ф3.5+; DEL — no-op)
+-- KEYS[6] stream  = ws:events:{shelf}   Stream (событие parked, I3/I12)
+-- ARGV[1] call, ARGV[2] event-json (type=parked, собран в Python), ARGV[3] stream_maxlen.
+-- Per-call HASH ws:call:{shelf}:{call} НЕ трогается: vft/starve-кредит —
+-- источник REQUEUE при resume (позиция восстанавливается, Ф4.3 I10).
+-- Идемпотентен на уровне индексов: ZREM/SREM/DEL отсутствующих — no-op;
+-- событие XADD-ится каждый вызов (ParkControl не пускает повторный park
+-- parked-вызова — дубликата события не бывает).
+-- Возврат: сколько индексов реально изъяли (0..3: q, starve, holders).
+local n = 0
+if redis.call('ZREM', KEYS[1], ARGV[1]) > 0 then n = n + 1 end
+if redis.call('ZREM', KEYS[2], ARGV[1]) > 0 then n = n + 1 end
+if redis.call('SREM', KEYS[3], ARGV[1]) > 0 then n = n + 1 end
+redis.call('DEL', KEYS[4])
+redis.call('DEL', KEYS[5])
+redis.call('XADD', KEYS[6], 'MAXLEN', '~', tonumber(ARGV[3]), '*', 'event', ARGV[2])
+return n
