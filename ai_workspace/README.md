@@ -121,10 +121,10 @@ Mode engine, admission (Ф3.5+); human-gate `ws:gate:*` + дашборд спя�
   (fail-closed: путь + причина, без молчаливых дефолтов).
 - Валидатор реестров — Ф3.5a-2; движок режимов — Ф3.5b.
 
-## Режимы: линт L1–L10 (Ф3.5a-3)
+## Режимы: линт L1–L11 (Ф3.5a-3, L11 — Ф3.9)
 
 `make modes-validate` гоняет ДВА контура: схему (S1–S8, `orchestrator/mode_schema.py`) и
-рантайм-линт (L1–L10, `orchestrator/mode_lint.py`): DAG/циклы критика, роли+seed-скиллы,
+рантайм-линт (L1–L11, `orchestrator/mode_lint.py`): DAG/циклы критика, роли+seed-скиллы,
 инструменты, покрытие вход/выход (транзитивно), human-gate для strategic/brainstorm,
 citation-политика, резолв `model_class` (+private→local-only), терминируемость, fork/join,
 single-writer секций доски. На каждое правило — фикстур-нарушитель в `tests/fixtures/modes/`.
@@ -175,3 +175,17 @@ citer(strict) → publish(gate)`. Гейт, отвеченный `approve`, да
 контекст `with gpu.lease("embed", ref):`. Ключи `ws:slots:gpu`, `ws:lease:gpu:{kind}:{ref}`,
 `ws:events:gpu`; K — env `WS_GPU_K` (dev 8 ГБ → 1). `reconcile()` снимает слоты с мёртвыми
 lease и отчитывается по видам — упавший воркер не держит GPU вечно.
+
+## Conformance-гейт (Ф3.9, `ai_workspace/conformance.py` + `tests/golden/`)
+Паттерн «Local-First Conformance Gate»: три раздельных вердикта.
+- **T** (transport) — зонный маршрут; unit `zone→egress` **red-first**: двойной ассерт
+  «отказ при `private` вне local» **и** «счётчик ext-egress == 0»; снятие зонного предиката
+  ловится тестом (`assert_no_ext_egress`).
+- **I** (interface) — **parity обязательна**: `decoding-pin` (temp=0/seed=42/thinking=off,
+  parity только при равных параметрах) и `prompt-hash parity` обеих полок (hash
+  РЕЗОЛВНУТОГО промпта); model-specific ветка → parity падает. Линт L11 в
+  `make modes-validate` запрещает упоминания моделей в режимах.
+- **Q** (quality, non-parity) — `tests/golden/golden-set.yaml` (5 заданий, `version: 1`),
+  `QReport` = **отчёт-таблица** (не ассерт): порог Q-floor по зоне (`public 0.80`,
+  `private 0.85`; владелец — оператор, `decide_by: Ф3.9-старт`), ниже порога → маркер
+  `local-draft`, N≥2 прогонов + флаг вариативности.

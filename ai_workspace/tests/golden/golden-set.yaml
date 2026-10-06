@@ -1,0 +1,34 @@
+# Golden-set AI-верстака (Ф3.9): 5–10 заданий, версионируется (R3).
+# Q-слой — ОТЧЁТ (не ассерт): прогон по обеим полкам, порог Q-floor по зоне,
+# ниже порога → маркер local-draft (P0-1). Порог/владелец фиксирует ОПЕРАТОР.
+version: 1
+owner: operator
+decide_by: "Ф3.9-старт"        # R3: Operator Gate перед private-«статьёй» на local
+min_runs: 2                   # R6: одиночный прогон — не отчёт
+floor: {public: 0.80, private: 0.85}
+tasks:
+  - id: g01-structure
+    zone: public
+    prompt: "Составь структуру статьи про MCP-RAG (разделы, порядок)."
+    expect_keywords: ["структура", "разделы", "MCP"]
+    max_latency_s: 180
+  - id: g02-draft
+    zone: public
+    prompt: "Напиши черновик раздела про семафор K и VRAM."
+    expect_keywords: ["семафор", "VRAM", "K"]
+    max_latency_s: 300
+  - id: g03-citations
+    zone: public
+    prompt: "Обогати текст ссылками на источники (ГОСТ, страницы)."
+    expect_keywords: ["источник", "страница", "ГОСТ"]
+    max_latency_s: 240
+  - id: g04-tool-loop
+    zone: public
+    prompt: "Найди в базе знаний материал про human-gate и процитируй."
+    expect_keywords: ["human-gate", "цитата", "источник"]
+    max_latency_s: 300
+  - id: g05-private-article
+    zone: private
+    prompt: "Собери статью по приватным заметкам (только local)."
+    expect_keywords: ["приватн", "local", "черновик"]
+    max_latency_s: 420

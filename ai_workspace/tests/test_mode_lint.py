@@ -1,4 +1,4 @@
-"""Offline-тесты линт-правил L1–L10 (Ф3.5a-3).
+"""Offline-тесты линт-правил L1–L11 (Ф3.5a-3, L11 — Ф3.9).
 
 Невакуумность: на каждый код — свой фикстур-нарушитель (ровно один код);
 валидный режим даёт пустой список; отдельные inline-мутации покрывают
@@ -57,12 +57,21 @@ def test_valid_mode_is_clean(registry: Registry):
         ("lint_L8_no_max_iter.yaml", "L8"),
         ("lint_L9_fork_unbalanced.yaml", "L9"),
         ("lint_L10_double_writer.yaml", "L10"),
+        ("lint_L11_model_specific.yaml", "L11"),
     ],
 )
 def test_each_rule_fires_exactly_its_code(registry: Registry, fixture: str, code: str):
     """Каждый фикстур-нарушитель даёт РОВНО свой код (не «пачку» замечаний)."""
     codes = _codes(_load(FIXTURES / fixture), registry)
     assert codes == {code}, f"{fixture}: ожидался {code}, получено {sorted(codes)}"
+
+
+def test_model_agnostic_prompts_rule(registry: Registry):
+    """L11: пустой prompt_overrides и отсутствие model-specific упоминаний."""
+    doc = _load(VALID)
+    doc["prompt_overrides"] = {"qwen2.5-7b": "кратко"}
+    doc["nodes"][0]["prompt"] = "используй модель deepseek-v4-pro"
+    assert "L11" in _codes(doc, registry)
 
 
 def test_citer_forbidden_for_verdict(registry: Registry):

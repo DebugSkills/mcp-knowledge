@@ -15,3 +15,8 @@ citer (`mcp.citation_attach`, strict) → **publish** (human-gate: `on_approve: 
 `on_edit: editor`). Гейт, отвеченный `approve`, становится pass-through (не спрашиваем
 повторно после REVISE-петли); ответ `edit` показывает гейт снова после переработки, а
 текст правки попадает во вход адресата (`on_edit`/`on_approve`) и меняет `effect_id`.
+
+**L11 (Ф3.9)** — промпты model-agnostic: `prompt_overrides` обязан быть пустым, а строки
+режима не должны упоминать модели (qwen/deepseek/gpt/glm/…). Это делает parity T/I
+достоверным: промпт одинаков на local и ext, слабая модель не тянет промпт вниз
+(взамен фантомного `prompt_overrides`, P1-3 паттерна Local-First).

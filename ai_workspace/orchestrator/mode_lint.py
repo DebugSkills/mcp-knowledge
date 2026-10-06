@@ -71,7 +71,7 @@ def validate_lint(doc: dict, registry: Any, *, base_dir: Path | None = None) -> 
     findings: list[Finding] = []
     for fn in (
         lint_l1, lint_l2, lint_l3, lint_l4, lint_l5,
-        lint_l6, lint_l7, lint_l8, lint_l9, lint_l10,
+        lint_l6, lint_l7, lint_l8, lint_l9, lint_l10, lint_l11,
     ):
         findings.extend(fn(doc, registry, base_dir))
     return findings
@@ -267,6 +267,58 @@ def lint_l9(doc: dict, registry: Any, base_dir: Path | None) -> list[Finding]:
     if len(forks) != len(joins):
         return [_f("L9", f"fork/join не сбалансированы: fork={len(forks)}, join={len(joins)}", "nodes")]
     return []
+
+
+MODEL_NAME_MARKERS: tuple[str, ...] = (
+    "qwen", "deepseek", "gpt-", "gpt4", "gpt-5", "glm", "llama", "mistral",
+    "claude", "gigachat", "yandexgpt", "ollama/",
+)
+"""Маркеры model-specific промптов (P1-3 паттерна Local-First): 7B-хаки запрещены."""
+
+
+def _walk_strings(value: Any, path: str = "$") -> list[tuple[str, str]]:
+    """Все строки документа с путями (для L11)."""
+    if isinstance(value, str):
+        return [(path, value)]
+    if isinstance(value, dict):
+        out: list[tuple[str, str]] = []
+        for key, item in value.items():
+            out.extend(_walk_strings(item, f"{path}.{key}"))
+        return out
+    if isinstance(value, list):
+        out = []
+        for i, item in enumerate(value):
+            out.extend(_walk_strings(item, f"{path}[{i}]"))
+        return out
+    return []
+
+
+def lint_l11(doc: dict, registry: Any, base_dir: Path | None) -> list[Finding]:
+    """Промпты model-agnostic: пустой ``prompt_overrides`` и нет упоминаний моделей.
+
+    Паттерн Local-First (P1-3): ``prompt_overrides`` (ветки под конкретную модель)
+    заменены механизируемым требованием — промпт одинаков для local и ext, иначе
+    parity-ассерт движка недостоверен, а слабая модель тянет промпт вниз.
+    """
+    out: list[Finding] = []
+    overrides = doc.get("prompt_overrides")
+    if overrides:
+        out.append(_f(
+            "L11",
+            "prompt_overrides должен быть пустым: промпты model-agnostic (P1-3)",
+            "prompt_overrides",
+        ))
+    for path, text in _walk_strings(doc):
+        low = text.lower()
+        for marker in MODEL_NAME_MARKERS:
+            if marker in low:
+                out.append(_f(
+                    "L11",
+                    f"model-specific упоминание {marker!r} — промпт должен быть model-agnostic",
+                    path,
+                ))
+                break
+    return out
 
 
 def lint_l10(doc: dict, registry: Any, base_dir: Path | None) -> list[Finding]:
