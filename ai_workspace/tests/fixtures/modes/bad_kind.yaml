@@ -1,0 +1,18 @@
+# Валидный режим «статья» — по спеке §1 (mode-engine).
+# Отступ от примера спеки: edges начинаются с analyst — «brief» это вход
+# режима, а не узел; S5 требует оба конца edge среди id узлов.
+id: statya
+version: 1
+shape: analyst-critic-editor
+contract: document
+output: {type: article, citation_policy: required}
+board: {buffer: board.md, store: job}
+nodes:
+  - {id: analyst, kind: wizard, role: analyst, model_class: heavy, seed: skills/analyst-code, inputs: [brief], outputs: [draft], retry: 2}
+  - {id: critic, kind: critic-gate, role: critic, model_class: fast, verdicts: [PASS, REVISE], max_iterations: 3, on_revise: analyst}
+  - {id: editor, kind: llm-step, role: editor, model_class: heavy, inputs: [draft, verdict], outputs: [document]}
+  - {id: citer, kind: tool-step, tool: mcp.citation_attach, policy: strict, outputs: [document+refs]}
+  - {id: publish, kind: human-gate, actor: operator, timeout: 24h, on_timeout: sleep, prompt: "Утвердить статью?"}
+edges: [analyst->critic, critic|PASS->editor, editor->citer, citer->publish]
+gates: {publish: {type: human, blocks_output: true}}
+tools: [mcp.search_knowledge, mcp.get_entry, mcp.write_knowledge]

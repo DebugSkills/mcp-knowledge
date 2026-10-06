@@ -1,0 +1,11 @@
+# Валидный режим «статья» — по спеке §1 (mode-engine).
+# Отступ от примера спеки: edges начинаются с analyst — «brief» это вход
+# режима, а не узел; S5 требует оба конца edge среди id узлов.
+id: statya
+version: 1
+shape: analyst-critic-editor
+contract: document
+output: {type: article, citation_policy: required}
+board: {buffer: board.md, store: job}
+nodes: []
+edges: []
