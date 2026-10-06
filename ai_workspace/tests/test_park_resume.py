@@ -10,7 +10,12 @@
   (без записей); после возврата бюджета → True, conc учтён ровно один раз;
 - идемпотентность park×2 / resume×2 — без дублей в очереди и событиях;
 - epoch-fencing (I4): допарковые эффекты (меньший epoch) не применяются ни
-  до, ни после resume; stale requeue по per-call epoch отвергнут.
+  до, ни после resume; stale requeue по per-call epoch отвергнут;
+- P1-1 (ревизия критика Ф4): провал CAS в resume КОМПЕНСИРОВАН — вызов
+  изъят из очереди тихо, conc-резерв job'а возвращён, повторный resume
+  возможен (для guest не «навсегда False»);
+- P1-2: повторный park после провала CAS — ОДНО событие parked, списание
+  conc по факту владения (чужой резерв не тронут — обход D6 закрыт).
 
 Паттерн — test_requeue_preempt.py (полка = изолированный namespace) и
 test_admission.py (боевой реестр read-only, снапшот ws:budget:global).
@@ -27,7 +32,12 @@ from uuid import uuid4
 
 import pytest
 
-from ai_workspace.orchestrator.job import JobState, JobStore, StaleEpoch
+from ai_workspace.orchestrator.job import (
+    JobState,
+    JobStore,
+    StaleEpoch,
+    VersionConflict,
+)
 from ai_workspace.registry import Registry
 from ai_workspace.registry.quotas import QuotaRegistry
 from ai_workspace.scheduler import policy
@@ -36,6 +46,7 @@ from ai_workspace.scheduler.admission import (
     admit,
     conc_exit,
     conc_key,
+    conchold_key,
 )
 from ai_workspace.scheduler.park import JobNotParked, ParkControl, pos_key
 from ai_workspace.scheduler.queue import Queue
@@ -184,17 +195,23 @@ def test_park_frees_slot_removes_from_queue_not_failed():
 
 
 def test_parked_does_not_hold_user_conc(ws):
-    """guest conc=1: admit взял резерв → park освободил → повторный admit
-    проходит (счётчик не течёт)."""
+    """guest conc=1: admit(job=) взял резерв с маркером владения (P1-2) →
+    park освободил РОВНО этот резерв → повторный admit проходит (счётчик
+    не течёт; чужого не задел — паркованный job и не брал другого)."""
     client, store, book, user = ws
-    assert admit(user, "guest", registry=book, redis=client).action == "allow"
-    assert int(client.get(conc_key(user))) == 1
-
     job = _mk_job(store, user, level="guest")
+    assert (
+        admit(user, "guest", registry=book, redis=client, job=job.id).action
+        == "allow"
+    )
+    assert int(client.get(conc_key(user))) == 1
+    assert client.sismember(conchold_key(user), job.id)
+
     pc = ParkControl(client, shelf=_shelf("conc"), store=store)
     assert pc.park(job.id, reason="command") is True  # парк до постановки
 
-    assert int(client.get(conc_key(user))) == 0  # резерв отдан
+    assert int(client.get(conc_key(user))) == 0  # резерв ЭТОГО job'а отдан
+    assert not client.sismember(conchold_key(user), job.id)
     assert admit(user, "guest", registry=book, redis=client).action == "allow"
     conc_exit(user, redis=client)
 
@@ -388,4 +405,104 @@ def test_stale_pre_park_epoch_rejected_before_and_after_resume(ws):
         assert q.size() == 1  # дубля не появилось
     finally:
         _cleanup_shelf(client, shelf, [call], [job.id])
+        conc_exit(user, redis=client)
+
+
+# ── 8. P1-1: провал CAS в resume компенсируется ────────────────────────
+
+
+def test_resume_cas_conflict_compensated_retry_possible(ws):
+    """Инъекция VersionConflict в transition resume (конкурентный писатель):
+    вызов изъят из очереди ТИХО (без resumed-события и без дубля parked),
+    conc-резерв job'а возвращён, job остался parked; повторный resume для
+    guest (conc=1) ВОЗМОЖЕН — «навсегда False» и утечка резерва закрыты."""
+    client, store, book, user = ws
+    shelf = _shelf("casfail")
+    q = Queue(client, shelf=shelf, clock=lambda: 0.0)
+    job = _mk_job(store, user, level="guest")
+    call = f"{job.id}:0:0"
+    pc = ParkControl(client, shelf=shelf, store=store, clock=lambda: 0.0)
+    orig_transition = pc.store.transition
+    try:
+        q.enqueue(
+            call, prio="med", call_class="interactive", cost_est=1.0,
+            now=0.0, job=job.id, epoch=0,
+        )
+        assert pc.park(job.id, call=call, reason="command") is True
+
+        def _conflicting(*_args: object, **_kwargs: object) -> None:
+            raise VersionConflict("injected: конкурентный писатель выиграл")
+
+        pc.store.transition = _conflicting  # type: ignore[method-assign]
+        with pytest.raises(VersionConflict):
+            pc.resume(job.id, registry=book, call=call)
+
+        # компенсация: очереди пусты, резерв отдан, state=parked
+        assert client.zscore(q.q_key, call) is None
+        assert client.zcard(q.starve_key) == 0
+        assert int(client.get(conc_key(user)) or 0) == 0
+        assert not client.sismember(conchold_key(user), job.id)
+        assert store.get(job.id).state is JobState.PARKED
+        types = [e["type"] for e in _events(client, shelf)]
+        assert "resumed" not in types
+        assert types.count("parked") == 1  # тихое изъятие ≠ дубль события
+
+        pc.store.transition = orig_transition  # type: ignore[method-assign]
+        assert pc.resume(job.id, registry=book, call=call) is True
+        assert store.get(job.id).state is JobState.QUEUED
+        assert int(client.get(conc_key(user))) == 1  # резерв взят один раз
+    finally:
+        _cleanup_shelf(client, shelf, [call], [job.id])
+        conc_exit(user, redis=client)
+
+
+# ── 9. P1-2: повторный park после провала CAS ──────────────────────────
+
+
+def test_double_park_after_cas_failure_single_release_single_event(ws):
+    """Двойной park при инъекции VersionConflict в transition: ретрай НЕ
+    декрементит повторно (списание по факту владения, P1-2), чужой резерв
+    other-job'а того же пользователя цел (обход D6 закрыт), событие
+    parked ровно ОДНО (условный XADD)."""
+    client, store, book, user = ws
+    shelf = _shelf("dpark")
+    q = Queue(client, shelf=shelf, clock=lambda: 0.0)
+    job = _mk_job(store, user)  # member, conc=2
+    other = _mk_job(store, user)
+    call = f"{job.id}:0:0"
+    pc = ParkControl(client, shelf=shelf, store=store, clock=lambda: 0.0)
+    orig_transition = pc.store.transition
+    try:
+        # чужой резерв: другой job того же пользователя держит один из двух
+        assert (
+            admit(user, "member", registry=book, redis=client, job=other.id).action
+            == "allow"
+        )
+        assert int(client.get(conc_key(user))) == 1
+
+        q.enqueue(
+            call, prio="med", call_class="interactive", cost_est=1.0,
+            now=0.0, job=job.id, epoch=0,
+        )
+
+        def _conflicting(*_args: object, **_kwargs: object) -> None:
+            raise VersionConflict("injected")
+
+        pc.store.transition = _conflicting  # type: ignore[method-assign]
+        with pytest.raises(VersionConflict):
+            pc.park(job.id, call=call, reason="command")
+        # park-резерва у job не было → conc_release no-op; агрегатный exit
+        # здесь снял бы ЧУЖОЙ резерв (1→0) — обход D6; по владению — цел:
+        assert int(client.get(conc_key(user))) == 1
+
+        pc.store.transition = orig_transition  # type: ignore[method-assign]
+        assert pc.park(job.id, call=call, reason="command") is True  # ретрай
+
+        assert int(client.get(conc_key(user))) == 1  # двойного списания нет
+        assert client.sismember(conchold_key(user), other.id)
+        assert store.get(job.id).state is JobState.PARKED
+        parked = [e for e in _events(client, shelf) if e["type"] == "parked"]
+        assert len(parked) == 1  # ретрай (индексы уже пусты) не дублирует
+    finally:
+        _cleanup_shelf(client, shelf, [call], [job.id, other.id])
         conc_exit(user, redis=client)

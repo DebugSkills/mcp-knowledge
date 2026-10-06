@@ -21,20 +21,18 @@ from pathlib import Path
 from typing import Any
 
 from ai_workspace.scheduler import policy
+from ai_workspace.scheduler.lua_scripts import extract_sections, section_of
 
 _LUA_SOURCE = Path(__file__).with_name("queue.lua").read_text(encoding="utf-8")
 """SSOT Lua-кода — читается один раз при импорте (файл рядом с модулем)."""
 
+_SECTIONS = extract_sections(_LUA_SOURCE, source_name="queue.lua")
+"""Секции ``-- @script`` (общий загрузчик lua_scripts, P2-5 критики Ф4)."""
+
 
 def _script(name: str) -> str:
-    """Вырезать секцию ``-- @script {name}`` из queue.lua."""
-    marker = f"-- @script {name}"
-    start = _LUA_SOURCE.find(marker)
-    if start < 0:
-        raise RuntimeError(f"queue.lua: секция {marker!r} не найдена")
-    start += len(marker)
-    end = _LUA_SOURCE.find("\n-- @script ", start)
-    return _LUA_SOURCE[start : end if end > 0 else len(_LUA_SOURCE)].strip() + "\n"
+    """Секция ``-- @script {name}`` из queue.lua (загружено при импорте)."""
+    return section_of(_SECTIONS, name, source_name="queue.lua")
 
 
 def f2s(x: float) -> str:
@@ -217,8 +215,10 @@ class Queue:
         ключ Ф3.5+ — DEL отсутствующего = no-op), ``XADD`` события (I3/I12).
         Per-call HASH не трогается: vft/starve-кредит — источник REQUEUE при
         resume (позиция восстанавливается). Возвращает число реально
-        изъятых индексов (0..3). Повторный вызов безопасен на уровне
-        индексов, но событие пишет — дедупликацию парковки делает ParkControl.
+        изъятых индексов (0..3). XADD УСЛОВЕН (P1-2): событие пишется только
+        если что-то изъято и ``event_json != ''`` — повторный вызов (индексы
+        уже пусты) не дублирует событие; ``event_json=''`` — тихое изъятие
+        (компенсация провала CAS в resume, P1-1).
         """
         raw = self._park(
             keys=[

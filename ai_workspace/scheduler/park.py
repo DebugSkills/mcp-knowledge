@@ -10,8 +10,11 @@ park (D5: ext-бюджет исчерпан, сигнал ``admit() -> Decision(
 - вызов изымается из ВСЕХ индексов полки одной Lua (``queue.lua:PARK`` через
   ``Queue.park_call``): ``ZREM ws:q`` + ``ZREM ws:starve`` + ``SREM holders``
   + ``DEL lease`` + ``DEL ws:pos:{job}`` + ``XADD`` события ``parked``;
-- conc-резерв пользователя освобождается (``conc_exit``, Ф4.2) — parked не
-  занимает личный параллелизм;
+- conc-резерв освобождается ПО ФАКТУ ВЛАДЕНИЯ (``conc_release(user, job)``,
+  P1-2): снимается только резерв ЭТОГО job'а (SREM-маркер атомарно решает)
+  — повторный park после проваленного CAS не декрементит повторно и не
+  трогает чужой резерв (обход D6 закрыт); parked не занимает личный
+  параллелизм;
 - vft- и starve-кредит зеркалится в хеш job (``vft``/``starve_deadline``,
   durable) — SSOT для восстановления остаётся per-call HASH
   ``ws:call:{shelf}:{call}`` (его читает REQUEUE), хеш job — наблюдение и
@@ -23,8 +26,10 @@ park (D5: ext-бюджет исчерпан, сигнал ``admit() -> Decision(
 resume (nightly reconcile D4 «бюджет вернулся» или команда админа):
 - перепроверяет admission (``admit()`` Ф4.2): ``park``/``deny`` → ``False``,
   job остаётся ``parked`` БЕЗ записей (не падать);
-- ``allow`` уже берёт conc-резерв (режим РЕЗЕРВ) — ``conc_enter`` НЕ
-  вызывается: путь «admit ИЛИ conc_enter» (admission.py), двойного учёта нет;
+- ``allow`` уже берёт conc-резерв с per-job маркером (``admit(job=...)``,
+  режим РЕЗЕРВ) — двойного учёта нет; провал CAS после admit+requeue
+  КОМПЕНСИРУЕТСЯ (P1-1: вызов изымается из очереди тихо + резерв job'а
+  возвращается, исходный конфликт — наружу);
 - вызов возвращается ``Queue.requeue`` — исходные vft и starve-дедлайн из
   per-call HASH (I2): resume НЕ теряет приоритет (встаёт впереди
   одноуровневых, вставших за время парковки);
@@ -46,9 +51,10 @@ from typing import Any
 from ai_workspace.orchestrator.job import (
     JobState,
     JobStore,
+    JobStoreError,
     validate_transition,
 )
-from ai_workspace.scheduler.admission import admit, conc_exit
+from ai_workspace.scheduler.admission import admit, conc_release
 from ai_workspace.scheduler.queue import Queue
 from ai_workspace.scheduler.slots import DEFAULT_STREAM_MAXLEN, Slots
 
@@ -141,8 +147,8 @@ class ParkControl:
 
         ``call`` — текущий вызов job'а (``job:step:attempt``): если job стартовал
         — слот и lease освобождаются; если стоит в очереди — изымается из обоих
-        индексов; ``None`` — парк до постановки (admission-park: только статус,
-        conc и событие). ``reason`` — в событие ``parked`` (наблюдение).
+        индексов; ``None`` — парк до постановки (admission-park: только статус
+        + conc_release по владению; события нет — индексы не трогались). ``reason`` — в событие ``parked`` (наблюдение).
         Нелегальный переход (терминал/waiting_human) — ``IllegalTransition``
         ДО любых записей Redis.
         """
@@ -163,9 +169,13 @@ class ParkControl:
             crec = self.queue.call_record(call)
             if crec:  # durable-зеркало кредитов в хеше job (0-кредит — паркуй как есть)
                 patch = {"vft": crec["vft"], "starve_deadline": crec["starve_deadline"]}
-        # conc-резерв не течёт (Ф4.2): exit идемпотентен (пол 0), берётся всегда —
-        # путь park мог пройти и без admit-резерва (команда оператора).
-        conc_exit(rec.user, redis=self.client)
+        # conc-резерв: списание ПО ФАКТУ ВЛАДЕНИЯ (P1-2) — conc_release
+        # атомарно снимает резерв только если его взял ЭТОТ job (SREM-маркер
+        # ws:quota:conchold). Идемпотентен: повторный park после проваленного
+        # CAS не декрементит повторно и не трогает чужой резерв (обход D6
+        # закрыт); парк до admit (команда оператора) — честный no-op, а не
+        # «декремент чужого» как у агрегатного conc_exit.
+        conc_release(rec.user, job_id, redis=self.client)
         # CAS-переход: state→parked + epoch+1 (владение у park: допарковые
         # коммиты с меньшим epoch → StaleEpoch, I4) + кредиты в хеш job.
         self.store.transition(
@@ -199,17 +209,18 @@ class ParkControl:
             registry=registry,
             redis=self.client,
             shelf=self.shelf,
+            job=job_id,
         )
         if not decision.allowed:
             return False
         # REQUEUE: vft/starve из per-call HASH (I2 — приоритет сохранён),
         # fence по текущему epoch job (после park-бампа — I4 держит и
         # после resume). Отказ = записи нет = кредит утерян: fail-closed —
-        # вернуть взятый admit-ом conc-резерв, job остаётся в парке.
+        # вернуть взятый admit-ом conc-резерв ЭТОГО job'а, job в парке.
         if call is not None and not self.queue.requeue(
             call, now=self.clock(), epoch=rec.epoch
         ):
-            conc_exit(rec.user, redis=self.client)
+            conc_release(rec.user, job_id, redis=self.client)
             raise ParkError(
                 f"resume: per-call запись {call!r} недоступна — vft/starve-"
                 f"кредит утерян; job {job_id!r} оставлен в парке"
@@ -218,12 +229,29 @@ class ParkControl:
         # parked — dequeue может выдать его «рано», но это и есть цель resume
         # (бюджет уже подтверждён admit-ом выше). Обратный порядок оставлял бы
         # state=queued без вызова в очереди — невидимый ствол до след. tick.
-        self.store.transition(
-            job_id,
-            JobState.QUEUED,
-            expect_version=rec.version,
-            epoch=rec.epoch,
-        )
+        try:
+            self.store.transition(
+                job_id,
+                JobState.QUEUED,
+                expect_version=rec.version,
+                epoch=rec.epoch,
+            )
+        except JobStoreError:
+            # P1-1: компенсация провала CAS (конкурентный писатель выиграл):
+            # вызов изымается из очереди ТИХО (event_json='' — resumed-события
+            # не было и parked-дубля не будет), резерв ЭТОГО job'а
+            # возвращается (иначе: утечка conc + вызов в очереди при parked;
+            # для guest conc=1 повторный resume был бы навсегда deny).
+            # Исходный конфликт (VersionConflict/StaleEpoch) — наружу.
+            if call is not None:
+                self.queue.park_call(
+                    call,
+                    job=job_id,
+                    event_json="",
+                    stream_maxlen=self.stream_maxlen,
+                )
+            conc_release(rec.user, job_id, redis=self.client)
+            raise
         self.client.xadd(
             f"ws:events:{self.shelf}",
             {"event": self._event("resumed", call or "", job_id, rec.epoch, "queued", "")},

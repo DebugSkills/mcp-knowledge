@@ -187,6 +187,18 @@ def test_fail_closed_empty_grants(tmp_path: Path) -> None:
     assert "grants" in _quota_error(tmp_path, mutate)
 
 
+def test_fail_closed_unlimited_defaults_role(tmp_path: Path) -> None:
+    """Q14 (P2-1 критики Ф4): фолбэк без личных лимитов (defaults.role со
+    стороны admin: tokens/conc = null) — эскалация неизвестных ролей;
+    least-privilege запрещает."""
+
+    def mutate(doc: dict[str, Any]) -> None:
+        doc["defaults"]["role"] = "admin"  # admin: tokens_per_day/conc null
+
+    msg = _quota_error(tmp_path, mutate)
+    assert "Q14" in msg and "least-privilege" in msg
+
+
 def test_fail_closed_defaults_role_missing(tmp_path: Path) -> None:
     def mutate(doc: dict[str, Any]) -> None:
         doc["defaults"]["role"] = "bot"

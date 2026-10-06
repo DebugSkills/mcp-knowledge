@@ -212,6 +212,30 @@ def validate_quotas(doc: Any, model_classes: Mapping[str, Any]) -> list[Finding]
             )
         )
 
+    # Q14 (P2-1 критики Ф4): defaults.role — least-privilege. Фолбэк для
+    # НЕИЗВЕСТНЫХ ролей не должен получать эскалацию: у роли-фолбэка обязаны
+    # быть личные лимиты (tokens_per_day и conc не null). Иначе схема вроде
+    # defaults.role: admin превращает любую опечатку в роли в безлимит.
+    if (
+        defaults_role is not None
+        and isinstance(participants, Mapping)
+        and defaults_role in participants
+    ):
+        fallback = participants[defaults_role]
+        if isinstance(fallback, Mapping) and (
+            fallback.get("tokens_per_day") is None or fallback.get("conc") is None
+        ):
+            findings.append(
+                _err(
+                    "Q14",
+                    f"defaults.role {defaults_role!r} должен иметь личные "
+                    f"лимиты (tokens_per_day и conc != null): фолбэк "
+                    f"неизвестной роли не может быть безлимитным "
+                    f"(least-privilege)",
+                    "defaults.role",
+                )
+            )
+
     # Q10-Q13: бюджеты контуров (обязана быть запись ext, D4).
     budgets = doc.get("budgets")
     if "budgets" in doc:
@@ -271,25 +295,25 @@ def _validate_participant(
         and tokens is not None
         and (not _is_int(tokens) or tokens < 0)
     ):
-            findings.append(
-                _err(
-                    "Q6",
-                    f"tokens_per_day должен быть целым >= 0 или null, "
-                    f"получено: {tokens!r}",
-                    f"{path}.tokens_per_day",
-                )
+        findings.append(
+            _err(
+                "Q6",
+                f"tokens_per_day должен быть целым >= 0 или null, "
+                f"получено: {tokens!r}",
+                f"{path}.tokens_per_day",
             )
+        )
 
     # Q7: conc — целое >= 1 или null (D6; null = только общий K).
     conc = spec.get("conc")
     if "conc" in spec and conc is not None and (not _is_int(conc) or conc < 1):
-            findings.append(
-                _err(
-                    "Q7",
-                    f"conc должен быть целым >= 1 или null, получено: {conc!r}",
-                    f"{path}.conc",
-                )
+        findings.append(
+            _err(
+                "Q7",
+                f"conc должен быть целым >= 1 или null, получено: {conc!r}",
+                f"{path}.conc",
             )
+        )
 
     # Q8: grants — ref-целостность на классы моделей.
     grants = spec.get("grants")
@@ -393,6 +417,11 @@ class QuotaRegistry:
     ``Registry.reload_if_changed`` или внешняя — по identity кэша) повторяет
     валидацию: испорченный hot-reload -> ``RegistryError``, а не тихие
     старые/дефолтные значения.
+
+    R3 (риск плана, P2-2 критики Ф4): hot-reload квот НЕ пересчитывает
+    живое — счётчики/резервы это ФАКТ расхода, enforcement только в момент
+    admit; уже допущенные job'ы и взятые резервы живут по старым правилам
+    до своего освобождения. Пересчёта в семантике нет и не планируется.
     """
 
     def __init__(self, registry: Registry) -> None:

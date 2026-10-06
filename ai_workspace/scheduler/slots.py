@@ -23,6 +23,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from ai_workspace.scheduler.lua_scripts import extract_sections, section_of
+
 _LUA_DIR = Path(__file__).with_name("lua")
 _COMMON = (_LUA_DIR / "_common.lua").read_text(encoding="utf-8")
 _SLOTS_SOURCE = (_LUA_DIR / "slots.lua").read_text(encoding="utf-8")
@@ -32,16 +34,15 @@ DEFAULT_LEASE_TTL_MS = 90_000
 DEFAULT_STREAM_MAXLEN = 10_000
 
 
+_SECTIONS = extract_sections(
+    _SLOTS_SOURCE, prefix=_COMMON, source_name="slots.lua"
+)
+"""Секции slots.lua с общим _COMMON-префиксом (загрузчик lua_scripts, P2-5)."""
+
+
 def _section(name: str) -> str:
-    """Вырезать секцию ``-- @script {name}`` из slots.lua."""
-    marker = f"-- @script {name}"
-    start = _SLOTS_SOURCE.find(marker)
-    if start < 0:
-        raise RuntimeError(f"slots.lua: секция {marker!r} не найдена")
-    start += len(marker)
-    end = _SLOTS_SOURCE.find("\n-- @script ", start)
-    body = _SLOTS_SOURCE[start : end if end > 0 else len(_SLOTS_SOURCE)]
-    return _COMMON + body.strip() + "\n"
+    """Секция ``-- @script {name}`` из slots.lua (+``_COMMON``)."""
+    return section_of(_SECTIONS, name, source_name="slots.lua")
 
 
 class Slots:

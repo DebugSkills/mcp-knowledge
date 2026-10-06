@@ -7,7 +7,15 @@
   1 allow — проверка и INCR в одной Lua;
 - TTL дневного ключа до локальной полуночи (D7), повторный charge не
   продлевает жизнь ключа за полночь;
-- фолбэк неизвестной роли на квоту defaults.role (Ф4.1).
+- фолбэк неизвестной роли на квоту defaults.role (Ф4.1);
+- P1-2 (ревизия критика Ф4): списание conc-резерва ПО ФАКТУ ВЛАДЕНИЯ —
+  conc_release(user, job) атомарно решает SREM-маркером, чужой/повторный
+  вызов резерв не трогает;
+- P1-3: свипер мёртвых резервов — lease истёк → снят (+событие), живой
+  lease/heartbeat продлевают владение, вечного deny после краха воркера нет;
+- P1-4: деградация ws-redis — fail-closed (QuotaRedisUnavailable) + ALARM
+  quota_degraded в logging, не трейс/зависание;
+- P2-9: битое значение ключа квот → человекочитаемый отказ.
 
 Реестр — боевой (read-only, не мутируется); redis — изолированные
 пользователи test-f42-* (паттерн test_slots_lua).
@@ -16,23 +24,34 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import time as time_mod
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+import redis
 
 from ai_workspace.registry import Registry
 from ai_workspace.registry.quotas import QuotaRegistry
 from ai_workspace.scheduler.admission import (
     BUDGET_GLOBAL_KEY,
+    QUOTA_EVENTS_KEY,
     AdmissionDenied,
     Decision,
+    QuotaRedisUnavailable,
     admit,
     charge_tokens,
     conc_exit,
+    conc_heartbeat,
     conc_key,
+    conc_reclaim_expired,
+    conc_release,
+    conchold_key,
     seconds_to_local_midnight,
+    sweep_expired_conc,
     tok_key,
 )
 from ai_workspace.tests.conftest import WS_TEST_ID_PREFIX, requires_redis
@@ -235,3 +254,131 @@ def test_decision_park_and_allow_are_not_exceptions():
     Decision(action="allow").raise_if_denied()
     assert Decision(action="allow").allowed
     assert not Decision(action="park").allowed
+
+
+# ── 10. P1-2: списание conc-резерва по факту владения ──────────────────
+
+
+def test_conc_release_by_ownership_no_foreign_decrement(ws):
+    """release чужого job'а и повторный release — no-op; счётчик ==
+    число живых маркеров; агрегат не уводится в минус/чужую сторону."""
+    client, book, user = ws
+    assert (
+        admit(user, "member", registry=book, redis=client, job="job-a").action
+        == "allow"
+    )
+    assert (
+        admit(user, "member", registry=book, redis=client, job="job-b").action
+        == "allow"
+    )
+    assert int(client.get(conc_key(user))) == 2
+
+    assert conc_release(user, "job-unknown", redis=client) is False  # не брал
+    assert int(client.get(conc_key(user))) == 2  # чужой резерв не тронут
+
+    assert conc_release(user, "job-a", redis=client) is True
+    assert conc_release(user, "job-a", redis=client) is False  # идемпотентен
+    assert int(client.get(conc_key(user))) == 1
+    assert client.smembers(conchold_key(user)) == {"job-b"}
+
+
+# ── 11. P1-3: свипер мёртвых резервов ──────────────────────────────────
+
+
+def test_sweep_reclaims_expired_reservation_leases_alive(ws):
+    """Мёртвый воркер (lease истёк, heartbeat нет) → sweep снимает его
+    резерв и пишет событие conc_reservation_reclaimed; живой lease не
+    трогается; после снятия admit снова проходит (вечного deny нет)."""
+    client, book, user = ws
+    assert (
+        admit(
+            user, "member", registry=book, redis=client, job="job-dead",
+            lease_ttl_ms=150,
+        ).action
+        == "allow"
+    )
+    assert (
+        admit(
+            user, "member", registry=book, redis=client, job="job-alive",
+            lease_ttl_ms=60_000,
+        ).action
+        == "allow"
+    )
+    assert int(client.get(conc_key(user))) == 2
+
+    assert conc_reclaim_expired(user, "job-alive", redis=client) is False
+    assert conc_heartbeat(user, "job-dead", redis=client, lease_ttl_ms=150) is True
+
+    time_mod.sleep(0.25)  # lease job-dead истёк (heartbeat больше не продлевал)
+    assert sweep_expired_conc(user, redis=client) == ["job-dead"]
+    assert int(client.get(conc_key(user))) == 1
+    assert client.smembers(conchold_key(user)) == {"job-alive"}
+    assert conc_heartbeat(user, "job-dead", redis=client) is False  # резерва нет
+
+    events = [
+        json.loads(entry[1]["event"]) for entry in client.xrange(QUOTA_EVENTS_KEY)
+    ]
+    assert any(
+        e["type"] == "conc_reservation_reclaimed" and e["job"] == "job-dead"
+        for e in events
+    )
+
+
+# ── 12. P1-4: деградация ws-redis — fail-closed + ALARM ────────────────
+
+
+class _DeadCall:
+    """Вызов зарегистрированного скрипта падает (реальный тип исключения
+    redis-py — контракт, а не выдуманный атрибут)."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def __call__(self, *_args: object, **_kwargs: object) -> None:
+        raise self._exc
+
+
+class _DeadRedis:
+    """Заглушка ws-redis: недоступен (connection refused / чёрная дыра)."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def register_script(self, _source: str) -> _DeadCall:
+        return _DeadCall(self._exc)
+
+    def xadd(self, *_args: object, **_kwargs: object) -> None:
+        raise self._exc
+
+
+def test_admit_degrades_fail_closed_with_alarm(ws, caplog):
+    """redis недоступен → QuotaRedisUnavailable (понятный отказ, cause
+    сохранён), а не трейс; ALARM quota_degraded в logging; best-effort
+    XADD не роняет обработку."""
+    _, book, user = ws
+    dead = _DeadRedis(redis.exceptions.ConnectionError("connection refused"))
+    with caplog.at_level(
+        logging.ERROR, logger="ai_workspace.scheduler.admission"
+    ), pytest.raises(QuotaRedisUnavailable) as ei:
+        admit(user, "member", registry=book, redis=dead)
+    assert isinstance(ei.value.__cause__, redis.exceptions.ConnectionError)
+    assert "fail-closed" in str(ei.value)
+    degraded = [r for r in caplog.records if "quota_degraded" in r.getMessage()]
+    assert degraded and "admit" in degraded[0].getMessage()
+
+
+def test_charge_tokens_timeout_degrades_fail_closed():
+    """«Чёрная дыра» (TimeoutError) → отказ fail-closed, не зависание."""
+    dead = _DeadRedis(redis.exceptions.TimeoutError("black hole"))
+    with pytest.raises(QuotaRedisUnavailable):
+        charge_tokens("u-degraded", 5, redis=dead)
+
+
+# ── 13. P2-9: битое значение ключа квот — читаемый отказ ───────────────
+
+
+def test_corrupt_conc_value_fails_readable_not_runtime(ws):
+    client, book, user = ws
+    client.set(conc_key(user), "not-a-number")
+    with pytest.raises(redis.exceptions.ResponseError, match="нечисловое"):
+        admit(user, "guest", registry=book, redis=client)

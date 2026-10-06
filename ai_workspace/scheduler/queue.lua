@@ -281,12 +281,16 @@ return 1
 -- KEYS[4] lease   = ws:lease:{shelf}:{call}  TTL-ключ воркера
 -- KEYS[5] pos     = ws:pos:{job}        панель очереди (Ф3.5+; DEL — no-op)
 -- KEYS[6] stream  = ws:events:{shelf}   Stream (событие parked, I3/I12)
--- ARGV[1] call, ARGV[2] event-json (type=parked, собран в Python), ARGV[3] stream_maxlen.
+-- ARGV[1] call, ARGV[2] event-json (type=parked, собран в Python; '' →
+--        БЕЗ события: тихая компенсация провала CAS в resume, P1-1),
+--        ARGV[3] stream_maxlen.
 -- Per-call HASH ws:call:{shelf}:{call} НЕ трогается: vft/starve-кредит —
 -- источник REQUEUE при resume (позиция восстанавливается, Ф4.3 I10).
--- Идемпотентен на уровне индексов: ZREM/SREM/DEL отсутствующих — no-op;
--- событие XADD-ится каждый вызов (ParkControl не пускает повторный park
--- parked-вызова — дубликата события не бывает).
+-- Идемпотентен на уровне индексов: ZREM/SREM/DEL отсутствующих — no-op.
+-- XADD УСЛОВЕН (P1-2): только если что-то реально изъято (n > 0) и
+-- event-json не пуст. Повторный park после проваленного CAS (индексы уже
+-- изъяты, n=0) не дублирует событие; парк вызова вне индексов (serviced)
+-- события не пишет — наблюдение статуса по job-store.
 -- Возврат: сколько индексов реально изъяли (0..3: q, starve, holders).
 local n = 0
 if redis.call('ZREM', KEYS[1], ARGV[1]) > 0 then n = n + 1 end
@@ -294,5 +298,7 @@ if redis.call('ZREM', KEYS[2], ARGV[1]) > 0 then n = n + 1 end
 if redis.call('SREM', KEYS[3], ARGV[1]) > 0 then n = n + 1 end
 redis.call('DEL', KEYS[4])
 redis.call('DEL', KEYS[5])
-redis.call('XADD', KEYS[6], 'MAXLEN', '~', tonumber(ARGV[3]), '*', 'event', ARGV[2])
+if n > 0 and ARGV[2] ~= '' then
+  redis.call('XADD', KEYS[6], 'MAXLEN', '~', tonumber(ARGV[3]), '*', 'event', ARGV[2])
+end
 return n
