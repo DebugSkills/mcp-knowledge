@@ -227,20 +227,43 @@ class TestChatPageSmoke:
 
 
 class TestRunTurnCarrier:
-    """Носитель (H): каждая дельта → set_content; сбои не роняют страницу."""
+    """Носитель (H): каждая дельта → set_content; сбои не роняют страницу.
+
+    Ф2 #2b-2a: ход идёт через ``chat_turn`` (tool-loop); стрим-дельты
+    приходят в ``on_delta`` — считаются set_content-вызовы как раньше.
+    """
+
+    @staticmethod
+    def _chat_turn_fake(deltas, error=None):
+        async def fake(
+            messages,
+            *,
+            session_id,
+            zone,
+            user=None,
+            store=None,
+            on_delta=None,
+            **kwargs,
+        ):
+            if error is not None:
+                raise error
+            for d in deltas:
+                if on_delta is not None:
+                    on_delta(d)
+            return {"text": "".join(deltas), "saved": False}
+
+        return fake
 
     async def test_each_delta_updates_carrier(self):
         """3 дельты → 3 обновления носителя (плюс сброс) + история дополнена."""
         from kb_console.pages import chat
 
-        async def fake_stream(messages, **kwargs):
-            for d in ("Раз ", "два ", "три"):
-                yield d
-
         output, status = MagicMock(), MagicMock()
         history = [{"role": "user", "content": "посчитай"}]
         with (
-            patch.object(chat, "stream_chat", fake_stream),
+            patch.object(
+                chat, "chat_turn", self._chat_turn_fake(("Раз ", "два ", "три"))
+            ),
             patch.object(chat, "ui"),
         ):
             await chat._run_turn(history, output, status)
@@ -254,14 +277,16 @@ class TestRunTurnCarrier:
         """LLMStreamError (429) → notify, ход откачен, исключение НЕ пробито."""
         from kb_console.pages import chat
 
-        async def broken_stream(messages, **kwargs):
-            raise LLMStreamError("LiteLLM HTTP 429 Too Many Requests: rate")
-            yield "never"  # pragma: no cover — генератор, но не yield'ится
-
         output, status = MagicMock(), MagicMock()
         history = [{"role": "user", "content": "q"}]
         with (
-            patch.object(chat, "stream_chat", broken_stream),
+            patch.object(
+                chat,
+                "chat_turn",
+                self._chat_turn_fake(
+                    (), error=LLMStreamError("LiteLLM HTTP 429: rate")
+                ),
+            ),
             patch.object(chat, "ui") as mock_ui,
         ):
             await chat._run_turn(history, output, status)
@@ -272,14 +297,14 @@ class TestRunTurnCarrier:
         """Сетевой сбой httpx.ConnectError → notify, без проброса."""
         from kb_console.pages import chat
 
-        async def broken_stream(messages, **kwargs):
-            raise httpx.ConnectError("connection refused")
-            yield "never"  # pragma: no cover
-
         output, status = MagicMock(), MagicMock()
         history = [{"role": "user", "content": "q"}]
         with (
-            patch.object(chat, "stream_chat", broken_stream),
+            patch.object(
+                chat,
+                "chat_turn",
+                self._chat_turn_fake((), error=httpx.ConnectError("refused")),
+            ),
             patch.object(chat, "ui") as mock_ui,
         ):
             await chat._run_turn(history, output, status)
