@@ -100,6 +100,12 @@ def test_workspace_env_endpoints(doc: Any) -> None:
     assert any(str(e).startswith("LITELLM_MASTER_KEY=") for e in env)
 
 
+def test_ws_mcp_import_key_wired(doc: Any) -> None:
+    """Ф2 #6b: import-ключ вложений прокинут в workspace (fail-closed ``:-``)."""
+    env = doc["services"]["workspace"]["environment"]
+    assert "WS_MCP_IMPORT_KEY=${WS_MCP_IMPORT_KEY:-}" in env
+
+
 def test_workspace_depends_on_ws_redis(doc: Any) -> None:
     assert "ws-redis" in doc["services"]["workspace"]["depends_on"]
 
@@ -107,6 +113,19 @@ def test_workspace_depends_on_ws_redis(doc: Any) -> None:
 def test_services_exactly_ws_redis_and_workspace(doc: Any) -> None:
     """Ф3+ (litellm/queue/admission) — НЕ в этом файле; здесь только 5b."""
     assert set(doc["services"]) == {"ws-redis", "workspace"}
+
+
+# ── Ф2 #6b-2: проводка attach_upload на странице «Чат» ──────────────
+
+
+def test_chat_page_mounts_attach_upload() -> None:
+    """Структурный guard: chat.py монтирует build_attach_upload(role)."""
+    chat_src = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "kb_console" / "pages" / "chat.py"
+    )
+    assert chat_src.exists(), f"нет {chat_src}"
+    assert "build_attach_upload(role)" in chat_src.read_text()
 
 
 # ── фабрика (unit; mock, без реального подключения) ─────────────────

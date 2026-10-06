@@ -146,4 +146,9 @@ def build_chat() -> None:
         await _run_turn(history, answer, status, store=store, user=user, zone=zone)
 
     ui.button("Отправить", icon="send", on_click=send).props("color=primary")
+
+    # Ф2 #6b: вложения в KB (admin-only) — серверный канал core/ws_attach.
+    from ..components.attach_upload import build_attach_upload
+    ui.separator().classes("q-my-md")
+    build_attach_upload(role)
     msg_input.on("keydown.enter", lambda: send())
