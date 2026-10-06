@@ -504,7 +504,7 @@ WS_COMPOSE := compose.workspace.yml
 WS_COMPOSE_TEST := compose.workspace.test.yml
 WS_TEST_REDIS_URL := redis://127.0.0.1:6390/0
 
-.PHONY: ws-up ws-down ws-up-test ws-test ws-test-integration ws-budget-reconcile ws-quota-sweep ws-prio modes-validate golden-run
+.PHONY: ws-up ws-down ws-up-test ws-test ws-test-integration ws-budget-reconcile ws-quota-sweep ws-prio quotas-set quotas-show modes-validate golden-run
 ws-up: ## Ф3.1: поднять ws-redis (порт НЕ публикуется — I6, internal-only)
 	docker compose -f $(WS_COMPOSE) up -d ws-redis
 
@@ -528,6 +528,12 @@ ws-quota-sweep: ## Ф4.2e P1-3: свип истёкших conc-резервов 
 
 ws-prio: ## Ф4.5a D8: per-job приоритет ws:prio:{job} (WS_REDIS_URL — ПРОД ws-redis, дефолта НЕТ): make ws-prio ARGS="set --job J --prio high [--ttl S] [--actor A] [--reason R]" | clear --job J | show --job J
 	.venv/bin/python scripts/ws_prio.py $(ARGS)
+
+quotas-set: ## Ф4.5c-1: правка quotas.yaml с хоста (dry-run по умолчанию; --apply = бэкап .trash + атомарная запись + пост-валидация; рантайм подхватит по mtime, рестарт не нужен): make quotas-set ARGS="set --role member --priority high [--tokens N|none] [--conc N|none] [--grants heavy,fast,local-only] [--budget-ext RUB] [--apply]"
+	.venv/bin/python scripts/quotas_set.py $(ARGS)
+
+quotas-show: ## Ф4.5c-1: показать participant-роли и бюджеты quotas.yaml: make quotas-show [ARGS="--json"]
+	.venv/bin/python scripts/quotas_set.py show $(ARGS)
 
 modes-validate: ## Ф3.5: валидация режимов ai_workspace/modes/*.yaml
 	.venv/bin/python -m ai_workspace.tools.modes_validate

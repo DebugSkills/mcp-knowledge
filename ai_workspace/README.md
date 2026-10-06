@@ -204,6 +204,18 @@ Mode engine, admission (Ф3.5+); human-gate `ws:gate:*` + дашборд спя�
 - CLI: `make ws-prio ARGS="set --job J --prio high"` (`scripts/ws_prio.py`,
   JSON-first; `WS_REDIS_URL` — ПРОД, дефолта НЕТ; exit 0/2=redis/3=валидация).
 
+## Квоты participant-ролей: хост-редактор `quotas.yaml` (Ф4.5c-1, `scripts/quotas_set.py`)
+- Оператор правит SSOT-квоты **вручную с хоста** (в контейнере консоли
+  `ai_workspace` нет, реестр не смонтирован — осознанное решение). Безопасный
+  редактор: `make quotas-set ARGS="set --role member --priority high
+  --tokens 300000 --apply"` (`scripts/quotas_set.py`, JSON-first; dry-run по
+  умолчанию — без `--apply` файл не трогается; `--apply` = бэкап в `.trash/` +
+  атомарная запись + пост-валидация `validate_quotas` с откатом). Просмотр:
+  `make quotas-show [ARGS="--json"]`. Комментарии/порядок ключей сохраняются
+  (точечная правка значений, не `yaml.safe_dump`). Рантайм подхватывает правку
+  по mtime (`Registry.reload_if_changed()`) — рестарт не нужен; git-коммит
+  делает оператор. Exit: 0 ок · 2 usage/IO · 3 валидация · 4 нет изменений.
+
 ## Реестры режимов (Ф3.5a-1, `registry/`)
 - `registry/` — data-only YAML-реестры `roles`/`tools`/`gates`/`model_classes`/
   `shapes` + загрузчик `Registry` (`load`/`get`/`reload_if_changed`).
