@@ -1,0 +1,53 @@
+# Реестр MCP-инструментов (спека §2: tool -> {server, JSON-схема, зона, стоимость}).
+# Сервер — mcp-knowledge; схемы — подмножество реальных контрактов инструментов.
+mcp.search_knowledge:
+  server: mcp-knowledge
+  zone_required: true
+  cost: cheap
+  json_schema:
+    type: object
+    properties:
+      query: {type: string, minLength: 1}
+      top_k: {type: integer, minimum: 1, maximum: 50}
+      domain: {type: string}
+      subject: {type: string}
+      zone: {type: string, enum: [public, private]}
+    required: [query]
+mcp.get_entry:
+  server: mcp-knowledge
+  zone_required: false
+  cost: cheap
+  json_schema:
+    type: object
+    properties:
+      knowledge_id: {type: string, minLength: 1}
+    required: [knowledge_id]
+mcp.write_knowledge:
+  server: mcp-knowledge
+  zone_required: true
+  cost: expensive
+  json_schema:
+    type: object
+    properties:
+      content: {type: string, minLength: 1}
+      domain: {type: string}
+      subject: {type: string}
+      zone: {type: string, enum: [public, private]}
+    required: [content, domain, subject]
+mcp.citation_attach:
+  server: mcp-knowledge
+  zone_required: true
+  cost: normal
+  json_schema:
+    type: object
+    properties:
+      knowledge_id: {type: string, minLength: 1}
+      source_id: {type: string, pattern: '^src-[0-9a-f]{16}$'}
+      locator:
+        type: object
+        properties:
+          kind: {type: string, enum: [page, timestamp]}
+          start: {type: number}
+          end: {type: number}
+        required: [kind]
+    required: [knowledge_id, source_id]

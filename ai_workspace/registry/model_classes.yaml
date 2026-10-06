@@ -1,0 +1,13 @@
+# Классы моделей (спека §2): heavy/fast — полка LiteLLM + шейпинг + ретраи
+# (полки плана Ф1: local/ext); local-only — НЕ полка, а маркер зонного правила
+# (I5: private -> только local, fallback выключен).
+heavy:
+  shelf: ext
+  shaping: full-context
+  retries: 2
+fast:
+  shelf: local
+  shaping: compressed
+  retries: 1
+local-only:
+  rule: zone

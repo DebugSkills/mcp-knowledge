@@ -113,3 +113,10 @@ Mode engine, admission (Ф3.5+); human-gate `ws:gate:*` + дашборд спя�
   `lease_expired`); гонку «lease ожил» закрывает сам Lua (повторный `EXISTS`).
   Requeue вызова — шаг caller'а (scheduler tick), свипер только возвращает слот.
 - **Дальше:** Ф3.5 — Mode engine (потребитель `ws:events`); Ф3.8 — полка `gpu`.
+
+## Реестры режимов (Ф3.5a-1, `registry/`)
+- `registry/` — data-only YAML-реестры `roles`/`tools`/`gates`/`model_classes`/
+  `shapes` + загрузчик `Registry` (`load`/`get`/`reload_if_changed`).
+- Hot-reload по mtime каждого файла; битый/отсутствующий YAML → `RegistryError`
+  (fail-closed: путь + причина, без молчаливых дефолтов).
+- Валидатор реестров — Ф3.5a-2; движок режимов — Ф3.5b.

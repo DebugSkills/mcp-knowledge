@@ -1,0 +1,11 @@
+# Реестр гейтов (спека §2): critic-gate — вердикты/порог/итерации (on_max_iter: fail —
+# спека §6, защита от вечного REVISE); human-gate — actor/timeout/on_timeout ∈ sleep|abort.
+critic-gate:
+  verdicts: [PASS, REVISE]
+  threshold: 0.80
+  max_iterations: 3
+  on_max_iter: fail
+human-gate:
+  actor: operator
+  timeout: 24h
+  on_timeout: sleep

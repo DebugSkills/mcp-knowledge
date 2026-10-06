@@ -1,0 +1,23 @@
+# Реестр ролей режимов (спека §2: role -> {seed-скилл, сигнатура вход/выход, права}).
+# seed_skill — существующий скилл экосистемы (prompt-источник роли), пути реальные.
+# Схемную валидацию (пути/сигнатуры) выполняет валидатор Ф3.5a-2.
+analyst:
+  seed_skill: .knowledge/skills/analyst-code/SKILL.md
+  signature_in: [brief]
+  signature_out: [draft]
+  rights: [mcp.search_knowledge, mcp.get_entry]
+critic:
+  seed_skill: .knowledge/skills/critic-gate/SKILL.md
+  signature_in: [draft]
+  signature_out: [verdict]
+  rights: [mcp.search_knowledge, mcp.get_entry]
+editor:
+  seed_skill: .knowledge/skills/content-create-manual/SKILL.md
+  signature_in: [draft, verdict]
+  signature_out: [document]
+  rights: [mcp.search_knowledge, mcp.get_entry]
+researcher:
+  seed_skill: .knowledge/skills/doc-collector/SKILL.md
+  signature_in: [brief]
+  signature_out: [research-notes, citations]
+  rights: [mcp.search_knowledge, mcp.get_entry, mcp.citation_attach]

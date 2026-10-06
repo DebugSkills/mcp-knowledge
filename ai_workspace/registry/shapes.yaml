@@ -1,0 +1,8 @@
+# Shapes (спека §2): shape -> допустимые output-contract'ы режима (поле §1 `contract`).
+# Валидатор Ф3.5a-2 сверяет совместимость shape x contract по этому каталогу.
+analyst-critic: [verdict, transcript]
+analyst-critic-editor: [document]
+analyst-critic-researcher: [document, transcript]
+analyst-strategic: [decision-record]
+brainstorm: [transcript]
+critic: [verdict]
