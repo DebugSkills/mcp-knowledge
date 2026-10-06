@@ -219,9 +219,10 @@ local new_epoch = tonumber(ARGV[2])
 local cur_epoch = tonumber(redis.call('HGET', KEYS[1], 'epoch')) or 0
 if new_epoch < cur_epoch then return 'STALE_EPOCH' end
 local nv = tonumber(ver) + 1
-redis.call('HSET', KEYS[1],
-           'state', ARGV[3], 'epoch', new_epoch,
-           'version', nv, 'updated', ARGV[4])
+redis.call('HSET', KEYS[1], 'epoch', new_epoch, 'version', nv, 'updated', ARGV[4])
+if ARGV[3] ~= '' then
+  redis.call('HSET', KEYS[1], 'state', ARGV[3])
+end
 local i = 5
 while i < #ARGV do
   redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1])
@@ -332,6 +333,34 @@ class JobStore:
                 f"epoch-fencing: job {job_id!r} epoch={epoch} < текущего; "
                 "redelivery старого владельца отвергнут"
             )
+        return self.get(job_id)
+
+    def patch(
+        self,
+        job_id: str,
+        *,
+        expect_version: int,
+        epoch: int,
+        patch: Mapping[str, Any] | None = None,
+    ) -> JobRecord:
+        """CAS-патч полей **без смены статуса** (курсор/версии доски; Ф3.5b-2).
+
+        Тот же Lua, что ``transition``, но ``state`` не пишется (ARGV[3]=''):
+        легальность перехода не проверяется — статус остаётся прежним.
+        """
+        encoded_patch = self._encode_patch(patch)
+        args: list[Any] = [expect_version, epoch, "", _utcnow_iso()]
+        for k, v in encoded_patch.items():
+            args.extend((k, v))
+        result = self._transition(keys=[self._key(job_id)], args=args)
+        if result == "NOT_FOUND":
+            raise JobNotFound(f"job {job_id!r} не найден при patch")
+        if result == "VERSION_CONFLICT":
+            raise VersionConflict(
+                f"CAS(patch): job {job_id!r} ожидалась version={expect_version}; перечитайте"
+            )
+        if result == "STALE_EPOCH":
+            raise StaleEpoch(f"epoch-fencing (patch): job {job_id!r} epoch={epoch} устарел")
         return self.get(job_id)
 
     # ── внутреннее ───────────────────────────────────────────────────────
