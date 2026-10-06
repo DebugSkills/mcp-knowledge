@@ -209,6 +209,9 @@ class ModeEngine:
         rec = self.jobs.get(job_id)
         if rec.state is not JobState.WAITING_HUMAN:
             raise EngineError(f"job {job_id!r} не в waiting_human (state={rec.state.value})")
+        # Durable-ответ гейта: approve делает его pass-through при повторном входе
+        # (REVISE-петля), edit — показать снова после переработки.
+        self.ledger.put(job_id, f"gate:{node_id}", {"decision": decision})
 
         if decision == "reject":
             rec = self.jobs.transition(job_id, JobState.FAILED, expect_version=rec.version,
@@ -223,7 +226,7 @@ class ModeEngine:
 
         rec = self.jobs.transition(job_id, JobState.RUNNING, expect_version=rec.version,
                                    epoch=epoch, patch={"cursor": node_id})
-        next_id = self.graph.next_for(node_id)
+        next_id = self._gate_target(self.graph.node(node_id), decision)
         if next_id is None:
             rec = self.jobs.transition(job_id, JobState.DONE, expect_version=rec.version, epoch=epoch)
             return EngineResult(status="done", node=node_id, board_version=self._board_version(rec))
@@ -243,6 +246,11 @@ class ModeEngine:
         if kind == "critic-gate":
             return self._critic_gate(job_id, rec, node, epoch)
         if kind == "human-gate":
+            answered = self.ledger.get(job_id, f"gate:{node.id}")
+            if answered is not None and answered.get("decision") == "approve":
+                # Гейт уже утверждён (напр. повторный вход через REVISE-петлю) —
+                # не спрашиваем человека снова, идём по approve-ветке.
+                return rec, None, self._gate_target(node, "approve")
             token = self.ledger.issue_token(job_id, node.id)
             raise _Pause(node.id, token, str(node.get("prompt", "Требуется подтверждение")))
         raise UnsupportedNode(f"kind {kind!r} (узел {node.id!r}) — Ф3.8+ (fork/join)")
@@ -353,11 +361,31 @@ class ModeEngine:
             )
         return out
 
+    def _gate_target(self, node: Node, decision: str) -> str | None:
+        """Куда идти после ответа человека: ``on_approve``/``on_edit`` узла, иначе edge.
+
+        ``on_approve: null`` (или несуществующий узел) → обычное ребро графа
+        (для финального gate это ``None`` → job done).
+        """
+        target = node.get(f"on_{decision}")
+        if isinstance(target, str) and target in self.graph.nodes:
+            return target
+        return self.graph.next_for(node.id)
+
     def _feedback_sections(self, node_id: str) -> list[str]:
-        """Секции critic-gate'ов, которые шлют ревизию в ``node_id`` (on_revise)."""
+        """Секции-замечания, адресованные ``node_id``: критика (on_revise) и правки людей.
+
+        Без этого повторный вход в узел дал бы тот же ``effect_id`` (кэш) и не
+        потребил бы ни вердикт критика, ни правку оператора (gate on_edit/on_approve).
+        """
         result: list[str] = []
         for other in self.graph.nodes.values():
-            if other.kind == "critic-gate" and other.get("on_revise") == node_id:
+            critic_loop = other.kind == "critic-gate" and other.get("on_revise") == node_id
+            human_edit = other.kind == "human-gate" and node_id in (
+                other.get("on_edit"),
+                other.get("on_approve"),
+            )
+            if critic_loop or human_edit:
                 result.append(self._out_section(other))
         return result
 
