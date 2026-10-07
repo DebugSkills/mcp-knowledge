@@ -27,11 +27,14 @@ from ai_workspace.tests.test_engine import (
 
 EVENT_KEYS = {
     "job", "trace_id", "node", "kind", "role", "model_class", "shelf", "cached",
-    "prompt_chars", "output_chars", "tokens", "wall_s",
+    "prompt_chars", "output_chars", "tokens", "wall_s", "tokens_estimated",
 }
-"""Контракт события on_node_usage (Ф6-a 6a.1 + Ф6 TODO 2/К1): ровно эти
-ключи, без сюрпризов; ``trace_id = f"{job}:{epoch}"`` — сквозной трейс
-(приёмка — wiring-подписчик → ws:quota:events, test_node_events_stream)."""
+"""Контракт события on_node_usage (Ф6-a 6a.1 + Ф6 TODO 2/К1 + TODO 4а/К4):
+ровно эти ключи, без сюрпризов; ``trace_id = f"{job}:{epoch}"`` — сквозной
+трейс (приёмка — wiring-подписчик → ws:quota:events, test_node_events_stream);
+``tokens_estimated`` — True когда токены узла ОЦЕНЕНЫ chars/4 (usage шлюза
+недоступен), False при реальных токенах/кэше/tool-step — по признаку подписчик
+инкрементирует ws:metrics:usage_fallback_total (test_node_metrics)."""
 
 
 def make_observed(script, events, *, ledger=None, on_node_usage=None):
@@ -79,6 +82,7 @@ def test_on_node_usage_collects_events_per_node() -> None:
     assert a["role"] == "analyst" and a["model_class"] == "heavy" and a["shelf"] == "local"
     assert a["cached"] is False
     assert a["tokens"] > 0  # свежий вызов: оценка по факту объёма (~4 симв/токен)
+    assert a["tokens_estimated"] is True  # FakeLLM без usage → chars/4 (TODO 4а)
     assert a["prompt_chars"] > 0 and a["output_chars"] == len("черновик")
     assert a["wall_s"] >= 0
 
@@ -90,6 +94,7 @@ def test_on_node_usage_collects_events_per_node() -> None:
     assert t["kind"] == "tool-step" and t["cached"] is False
     assert t["role"] is None and t["model_class"] is None
     assert t["tokens"] == 0  # MCP-вызов не тратит LLM-токены
+    assert t["tokens_estimated"] is False  # LLM не вызывался — не оценивали
     assert t["output_chars"] == len('{"refs": ["src-deadbeef"]}')
 
 
@@ -109,6 +114,7 @@ def test_cache_hit_second_visit_emits_cached_true_and_zero_tokens() -> None:
     first, second = events
     assert first["cached"] is False and first["tokens"] > 0
     assert second["cached"] is True and second["tokens"] == 0  # LLM не вызывался
+    assert second["tokens_estimated"] is False  # кэш: fallback не привлекался
     assert second["prompt_chars"] == first["prompt_chars"] > 0  # промпт считаем и на кэше
     assert second["output_chars"] == first["output_chars"]
 

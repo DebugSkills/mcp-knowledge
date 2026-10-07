@@ -61,6 +61,7 @@ from ai_workspace.scheduler.admission import (
 )
 from ai_workspace.scheduler.budget import charge_budget
 from ai_workspace.scheduler.eta import ETAStore
+from ai_workspace.scheduler.metrics import incr_node_metrics
 from ai_workspace.scheduler.park import ParkControl
 from ai_workspace.scheduler.position import PositionStore
 from ai_workspace.scheduler.prio import (
@@ -122,6 +123,12 @@ def make_on_node_usage(
     движка (engine ``_observe_node_usage``). Best-effort: деградация ws-redis
     глотается ``emit_event`` — наблюдение не валит узел.
 
+    Метрики-ядро (Ф6 TODO 4а/К4): тот же подписчик ПОСЛЕ эмита
+    инкрементирует Redis-хэши ``ws:metrics:*`` (лейблы
+    ``{kind, model_class, shelf, role}``, без node_id/job_id; счётчик
+    ``usage_fallback_total`` — по признаку ``tokens_estimated`` из события)
+    — ``scheduler.metrics.incr_node_metrics``, best-effort.
+
     Склейка session↔job↔узел (Ф6 TODO 3/F3): опциональный ``store``
     (``JobStore`` на том же ws-redis) — подписчик best-effort доносит из
     ``job.meta`` в эмит ``session_id``/``turn_id`` (белый список из ДВУХ
@@ -155,6 +162,10 @@ def make_on_node_usage(
         if store is not None and isinstance(event.get("job"), str):
             extra = _trace_meta(event["job"])
         emit_event(client, "node_usage", **{**extra, **event})
+        # Ф6 TODO 4а/К4: метрики-ядро ws:metrics:* — ПОСЛЕ эмита (событие
+        # важнее счётчиков), best-effort (``scheduler.metrics`` глотает
+        # деградацию Redis так же, как emit_event).
+        incr_node_metrics(client, event)
 
     return _on_node_usage
 

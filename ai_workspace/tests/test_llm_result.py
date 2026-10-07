@@ -115,9 +115,11 @@ def test_llm_step_reports_real_tokens_and_request_id() -> None:
     assert a["kind"] == "llm-step" and a["cached"] is False
     assert a["tokens"] == 121, "реальные total_tokens из usage, а не оценка chars/4"
     assert a["tokens"] != _chars4_usage(llm.prompts["analyst"], "черновик")
+    assert a["tokens_estimated"] is False  # реальные токены — не оценка (TODO 4а)
 
     c = by_node["critic"]
     assert c["kind"] == "critic-gate" and c["tokens"] == 121
+    assert c["tokens_estimated"] is False
 
     # персистентный агрегат узла: те же реальные токены + request_id шлюза
     agg = engine.ledger.get("j1", "usage:analyst")
@@ -137,6 +139,7 @@ def test_usage_none_falls_back_to_estimate_without_crash() -> None:
     assert res.status == "paused"  # прогон дошёл до human-gate — не упал
     a = next(e for e in events if e["node"] == "analyst")
     assert a["tokens"] == _chars4_usage(llm.prompts["analyst"], "черновик") > 0
+    assert a["tokens_estimated"] is True  # usage нет → оценка (счётчик подписчика)
     agg = engine.ledger.get("j1", "usage:analyst")
     assert agg["tokens"] == a["tokens"]
     assert "request_id_last" not in agg  # id не было — не выдумываем

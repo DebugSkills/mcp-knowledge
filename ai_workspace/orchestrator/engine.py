@@ -820,6 +820,12 @@ class ModeEngine:
           tool-step (MCP-вызов не тратит токены); иначе — реальные токены из
           ``usage`` ответа шлюза (Ф6 TODO 1/К2), а при ``usage is None`` — та
           же fallback-оценка, что списывает ``_bump_usage`` (``usage_of``);
+        - ``tokens_estimated`` (Ф6 TODO 4а/К4): True — токены этого узла
+          ОЦЕНЕНЫ ``chars/4`` (usage шлюза недоступен); False при реальных
+          токенах, кэше и tool-step. Признак едет в событии (дизайн TODO 2:
+          данные — в событии, агрегация — у подписчика): инкремент счётчика
+          ``ws:metrics:usage_fallback_total`` делает wiring-подписчик
+          (``scheduler.metrics``), движок в Redis не пишет;
         - ``prompt_chars``/``output_chars`` считаются и на кэше (длина текста);
         - ``wall_s`` — по ``self.clock`` от входа в узел до записи секции;
         - персистентный агрегат ``usage:{node_id}`` (read-modify-write сумм)
@@ -837,12 +843,14 @@ class ModeEngine:
             model_class = str(node.get("model_class", "fast"))
             shelf = self.shelf_for(model_class)
         real = _tokens_from_usage(usage)
+        estimated = False  # Ф6 TODO 4а/К4: признак fallback-оценки в событии
         if cached or kind == "tool-step":
             tokens = 0
         elif real is not None:
             tokens = real
         else:
             tokens = self.usage_of(prompt, output)
+            estimated = True  # узел реально оценил chars/4 (usage нет)
         wall_s = self.clock() - t0
 
         agg = self.ledger.get(job_id, f"usage:{node.id}") or {}
@@ -873,6 +881,7 @@ class ModeEngine:
                     "prompt_chars": len(prompt),
                     "output_chars": len(output),
                     "tokens": tokens,
+                    "tokens_estimated": estimated,
                     "wall_s": wall_s,
                 })
             except Exception:  # best-effort: наблюдение не валит узел
