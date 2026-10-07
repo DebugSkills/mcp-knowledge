@@ -15,6 +15,10 @@ services:
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      # Ф6 TODO 5 (К5/I5): не тянуть model cost map с raw.githubusercontent.com при импорте —
+      # иначе local_only-прогон даёт внешний egress (счётчик: 56 → 0 пкт). Используем
+      # встроенную в образ карту; ₽-учёт — свой pricing.yaml.
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
     volumes:
       # переключение полок: GATEWAY_CONFIG=litellm.local_only.config.yaml make gateway-up
       - ./${GATEWAY_CONFIG:-litellm.config.yaml}:/app/litellm.config.yaml:ro

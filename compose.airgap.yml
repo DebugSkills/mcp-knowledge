@@ -1,0 +1,29 @@
+# =============================================================================
+# compose.airgap.yml — air-gap overlay для ws-стека (workspace + ws-redis + litellm)
+# Трасса: arch-2026-10-05-ai-workspace · Ф6 TODO 6 (код-часть: air-gap overlay)
+#
+# НАЗНАЧЕНИЕ: подъём ws-стека на air-gap узле из образов бандла БЕЗ сборки,
+# с жёстким пиннингом внешних образов по digest (tag@sha256).
+#
+# Применение — overlay ДОПОЛНЯЕТ два файла, сами сервисы живут в них
+# (compose.workspace.yml: workspace, ws-redis; compose.gateway.yml: litellm);
+# этот файл новых сервисов и профилей НЕ вводит:
+#
+#   docker compose -f compose.workspace.yml -f compose.gateway.yml -f compose.airgap.yml up -d
+#
+# Образы бандла готовит scripts/airgap-pack-subset.sh (docker save по пиннам ниже).
+# =============================================================================
+
+services:
+  ws-redis:
+    image: redis:7-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable@sha256:625981c83410a3ea68eb0697590a57ec1d764d634514d54fa5db0591077ee839
+
+  workspace:
+    image: kb-console:prod
+    # На air-gap узле сборка недоступна (нет build-контекста и сети): сбрасываем
+    # build, унаследованный из compose.workspace.yml, — используется готовый образ
+    # из бандла. Требование: docker compose >= 2.24 (поддержка `!reset`).
+    build: !reset null
