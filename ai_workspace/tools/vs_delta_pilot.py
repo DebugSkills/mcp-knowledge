@@ -629,14 +629,13 @@ class _OllamaPilotClient:
         self._inner = inner
 
     def chat(self, prompt: str) -> str:
-        return str(
-            self._inner.complete(
-                role="critic",
-                model_class="vs_delta_pilot",
-                prompt=prompt,
-                inputs={},
-            )
-        )
+        # complete() теперь возвращает LLMResult (Ф6 TODO 1) — текст в .output
+        return self._inner.complete(
+            role="critic",
+            model_class="vs_delta_pilot",
+            prompt=prompt,
+            inputs={},
+        ).output
 
 
 def make_client(model: str, base_url: str) -> ChatClient:

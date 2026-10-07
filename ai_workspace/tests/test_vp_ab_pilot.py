@@ -15,7 +15,12 @@ from pathlib import Path
 
 import pytest
 
-from ai_workspace.orchestrator.engine import MemoryLedger, ModeEngine, load_mode
+from ai_workspace.orchestrator.engine import (
+    LLMResult,
+    MemoryLedger,
+    ModeEngine,
+    load_mode,
+)
 from ai_workspace.orchestrator.graph import Node
 from ai_workspace.registry import Registry
 from ai_workspace.tests.test_engine import FakeBoards, FakeJobs, FakeLLM, FakeMCP
@@ -51,9 +56,26 @@ OLLAMA_RESPONSE = {
 """Форма ответа — из живого зонда ollama :11435 (не выдуманная)."""
 
 
-def _fake_response(payload: dict) -> io.BytesIO:
-    """Контекст-менеджер с телом ответа (как urllib-ответ)."""
-    return io.BytesIO(json.dumps(payload).encode("utf-8"))
+class _FakeResponse(io.BytesIO):
+    """urllib-ответ: тело + заголовки (как http.client.HTTPResponse).
+
+    Заголовки шлюза — часть контракта Ф6 TODO 1: ``x-litellm-call-id``
+    подтверждён живой пробой mcp-knowledge-litellm (2026-10-07). Ключи
+    регистронезависимы, как у настоящего ``HTTPMessage``.
+    """
+
+    def __init__(self, payload: dict, headers: dict[str, str] | None = None) -> None:
+        super().__init__(json.dumps(payload).encode("utf-8"))
+        self.headers = {k.lower(): v for k, v in (headers or {}).items()}
+
+
+GW_HEADERS = {"x-litellm-call-id": "call-gw-0123"}
+"""Заголовок шлюза из живой пробы (не выдуманный)."""
+
+
+def _fake_response(payload: dict) -> _FakeResponse:
+    """Контекст-менеджер с телом ответа + заголовками шлюза."""
+    return _FakeResponse(payload, GW_HEADERS)
 
 
 def test_ollama_client_builds_openai_payload(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -71,11 +93,15 @@ def test_ollama_client_builds_openai_payload(monkeypatch: pytest.MonkeyPatch) ->
     client = OllamaClient()
     out = client.complete(
         role="critic", model_class="fast", prompt="промпт",
-        inputs={"draft": "x"},
+        inputs={"draft": "x"}, job_id="job-1",
         params={"temperature": 0.0, "seed": 42, "thinking": False, "max_output_tokens": 2048},
     )
 
-    assert out == "PASS — по рубрике"
+    assert isinstance(out, LLMResult)
+    assert out.output == "PASS — по рубрике"
+    # наблюдаемость шлюза (Ф6 TODO 1): request_id из заголовка, usage из тела
+    assert out.request_id == "call-gw-0123"
+    assert out.usage == {"prompt_tokens": 64, "completion_tokens": 57, "total_tokens": 121}
     assert seen["url"] == "http://127.0.0.1:11435/v1/chat/completions"
     assert seen["method"] == "POST"
     assert seen["content_type"] == "application/json"
@@ -87,6 +113,8 @@ def test_ollama_client_builds_openai_payload(monkeypatch: pytest.MonkeyPatch) ->
     assert body["temperature"] == 0.0 and body["seed"] == 42
     assert body["max_tokens"] == 2048
     assert "thinking" not in body, "ollama OpenAI-эндпоинт thinking не принимает"
+    # job_id → metadata запроса шлюза (Ф6 TODO 1)
+    assert body["metadata"] == {"job_id": "job-1"}
     # журнал живого вызова: usage из ответа (доказательство реального вызова)
     assert client.calls[0]["usage"]["completion_tokens"] == 57
     assert client.calls[0]["fragment"]
@@ -104,7 +132,7 @@ def test_ollama_client_retries_once(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     client = OllamaClient()
     out = client.complete(role="analyst", model_class="heavy", prompt="p", inputs={})
-    assert out == "PASS — по рубрике" and len(attempts) == 2
+    assert out.output == "PASS — по рубрике" and len(attempts) == 2
 
     def always_fail(req: urllib.request.Request, timeout: float = -1) -> io.BytesIO:
         raise OSError("down")

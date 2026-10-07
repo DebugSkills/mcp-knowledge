@@ -15,6 +15,7 @@ import pytest
 from ai_workspace.orchestrator.board import BoardError, StaleBoard
 from ai_workspace.orchestrator.engine import (
     MAX_STEPS,
+    LLMResult,
     MemoryLedger,
     ModeEngine,
     TokenInvalid,
@@ -130,14 +131,16 @@ class FakeLLM:
         self.script = {k: list(v) for k, v in script.items()}
         self.calls: list[str] = []
 
-    def complete(self, *, role, model_class, prompt, inputs, params=None) -> str:
+    def complete(self, *, role, model_class, prompt, inputs, params=None,
+                 job_id=None) -> LLMResult:
         self.calls.append(role)
         self.params_seen = getattr(self, "params_seen", [])
         self.params_seen.append(dict(params or {}))
         queue = self.script.get(role)
         if not queue:
             raise AssertionError(f"нет скриптованного ответа для роли {role!r}")
-        return queue.pop(0)
+        # usage не скриптуется: None → движок оценивает (fallback chars/4)
+        return LLMResult(output=queue.pop(0))
 
 
 class FakeMCP:

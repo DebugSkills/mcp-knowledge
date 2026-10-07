@@ -61,7 +61,7 @@ from typing import Any
 from ai_workspace.artifacts import ArtifactStore, RedisBackend
 from ai_workspace.conformance import DECODING_PIN
 from ai_workspace.orchestrator.board import BoardStore
-from ai_workspace.orchestrator.engine import ModeEngine, load_mode
+from ai_workspace.orchestrator.engine import LLMResult, ModeEngine, load_mode
 from ai_workspace.orchestrator.job import JobState, JobStore
 from ai_workspace.orchestrator.ledger import RedisLedger
 from ai_workspace.redis_client import make_ws_redis
@@ -234,7 +234,8 @@ class _SlowStubShelfLLM(StubShelfLLM):
         prompt: str,
         inputs: Mapping[str, str],
         params: Mapping[str, Any] | None = None,
-    ) -> str:
+        job_id: str | None = None,
+    ) -> LLMResult:
         time.sleep(self.delay_s)
         return super().complete(
             role=role,
@@ -242,6 +243,7 @@ class _SlowStubShelfLLM(StubShelfLLM):
             prompt=prompt,
             inputs=inputs,
             params=params,
+            job_id=job_id,
         )
 
 

@@ -92,9 +92,10 @@ def test_golden_run_pin_is_checked_on_received_params() -> None:
     seen: list[dict] = []
 
     class RecordingLLM(StubShelfLLM):
-        def complete(self, *, role, model_class, prompt, inputs, params=None):
+        def complete(self, *, role, model_class, prompt, inputs, params=None, job_id=None):
             seen.append(dict(params or {}))
-            return super().complete(role=role, model_class=model_class, prompt=prompt, inputs=inputs, params=params)
+            return super().complete(role=role, model_class=model_class, prompt=prompt,
+                                    inputs=inputs, params=params, job_id=job_id)
 
     def factory(shelf, job_id, artifacts, answer, zone, mode_path) -> ModeEngine:
         jobs, boards = FakeJobs(), FakeBoards()
@@ -188,11 +189,11 @@ def test_golden_run_report_has_per_node_usage_and_mode_attribution() -> None:
 def test_golden_run_detects_broken_parity() -> None:
     """Мутация: стаб добавляет model-specific строку в промпт → parity падает."""
     class BranchingLLM(StubShelfLLM):
-        def complete(self, *, role, model_class, prompt, inputs, params=None):
+        def complete(self, *, role, model_class, prompt, inputs, params=None, job_id=None):
             if self.shelf == "local":
                 prompt = prompt + "\nОтвечай кратко (7B)."
             return super().complete(role=role, model_class=model_class, prompt=prompt,
-                                    inputs=inputs, params=params)
+                                    inputs=inputs, params=params, job_id=job_id)
 
     def factory(shelf, job_id, artifacts, answer, zone, mode_path) -> ModeEngine:
         jobs, boards = FakeJobs(), FakeBoards()

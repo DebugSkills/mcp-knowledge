@@ -51,6 +51,7 @@ from ai_workspace import conformance as cf
 from ai_workspace.artifacts import ArtifactStore, MemoryBackend
 from ai_workspace.orchestrator.engine import (
     LLMClient,
+    LLMResult,
     MemoryLedger,
     ModeEngine,
     load_mode,
@@ -126,7 +127,8 @@ class OllamaClient:
     def complete(
         self, *, role: str, model_class: str, prompt: str,
         inputs: Mapping[str, str], params: Mapping[str, Any] | None = None,
-    ) -> str:
+        job_id: str | None = None,
+    ) -> LLMResult:
         p = dict(params or {})
         payload: dict[str, Any] = {
             "model": self.model,
@@ -136,6 +138,9 @@ class OllamaClient:
         }
         if p.get("seed") is not None:
             payload["seed"] = int(p["seed"])
+        if job_id is not None:
+            # metadata запроса LiteLLM (Ф6 TODO 1): склейка вызова с job'ом
+            payload["metadata"] = {"job_id": job_id}
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         last: Exception | None = None
         for _attempt in (1, 2):  # одна повторная попытка
@@ -147,14 +152,22 @@ class OllamaClient:
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
+                    # request_id из заголовка шлюза (Ф6 TODO 1/К2:
+                    # x-litellm-call-id; прямой ollama его не шлёт → None)
+                    request_id = resp.headers.get("x-litellm-call-id")
                 content = str(data["choices"][0]["message"]["content"])
                 usage = dict(data.get("usage") or {})
                 self.calls.append({
                     "role": role, "wall_s": round(time.monotonic() - t0, 3),
                     "prompt_chars": len(prompt), "output_chars": len(content),
+                    "request_id": request_id,
                     "usage": usage, "fragment": content[:200],
                 })
-                return content
+                return LLMResult(
+                    output=content,
+                    request_id=str(request_id) if request_id else None,
+                    usage=usage or None,
+                )
             except Exception as exc:  # noqa: BLE001 — транспортная ошибка = ретрай
                 last = exc
         raise RuntimeError(f"ollama: две попытки не прошли ({self.url}): {last}")

@@ -64,6 +64,7 @@ __all__ = [
     "EngineError",
     "EngineResult",
     "LLMClient",
+    "LLMResult",
     "MemoryLedger",
     "ModeEngine",
     "ModeGraph",
@@ -128,12 +129,36 @@ class QuotaLeaseLost(EngineError):
 def _chars4_usage(prompt: str, output: str) -> int:
     """Оценка токенов по измеримому факту вызова: ~4 символа/токен.
 
-    Placeholder-источник usage до контура реального списания (LiteLLM
-    usage-json — задача reconcile P0-1): списание идёт по факту объёма
-    текста вызова (prompt+output), а не по выдуманным числам; инъекция
-    ``usage_of`` в ModeEngine заменяет оценку без правки движка.
+    FALLBACK (Ф6 TODO 1/К2): применяется только когда шлюз не отдал usage
+    (``LLMResult.usage is None``) — списание идёт по факту объёма текста
+    вызова (prompt+output), а не по выдуманным числам; инъекция ``usage_of``
+    в ModeEngine заменяет оценку без правки движка. Основной путь — реальные
+    токены из ``usage`` ответа шлюза (``_tokens_from_usage``).
     """
     return (len(prompt) + len(output) + 3) // 4
+
+
+def _tokens_from_usage(usage: Mapping[str, Any] | None) -> int | None:
+    """Реальные токены из usage-объекта ответа шлюза (Ф6 TODO 1/К2).
+
+    ``total_tokens``, при отсутствии — сумма ``prompt_tokens +
+    completion_tokens`` (все три поля подтверждены живой пробой шлюза).
+    Недоступен/битый (``None``, пустой, нечисловой) → ``None``: вызывающий
+    честно падает обратно на оценку (``usage_of``), не выдумывая чисел.
+    """
+    if not isinstance(usage, Mapping):
+        return None
+    try:
+        total = int(usage.get("total_tokens"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        total = None
+    if total is not None:
+        return total if total >= 0 else None
+    try:
+        parts = int(usage.get("prompt_tokens")) + int(usage.get("completion_tokens"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parts if parts >= 0 else None
 
 
 # ── шейпинг-гигиена контекста (Ф6-a 6a.3) ─────────────────────────────────
@@ -195,8 +220,28 @@ def shape_section(
 # ── порты (инъектируемые зависимости) ────────────────────────────────────
 
 
+@dataclass(frozen=True)
+class LLMResult:
+    """Результат LLM-вызова (Ф6 TODO 1/К2): выход + наблюдаемость шлюза.
+
+    ``request_id`` — из заголовка ответа шлюза ``x-litellm-call-id``;
+    ``usage`` — из тела ответа (``{prompt_tokens, completion_tokens,
+    total_tokens}``); контракт подтверждён живой пробой шлюза. Оба
+    ``None`` — шлюз не отдал факт (например, прямой ollama без id):
+    потребители обязаны fallback'ить (движок — на оценку ``usage_of``).
+    """
+
+    output: str
+    request_id: str | None = None
+    usage: dict[str, Any] | None = None
+
+
 class LLMClient(Protocol):
-    """Шлюз LiteLLM (минимальный контракт движка)."""
+    """Шлюз LiteLLM (минимальный контракт движка).
+
+    ``job_id`` (опционально) клиент кладёт в metadata запроса LiteLLM —
+    склейка вызова с job'ом на стороне шлюза (reconcile P0-1).
+    """
 
     def complete(
         self,
@@ -206,7 +251,8 @@ class LLMClient(Protocol):
         prompt: str,
         inputs: Mapping[str, str],
         params: Mapping[str, Any] | None = None,
-    ) -> str: ...
+        job_id: str | None = None,
+    ) -> LLMResult: ...
 
 
 class ToolClient(Protocol):
@@ -554,17 +600,23 @@ class ModeEngine:
         eff = compute_effect_id(job_id, node.id, "llm:" + self._digest({"prompt": prompt, "inputs": inputs}))
 
         hit = self.ledger.get(job_id, f"fx:{eff}")
+        result: LLMResult | None = None
         if hit is not None:
             output = str(hit["output"])
         else:
-            output = self._call_llm_with_retry(rec, node, prompt, inputs)
-            self._bump_usage(job_id, prompt, output)
+            result = self._call_llm_with_retry(rec, node, prompt, inputs)
+            output = result.output
+            self._bump_usage(job_id, prompt, output, usage=result.usage)
             self.ledger.put(job_id, f"fx:{eff}", {"output": output})
 
         section = self._out_section(node)
         rec = self._write_section(job_id, rec, section, output, epoch)
-        self._observe_node_usage(job_id, node, "llm-step", prompt=prompt, output=output,
-                                 cached=hit is not None, t0=t0)
+        self._observe_node_usage(
+            job_id, node, "llm-step", prompt=prompt, output=output,
+            cached=hit is not None, t0=t0,
+            usage=result.usage if result is not None else None,
+            request_id=result.request_id if result is not None else None,
+        )
         return rec, None, self.graph.next_for(node.id)
 
     def _tool_step(self, job_id, rec, node, epoch):
@@ -597,17 +649,23 @@ class ModeEngine:
         prompt = self._prompt(node, inputs)
         eff = compute_effect_id(job_id, node.id, "critic:" + self._digest({"prompt": prompt}))
         hit = self.ledger.get(job_id, f"fx:{eff}")
+        result: LLMResult | None = None
         if hit is not None:
             output = str(hit["output"])
         else:
-            output = self._call_llm_with_retry(rec, node, prompt, inputs)
-            self._bump_usage(job_id, prompt, output)
+            result = self._call_llm_with_retry(rec, node, prompt, inputs)
+            output = result.output
+            self._bump_usage(job_id, prompt, output, usage=result.usage)
             self.ledger.put(job_id, f"fx:{eff}", {"output": output})
 
         verdict = self._parse_verdict(node, output)
         rec = self._write_section(job_id, rec, self._out_section(node), output, epoch)
-        self._observe_node_usage(job_id, node, "critic-gate", prompt=prompt, output=output,
-                                 cached=hit is not None, t0=t0)
+        self._observe_node_usage(
+            job_id, node, "critic-gate", prompt=prompt, output=output,
+            cached=hit is not None, t0=t0,
+            usage=result.usage if result is not None else None,
+            request_id=result.request_id if result is not None else None,
+        )
 
         if verdict != "REVISE":
             return rec, verdict, self.graph.next_for(node.id, verdict)
@@ -718,17 +776,24 @@ class ModeEngine:
                 rec.id, exc_info=True,
             )
 
-    def _bump_usage(self, job_id: str, prompt: str, output: str) -> None:
+    def _bump_usage(
+        self, job_id: str, prompt: str, output: str, *,
+        usage: Mapping[str, Any] | None = None,
+    ) -> None:
         """Учесть фактический расход LLM-вызова (durable, ключ ``usage``).
 
         Вызывается только при реальном вызове модели (мимо кэша эффектов).
+        Токены — реальные из ``usage`` ответа шлюза (Ф6 TODO 1/К2);
+        ``usage is None`` → fallback-оценка ``usage_of`` (не падаем).
         Контур выключен (``quota is None``) — счётчик не ведётся: старые
         прогоны не платят накладные расходы и не меняют ledger-контракт.
         """
         if self.quota is None:
             return
+        real = _tokens_from_usage(usage)
+        tokens = real if real is not None else self.usage_of(prompt, output)
         used = self.ledger.get(job_id, "usage") or {"tokens": 0}
-        used["tokens"] = int(used.get("tokens", 0)) + self.usage_of(prompt, output)
+        used["tokens"] = int(used.get("tokens", 0)) + tokens
         self.ledger.put(job_id, "usage", used)
 
     def _observe_node_usage(
@@ -741,6 +806,8 @@ class ModeEngine:
         output: str,
         cached: bool,
         t0: float,
+        usage: Mapping[str, Any] | None = None,
+        request_id: str | None = None,
     ) -> None:
         """Per-node наблюдение (Ф6-a 6a.1): событие ``on_node_usage`` + агрегат в ledger.
 
@@ -748,8 +815,9 @@ class ModeEngine:
         human-gate не измеряется). Аддитивно — семантику исполнения не меняет:
 
         - ``tokens``: 0 при cache-hit (LLM не вызывался — не тратим) и для
-          tool-step (MCP-вызов не тратит токены); иначе — та же оценка, что
-          списывает ``_bump_usage`` (``usage_of``);
+          tool-step (MCP-вызов не тратит токены); иначе — реальные токены из
+          ``usage`` ответа шлюза (Ф6 TODO 1/К2), а при ``usage is None`` — та
+          же fallback-оценка, что списывает ``_bump_usage`` (``usage_of``);
         - ``prompt_chars``/``output_chars`` считаются и на кэше (длина текста);
         - ``wall_s`` — по ``self.clock`` от входа в узел до записи секции;
         - персистентный агрегат ``usage:{node_id}`` (read-modify-write сумм)
@@ -763,7 +831,13 @@ class ModeEngine:
             role = str(node.get("role", node.id))
             model_class = str(node.get("model_class", "fast"))
             shelf = self.shelf_for(model_class)
-        tokens = 0 if (cached or kind == "tool-step") else self.usage_of(prompt, output)
+        real = _tokens_from_usage(usage)
+        if cached or kind == "tool-step":
+            tokens = 0
+        elif real is not None:
+            tokens = real
+        else:
+            tokens = self.usage_of(prompt, output)
         wall_s = self.clock() - t0
 
         agg = self.ledger.get(job_id, f"usage:{node.id}") or {}
@@ -773,6 +847,8 @@ class ModeEngine:
         agg["prompt_chars"] = int(agg.get("prompt_chars", 0)) + len(prompt)
         agg["output_chars"] = int(agg.get("output_chars", 0)) + len(output)
         agg["wall_s_last"] = wall_s
+        if request_id is not None:  # id шлюза последнего реального вызова
+            agg["request_id_last"] = str(request_id)
         agg["role"] = role
         agg["model_class"] = model_class
         agg["shelf"] = shelf
@@ -846,7 +922,9 @@ class ModeEngine:
                 f"(model_class={node.get('model_class')!r})"
             )
 
-    def _call_llm_with_retry(self, rec: JobRecord, node: Node, prompt: str, inputs: Mapping[str, str]) -> str:
+    def _call_llm_with_retry(
+        self, rec: JobRecord, node: Node, prompt: str, inputs: Mapping[str, str],
+    ) -> LLMResult:
         model_class = str(node.get("model_class", "fast"))
         self._guard_zone(rec, node, self.shelf_for(model_class))
         params = self.decoding.as_params() if self.decoding is not None else {}
@@ -855,13 +933,17 @@ class ModeEngine:
         for _ in range(attempts + 1):
             self._beat(rec)  # lease жив перед КАЖДОЙ попыткой (P1-3/P1-5)
             try:
-                return self.llm.complete(
+                result = self.llm.complete(
                     role=str(node.get("role", node.id)),
                     model_class=model_class,
                     prompt=prompt,
                     inputs=dict(inputs),
                     params=params,
+                    job_id=rec.id,  # → metadata запроса шлюза (Ф6 TODO 1)
                 )
+                # легаси-клиент ещё возвращает str (переходный период) —
+                # заворачиваем; isinstance, не getattr (rule 10)
+                return result if isinstance(result, LLMResult) else LLMResult(output=str(result))
             except Exception as exc:  # noqa: BLE001 — ошибка шлюза LLM = повод для retry
                 last = exc
         raise NodeFailure(f"llm-step {node.id!r}: исчерпан retry={attempts}: {last}")

@@ -33,7 +33,7 @@ import yaml
 
 from ai_workspace import conformance as cf
 from ai_workspace.artifacts import ArtifactStore, MemoryBackend
-from ai_workspace.orchestrator.engine import ModeEngine, load_mode
+from ai_workspace.orchestrator.engine import LLMResult, ModeEngine, load_mode
 from ai_workspace.registry import Registry
 from ai_workspace.registry.pricing import MICRO_PER_UNIT, PricingRegistry
 
@@ -72,13 +72,15 @@ class StubShelfLLM:
 
     def complete(
         self, *, role: str, model_class: str, prompt: str, inputs: Mapping[str, str],
-        params: Mapping[str, Any] | None = None,
-    ) -> str:
+        params: Mapping[str, Any] | None = None, job_id: str | None = None,
+    ) -> LLMResult:
         self.calls.append({"role": role, "prompt": prompt, "shelf": self.shelf,
                            "params": dict(params or {})})
+        # Стаб без наблюдаемости шлюза: request_id/usage = None → движок
+        # fallback'ит токены на оценку (числа golden-прогонов не меняются)
         if role == "critic":
-            return self.VERDICT  # critic-gate ждёт вердикт (PASS|REVISE)
-        return self.answer
+            return LLMResult(output=self.VERDICT)  # critic-gate ждёт вердикт (PASS|REVISE)
+        return LLMResult(output=self.answer)
 
     def params(self) -> dict[str, Any]:
         """Параметры декодинга, ФАКТИЧЕСКИ полученные от движка (P1-1: не вакуумно)."""
