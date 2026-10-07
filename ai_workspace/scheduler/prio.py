@@ -42,6 +42,7 @@ from functools import wraps
 from typing import Any, TypeVar
 
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import RedisError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from ai_workspace.scheduler.admission import (
@@ -84,7 +85,12 @@ def emit_event(client: Any, type_: str, **fields: Any) -> None:
     """Событие приоритет-контура в ``ws:quota:events`` — best-effort.
 
     Наблюдение не имеет права валить операцию (паттерн best-effort XADD из
-    ``_emit_degraded``); потребитель — оператор (хвост стрима).
+    ``_emit_degraded``); потребитель — оператор (хвост стрима). Ловится весь
+    ``RedisError``, не только Connection/Timeout: при ``--maxmemory`` +
+    ``noeviction`` (Ф6 TODO 8, I12/D2) исчерпание ws-redis отказывает на
+    записывающих командах OOM'ом (``OutOfMemoryError`` — наследник
+    ``RedisError``); событие наблюдения глотается с логом, постановка job'а
+    (``wiring.submit`` → ``_resolve_priority``) не валится.
     """
     try:
         client.xadd(
@@ -93,8 +99,15 @@ def emit_event(client: Any, type_: str, **fields: Any) -> None:
             maxlen=DEFAULT_QUOTA_STREAM_MAXLEN,
             approximate=True,
         )
-    except (RedisConnectionError, RedisTimeoutError):
-        logger.warning("prio: событие %s не записано (ws-redis недоступен)", type_)
+    except RedisError as exc:
+        # Ф6 TODO 8 (I12/D2): ws-redis — --maxmemory 200mb + noeviction
+        # (compose.workspace.yml); при исчерпании памяти XADD отказывает
+        # OOM'ом (redis-py: OutOfMemoryError/ResponseError — наследники
+        # RedisError), а не Connection/Timeout. Событие — наблюдение:
+        # глотаем ЛЮБОЙ RedisError (лог), submit/узел не валятся.
+        logger.warning(
+            "prio: событие %s не записано (ws-redis: %s)", type_, exc
+        )
 
 
 def _prio_fail_closed(fn: Callable[..., _T]) -> Callable[..., _T]:

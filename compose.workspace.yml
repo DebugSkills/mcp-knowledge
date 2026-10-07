@@ -22,7 +22,10 @@ services:
     restart: unless-stopped
     # I12: AOF-персистентность + noeviction (вытеснение ws:*-сессий недопустимо;
     # при исчерпании памяти контейнера — отказ, а не тихая потеря сессий).
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    # Ф6 TODO 8 (I12/D2) — контролируемый отказ: при mem_limit 256m лимит 200mb
+    # даёт headroom 56m; при исчерпании — noeviction → ошибка записи, не тихая
+    # потеря сессий.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "200mb", "--maxmemory-policy", "noeviction"]
     volumes:
       - ws-redis-data:/data   # AOF переживает пересоздание контейнера
     networks:
