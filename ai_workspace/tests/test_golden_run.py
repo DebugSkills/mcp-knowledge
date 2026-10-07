@@ -155,6 +155,33 @@ def test_golden_run_report_has_all_sections_and_artifact(tmp_path: Path) -> None
     assert exported.exists() and exported.read_text(encoding="utf-8") == result.report_md
 
 
+def test_golden_run_report_has_per_node_usage_and_mode_attribution() -> None:
+    """Ф6-a 6a.1b: секция per-node usage + имя режима в заголовке (не хардкод).
+
+    Коллектор инжектируется обёрткой фабрики внутри ``run_golden`` — фабрика
+    теста ничего о нём не знает (порт ставится на движок пост-сборки).
+    """
+    result = run_golden(RunConfig(), engine_factory=_factory())
+
+    # атрибуция режима: заголовок несёт имя режима из --mode (statya по умолчанию)
+    assert "# Golden-run режима «statya»" in result.report_md
+
+    # секция per-node usage: строка узла analyst (llm-step, heavy→ext → cost в ₽)
+    assert "## Per-node usage" in result.report_md
+    section = result.report_md.split("## Per-node usage", 1)[1]
+    analyst = next(ln for ln in section.splitlines() if ln.startswith("| analyst |"))
+    assert "llm-step" in analyst and "₽" in analyst
+    # local-полка (critic: fast→local): ₽ не определён by design → «—»
+    critic = next(ln for ln in section.splitlines() if ln.startswith("| critic |"))
+    assert "| — |" in critic
+    # порядок строк — как узлы идут в режиме; human-gate не измеряется
+    rows = [ln for ln in section.splitlines()
+            if ln.startswith("| ") and not ln.startswith("| node")]
+    assert [r.split("|")[1].strip() for r in rows] == ["analyst", "critic", "editor", "citer"]
+    # комментарий о GPU-слот-времени для local-полки присутствует
+    assert "GPU-слот-время" in section
+
+
 def test_golden_run_detects_broken_parity() -> None:
     """Мутация: стаб добавляет model-specific строку в промпт → parity падает."""
     class BranchingLLM(StubShelfLLM):

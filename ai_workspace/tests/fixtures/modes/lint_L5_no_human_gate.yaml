@@ -19,6 +19,8 @@ nodes:
   retry: 2
 - id: critic
   kind: critic-gate
+  inputs:
+  - draft
   role: critic
   model_class: fast
   verdicts:

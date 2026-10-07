@@ -74,13 +74,22 @@ class DecodingPin:
     temperature: float = 0.0
     seed: int | None = 42
     thinking: bool = False
+    max_output_tokens: int = 2048
+    """Потолок генерации (Ф6-a 6a.1): консервативный дефолт, ЕДИНЫЙ для обеих
+    полок — это decoding-pin, per-node ветки запрещены (parity T/I)."""
 
     def as_params(self) -> dict[str, Any]:
-        return {"temperature": self.temperature, "seed": self.seed, "thinking": self.thinking}
+        return {
+            "temperature": self.temperature,
+            "seed": self.seed,
+            "thinking": self.thinking,
+            "max_output_tokens": self.max_output_tokens,
+        }
 
 
 DECODING_PIN = DecodingPin()
-"""Канонический пин: temp=0, seed=42, thinking=off (ассерты воспроизводимы)."""
+"""Канонический пин: temp=0, seed=42, thinking=off, max_output_tokens=2048
+(ассерты воспроизводимы)."""
 
 
 def assert_decoding_pin(params: Mapping[str, Any], *, pin: DecodingPin = DECODING_PIN) -> None:

@@ -1,4 +1,4 @@
-"""Golden-run режима «статья» (Ф3.10): T/I/Q-прогон + отчёт для Critic-вердикта.
+"""Golden-run режима (по ``--mode``): T/I/Q-прогон + отчёт для Critic-вердикта.
 
 Запуск: ``python -m ai_workspace.tools.golden_run [--golden PATH] [--out DIR] [--report PATH]``
 (или ``make golden-run``). Выход: ``0`` — гейт пройден, ``1`` — нарушение T/I
@@ -35,6 +35,7 @@ from ai_workspace import conformance as cf
 from ai_workspace.artifacts import ArtifactStore, MemoryBackend
 from ai_workspace.orchestrator.engine import ModeEngine, load_mode
 from ai_workspace.registry import Registry
+from ai_workspace.registry.pricing import MICRO_PER_UNIT, PricingRegistry
 
 AI_WORKSPACE_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = AI_WORKSPACE_DIR.parent
@@ -95,6 +96,32 @@ class StubMCP:
         return {"tool": tool, "refs": ["src-0123456789abcdef"]}
 
 
+class NodeUsageCollector:
+    """Коллектор событий ``on_node_usage`` текущего golden-прогона (Ф6-a 6a.1).
+
+    Копит события ВСЕХ движков прогона (parity + Q + негативные) по узлам;
+    таблица отчёта идёт по порядку первого появления узла — это порядок, в
+    котором узлы идут в режиме (human-gate не эмитируется). Агрегаты
+    ``usage:{node}`` из ledger не дублируются — коллектора достаточно.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    def observe(self, event: dict[str, Any]) -> None:
+        """Принять событие движка (движок вызывает best-effort)."""
+        self.events.append(dict(event))
+
+    def attach(self, engine: ModeEngine) -> ModeEngine:
+        """Инжекция коллектора при сборке движка (порт — публичный атрибут).
+
+        Ставится обёрткой фабрики в ``run_golden`` на КАЖДЫЙ движок прогона —
+        включая кастомные фабрики тестов (без смены их сигнатуры).
+        """
+        engine.on_node_usage = self.observe
+        return engine
+
+
 EngineFactory = Callable[[str, str, ArtifactStore, str, str, Path], ModeEngine]
 """Фабрика движка: (полка, job_id, artifact-store, стаб-ответ, zone, путь режима)."""
 
@@ -128,6 +155,59 @@ class GoldenRunResult:
 def _coverage(answer: str, keywords: Sequence[str]) -> float:
     low = answer.lower()
     return sum(1 for k in keywords if k.lower() in low) / len(keywords)
+
+
+def _per_node_rows(collector: NodeUsageCollector, pricing: PricingRegistry) -> list[str]:
+    """Строки таблицы per-node usage: суммы событий по узлам режима.
+
+    - ``cost`` — ТОЛЬКО полка ``ext``: ``price_for("ext").cost_micro`` по
+      ``registry/pricing``. Для ``local`` прайса нет by design и
+      ``price_for("local")`` НЕ вызывается (fail-loud: отчёт не должен
+      падать на полке без прайса) — колонка «—», единица local-полки —
+      GPU-слот-время (``wall_s``).
+    - токены in/out для прайса — оценка свежих (не кэш) вызовов по той же
+      эвристике движка ~4 симв/токен; кэш-попадание LLM не вызывает →
+      денег не тратит (в ``tokens`` таких вызовов 0).
+    """
+    order: list[str] = []
+    rows: dict[str, dict[str, Any]] = {}
+    for ev in collector.events:
+        node = str(ev["node"])
+        if node not in rows:
+            order.append(node)
+            rows[node] = {
+                "kind": ev["kind"], "role": ev["role"], "model_class": ev["model_class"],
+                "shelf": ev["shelf"], "calls": 0, "cached": 0, "tokens": 0,
+                "prompt_chars": 0, "output_chars": 0, "wall_s": 0.0,
+                "fresh_in_chars": 0, "fresh_out_chars": 0,
+            }
+        row = rows[node]
+        row["calls"] += 1
+        row["cached"] += 1 if ev["cached"] else 0
+        row["tokens"] += int(ev["tokens"])
+        row["prompt_chars"] += int(ev["prompt_chars"])
+        row["output_chars"] += int(ev["output_chars"])
+        row["wall_s"] += float(ev["wall_s"])
+        if not ev["cached"]:
+            row["fresh_in_chars"] += int(ev["prompt_chars"])
+            row["fresh_out_chars"] += int(ev["output_chars"])
+
+    lines: list[str] = []
+    for node in order:
+        r = rows[node]
+        if r["shelf"] == "ext":
+            micro = pricing.price_for("ext").cost_micro(
+                (r["fresh_in_chars"] + 3) // 4, (r["fresh_out_chars"] + 3) // 4,
+            )
+            cost = f"{micro / MICRO_PER_UNIT:.4f} ₽"
+        else:
+            cost = "—"  # local: ₽ не определён by design
+        lines.append(
+            f"| {node} | {r['kind']} | {r['role'] or '—'} | {r['model_class'] or '—'} "
+            f"| {r['shelf']} | {r['calls']} | {r['cached']} | {r['tokens']} "
+            f"| {r['prompt_chars']} | {r['output_chars']} | {cost} | {r['wall_s']:.4f} |"
+        )
+    return lines
 
 
 def _run_pipeline(
@@ -192,6 +272,19 @@ def run_golden(config: RunConfig, *, engine_factory: EngineFactory) -> GoldenRun
     artifacts = ArtifactStore(MemoryBackend())
     q_report = cf.QReport(min_runs=int(golden.get("min_runs", config.min_runs)))
     pin_violations: list[str] = []
+    mode_name = config.mode.stem  # атрибуция отчёта: имя режима, не хардкод
+    pricing = PricingRegistry(Registry(AI_WORKSPACE_DIR / "registry"))
+    usage = NodeUsageCollector()
+    raw_factory = engine_factory
+
+    def observed_factory(
+        shelf: str, job_id: str, artifacts: ArtifactStore, answer: str,
+        zone: str, mode_path: Path,
+    ) -> ModeEngine:
+        """Сборка движка с инжекцией on_node_usage-коллектора (Ф6-a 6a.1b)."""
+        return usage.attach(raw_factory(shelf, job_id, artifacts, answer, zone, mode_path))
+
+    engine_factory = observed_factory
 
     # ── I: parity на ОДИНАКОВЫХ стаб-ответах (промпты model-agnostic) ──
     parity: dict[str, cf.ParityReport] = {}
@@ -269,8 +362,9 @@ def run_golden(config: RunConfig, *, engine_factory: EngineFactory) -> GoldenRun
     artifact_id: str | None = None
     export_path = ""
     sections = [
-        "# Golden-run «статья» (Ф3.10)",
+        f"# Golden-run режима «{mode_name}»",
         "",
+        f"- Режим: `{config.mode.name}` (атрибуция: имя режима из --mode)",
         f"- Golden-set: `{config.golden.name}` (version {golden.get('version')}), N={q_report.min_runs} на полку",
         "- Провайдеры: **детерминированные стабы полок** (валидируется контур; живой прогон — шаг прода, Ф6)",
         f"- Decoding-pin: {cf.DECODING_PIN.as_params()}",
@@ -312,6 +406,19 @@ def run_golden(config: RunConfig, *, engine_factory: EngineFactory) -> GoldenRun
         f"- Зон: private-задания идут только на local; нарушений зонного гейта: {len(zone_violations)}"
         + (f" — {zone_violations}" if zone_violations else ""),
         "",
+        "## Per-node usage",
+        "",
+        "События `on_node_usage` (Ф6-a 6a.1) всех движков прогона, сгруппированы по узлам;",
+        "порядок строк — как узлы идут в режиме. `cached` — попадания в fx-кэш (LLM не",
+        "вызывался: `tokens` за такой вызов 0).",
+        "",
+        "| node | kind | role | model_class | shelf | calls | cached | tokens | prompt_chars | output_chars | cost | wall_s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        *_per_node_rows(usage, pricing),
+        "",
+        "local: ₽ не определён by design, единица — GPU-слот-время (`wall_s`);",
+        "`cost` (₽) — только полка `ext` по `registry/pricing` (`price_for`).",
+        "",
         "## Не покрыто (чек-лист Ф6, по ревью критика)",
         "- живые провайдеры (LiteLLM local/ext): wire-параметры, gateway-трансформации промптов;",
         "- REVISE-петля критика и `max_iterations` (стаб всегда PASS), retry узлов;",
@@ -323,8 +430,8 @@ def run_golden(config: RunConfig, *, engine_factory: EngineFactory) -> GoldenRun
     if config.out_dir is not None:
         config.out_dir.mkdir(parents=True, exist_ok=True)
         record = artifacts.save(
-            report_md, user="golden-run", job_id="Ф3.10",
-            type="golden-report", zone="public", title="Ф3.10 golden-run «статья»",
+            report_md, user="golden-run", job_id=f"golden-run-{mode_name}",
+            type="golden-report", zone="public", title=f"golden-run «{mode_name}»",
         )
         artifact_id = record.id
         export_path = str(artifacts.export("golden-run", record.id, config.out_dir))
@@ -376,7 +483,9 @@ def _default_engine_factory(config: RunConfig) -> EngineFactory:
 
 def main(argv: list[str] | None = None) -> int:
     """CLI golden-run: пишет отчёт в файл; 0 — T/I пройдены, 1 — нарушение."""
-    parser = argparse.ArgumentParser(prog="golden-run", description="Golden-run «статья» (Ф3.10)")
+    parser = argparse.ArgumentParser(
+        prog="golden-run", description="Golden-run режима (T/I/Q; режим — по --mode)",
+    )
     parser.add_argument("--golden", type=Path, default=DEFAULT_GOLDEN)
     parser.add_argument("--mode", type=Path, default=DEFAULT_MODE)
     parser.add_argument("--private-mode", type=Path, default=DEFAULT_PRIVATE_MODE)

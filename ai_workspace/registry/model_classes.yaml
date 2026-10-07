@@ -1,6 +1,13 @@
 # Классы моделей (спека §2): heavy/fast — полка LiteLLM + шейпинг + ретраи
 # (полки плана Ф1: local/ext); local-only — НЕ полка, а маркер зонного правила
 # (I5: private -> только local, fallback выключен).
+#
+# shaping (Ф6-a 6a.3, читается engine._prompt):
+#   full-context — секции-входы идут в промпт как есть;
+#   compressed   — каждая секция-вход сжимается до max_chars_per_section
+#                  по схеме «голова+хвост» с маркером […срезано N% …];
+#                  контракт роли и хедер # РОЛЬ/# УЗЕЛ НЕ сжимаются никогда;
+#                  секция в пределах бюджета — байт-в-байт без маркера (no-op).
 heavy:
   shelf: ext
   shaping: full-context
@@ -8,6 +15,9 @@ heavy:
 fast:
   shelf: local
   shaping: compressed
+  # PLACEHOLDER (Ф6-a 6a.3): стартовый бюджет сжатия секции для compressed;
+  # калибровка по живому пилоту позже — см. plans/_provenance/…/Ф6a-3-shaping-check.md
+  max_chars_per_section: 4000
   retries: 1
 local-only:
   rule: zone

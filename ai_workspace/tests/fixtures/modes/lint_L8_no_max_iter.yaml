@@ -22,6 +22,8 @@ nodes:
   retry: 2
 - id: critic
   kind: critic-gate
+  inputs:
+  - draft
   role: critic
   model_class: fast
   verdicts:
@@ -39,6 +41,8 @@ nodes:
   - document
 - id: citer
   kind: tool-step
+  inputs:
+  - document
   tool: mcp.citation_attach
   policy: strict
   outputs:
