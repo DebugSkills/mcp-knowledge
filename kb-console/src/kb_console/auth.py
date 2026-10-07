@@ -27,8 +27,10 @@ kb-console-roles Ф2 (B2), middleware v2 — per-user Basic поверх 002:
     админ-вход запрещён).
 
 035, middleware v3 — cookie-сессия + allowlist + ревалидация (план §3):
-  - без аутентификации доступны РОВНО 3 пути: /healthz (033-F3), /login
-    (GET, статический HTML), /api/login (POST, rate-limit в login_page);
+  - без аутентификации доступны РОВНО: /healthz (033-F3), /login (GET,
+    статический HTML), /api/login (POST, rate-limit в login_page),
+    /api/access-request (POST, 036), /metrics (GET, Ф6 4б — Prometheus
+    scrape ws-метрик);
     /_nicegui/ и /_nicegui_ws/ — ВСЕГДА за аутентификацией (least
     privilege, P2-1; favicon = data-URI);
   - приоритет источников: cookie-сессия → Basic → отказ. Cookie-identity
@@ -88,6 +90,10 @@ _API_LOGIN_PATH = "/api/login"
 _API_ACCESS_REQUEST_PATH = "/api/access-request"
 """Публичная заявка на доступ (036 §3): только POST в allowlist —
 метод-специфично; GET этого пути остаётся в XHR-ветке → 401 JSON."""
+
+_METRICS_PATH = "/metrics"
+"""Prometheus-exposition метрик ws-контура (Ф6 TODO 4б, К4): только GET в
+allowlist — метод-специфично (как /api/access-request); scrape без кредов."""
 
 _API_PREFIXES = ("/api/", "/_nicegui_ws/")
 """Пути, всегда классифицируемые как XHR/API (401 JSON, не 302)."""
@@ -268,8 +274,9 @@ class ConsoleAuthMiddleware:
         path = scope.get("path", "") or "/"
         method = scope.get("method", "GET").upper()
 
-        # 035 §3а-1 + 036 §3: анонимный allowlist — РОВНО 4 пути (счётность;
-        # последний метод-специфичен: только POST /api/access-request).
+        # 035 §3а-1 + 036 §3 + Ф6 4б: анонимный allowlist — РОВНО 5 путей
+        # (счётность; метод-специфичные: POST /api/access-request,
+        # GET /metrics — strict-равенство, /metrics/ идёт в отказ).
         if scope_type == "http":
             if path == _LOGIN_PATH and method == "GET":
                 await self.app(scope, receive, send)
@@ -278,6 +285,9 @@ class ConsoleAuthMiddleware:
                 await self.app(scope, receive, send)
                 return
             if path == _API_ACCESS_REQUEST_PATH and method == "POST":
+                await self.app(scope, receive, send)
+                return
+            if path == _METRICS_PATH and method == "GET":
                 await self.app(scope, receive, send)
                 return
 

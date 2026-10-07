@@ -383,8 +383,9 @@ def _ident(store, username: str = "alice", role: str = "editor") -> dict:
 
 
 class TestAllowlistV3:
-    """Контракт §3а: без аутентификации доступны РОВНО 3 пути (+favicon data-URI
-    в самом HTML — /favicon.ico не существует и не запрашивается)."""
+    """Контракт §3а (+036, +Ф6 4б): анонимно доступны /login GET,
+    /api/login POST, /api/access-request POST, /metrics GET (+inline
+    /healthz до enabled-ветки; favicon — data-URI в самом HTML)."""
 
     def test_login_get_allowed_without_auth(self):
         mw, stub = _make_mw()

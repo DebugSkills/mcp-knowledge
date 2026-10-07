@@ -220,6 +220,13 @@ from .documents_proxy import register_documents_proxy
 
 register_documents_proxy(core.app)
 
+# Ф6 TODO 4б (К4): GET /metrics — Prometheus-exposition метрик ws-контура
+# (ws:metrics:* + Gauges очередей/slots/lease из ws-redis). Анонимный scrape —
+# метод-специфичный allowlist GET в ConsoleAuthMiddleware (auth.py).
+from .ws_metrics import register_metrics_route
+
+register_metrics_route(core.app)
+
 # 035 §3б: секрет подписи cookie-сессий (env → файл в volume → ephemeral)
 # и ЯВНЫЕ параметры cookie: абсолютные 12ч (дефолт Starlette 14 суток
 # отклонён), SameSite=Lax, https_only=False — двойной контур доступа

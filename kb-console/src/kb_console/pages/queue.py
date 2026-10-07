@@ -36,6 +36,12 @@ Fail-soft: у операторской консоли ``WS_REDIS_URL`` НЕ за
 
 R6: ``components/queue_console.py`` — витрина ИМПОРТ-очереди KB; здесь
 общего только слово «очередь» — НЕ переиспользуется и не смешивается.
+
+Ф6 TODO 4б (К4): внизу страницы — блок «Метрики узлов» (счётчики
+``ws:metrics:*``: calls/cached/tokens по лейблам {kind, model_class,
+shelf, role} + ``usage_fallback_total``). Состояние НЕ дублируется в
+памяти: носитель — Redis, перечитывается каждым обновлением таймера;
+сбой метрик — отдельный fail-soft (НЕ роняет панель очередей).
 """
 
 from __future__ import annotations
@@ -49,6 +55,7 @@ from nicegui import ui
 
 from ..core.identity import current_actor, current_role
 from ..core.redis_client import make_ws_redis
+from ..ws_metrics import fetch_ws_metrics_snapshot
 
 REFRESH_SECONDS = 2.0
 """Авто-обновление панели (паттерн status.py / import_page.py:227-237)."""
@@ -429,6 +436,23 @@ def _clear_priority_from_ui(
         on_refresh()
 
 
+def _refresh_metrics(state: dict[str, Any]) -> None:
+    """Ф6 4б: собрать метрики ws:metrics:* в state (отдельный fail-soft).
+
+    Сбой метрик НЕ трогает snapshot очередей (``error`` остаётся про
+    очередь): панель показывает предупреждение с КЛАССОМ ошибки (без
+    host:port — гигиена core/redis_client.py) и живёт до следующего
+    тика таймера.
+    """
+    try:
+        client = state["client"] or make_ws_redis()
+        state["metrics"] = fetch_ws_metrics_snapshot(client)
+        state["metrics_error"] = None
+    except Exception as exc:  # fail-soft витрина метрик — см. выше
+        state["metrics"] = None
+        state["metrics_error"] = type(exc).__name__
+
+
 # ── UI: страница ───────────────────────────────────────────────────────
 
 
@@ -586,13 +610,92 @@ def _render(
                         ).props("flat")
 
 
+    _render_metrics(state)
+
+
+def _render_metrics(state: dict[str, Any]) -> None:
+    """Ф6 4б (К4): карточка метрик узлов — таблица calls/cached/tokens по
+    лейблам + счётчик usage_fallback_total. Простой блок: одна таблица,
+    без агрегаций/графиков (nosherie — носитель К4 это /metrics и Redis)."""
+    metrics = state.get("metrics")
+    with ui.card().classes("w-full q-mb-md"):
+        ui.label("Метрики узлов ws-контура (ws:metrics)").classes("text-h6")
+        if metrics is None:
+            ui.label(
+                f"⚠ Метрики недоступны ({state.get('metrics_error')}) — "
+                "обновление продолжится"
+            ).classes("text-orange")
+        elif not metrics["nodes"]:
+            ui.label(
+                "Метрик узлов ещё нет — движок не писал ws:metrics:* "
+                "(счётчики появятся после golden-run/интеграций)"
+            ).classes("text-grey")
+        else:
+            columns = [
+                {"name": "kind", "label": "kind", "field": "kind", "align": "left"},
+                {
+                    "name": "model_class",
+                    "label": "model_class",
+                    "field": "model_class",
+                    "align": "left",
+                },
+                {"name": "shelf", "label": "shelf", "field": "shelf", "align": "left"},
+                {"name": "role", "label": "role", "field": "role", "align": "left"},
+                {
+                    "name": "calls",
+                    "label": "calls",
+                    "field": "calls",
+                    "align": "right",
+                },
+                {
+                    "name": "cached",
+                    "label": "cached",
+                    "field": "cached",
+                    "align": "right",
+                },
+                {
+                    "name": "tokens",
+                    "label": "tokens",
+                    "field": "tokens",
+                    "align": "right",
+                },
+            ]
+            rows = [
+                {
+                    k: node[k]
+                    for k in (
+                        "kind",
+                        "model_class",
+                        "shelf",
+                        "role",
+                        "calls",
+                        "cached",
+                        "tokens",
+                    )
+                }
+                for node in metrics["nodes"]
+            ]
+            ui.table(columns=columns, rows=rows).classes("w-full")
+        fallback = metrics["usage_fallback"] if metrics is not None else None
+        ui.label(
+            "Счётчик fallback-оценок токенов chars/4 (usage_fallback_total): "
+            f"{fallback if fallback is not None else '—'}"
+        ).classes("text-caption text-grey")
+
+
 def build_queue() -> None:
     """Построить страницу «Очередь» (панель ws-контура).
 
     Чтение — для всех ролей страницы (min_role contributor); запись
     приоритета — только admin (гейт в render → _render can_manage).
     """
-    state: dict[str, Any] = {"client": None, "snapshot": None, "error": None}
+    state: dict[str, Any] = {
+        "client": None,
+        "snapshot": None,
+        "error": None,
+        "metrics": None,
+        "metrics_error": None,
+    }
     _refresh_timer: ui.timer | None = None
 
     @ui.refreshable
@@ -613,6 +716,7 @@ def build_queue() -> None:
         except Exception as exc:  # fail-soft панель — см. докстринг модуля
             state["snapshot"] = None
             state["error"] = type(exc).__name__
+        _refresh_metrics(state)
 
     def refresh() -> None:
         _refresh_data()
