@@ -1,9 +1,15 @@
 # =============================================================================
 # compose.airgap.yml — air-gap overlay для ws-стека (workspace + ws-redis + litellm)
-# Трасса: arch-2026-10-05-ai-workspace · Ф6 TODO 6 (код-часть: air-gap overlay)
+# Трасса: arch-2026-10-05-ai-workspace · Ф6 TODO 6 (код-часть: air-gap overlay) · TODO 7 (overlay по тегу)
 #
 # НАЗНАЧЕНИЕ: подъём ws-стека на air-gap узле из образов бандла БЕЗ сборки,
-# с жёстким пиннингом внешних образов по digest (tag@sha256).
+# со ссылками на внешние образы по тегам (строгий digest-пин — manifest + pin-verify).
+#
+# Форма пинов (решение оператора, TODO 7): overlay ссылается по ТЕГУ — на узле
+# с overlayfs `repo@digest` не разрешается после `docker load` (dangling,
+# `error: no such object`); строгая проверка «именно pinned» живёт в `manifest.json`
+# (`images[].id/.digest`) и в pin-verify на узле: ID/digest образа ↔ manifest.
+# Сам `@digest` сохранён в комментарии рядом с тегом (справочно).
 #
 # Применение — overlay ДОПОЛНЯЕТ два файла, сами сервисы живут в них
 # (compose.workspace.yml: workspace, ws-redis; compose.gateway.yml: litellm);
@@ -16,10 +22,12 @@
 
 services:
   ws-redis:
-    image: redis:7-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    # digest-пин (справочно): redis:7-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08
+    image: redis:7-alpine
 
   litellm:
-    image: ghcr.io/berriai/litellm:main-stable@sha256:625981c83410a3ea68eb0697590a57ec1d764d634514d54fa5db0591077ee839
+    # digest-пин (справочно): ghcr.io/berriai/litellm:main-stable@sha256:625981c83410a3ea68eb0697590a57ec1d764d634514d54fa5db0591077ee839
+    image: ghcr.io/berriai/litellm:main-stable
 
   workspace:
     image: kb-console:prod
