@@ -1,0 +1,80 @@
+# Режим «исследование» — drop-in-режим AI-верстака (Ф5): исследовательский документ.
+# Схема: спека mode-engine §1; самопроверка: `make modes-validate` (S1–S8 + L1–L11).
+#
+# Контракт document, тип выхода research; shape analyst-critic-researcher (роль researcher
+# уже в registry/roles.yaml — seed_skill doc-collector). Два human-gate (HITL-first):
+#   structure — утверждение структуры: approve → critic, edit → analyst;
+#   publish   — утверждение публикации: approve → финал, edit → researcher (правка текста).
+# Ревизионная петля критика: critic->analyst разрешена ТОЛЬКО как on_revise (max_iterations: 3).
+# L11: промпты model-agnostic — prompt_overrides пуст, модели нигде не упоминаются.
+id: issledovanie
+version: 1
+shape: analyst-critic-researcher
+contract: document
+zone: public
+output: {type: research, citation_policy: required, sections: [document, document+refs]}
+board: {buffer: board.md, store: job}
+nodes:
+  - id: analyst
+    kind: llm-step
+    role: analyst
+    model_class: heavy
+    inputs: [brief]
+    outputs: [draft]
+    writes: [draft]
+    retry: 2
+  - id: structure
+    kind: human-gate
+    actor: operator
+    prompt: "Утвердить структуру исследования?"
+    timeout: 24h
+    on_timeout: sleep
+    on_approve: critic
+    on_edit: analyst
+    writes: [structure]
+  - id: critic
+    kind: critic-gate
+    role: critic
+    model_class: fast
+    inputs: [draft]
+    verdicts: [PASS, REVISE]
+    threshold: 0.80
+    max_iterations: 3
+    on_max_iter: fail
+    on_revise: analyst
+    writes: [verdict]
+  - id: researcher
+    kind: llm-step
+    role: researcher
+    model_class: heavy
+    inputs: [draft, verdict]
+    outputs: [document]
+    writes: [document]
+    retry: 2
+  - id: citer
+    kind: tool-step
+    tool: mcp.citation_attach
+    policy: strict
+    inputs: [document]
+    outputs: [document+refs]
+    writes: [document+refs]
+  - id: publish
+    kind: human-gate
+    actor: operator
+    prompt: "Утвердить исследование к публикации?"
+    timeout: 24h
+    on_timeout: sleep
+    on_approve: null
+    on_edit: researcher
+    writes: [publish]
+edges:
+  - analyst->structure
+  - structure->critic
+  - critic|PASS->researcher
+  - critic->analyst
+  - researcher->citer
+  - citer->publish
+gates:
+  structure: {type: human, blocks_output: false}
+  publish: {type: human, blocks_output: true}
+tools: [mcp.search_knowledge, mcp.get_entry, mcp.citation_attach]
