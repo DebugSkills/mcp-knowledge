@@ -22,6 +22,8 @@ make push    # preflight → git push --no-verify → deploy → verify-deploy
 
 `--no-verify` здесь безопасен: preflight уже прогнан первым шагом цели `push`, а повторный запуск в pre-push хуке — это лишние ~4–5 мин. `verify-deploy` (`scripts/verify-deploy.sh`, выход = число упавших) проверяет: `/health` :8000 (status=healthy + reconcile без error) · логи `mcp-knowledge-server` (0 строк error/traceback/critical) · MCP `tools/list` (≥30, read-ключ из `.env`, не печатается) · консоль :8085 auth-aware (`CONSOLE_AUTH=required` → 401+WWW-Authenticate без кредов и 200 с паролем; auth off → 200). Если verify-deploy падает, `make push` явно сообщает: **код уже запушен, стек требует внимания**.
 
+**Новый host-скрипт `scripts/*.py` → строка в реестре E5.** Любой добавленный скрипт в `scripts/` обязан иметь строку в `docs/operations/error-sources.md` (механизм сбора **или** `gap`-строка с причиной) — иначе preflight падает на **G4/G5** (`tests/test_error_sources.py::test_all_markers_covered`, fail-closed). Забытая строка = блокировка `make push` на ~7 мин. Прецедент 07.10.2026: `make push` упал на 4 незадокументированных скриптах Ф4 (`quotas_set.py`, `ws_prio.py`, `ws_quota_sweep.py`, `ws_budget_reconcile.py`) → фикс `fa45f68`.
+
 **Быстрый режим для config/docs-правок** (без изменения кода):
 
 ```bash
