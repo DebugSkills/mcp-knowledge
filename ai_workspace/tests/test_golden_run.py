@@ -171,9 +171,12 @@ def test_golden_run_report_has_per_node_usage_and_mode_attribution() -> None:
     section = result.report_md.split("## Per-node usage", 1)[1]
     analyst = next(ln for ln in section.splitlines() if ln.startswith("| analyst |"))
     assert "llm-step" in analyst and "₽" in analyst
-    # local-полка (critic: fast→local): ₽ не определён by design → «—»
+    # critic на heavy (protected-принцип, L14): полка ext → стоимость в ₽
     critic = next(ln for ln in section.splitlines() if ln.startswith("| critic |"))
-    assert "| — |" in critic
+    assert "₽" in critic and "| — |" not in critic
+    # local-полка без LLM (citer: tool-step): ₽ не определён by design → «—»
+    citer = next(ln for ln in section.splitlines() if ln.startswith("| citer |"))
+    assert "| — |" in citer
     # порядок строк — как узлы идут в режиме; human-gate не измеряется
     rows = [ln for ln in section.splitlines()
             if ln.startswith("| ") and not ln.startswith("| node")]

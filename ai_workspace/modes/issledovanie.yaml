@@ -35,7 +35,7 @@ nodes:
   - id: critic
     kind: critic-gate
     role: critic
-    model_class: fast
+    model_class: heavy
     inputs: [draft]
     verdicts: [PASS, REVISE]
     threshold: 0.80

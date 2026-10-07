@@ -22,7 +22,7 @@ nodes:
   inputs:
   - draft
   role: critic
-  model_class: fast
+  model_class: heavy
   verdicts:
   - PASS
   - REVISE

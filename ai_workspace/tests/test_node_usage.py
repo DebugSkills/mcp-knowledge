@@ -80,7 +80,7 @@ def test_on_node_usage_collects_events_per_node() -> None:
 
     c = by_node["critic"]
     assert c["kind"] == "critic-gate" and c["role"] == "critic"
-    assert c["model_class"] == "fast" and c["tokens"] > 0
+    assert c["model_class"] == "heavy" and c["tokens"] > 0
 
     t = by_node["citer"]
     assert t["kind"] == "tool-step" and t["cached"] is False
@@ -134,7 +134,7 @@ def test_ledger_persists_per_node_usage_aggregates() -> None:
         assert agg["prompt_chars"] >= 0 and agg["output_chars"] >= 0
         assert agg["wall_s_last"] >= 0 and agg["shelf"] == "local"
     critic_agg = engine.ledger.get("j1", "usage:critic")
-    assert critic_agg["role"] == "critic" and critic_agg["model_class"] == "fast"
+    assert critic_agg["role"] == "critic" and critic_agg["model_class"] == "heavy"
     # агрегат и событие сходятся по токенам единственного вызова
     critic_event = next(e for e in events if e["node"] == "critic")
     assert critic_agg["tokens"] == critic_event["tokens"]

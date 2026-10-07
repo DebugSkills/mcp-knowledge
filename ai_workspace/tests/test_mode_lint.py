@@ -1,4 +1,4 @@
-"""Offline-тесты линт-правил L1–L13 (Ф3.5a-3, L11 — Ф3.9, L13 — Ф6-a 6a.4).
+"""Offline-тесты линт-правил L1–L14 (Ф3.5a-3, L11 — Ф3.9, L13 — Ф6-a 6a.4; L14 — protected-принцип критика).
 
 Невакуумность: на каждый код — свой фикстур-нарушитель (ровно один код);
 валидный режим даёт пустой список; отдельные inline-мутации покрывают
@@ -60,6 +60,7 @@ def test_valid_mode_is_clean(registry: Registry):
         ("lint_L10_double_writer.yaml", "L10"),
         ("lint_L11_model_specific.yaml", "L11"),
         ("lint_L13_fork_join_unsupported.yaml", "L13"),
+        ("lint_L14_critic_on_fast.yaml", "L14"),
     ],
 )
 def test_each_rule_fires_exactly_its_code(registry: Registry, fixture: str, code: str):
@@ -97,6 +98,36 @@ def test_l13_message_points_to_engine_and_plan(registry: Registry):
     assert "узел 'fan' (kind=fork) не поддержан движком (engine.py:548)" in msgs["nodes.fan"]
     assert "plans/arch-2026-10-05-ai-workspace-f6a4-plan.md" in msgs["nodes.fan"]
     assert "узел 'merge' (kind=join) не поддержан движком (engine.py:548)" in msgs["nodes.merge"]
+
+
+def test_l14_message_names_protected_principle(registry: Registry):
+    """L14: сообщение называет слабый класс, сильный класс и зонную альтернативу."""
+    findings = validate_lint(
+        _load(FIXTURES / "lint_L14_critic_on_fast.yaml"),
+        registry,
+        base_dir=REPO_ROOT,
+    )
+    l14 = [f for f in findings if f.code == "L14"]
+    assert len(l14) == 1, f"ожидался ровно один L14, получено {[f.code for f in findings]}"
+    assert l14[0].path == "nodes.critic.model_class"
+    assert "critic-gate на слабом классе `fast`" in l14[0].message
+    assert "`heavy` (protected-принцип)" in l14[0].message
+    assert "класс `local-only`" in l14[0].message
+
+
+def test_l14_allows_heavy_and_local_only(registry: Registry):
+    """L14: heavy (public) и local-only (private) легальны; fast — ошибка."""
+    doc = _load(VALID)
+    critic = next(n for n in doc["nodes"] if n.get("kind") == "critic-gate")
+    critic["model_class"] = "fast"
+    assert "L14" in _codes(doc, registry)
+    critic["model_class"] = "heavy"
+    assert "L14" not in _codes(doc, registry)
+    doc["zone"] = "private"  # зонный режим I5: всем узлам local-only
+    for n in doc["nodes"]:
+        if n.get("model_class"):
+            n["model_class"] = "local-only"
+    assert "L14" not in _codes(doc, registry)
 
 
 def test_valid_fixtures_do_not_fire_l13(registry: Registry):

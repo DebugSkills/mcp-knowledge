@@ -1,11 +1,11 @@
-"""Runtime lint L1-L13 для режимов AI-верстака (Ф3.5a-3; L11 — Ф3.9; L12 — Ф6-a 6a.3; L13 — Ф6-a 6a.4).
+"""Runtime lint L1-L14 для режимов AI-верстака (Ф3.5a-3; L11 — Ф3.9; L12 — Ф6-a 6a.3; L13 — Ф6-a 6a.4; L14 — protected-принцип критика).
 
 Спека: plans/_provenance/arch-2026-10-05-ai-workspace/
        arch-2026-10-05-ai-workspace-mode-engine-spec.md §4б.
 
 Контракт: ``validate_lint(doc, registry, *, base_dir) -> list[Finding]``;
 ``Finding`` реиспользуется из ``mode_schema``; все severity — ``error``,
-коды ``L1..L13``. Каждое правило — чистая функция (кроме L2, читающей ФС).
+коды ``L1..L14``. Каждое правило — чистая функция (кроме L2, читающей ФС).
 
 Правила:
   L1  DAG ацикличен (цикл допустим только у critic-gate с on_revise+max_iterations)
@@ -21,6 +21,7 @@
   L11 промпты model-agnostic: пустой prompt_overrides, нет упоминаний моделей
   L12 inputs объявлен и непуст у узлов-потребителей (llm/tool/critic-gate)
   L13 kind=fork/join не поддержан движком до Ф3 (engine.py:548)
+  L14 critic-gate не на слабом классе: fast запрещён (heavy/local-only)
 """
 
 from __future__ import annotations
@@ -70,14 +71,14 @@ def _effective_outputs(node: dict) -> set[str]:
 
 
 def validate_lint(doc: dict, registry: Any, *, base_dir: Path | None = None) -> list[Finding]:
-    """Запустить L1-L13; вернуть список Finding (severity=error)."""
+    """Запустить L1-L14; вернуть список Finding (severity=error)."""
     findings: list[Finding] = []
     # L13 выполняется ПЕРЕД L9 (Ф6-a 6a.4): «не поддержано движком» должно
     # идти раньше «не сбалансированы» — порядок findings детерминирован.
     for fn in (
         lint_l1, lint_l2, lint_l3, lint_l4, lint_l5,
         lint_l6, lint_l7, lint_l8, lint_l13, lint_l9,
-        lint_l10, lint_l11, lint_l12,
+        lint_l10, lint_l11, lint_l12, lint_l14,
     ):
         findings.extend(fn(doc, registry, base_dir))
     return findings
@@ -401,4 +402,26 @@ def lint_l12(doc: dict, registry: Any, base_dir: Path | None) -> list[Finding]:
             "движок подставит весь борд; задайте явный список секций",
             f"nodes.{node.get('id')}.inputs",
         ))
+    return out
+
+def lint_l14(doc: dict, registry: Any, base_dir: Path | None) -> list[Finding]:
+    """critic-gate не на слабом классе (protected-принцип).
+
+    Вердикт качества (PASS/REVISE) выносит сильная модель: ``fast``
+    (compressed-шейпинг, локальная полка) занижает качество вердикта.
+    Допустимы ``heavy`` (public) и ``local-only`` (private, зонное
+    правило I5); ``fast`` — ошибка дизайна режима.
+    """
+    out: list[Finding] = []
+    for node in _nodes(doc):
+        if node.get("kind") != "critic-gate":
+            continue
+        if node.get("model_class") == "fast":
+            out.append(_f(
+                "L14",
+                "critic-gate на слабом классе `fast`: вердикт качества выносит "
+                "`heavy` (protected-принцип); для приватных режимов используйте "
+                "класс `local-only`",
+                f"nodes.{node.get('id')}.model_class",
+            ))
     return out
