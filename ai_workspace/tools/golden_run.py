@@ -504,8 +504,11 @@ def _default_engine_factory(config: RunConfig) -> EngineFactory:
             registry=registry,
             decoding=cf.DECODING_PIN,
             # Ф6 TODO 2/К1: трейс узлов → ws:quota:events (единый стрим
-            # приёмки; коллектор отчёта ДОПОЛНЯЕТ подписчика — observed_factory)
-            on_node_usage=make_on_node_usage(client),
+            # приёмки; коллектор отчёта ДОПОЛНЯЕТ подписчика — observed_factory).
+            # Ф6 TODO 3/F3: store= — склейка session↔job: session_id/turn_id
+            # из job.meta доносятся до node-события (job без meta → эмит
+            # без изменений, обратная совместимость).
+            on_node_usage=make_on_node_usage(client, store=jobs),
         )
 
     return factory

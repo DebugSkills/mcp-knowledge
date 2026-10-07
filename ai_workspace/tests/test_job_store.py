@@ -110,7 +110,7 @@ def test_record_hash_roundtrip():
     assert set(h) == {
         "id", "user", "account_level", "class", "mode", "zone", "state",
         "step", "vft", "starve_deadline", "retry", "epoch", "attempt",
-        "cursor", "board_versions", "created", "updated", "version",
+        "cursor", "board_versions", "meta", "created", "updated", "version",
     }
     assert h["class"] == "interactive"  # python job_class ↔ HASH-поле "class"
     assert job_from_hash(h) == rec
@@ -126,6 +126,7 @@ def test_decode_defaults_for_partial_hash():
     assert rec.board_versions == {}
     assert rec.vft == 0.0
     assert rec.starve_deadline == 0.0  # кредита нет (Ф4.3)
+    assert rec.meta == {}  # Ф6 TODO 3: старые записи без meta → пустой контекст
 
 
 # ── INTEGRATION (живой ws-redis; авто-skip без WS_REDIS_URL) ──────────────

@@ -44,7 +44,7 @@ admin/member/guest, quotas.yaml Ф4.1; node-роли режимов — друг
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any
 from uuid import uuid4
@@ -109,7 +109,9 @@ def make_on_job_terminal(client: Any, shelf: str) -> Callable[[str, float], None
     return _on_job_terminal
 
 
-def make_on_node_usage(client: Any) -> Callable[[dict], None]:
+def make_on_node_usage(
+    client: Any, store: Any = None
+) -> Callable[[dict], None]:
     """Прод-проводка трейса узлов (Ф6 TODO 2/К1): ``ModeEngine(on_node_usage=...)``
     → события ``node_usage`` в ``ws:quota:events`` через ``prio.emit_event``.
 
@@ -120,12 +122,39 @@ def make_on_node_usage(client: Any) -> Callable[[dict], None]:
     движка (engine ``_observe_node_usage``). Best-effort: деградация ws-redis
     глотается ``emit_event`` — наблюдение не валит узел.
 
+    Склейка session↔job↔узел (Ф6 TODO 3/F3): опциональный ``store``
+    (``JobStore`` на том же ws-redis) — подписчик best-effort доносит из
+    ``job.meta`` в эмит ``session_id``/``turn_id`` (белый список из ДВУХ
+    ключей: кардинальность стрима и защита от утечек прочих meta-полей;
+    ключи события движка доминируют). Кэш per-job в замыкании — meta
+    пишется один раз на постановке, HGETALL не делается на каждый узел.
+    Отказ store (job удалён / redis вниз) НЕ валит эмит: событие уходит
+    без session-полей. ``store=None`` — эмит байт-в-байт прежний (TODO 2).
+
     Точка установки: golden-run/интеграции (``tools/golden_run.py`` — фабрика
     движка на ws-redis). Прод-воркера в репо НЕТ (R1, grep-фиксация Ф6 TODO 2)
     — прод-сбор per-node событий/метрик = arq-воркер, P2-хвост Ф6.
     """
+    trace_cache: dict[str, dict[str, str]] = {}
+
+    def _trace_meta(job_id: str) -> dict[str, str]:
+        if job_id not in trace_cache:
+            try:
+                meta = store.get(job_id).meta or {}
+                picked = {
+                    k: str(meta[k]) for k in ("session_id", "turn_id") if meta.get(k)
+                }
+            except Exception:  # noqa: BLE001 — любой отказ store = событие без
+                # session-полей (best-effort: наблюдение важнее полноты трейса)
+                picked = {}
+            trace_cache[job_id] = picked
+        return trace_cache[job_id]
+
     def _on_node_usage(event: dict) -> None:
-        emit_event(client, "node_usage", **event)
+        extra: dict[str, str] = {}
+        if store is not None and isinstance(event.get("job"), str):
+            extra = _trace_meta(event["job"])
+        emit_event(client, "node_usage", **{**extra, **event})
 
     return _on_node_usage
 
@@ -274,6 +303,7 @@ class QuotaWiring:
         zone: str,
         vft: float = 0.0,
         job_id: str | None = None,
+        meta: Mapping[str, str] | None = None,
     ):
         """Поставить job с admission-гейтом ДО создания (D5/P1-5).
 
@@ -287,6 +317,17 @@ class QuotaWiring:
         - ``allow`` → job в ``queued``; conc-резерв взят admit'ом (per-job
           маркер + lease, P1-2/P1-3) — движок продлевает heartbeat'ом,
           терминал возвращает (``engine.ModeEngine(quota=port)``).
+
+        ``meta`` — trace-context вызывающего (Ф6 TODO 3/F3):
+          ``{session_id, turn_id}`` UI-запроса → ``job.meta`` (HASH
+          ``ws:job:{id}``, JSON) — склейка session↔job; читает подписчик
+          ``make_on_node_usage(store=...)``, донося session до node-события.
+          ПРОБА (P2-примечание №3 критика-2): UI (kb-console) job НЕ создаёт
+          (чат ходит в шлюз напрямую, ``llm_stream.py``; scheduler-вызовов в
+          kb-console/src нет) — РЕЗЕРВНЫЙ путь: trace-context пробрасывается
+          ЗДЕСЬ, на границе фактического создания job; когда оркестратор
+          начнёт принимать чат-запросы, он передаст сюда тот же ``meta``.
+          ``None``/пусто — прежнее поведение (обратная совместимость).
 
         ``account_level`` — participant-роль (quotas.yaml); ``job_id``
           можно передать для идемпотентного ретрая постановки: повторный
@@ -325,6 +366,7 @@ class QuotaWiring:
                 zone=zone,
                 vft=vft,
                 job_id=job_id,
+                meta=meta,
             )
         except JobAlreadyExists:
             # P2-1 iter2 + N1 (reopen Ф4.2e): ретрай постановки наткнулся на

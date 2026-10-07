@@ -3,7 +3,9 @@
 Спека Scheduler §2 (plans/_provenance/arch-2026-10-05-ai-workspace/
 …-scheduler-spec.md, строки 23-36): ``ws:job:{id}`` — HASH с полями user,
 account_level, class, mode, step, state, vft, retry, epoch; Ф3.1 добавляет
-id, attempt, zone, cursor, board_versions, created, updated, version.
+id, attempt, zone, cursor, board_versions, created, updated, version;
+Ф6 TODO 3 (F3) добавляет meta — trace-context вызывающего (session_id/
+turn_id UI-запроса → склейка session↔job; JSON, паттерн board_versions).
 
 Инварианты плана (REV.12):
 - I3: владелец статуса job — Mode engine; union-статус один и живёт здесь.
@@ -175,6 +177,12 @@ class JobRecord:
     attempt: int = 0
     cursor: str = ""
     board_versions: dict[str, int] = field(default_factory=dict)
+    meta: dict[str, str] = field(default_factory=dict)
+    """Trace-context и строковые метки вызывающего (Ф6 TODO 3/F3):
+    ``{session_id, turn_id}`` UI-запроса → склейка session↔job; JSON в
+    HASH-поле ``meta`` (паттерн ``board_versions``). Пишется один раз на
+    ``create`` (не патчится через transition); пустой словарь = контекст
+    неизвестен (старые записи/вызовы без параметра — обратная совместимость)."""
     created: str = ""
     updated: str = ""
     version: int = 1
@@ -207,7 +215,7 @@ def job_to_hash(rec: JobRecord) -> dict[str, str]:
     for f in fields(rec):
         name = _REC_TO_HASH.get(f.name, f.name)
         val = getattr(rec, f.name)
-        if name == "board_versions":
+        if name in ("board_versions", "meta"):
             out[name] = json.dumps(val, sort_keys=True, ensure_ascii=False)
         elif isinstance(val, StrEnum):
             out[name] = str(val)
@@ -224,7 +232,7 @@ def job_from_hash(data: Mapping[str, str]) -> JobRecord:
         raw = data.get(hash_name)
         if raw is None:
             continue
-        if f.name == "board_versions":
+        if f.name in ("board_versions", "meta"):
             kwargs[f.name] = json.loads(raw) if raw else {}
         elif f.name == "state":
             kwargs[f.name] = JobState(raw)
@@ -294,6 +302,7 @@ class JobStore:
         attempt: int = 0,
         cursor: str = "",
         board_versions: dict[str, int] | None = None,
+        meta: Mapping[str, str] | None = None,
     ) -> JobRecord:
         """Создать job в state=queued, version=1 (атомарный захват id: HSETNX)."""
         job_id = job_id or uuid4().hex
@@ -313,6 +322,7 @@ class JobStore:
             attempt=attempt,
             cursor=cursor,
             board_versions=board_versions or {},
+            meta=dict(meta or {}),
             created=now,
             updated=now,
             version=1,
