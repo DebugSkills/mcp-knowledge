@@ -26,10 +26,12 @@ from ai_workspace.tests.test_engine import (
 )
 
 EVENT_KEYS = {
-    "job", "node", "kind", "role", "model_class", "shelf", "cached",
+    "job", "trace_id", "node", "kind", "role", "model_class", "shelf", "cached",
     "prompt_chars", "output_chars", "tokens", "wall_s",
 }
-"""Контракт события on_node_usage (Ф6-a 6a.1): ровно эти ключи, без сюрпризов."""
+"""Контракт события on_node_usage (Ф6-a 6a.1 + Ф6 TODO 2/К1): ровно эти
+ключи, без сюрпризов; ``trace_id = f"{job}:{epoch}"`` — сквозной трейс
+(приёмка — wiring-подписчик → ws:quota:events, test_node_events_stream)."""
 
 
 def make_observed(script, events, *, ledger=None, on_node_usage=None):
@@ -72,6 +74,8 @@ def test_on_node_usage_collects_events_per_node() -> None:
 
     a = by_node["analyst"]
     assert (a["job"], a["node"], a["kind"]) == ("j1", "analyst", "llm-step")
+    # Ф6 TODO 2/К1: сквозной трейс job:epoch в каждом событии узла
+    assert all(e["trace_id"] == f"j1:{EPOCH}" for e in events)
     assert a["role"] == "analyst" and a["model_class"] == "heavy" and a["shelf"] == "local"
     assert a["cached"] is False
     assert a["tokens"] > 0  # свежий вызов: оценка по факту объёма (~4 симв/токен)

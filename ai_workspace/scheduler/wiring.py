@@ -73,6 +73,7 @@ __all__ = [
     "QuotaWiring",
     "RedisQuotaPort",
     "make_on_job_terminal",
+    "make_on_node_usage",
     "make_on_queue_change",
 ]
 
@@ -106,6 +107,27 @@ def make_on_job_terminal(client: Any, shelf: str) -> Callable[[str, float], None
         eta.observe(shelf, seconds)
 
     return _on_job_terminal
+
+
+def make_on_node_usage(client: Any) -> Callable[[dict], None]:
+    """Прод-проводка трейса узлов (Ф6 TODO 2/К1): ``ModeEngine(on_node_usage=...)``
+    → события ``node_usage`` в ``ws:quota:events`` через ``prio.emit_event``.
+
+    ЕДИНЫЙ поток приёмки (P2-примечание 1 критика-2): стрим квот-контура
+    уже существует (``emit_event``, формат ``_quota_event`` с ``ts``) — второй
+    стрим НЕ вводится; ``ws:events:{shelf}`` — стрим слотов/очереди, туда
+    трейс узлов не пишется. ``trace_id = job:epoch`` приходит в событии
+    движка (engine ``_observe_node_usage``). Best-effort: деградация ws-redis
+    глотается ``emit_event`` — наблюдение не валит узел.
+
+    Точка установки: golden-run/интеграции (``tools/golden_run.py`` — фабрика
+    движка на ws-redis). Прод-воркера в репо НЕТ (R1, grep-фиксация Ф6 TODO 2)
+    — прод-сбор per-node событий/метрик = arq-воркер, P2-хвост Ф6.
+    """
+    def _on_node_usage(event: dict) -> None:
+        emit_event(client, "node_usage", **event)
+
+    return _on_node_usage
 
 
 def _require_pricing(shelf: str, pricing: Any) -> None:

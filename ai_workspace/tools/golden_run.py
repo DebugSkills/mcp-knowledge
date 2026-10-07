@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -283,8 +284,30 @@ def run_golden(config: RunConfig, *, engine_factory: EngineFactory) -> GoldenRun
         shelf: str, job_id: str, artifacts: ArtifactStore, answer: str,
         zone: str, mode_path: Path,
     ) -> ModeEngine:
-        """Сборка движка с инжекцией on_node_usage-коллектора (Ф6-a 6a.1b)."""
-        return usage.attach(raw_factory(shelf, job_id, artifacts, answer, zone, mode_path))
+        """Сборка движка с инжекцией on_node_usage-коллектора (Ф6-a 6a.1b).
+
+        Ф6 TODO 2: движок может уже нести wiring-подписчика (прод-фабрика
+        ставит ``make_on_node_usage`` → ws:quota:events) — коллектор отчёта
+        ДОПОЛНЯЕТ его веером, не затирая; каждый канал best-effort (падение
+        одного не съедает событие другого).
+        """
+        engine = raw_factory(shelf, job_id, artifacts, answer, zone, mode_path)
+        inner = engine.on_node_usage
+        if inner is None:
+            return usage.attach(engine)
+
+        def _fanout(event: dict[str, Any]) -> None:
+            try:
+                inner(event)  # wiring-подписчик (best-effort внутри emit_event)
+            except Exception:  # канал не валит соседа/прогон (best-effort)
+                logging.getLogger(__name__).warning(
+                    "on_node_usage: wiring-подписчик упал (best-effort, игнор)",
+                    exc_info=True,
+                )
+            usage.observe(event)
+
+        engine.on_node_usage = _fanout
+        return engine
 
     engine_factory = observed_factory
 
@@ -458,6 +481,8 @@ def _default_engine_factory(config: RunConfig) -> EngineFactory:
         shelf: str, job_id: str, artifacts: ArtifactStore, answer: str,
         zone: str, mode_path: Path,
     ) -> ModeEngine:
+        from ai_workspace.scheduler.wiring import make_on_node_usage
+
         graph = load_mode(mode_path)
         client = make_ws_redis()
         # Идемпотентность повторных прогонов: снести ключи этого job'а (job/board/fx/resume).
@@ -478,6 +503,9 @@ def _default_engine_factory(config: RunConfig) -> EngineFactory:
             artifacts=ArtifactStore(RedisBackend(client)),
             registry=registry,
             decoding=cf.DECODING_PIN,
+            # Ф6 TODO 2/К1: трейс узлов → ws:quota:events (единый стрим
+            # приёмки; коллектор отчёта ДОПОЛНЯЕТ подписчика — observed_factory)
+            on_node_usage=make_on_node_usage(client),
         )
 
     return factory

@@ -24,7 +24,8 @@
 Per-node наблюдение (Ф6-a 6a.1, инструмент-минимум): колбэк ``on_node_usage``
 + персистентный агрегат ``usage:{node_id}`` в ledger (вызовы/cache-hit/токены/
 символы промпта-выхода/wall-time). Аддитивно и best-effort — семантику
-исполнения не меняет.
+исполнения не меняет. Событие несёт ``trace_id = job:epoch`` (Ф6 TODO 2/К1):
+прод-проводка — ``wiring.make_on_node_usage`` → ``ws:quota:events``.
 """
 
 from __future__ import annotations
@@ -613,7 +614,7 @@ class ModeEngine:
         rec = self._write_section(job_id, rec, section, output, epoch)
         self._observe_node_usage(
             job_id, node, "llm-step", prompt=prompt, output=output,
-            cached=hit is not None, t0=t0,
+            cached=hit is not None, t0=t0, epoch=epoch,
             usage=result.usage if result is not None else None,
             request_id=result.request_id if result is not None else None,
         )
@@ -640,7 +641,7 @@ class ModeEngine:
         text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, sort_keys=True)
         rec = self._write_section(job_id, rec, self._out_section(node), text, epoch)
         self._observe_node_usage(job_id, node, "tool-step", prompt=request, output=text,
-                                 cached=hit is not None, t0=t0)
+                                 cached=hit is not None, t0=t0, epoch=epoch)
         return rec, None, self.graph.next_for(node.id)
 
     def _critic_gate(self, job_id, rec, node, epoch):
@@ -662,7 +663,7 @@ class ModeEngine:
         rec = self._write_section(job_id, rec, self._out_section(node), output, epoch)
         self._observe_node_usage(
             job_id, node, "critic-gate", prompt=prompt, output=output,
-            cached=hit is not None, t0=t0,
+            cached=hit is not None, t0=t0, epoch=epoch,
             usage=result.usage if result is not None else None,
             request_id=result.request_id if result is not None else None,
         )
@@ -806,6 +807,7 @@ class ModeEngine:
         output: str,
         cached: bool,
         t0: float,
+        epoch: int = 0,
         usage: Mapping[str, Any] | None = None,
         request_id: str | None = None,
     ) -> None:
@@ -823,7 +825,10 @@ class ModeEngine:
         - персистентный агрегат ``usage:{node_id}`` (read-modify-write сумм)
           пишется ВСЕГДА, независимо от колбэка; ключи ``fx:*`` и job-level
           ``usage`` не затрагиваются;
-        - колбэк — best-effort: его исключение НЕ валит узел (warning, дальше).
+        - колбэк — best-effort: его исключение НЕ валит узел (warning, дальше);
+        - ``trace_id = f"{job_id}:{epoch}"`` (Ф6 TODO 2/К1): сквозной трейс
+          шага в каждом событии; прод-проводка — ``wiring.make_on_node_usage``
+          → ``ws:quota:events`` (``prio.emit_event``, второй стрим не вводится).
         """
         if kind == "tool-step":
             role, model_class, shelf = None, None, "local"
@@ -858,6 +863,7 @@ class ModeEngine:
             try:
                 self.on_node_usage({
                     "job": job_id,
+                    "trace_id": f"{job_id}:{epoch}",
                     "node": node.id,
                     "kind": kind,
                     "role": role,
