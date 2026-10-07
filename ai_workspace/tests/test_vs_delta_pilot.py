@@ -279,7 +279,13 @@ def test_main_dry_run_no_network_writes_report(
             "correct",
             "prompt_chars",
             "wall_s",
+            "kind",
+            "escalated",
+            "fallback_verdict",
+            "delta_sufficient",
         }
+        assert rec["kind"] in {"easy", "hard"}
+        assert rec["escalated"] is False and rec["fallback_verdict"] is None
         assert rec["verdict"] is None and rec["correct"] is False
         assert rec["wall_s"] == 0.0
     assert set(payload["aggregate"]) == {"full", "delta", "delta-map", "delta_ratio"}
@@ -291,11 +297,13 @@ def test_main_end_to_end_with_injected_fake_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Полный цикл main на fake-клиенте: метрики, correct, JSON, exit 0."""
-    calls_total = len(VARIANTS) * len(PAIRS) * 2  # --n по умолчанию = 2
+    # --pairs easy: happy-path exit 0 (PASS-факер на hard-парах дал бы exit 3)
+    easy_pairs = [pair for pair in PAIRS if pair.kind == "easy"]
+    calls_total = len(VARIANTS) * len(easy_pairs) * 2  # --n по умолчанию = 2
     fake = FakeChatClient(["PASS"] * calls_total)
     monkeypatch.setattr(vdp, "make_client", lambda _model, _base_url: fake)
     out = tmp_path / "e2e.json"
-    assert vdp.main(["--out", str(out)]) == 0
+    assert vdp.main(["--pairs", "easy", "--out", str(out)]) == 0
     assert len(fake.calls) == calls_total  # все вызовы LLM — через fake
     payload = json.loads(out.read_text(encoding="utf-8"))
     records = payload["records"]
@@ -309,6 +317,118 @@ def test_main_end_to_end_with_injected_fake_client(
     for name in VARIANTS:  # fake везде врёт PASS -> accuracy 0.5, контракт 1.0
         assert agg[name]["accuracy"] == pytest.approx(0.5)
         assert agg[name]["verdict_compliance"] == pytest.approx(1.0)
-    delta_mean = sum(len(pair_prompt("delta", pair)) for pair in PAIRS) / len(PAIRS)
-    full_mean = sum(len(pair_prompt("full", pair)) for pair in PAIRS) / len(PAIRS)
+    n_easy = len(easy_pairs)  # delta_ratio считается только по easy-парам
+    delta_mean = sum(len(pair_prompt("delta", p)) for p in easy_pairs) / n_easy
+    full_mean = sum(len(pair_prompt("full", p)) for p in easy_pairs) / n_easy
     assert agg["delta_ratio"] == pytest.approx(delta_mean / full_mean)
+
+# ── доработка пилота: hard-пары, ESCALATE/fallback, гейты ─────────────────
+
+
+def test_hard_pairs_present_and_delta_insufficient() -> None:
+    """HD1/HD2 входят в hard: kind=hard, delta_sufficient=False, REVISE."""
+    hard = vdp.select_pairs("hard")
+    assert {p.name for p in hard} == {"hd1-unchanged-defect", "hd2-cross-section"}
+    for pair in hard:
+        assert pair.kind == "hard"
+        assert pair.delta_sufficient is False
+        assert pair.expected == "REVISE"
+        assert len(pair.doc_v2) == 3  # компактные самодостаточные данные
+    easy = vdp.select_pairs("easy")
+    assert {p.name for p in easy} == {"fixed", "not-fixed"}
+    assert all(p.kind == "easy" and p.delta_sufficient for p in easy)
+    assert vdp.select_pairs("all") == PAIRS
+    # HD1: дефектная секция не попадает в дельту (правится другая секция)
+    hd1_delta = diff_sections(hard[0].doc_v1, hard[0].doc_v2)
+    assert set(hd1_delta["changed"]) == {"Артефакты"}
+    assert "User Gate" not in hd1_delta["changed"]
+    # HD2: конфликтующие секции не в дельте — правится третья секция
+    hd2_delta = diff_sections(hard[1].doc_v1, hard[1].doc_v2)
+    assert set(hd2_delta["changed"]) == {"Сжатие контекста"}
+
+
+def test_escalate_token_prompt_rules_and_parser() -> None:
+    """ESCALATE: инструкция в delta/delta-map, запрет в full, парсер строг."""
+    pair = PAIRS[0]
+    for variant in ("delta", "delta-map"):
+        prompt = pair_prompt(variant, pair)
+        assert "ESCALATE" in prompt
+        assert "Если дельты недостаточно для вердикта" in prompt
+    full_prompt = pair_prompt("full", pair)
+    assert "ESCALATE" in full_prompt and "запрещён" in full_prompt
+    # парсер: ESCALATE — не вердикт; принимается только с allow_escalate
+    assert vdp.parse_verdict("ESCALATE") is None
+    assert vdp.parse_answer("ESCALATE", allow_escalate=True) == "ESCALATE"
+    assert vdp.parse_answer("escalate\nмало данных", allow_escalate=True) == "ESCALATE"
+    assert vdp.parse_answer("ESCALATE") is None  # full: токен запрещён
+    assert vdp.parse_answer("PASS", allow_escalate=True) == "PASS"
+
+
+def test_escalate_accepted_in_delta_rejected_in_full() -> None:
+    """run_variant: ESCALATE в delta -> fallback; в full -> контракт нарушен."""
+    pair = vdp.select_pairs("hard")[0]  # hd1: дельта недостаточна по построению
+    fake = FakeChatClient(["ESCALATE\nне видно секции «User Gate»", "REVISE"])
+    rec = vdp.run_variant("delta", pair, fake, n=1)[0]
+    assert rec.escalated is True
+    assert len(fake.calls) == 2  # дельта-промпт + full-промпт fallback'а
+    assert "## Документ v2 (полностью)" in fake.calls[1]
+    assert rec.fallback_verdict == "REVISE" and rec.verdict == "REVISE"
+    assert rec.correct is True and rec.kind == "hard"
+    assert rec.delta_sufficient is False
+
+    stubborn = FakeChatClient(["ESCALATE\nне хватает контекста"])
+    rec_full = vdp.run_variant("full", pair, stubborn, n=1)[0]
+    assert rec_full.escalated is False  # full не умеет эскалировать
+    assert rec_full.verdict is None  # ESCALATE в full запрещён контрактом
+    assert rec_full.fallback_verdict is None
+
+
+def test_fallback_metrics_in_aggregate() -> None:
+    """escalation_rate/accuracy_raw/accuracy_after_fallback после fallback."""
+    records = vdp.run_variant(  # fixed (PASS): ESCALATE -> fallback PASS
+        "delta", PAIRS[0], FakeChatClient(["ESCALATE", "PASS"]), n=1
+    )
+    records += vdp.run_variant(  # not-fixed (REVISE): без эскалации
+        "delta", PAIRS[1], FakeChatClient(["REVISE"]), n=1
+    )
+    stats = aggregate(records)["delta"]
+    assert stats["escalation_rate"] == pytest.approx(0.5)
+    assert stats["accuracy_raw"] == pytest.approx(0.5)  # эскалация = raw-промах
+    assert stats["accuracy_after_fallback"] == pytest.approx(1.0)
+    assert stats["accuracy"] == pytest.approx(1.0)  # итог = после fallback
+
+
+def test_delta_ratio_null_when_pairs_hard_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--pairs hard: easy-пар нет -> aggregate delta_ratio = None; exit 0."""
+    monkeypatch.setattr(vdp, "make_client", _refuse_network)
+    out = tmp_path / "hard.json"
+    argv = ["--dry-run", "--variant", "all", "--pairs", "hard", "--out", str(out)]
+    assert vdp.main(argv) == 0
+    printed = capsys.readouterr().out
+    assert printed.count("[PROMPT]") == len(VARIANTS) * 2  # только hd1/hd2
+    assert "kind=hard" in printed
+    assert "kind=easy" not in printed
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["pairs"] == "hard"
+    assert payload["aggregate"]["delta_ratio"] is None
+
+
+def test_exit3_when_full_inaccurate_on_hard_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """hard_pair_gate: accuracy(full) на hard-парах < 0.8 -> exit 3."""
+
+    class WrongOnFull:
+        """full -> PASS (неверно: hard ждёт REVISE); дельта -> REVISE."""
+
+        def chat(self, prompt: str) -> str:
+            is_full = "## Документ v2 (полностью)" in prompt
+            return "PASS" if is_full else "REVISE"
+
+    monkeypatch.setattr(vdp, "make_client", lambda _m, _b: WrongOnFull())
+    code = vdp.main(["--variant", "all", "--pairs", "hard", "--n", "1"])
+    assert code == 3  # full на обеих hard-парах неправ: accuracy 0.0 < 0.8

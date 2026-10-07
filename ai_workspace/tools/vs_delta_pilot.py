@@ -10,13 +10,25 @@
     delta     — только изменённые/добавленные секции + критика;
     delta-map — дельта + список всех заголовков v2 без тел.
 
-Ground truth: две пары (fixed -> PASS, not-fixed -> REVISE), данные
-самодостаточны (текст «статьи» про MCP/оркестрацию режимов). Клиент
-инжектируется (Protocol с chat(prompt) -> str); реальная реализация
-переиспользуется из ai_workspace/tools/vp_ab_pilot.py через import.
+Наборы пар (--pairs easy|hard|all, по умолчанию all):
+    easy — fixed -> PASS, not-fixed -> REVISE: дельта достаточна по
+           построению (delta_sufficient=True);
+    hard — hd1/hd2 -> REVISE, delta_sufficient=False: дефект живёт вне
+           дельты (неизменённая секция / межсекционное противоречие).
+
+Токен ESCALATE разрешён только в delta/delta-map: если дельты
+недостаточно для вердикта, критик отвечает ESCALATE, пилот делает
+fallback-повтор с full-промптом (fallback_verdict) и метрики
+escalation_rate / accuracy_raw / accuracy_after_fallback. В full токен
+ESCALATE запрещён (контрактом и парсером).
+
+Клиент инжектируется (Protocol с chat(prompt) -> str); реальная
+реализация переиспользуется из ai_workspace/tools/vp_ab_pilot.py.
 
 Exit codes: 0 — ок; 1 — ошибка конфигурации/сети; 2 — по design,
-гипотеза не подтвердилась (см. hypothesis_gate).
+гипотеза не подтвердилась (hypothesis_gate); 3 — full-критик неточен на
+hard-парах: accuracy(full) < 0.8 (hard_pair_gate). В --dry-run гейты
+отключены (всегда 0).
 """
 
 from __future__ import annotations
@@ -33,6 +45,9 @@ from typing import TYPE_CHECKING, Protocol
 DEFAULT_MODEL = "qwen2.5:7b"
 DEFAULT_BASE_URL = "http://127.0.0.1:11435/v1"
 VARIANTS = ("full", "delta", "delta-map")
+ESCALATE_VARIANTS = frozenset({"delta", "delta-map"})
+PAIR_KINDS = ("easy", "hard")
+HARD_FULL_ACCURACY_MIN = 0.8
 
 ROLE_CONTRACT = (
     "Ты — критик технической документации. КОНТРАКТ ОТВЕТА: первая строка "
@@ -41,7 +56,19 @@ ROLE_CONTRACT = (
     "(если требуется) — со второй строки."
 )
 
+ESCALATE_INSTRUCTION = (
+    "Если дельты недостаточно для вердикта — ответь ровно ESCALATE: "
+    "первая строка только это слово заглавными буквами, без markdown и "
+    "кавычек; обоснование эскалации — со второй строки."
+)
+
+FULL_NO_ESCALATE = (
+    "Ответ ESCALATE в этом режиме запрещён: тебе доступен полный "
+    "документ v2, нехватки информации нет — отвечай PASS или REVISE."
+)
+
 VERDICTS = frozenset({"PASS", "REVISE"})
+ESCALATE = "ESCALATE"
 
 Doc = dict[str, str]  # заголовок секции -> тело секции
 
@@ -57,18 +84,30 @@ class ChatClient(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class Pair:
-    """Ground-truth пара: v1 + предыдущая критика + v2 + ожидаемый вердикт."""
+    """Ground-truth пара: v1 + предыдущая критика + v2 + ожидаемый вердикт.
+
+    kind: easy — дефект/фикс виден в дельте; hard — дефект вне дельты.
+    delta_sufficient: достаточно ли ТОЛЬКО дельты для корректного
+    вердикта (ground truth; для hard-пар False — ожидается ESCALATE).
+    """
 
     name: str
     expected: str
     doc_v1: Doc
     doc_v2: Doc
     critique: str
+    kind: str = "easy"
+    delta_sufficient: bool = True
 
 
 @dataclass(frozen=True, slots=True)
 class CallRecord:
-    """Метрики одного вызова критика."""
+    """Метрики одного вызова критика.
+
+    escalated: ответ по дельте был ESCALATE (только delta/delta-map);
+    fallback_verdict: вердикт fallback-повтора с full-промптом (он же
+    итоговый verdict записи); delta_sufficient: ground-truth флаг пары.
+    """
 
     variant: str
     pair: str
@@ -77,6 +116,10 @@ class CallRecord:
     correct: bool
     prompt_chars: int
     wall_s: float
+    kind: str = "easy"
+    escalated: bool = False
+    fallback_verdict: str | None = None
+    delta_sufficient: bool = True
 
 
 _PAIR_FIXED = Pair(
@@ -116,7 +159,7 @@ _PAIR_FIXED = Pair(
             "Команда reindex перестраивает индекс по blue-green схеме: "
             "новые точки пишутся в коллекцию-кандидат *_v1, параллельно "
             "обслуживается текущая коллекция через алиас. После завершения "
-            "загрузки выполняется атомарный свап алиаса "
+            "загрузки выполняется атомарный своп алиаса "
             "(knowledge_private -> knowledge_private_v1, аналогично public), "
             "затем старая коллекция удаляется. Поиск остаётся доступным на "
             "всём протяжении перестроения."
@@ -203,7 +246,126 @@ _PAIR_NOT_FIXED = Pair(
     ),
 )
 
-PAIRS: tuple[Pair, ...] = (_PAIR_FIXED, _PAIR_NOT_FIXED)
+# --- hard-пары: дельта недостаточна по построению (delta_sufficient=False) ---
+
+_PAIR_HD1 = Pair(
+    name="hd1-unchanged-defect",
+    expected="REVISE",
+    doc_v1={
+        "Конвейер режимов": (
+            "Оркестратор ведёт задачу через доску .board.md: анализ, "
+            "критика, реализация. Метаданные доски — SSOT состояния, "
+            "приоритет полей implementation_status > analysis_status > "
+            "next_role."
+        ),
+        "User Gate": (
+            "После аналитики оркестратор сам решает, запускать ли "
+            "реализацию: уровень задачи (simple/complex/strategic) не "
+            "меняет порядок шагов, выбор implement/critic/supplement "
+            "агент делает без участия оператора."
+        ),
+        "Артефакты": (
+            "Промежуточные выводы фиксируются на доске, финальные "
+            "результаты — файлами. Одноразовые скрипты создаются сразу "
+            "в .trash/."
+        ),
+    },
+    doc_v2={
+        "Конвейер режимов": (
+            "Оркестратор ведёт задачу через доску .board.md: анализ, "
+            "критика, реализация. Метаданные доски — SSOT состояния, "
+            "приоритет полей implementation_status > analysis_status > "
+            "next_role."
+        ),
+        "User Gate": (
+            "После аналитики оркестратор сам решает, запускать ли "
+            "реализацию: уровень задачи (simple/complex/strategic) не "
+            "меняет порядок шагов, выбор implement/critic/supplement "
+            "агент делает без участия оператора."
+        ),
+        "Артефакты": (
+            "Промежуточные выводы фиксируются на доске, финальные "
+            "результаты — файлами. Одноразовые скрипты создаются сразу "
+            "в .trash/, черновики и ревизии планов — в .tmp/, постоянные "
+            "скрипты — в scripts/ или app/."
+        ),
+    },
+    critique=(
+        "REVISE. Секция «User Gate» нарушает инвариант: реализацию нельзя "
+        "запускать без явного выбора оператора (user_choice: implement) "
+        "через ask_followup_question; уровень задачи определяет форму "
+        "гейта (вопрос / brainstorming / Operator Gate), но право выбора "
+        "всегда у оператора, а не у агента. Требуется переписать секцию: "
+        "обязательный вопрос оператору перед запуском реализации."
+    ),
+    kind="hard",
+    delta_sufficient=False,
+)
+
+_PAIR_HD2 = Pair(
+    name="hd2-cross-section",
+    expected="REVISE",
+    doc_v1={
+        "Единый писатель доски": (
+            ".board.md правит только оркестратор: субагенты возвращают "
+            "результат делегированием и сами файлы доски не трогают. "
+            "Инвариант single-writer исключает гонки параллельных правок."
+        ),
+        "Heartbeat ролей": (
+            "Каждая роль при старте и после значимых изменений сама "
+            "дописывает в .board.md свой heartbeat: критик — вердикт в §6, "
+            "реализатор — ошибки в §5. Прямая правка доски ролями "
+            "ускоряет цикл."
+        ),
+        "Сжатие контекста": (
+            "При росте доски запускается сжатие: устаревшие чекпойнты "
+            "обрезаются по дате, снимаются устаревшие DIGEST."
+        ),
+    },
+    doc_v2={
+        "Единый писатель доски": (
+            ".board.md правит только оркестратор: субагенты возвращают "
+            "результат делегированием и сами файлы доски не трогают. "
+            "Инвариант single-writer исключает гонки параллельных правок."
+        ),
+        "Heartbeat ролей": (
+            "Каждая роль при старте и после значимых изменений сама "
+            "дописывает в .board.md свой heartbeat: критик — вердикт в §6, "
+            "реализатор — ошибки в §5. Прямая правка доски ролями "
+            "ускоряет цикл."
+        ),
+        "Сжатие контекста": (
+            "При росте доски запускается сжатие: устаревшие чекпойнты "
+            "обрезаются по дате, решения и CSIL перед очисткой доски "
+            "переносятся в durable-лог board-decisions.jsonl."
+        ),
+    },
+    critique=(
+        "REVISE. Секции «Единый писатель доски» и «Heartbeat ролей» "
+        "противоречат друг другу: первая требует, чтобы .board.md правил "
+        "только оркестратор, вторая — чтобы роли сами дописывали heartbeat "
+        "и вердикты. Требуется устранить противоречие: либо роли передают "
+        "записи через оркестратора, либо описать протокол блокировок."
+    ),
+    kind="hard",
+    delta_sufficient=False,
+)
+
+PAIRS: tuple[Pair, ...] = (
+    _PAIR_FIXED,
+    _PAIR_NOT_FIXED,
+    _PAIR_HD1,
+    _PAIR_HD2,
+)
+
+
+def select_pairs(which: str = "all") -> tuple[Pair, ...]:
+    """Выборка ground-truth пар по набору: easy | hard | all."""
+    if which == "all":
+        return PAIRS
+    if which not in PAIR_KINDS:
+        raise ValueError(f"неизвестный набор пар: {which}")
+    return tuple(p for p in PAIRS if p.kind == which)
 
 
 def diff_sections(v1: Doc, v2: Doc) -> dict[str, object]:
@@ -244,7 +406,11 @@ def build_critic_prompt(
     critique: str,
     headings: list[str],
 ) -> str:
-    """Промпт критика для выбранной вариант-стратегии (full/delta/delta-map)."""
+    """Промпт критика для выбранной вариант-стратегии (full/delta/delta-map).
+
+    В delta/delta-map добавляется инструкция про токен ESCALATE; в full —
+    явный запрет ESCALATE (полный документ доступен целиком).
+    """
     if variant not in VARIANTS:
         raise ValueError(f"неизвестный вариант: {variant}")
     parts = [
@@ -284,14 +450,15 @@ def build_critic_prompt(
             "с кратким указанием, что осталось неисправленным."
         ),
     ]
+    if variant in ESCALATE_VARIANTS:
+        parts += ["", ESCALATE_INSTRUCTION]
+    else:
+        parts += ["", FULL_NO_ESCALATE]
     return "\n".join(parts)
 
 
-def parse_verdict(text: str) -> str | None:
-    """PASS/REVISE из первой строки ответа (после снятия markdown-обёртки).
-
-    Регистронезависимо; None — если контракт первой строки нарушен.
-    """
+def _first_token(text: str) -> str | None:
+    """Первый значимый токен первой строки ответа (верхний регистр)."""
     cleaned = text.strip()
     if cleaned.startswith("```"):
         lines = cleaned.splitlines()[1:]
@@ -303,7 +470,28 @@ def parse_verdict(text: str) -> str | None:
     first = cleaned.splitlines()[0].lstrip("`#>*- \t—").strip()
     if not first:
         return None
-    token = first.split()[0].strip("`*_#>:,.!?—-").upper()
+    return first.split()[0].strip("`*_#>:,.!?—-").upper()
+
+
+def parse_verdict(text: str) -> str | None:
+    """PASS/REVISE из первой строки ответа (после снятия markdown-обёртки).
+
+    Регистронезависимо; None — если контракт первой строки нарушен.
+    ESCALATE вердиктом не является — для него None (см. parse_answer).
+    """
+    token = _first_token(text)
+    return token if token in VERDICTS else None
+
+
+def parse_answer(text: str, *, allow_escalate: bool = False) -> str | None:
+    """PASS/REVISE/ESCALATE из первой строки ответа критика.
+
+    Токен ESCALATE принимается только при allow_escalate=True
+    (варианты delta/delta-map); в full он запрещён контрактом — None.
+    """
+    token = _first_token(text)
+    if token == ESCALATE:
+        return ESCALATE if allow_escalate else None
     return token if token in VERDICTS else None
 
 
@@ -321,15 +509,30 @@ def run_variant(
     client: ChatClient | None,
     n: int = 1,
 ) -> list[CallRecord]:
-    """n вызовов критика на (variant x pair); client=None -> dry-run (1 прогон)."""
+    """n вызовов критика на (variant x pair); client=None -> dry-run (1 прогон).
+
+    В delta/delta-map разрешён ESCALATE: при нём выполняется fallback-повтор
+    с full-промптом; вердикт fallback'а становится итоговым verdict записи
+    и сохраняется отдельно в fallback_verdict.
+    """
+    allow_escalate = variant in ESCALATE_VARIANTS
     prompt = pair_prompt(variant, pair)
+    full_prompt = pair_prompt("full", pair) if allow_escalate else prompt
     records: list[CallRecord] = []
     for _ in range(1 if client is None else max(1, n)):
         verdict: str | None = None
+        fallback_verdict: str | None = None
+        escalated = False
         wall = 0.0
         if client is not None:
             started = time.monotonic()
-            verdict = parse_verdict(client.chat(prompt))
+            answer = parse_answer(client.chat(prompt), allow_escalate=allow_escalate)
+            if answer == ESCALATE:
+                escalated = True
+                fallback_verdict = parse_verdict(client.chat(full_prompt))
+                verdict = fallback_verdict
+            else:
+                verdict = answer
             wall = time.monotonic() - started
         records.append(
             CallRecord(
@@ -340,28 +543,53 @@ def run_variant(
                 correct=verdict == pair.expected,
                 prompt_chars=len(prompt),
                 wall_s=round(wall, 3),
+                kind=pair.kind,
+                escalated=escalated,
+                fallback_verdict=fallback_verdict,
+                delta_sufficient=pair.delta_sufficient,
             )
         )
     return records
 
 
 def aggregate(records: list[CallRecord]) -> dict[str, object]:
-    """Агрегаты по вариантам + delta_ratio = prompt_chars(delta)/prompt_chars(full)."""
+    """Агрегаты по вариантам.
+
+    Для delta/delta-map дополнительно: escalation_rate, accuracy_raw
+    (до fallback; ESCALATE = неверный вердикт) и accuracy_after_fallback.
+    delta_ratio = prompt_chars(delta)/prompt_chars(full) считается ТОЛЬКО
+    по easy-парам (нет easy -> None).
+    """
     by_variant: dict[str, list[CallRecord]] = {}
     for rec in records:
         by_variant.setdefault(rec.variant, []).append(rec)
     out: dict[str, object] = {}
     for name, recs in sorted(by_variant.items()):
-        out[name] = {
+        stats: dict[str, object] = {
             "verdict_compliance": sum(r.verdict is not None for r in recs) / len(recs),
             "accuracy": sum(r.correct for r in recs) / len(recs),
             "mean_prompt_chars": statistics.mean(r.prompt_chars for r in recs),
         }
-    delta_stats = out.get("delta")
-    full_stats = out.get("full")
-    if isinstance(delta_stats, dict) and isinstance(full_stats, dict):
-        full_chars = full_stats["mean_prompt_chars"] or 1.0
-        out["delta_ratio"] = delta_stats["mean_prompt_chars"] / full_chars
+        if name in ESCALATE_VARIANTS:
+            escalated_n = sum(r.escalated for r in recs)
+            stats["escalation_rate"] = escalated_n / len(recs)
+            stats["accuracy_raw"] = (
+                sum(r.correct and not r.escalated for r in recs) / len(recs)
+            )
+            stats["accuracy_after_fallback"] = stats["accuracy"]
+        out[name] = stats
+    if "delta" in out and "full" in out:
+        easy_delta = [
+            r.prompt_chars for r in records if r.kind == "easy" and r.variant == "delta"
+        ]
+        easy_full = [
+            r.prompt_chars for r in records if r.kind == "easy" and r.variant == "full"
+        ]
+        if easy_delta and easy_full:
+            full_chars = statistics.mean(easy_full) or 1.0
+            out["delta_ratio"] = statistics.mean(easy_delta) / full_chars
+        else:
+            out["delta_ratio"] = None
     return out
 
 
@@ -378,6 +606,16 @@ def hypothesis_gate(agg: dict[str, object]) -> int | None:
     if delta["verdict_compliance"] < 0.8:
         return 2
     return None
+
+
+def hard_pair_gate(records: list[CallRecord]) -> int | None:
+    """3 — full-критик обязан давать accuracy >= 0.8 на hard-парах:
+    неточный full-оракул обесценивает сравнение дельты с ним."""
+    full_hard = [r for r in records if r.variant == "full" and r.kind == "hard"]
+    if not full_hard:
+        return None
+    accuracy = sum(r.correct for r in full_hard) / len(full_hard)
+    return 3 if accuracy < HARD_FULL_ACCURACY_MIN else None
 
 
 class _OllamaPilotClient:
@@ -428,6 +666,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="какую prompt-стратегию гонять (all — все три)",
     )
     parser.add_argument(
+        "--pairs",
+        choices=["all", *PAIR_KINDS],
+        default="all",
+        help="какой набор ground-truth пар гонять (all — easy + hard)",
+    )
+    parser.add_argument(
         "--n",
         type=int,
         default=2,
@@ -439,7 +683,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="без сети: печатает промпты и метрики (verdict=NONE)",
+        help="без сети: печатает промпты и метрики (verdict=NONE), гейты отключены",
     )
     return parser
 
@@ -447,6 +691,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     variants = list(VARIANTS) if args.variant == "all" else [args.variant]
+    pairs = select_pairs(args.pairs)
 
     client: ChatClient | None = None
     if not args.dry_run:
@@ -458,12 +703,12 @@ def main(argv: list[str] | None = None) -> int:
 
     records: list[CallRecord] = []
     for variant in variants:
-        for pair in PAIRS:
+        for pair in pairs:
             if args.dry_run:
                 print("=" * 72)
                 print(
                     f"[PROMPT] variant={variant} pair={pair.name} "
-                    f"expected={pair.expected}"
+                    f"kind={pair.kind} expected={pair.expected}"
                 )
                 print(pair_prompt(variant, pair))
             try:
@@ -476,10 +721,14 @@ def main(argv: list[str] | None = None) -> int:
     print("\n== МЕТРИКИ ==")
     for rec in records:
         verdict = rec.verdict if rec.verdict is not None else "NONE"
+        fallback = (
+            rec.fallback_verdict if rec.fallback_verdict is not None else "NONE"
+        )
         print(
             f"{rec.variant:<9} {rec.pair:<10} expected={rec.expected:<6} "
             f"verdict={verdict:<6} correct={rec.correct!s:<5} "
-            f"prompt_chars={rec.prompt_chars} wall_s={rec.wall_s}"
+            f"prompt_chars={rec.prompt_chars} wall_s={rec.wall_s} "
+            f"kind={rec.kind} escalated={rec.escalated!s} fallback={fallback}"
         )
     for name, value in agg.items():
         print(f"aggregate {name}: {value}")
@@ -490,6 +739,7 @@ def main(argv: list[str] | None = None) -> int:
             "base_url": args.base_url,
             "dry_run": args.dry_run,
             "n": args.n,
+            "pairs": args.pairs,
             "records": [asdict(rec) for rec in records],
             "aggregate": agg,
         }
@@ -500,6 +750,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         return 0
+    gate = hard_pair_gate(records)
+    if gate == 3:
+        print(
+            "[gate] full-критик неточен на hard-парах: accuracy(full) < 0.8",
+            file=sys.stderr,
+        )
+        return gate
     gate = hypothesis_gate(agg)
     if gate is not None:
         print(
