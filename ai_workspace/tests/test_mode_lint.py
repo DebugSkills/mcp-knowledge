@@ -1,4 +1,4 @@
-"""Offline-тесты линт-правил L1–L11 (Ф3.5a-3, L11 — Ф3.9).
+"""Offline-тесты линт-правил L1–L13 (Ф3.5a-3, L11 — Ф3.9, L13 — Ф6-a 6a.4).
 
 Невакуумность: на каждый код — свой фикстур-нарушитель (ровно один код);
 валидный режим даёт пустой список; отдельные inline-мутации покрывают
@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from ai_workspace.orchestrator.mode_lint import validate_lint
+from ai_workspace.orchestrator.mode_lint import lint_l9, validate_lint
 from ai_workspace.orchestrator.mode_schema import validate_schema
 from ai_workspace.registry import Registry
 
@@ -55,15 +55,56 @@ def test_valid_mode_is_clean(registry: Registry):
         ("lint_L6_missing_citer.yaml", "L6"),
         ("lint_L7_bad_model_class.yaml", "L7"),
         ("lint_L8_no_max_iter.yaml", "L8"),
-        ("lint_L9_fork_unbalanced.yaml", "L9"),
+        # L9 вынесен из «ровно одного кода» (Ф6-a 6a.4): фикстура содержит
+        # fork → вместе с L9 срабатывает L13; см. test_l9_fixture_l13_before_l9.
         ("lint_L10_double_writer.yaml", "L10"),
         ("lint_L11_model_specific.yaml", "L11"),
+        ("lint_L13_fork_join_unsupported.yaml", "L13"),
     ],
 )
 def test_each_rule_fires_exactly_its_code(registry: Registry, fixture: str, code: str):
     """Каждый фикстур-нарушитель даёт РОВНО свой код (не «пачку» замечаний)."""
     codes = _codes(_load(FIXTURES / fixture), registry)
     assert codes == {code}, f"{fixture}: ожидался {code}, получено {sorted(codes)}"
+
+
+def test_l9_fixture_l13_before_l9(registry: Registry):
+    """Фикстура L9 содержит fork → с L13 (Ф6-a 6a.4) срабатывают ОБА кода.
+
+    Механизма подавления L13 в линте нет, поэтому фикстура больше не даёт
+    «ровно один код». Порядок детерминирован и зафиксирован: L13
+    («не поддержано движком») раньше L9 («не сбалансированы»). Сущность
+    L9 проверяется прямым вызовом lint_l9 (парность fork=1, join=0).
+    """
+    doc = _load(FIXTURES / "lint_L9_fork_unbalanced.yaml")
+    findings = validate_lint(doc, registry, base_dir=REPO_ROOT)
+    codes = [f.code for f in findings]
+    assert set(codes) == {"L9", "L13"}, f"ожидались L9+L13, получено {codes}"
+    assert codes.index("L13") < codes.index("L9"), f"L13 должен идти раньше L9: {codes}"
+    parity = lint_l9(doc, registry, None)
+    assert [f.code for f in parity] == ["L9"]
+    assert "fork=1, join=0" in parity[0].message
+
+
+def test_l13_message_points_to_engine_and_plan(registry: Registry):
+    """L13: сообщение называет узел+kind, ссылку engine.py:548 и план 6a.4."""
+    findings = validate_lint(
+        _load(FIXTURES / "lint_L13_fork_join_unsupported.yaml"),
+        registry,
+        base_dir=REPO_ROOT,
+    )
+    msgs = {f.path: f.message for f in findings}
+    assert "узел 'fan' (kind=fork) не поддержан движком (engine.py:548)" in msgs["nodes.fan"]
+    assert "plans/arch-2026-10-05-ai-workspace-f6a4-plan.md" in msgs["nodes.fan"]
+    assert "узел 'merge' (kind=join) не поддержан движком (engine.py:548)" in msgs["nodes.merge"]
+
+
+def test_valid_fixtures_do_not_fire_l13(registry: Registry):
+    """Валидные фикстуры не дают L13 (правило не ломает валидные режимы)."""
+    paths = sorted(FIXTURES.glob("valid_*.yaml"))
+    assert paths, "ожидалась хотя бы одна valid_* фикстура"
+    for path in paths:
+        assert "L13" not in _codes(_load(path), registry), f"{path.name}: неожиданный L13"
 
 
 def test_model_agnostic_prompts_rule(registry: Registry):
