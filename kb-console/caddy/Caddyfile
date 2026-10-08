@@ -92,3 +92,47 @@ https://{$CONSOLE_LAN_IP}:8443 {
 		-Server
 	}
 }
+
+# ── MCP — тот же TLS-фасад (Б6.2, трасса arch-2026-10-05-ai-workspace) ──
+# Участники ходят в MCP по HTTPS из LAN. Разрешён ТОЛЬКО путь /mcp (POST/GET);
+# всё прочее — 403: /metrics (auth-exempt на бэкенде!), /docs, /openapi.json,
+# /health*, /tokens. Порт 8444 (8443 занят консолью). Backend: mcp-server на
+# 127.0.0.1:8000 (host-сеть). ВНИМАНИЕ (F10): :8000 слушает 0.0.0.0 — прямой
+# LAN-доступ в обход фасада закрывается отдельно (firewall/bind).
+https://{$CONSOLE_LAN_IP}:8444 {
+	log {
+		output stdout
+		format json
+	}
+	tls internal
+	bind {$CONSOLE_LAN_IP}
+
+	@lan_mcp {
+		remote_ip {$CONSOLE_LAN_CIDR}
+		path /mcp
+		method POST GET
+	}
+	@lan remote_ip {$CONSOLE_LAN_CIDR}
+
+	handle @lan_mcp {
+		reverse_proxy 127.0.0.1:8000 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+			flush_interval -1
+		}
+	}
+	handle @lan {
+		respond "MCP: доступен только /mcp" 403
+	}
+	handle {
+		respond "MCP: доступ только из локальной сети" 403
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
