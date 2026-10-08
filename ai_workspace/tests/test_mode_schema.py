@@ -78,3 +78,16 @@ def test_cli_file_violator_exits_one(capsys: pytest.CaptureFixture[str]) -> None
 def test_cli_empty_dir_exits_zero(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
     assert cli_main(["--dir", str(tmp_path)]) == 0
     assert "режимов нет" in capsys.readouterr().out
+
+
+def test_s9_unknown_context_inline() -> None:
+    doc = _load("valid_statya.yaml")
+    doc["nodes"][0]["context"] = "deltas"
+    assert _codes(validate_schema(doc, Registry(REGISTRY_DIR))) == {"S9"}
+
+
+def test_s9_accepts_declared_context_values() -> None:
+    doc = _load("valid_statya.yaml")
+    doc["nodes"][0]["context"] = "delta"
+    doc["nodes"][2]["context"] = "full"
+    assert validate_schema(doc, Registry(REGISTRY_DIR)) == []

@@ -1,11 +1,11 @@
-"""Runtime lint L1-L14 для режимов AI-верстака (Ф3.5a-3; L11 — Ф3.9; L12 — Ф6-a 6a.3; L13 — Ф6-a 6a.4; L14 — protected-принцип критика).
+"""Runtime lint L1-L15 для режимов AI-верстака (Ф3.5a-3; L11 — Ф3.9; L12 — Ф6-a 6a.3; L13/L15 — Ф6-a 6a.4; L14 — protected-принцип критика).
 
 Спека: plans/_provenance/arch-2026-10-05-ai-workspace/
        arch-2026-10-05-ai-workspace-mode-engine-spec.md §4б.
 
 Контракт: ``validate_lint(doc, registry, *, base_dir) -> list[Finding]``;
 ``Finding`` реиспользуется из ``mode_schema``; все severity — ``error``,
-коды ``L1..L14``. Каждое правило — чистая функция (кроме L2, читающей ФС).
+коды ``L1..L15``. Каждое правило — чистая функция (кроме L2, читающей ФС).
 
 Правила:
   L1  DAG ацикличен (цикл допустим только у critic-gate с on_revise+max_iterations)
@@ -22,6 +22,7 @@
   L12 inputs объявлен и непуст у узлов-потребителей (llm/tool/critic-gate)
   L13 kind=fork/join не поддержан движком до Ф3 (engine.py:548)
   L14 critic-gate не на слабом классе: fast запрещён (heavy/local-only)
+  L15 context: delta — только на llm-step/tool-step (защита critic-gate)
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ai_workspace.orchestrator.context_delta import CONTEXT_DELTA, DELTA_CONSUMER_KINDS
 from ai_workspace.orchestrator.mode_schema import Finding
 
 _SEVERITY = "error"
@@ -71,14 +73,14 @@ def _effective_outputs(node: dict) -> set[str]:
 
 
 def validate_lint(doc: dict, registry: Any, *, base_dir: Path | None = None) -> list[Finding]:
-    """Запустить L1-L14; вернуть список Finding (severity=error)."""
+    """Запустить L1-L15; вернуть список Finding (severity=error)."""
     findings: list[Finding] = []
     # L13 выполняется ПЕРЕД L9 (Ф6-a 6a.4): «не поддержано движком» должно
     # идти раньше «не сбалансированы» — порядок findings детерминирован.
     for fn in (
         lint_l1, lint_l2, lint_l3, lint_l4, lint_l5,
         lint_l6, lint_l7, lint_l8, lint_l13, lint_l9,
-        lint_l10, lint_l11, lint_l12, lint_l14,
+        lint_l10, lint_l11, lint_l12, lint_l14, lint_l15,
     ):
         findings.extend(fn(doc, registry, base_dir))
     return findings
@@ -424,4 +426,29 @@ def lint_l14(doc: dict, registry: Any, base_dir: Path | None) -> list[Finding]:
                 "класс `local-only`",
                 f"nodes.{node.get('id')}.model_class",
             ))
+    return out
+
+
+def lint_l15(doc: dict, registry: Any, base_dir: Path | None) -> list[Finding]:
+    """``context: delta`` — только на узлах-потребителях (Ф6-a 6a.4 Ф1).
+
+    ``critic-gate`` + delta нарушает protected-принцип: вердикт качества
+    выносится на ПОЛНОМ контексте решения (стоп-сигнал Ф1.0 — дельта на
+    гейте даёт ложный PASS). ``human-gate`` промпт из секций не собирает;
+    ``fork``/``join`` не поддержаны движком (L13). Движок дублирует глушилку
+    (``engine._context_mode``) — линт ловит на статике, рантайм — на исполнении.
+    """
+    out: list[Finding] = []
+    for node in _nodes(doc):
+        if node.get("context") != CONTEXT_DELTA:
+            continue
+        if node.get("kind") in DELTA_CONSUMER_KINDS:
+            continue
+        out.append(_f(
+            "L15",
+            f"узел {node.get('id')} ({node.get('kind')}): context: delta допустим "
+            "только на llm-step/tool-step; вердикт критика — на полном контексте "
+            "(protected-принцип, Ф1.0)",
+            f"nodes.{node.get('id')}.context",
+        ))
     return out

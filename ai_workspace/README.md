@@ -223,13 +223,16 @@ Mode engine, admission (Ф3.5+); human-gate `ws:gate:*` + дашборд спя�
   (fail-closed: путь + причина, без молчаливых дефолтов).
 - Валидатор реестров — Ф3.5a-2; движок режимов — Ф3.5b.
 
-## Режимы: линт L1–L11 (Ф3.5a-3, L11 — Ф3.9)
+## Режимы: линт L1–L15 (Ф3.5a-3; L11 — Ф3.9; L13/L15 — Ф6-a 6a.4)
 
-`make modes-validate` гоняет ДВА контура: схему (S1–S8, `orchestrator/mode_schema.py`) и
-рантайм-линт (L1–L11, `orchestrator/mode_lint.py`): DAG/циклы критика, роли+seed-скиллы,
+`make modes-validate` гоняет ДВА контура: схему (S1–S9, `orchestrator/mode_schema.py`) и
+рантайм-линт (L1–L15, `orchestrator/mode_lint.py`): DAG/циклы критика, роли+seed-скиллы,
 инструменты, покрытие вход/выход (транзитивно), human-gate для strategic/brainstorm,
 citation-политика, резолв `model_class` (+private→local-only), терминируемость, fork/join,
-single-writer секций доски. На каждое правило — фикстур-нарушитель в `tests/fixtures/modes/`.
+single-writer секций доски. S9 валидирует `nodes[].context ∈ {full, delta}`;
+L14 запрещает critic-gate на слабом классе; L15 — `context: delta` только на
+llm-step/tool-step (вердикт критика — на полном контексте, protected-принцип).
+На каждое правило — фикстур-нарушитель в `tests/fixtures/modes/`.
 
 ## Board-store (Ф3.5b-1, `orchestrator/board.py`)
 - `BoardStore` (`ws:board:{job}` = `version`+`sec:*`, `:owner` = секция→узел,
@@ -254,6 +257,14 @@ single-writer секций доски. На каждое правило — фи
 идемпотентны (`compute_effect_id` → ledger), секции пишутся через board-CAS.
 Зависимости инъектируются (`jobs`/`boards`/`llm`/`mcp`/`ledger`/`artifacts`).
 `fork`/`join` — Ф3.8+ (`UnsupportedNode`, fail-loud).
+
+Дельта-контекст в REVISE [РЕАЛИЗОВАНО В: arch-2026-10-05-ai-workspace, Ф6-a 6a.4 Ф1]:
+опт-ин `context: delta` на узле-потребителе; достаточность решает движок СТРУКТУРНО
+(`orchestrator/context_delta.py`: `referenced ⊆ changed`, без опроса модели — стоп-сигнал
+Ф1.0: `escalation_rate=0.00`). Достаточно → узел получает изменённые секции (по маркеру
+ledger `board_seen:{node}` + `board.diff`) + свежую критику; иначе/неопределённо (первый
+прогон, правка человека, потеря снапшота) → полный контекст. Кэш эффектов разделяется
+автоматически: digest эффекта включает inputs (`engine._llm_step`).
 
 ## Режим «статья» (Ф3.6, `modes/statya.yaml`)
 Первый drop-in-режим: `analyst → structure(gate) → critic(on_revise) → editor →

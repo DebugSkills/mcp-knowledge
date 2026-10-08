@@ -1,0 +1,19 @@
+# Фикстур-нарушитель линта (Ф6-a 6a.4 Ф1): ожидается ровно L15.
+# Копия valid_statya.yaml, где critic-gate получил context: delta — вердикт
+# качества выносится только на полном контексте (protected-принцип, стоп-сигнал
+# Ф1.0: дельта на гейте даёт ложный PASS). Схема чиста (delta — валидное значение).
+id: statya
+version: 1
+shape: analyst-critic-editor
+contract: document
+output: {type: article, citation_policy: required}
+board: {buffer: board.md, store: job}
+nodes:
+  - {id: analyst, kind: llm-step, role: analyst, model_class: heavy, seed: skills/analyst-code, inputs: [brief], outputs: [draft], retry: 2}
+  - {id: critic, kind: critic-gate, role: critic, model_class: heavy, inputs: [draft], verdicts: [PASS, REVISE], max_iterations: 3, on_revise: analyst, context: delta}
+  - {id: editor, kind: llm-step, role: editor, model_class: heavy, inputs: [draft, verdict], outputs: [document]}
+  - {id: citer, kind: tool-step, tool: mcp.citation_attach, policy: strict, inputs: [document], outputs: [document+refs]}
+  - {id: publish, kind: human-gate, actor: operator, timeout: 24h, on_timeout: sleep, prompt: "Утвердить статью?"}
+edges: [analyst->critic, critic|PASS->editor, editor->citer, citer->publish]
+gates: {publish: {type: human, blocks_output: true}}
+tools: [mcp.search_knowledge, mcp.get_entry, mcp.write_knowledge]

@@ -38,7 +38,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Literal, Protocol
+from typing import AbstractSet, Any, Literal, Protocol
 
 from ai_workspace.orchestrator.graph import (
     EngineError,
@@ -53,6 +53,12 @@ from ai_workspace.orchestrator.job import (
     JobState,
     JobStoreError,
     compute_effect_id,
+)
+from ai_workspace.orchestrator.context_delta import (
+    CONTEXT_DELTA,
+    CONTEXT_FULL,
+    DELTA_CONSUMER_KINDS,
+    decide_context_mode,
 )
 from ai_workspace.orchestrator.ledger import Ledger, MemoryLedger, RedisLedger
 
@@ -969,8 +975,17 @@ class ModeEngine:
         Секция-критика (``on_revise: <этот узел>``) добавляется, если уже есть на
         доске: иначе повторный прогон дал бы тот же ``effect_id`` (кэш) и петля
         REVISE не двигалась бы. Отсутствующая обязательная секция → fail-closed.
+
+        ``context: delta`` (Ф6-a 6a.4 Ф1, опт-ин на узле): при структурно
+        доказанной достаточности узел получает ТОЛЬКО изменённые секции +
+        предыдущую критику (``_delta_view``); любая неопределённость —
+        прежнее поведение (полный контекст по ``inputs``).
         """
-        _, sections = self.boards.read()
+        cur_v, sections = self.boards.read()
+        if self._context_mode(node) == CONTEXT_DELTA:
+            view = self._delta_view(rec.id, node, cur_v, sections)
+            if view is not None:
+                return view
         wanted = list(node.get("inputs") or [])
         out = {name: sections[name] for name in wanted if name in sections}
         for feedback in self._feedback_sections(node.id):
@@ -1047,6 +1062,101 @@ class ModeEngine:
             if critic_loop or human_edit:
                 result.append(self._out_section(other))
         return result
+
+    # ── дельта-контекст (Ф6-a 6a.4 Ф1, В3/в) ──────────────────────────────
+
+    @staticmethod
+    def _context_mode(node: Node) -> str:
+        """Режим контекста узла: ``context`` из spec, ``full`` по умолчанию.
+
+        ``delta`` действует только для узлов-потребителей (``llm-step`` /
+        ``tool-step``): ``critic-gate`` защищён protected-принципом (вердикт
+        качества — на полном контексте, стоп-сигнал Ф1.0), ``human-gate``
+        промпт из секций не собирает. Неизвестное значение — ``full``
+        (схема S9 ловит на статике, движок глух к мусору на исполнении).
+        """
+        if node.kind not in DELTA_CONSUMER_KINDS:
+            return CONTEXT_FULL
+        return CONTEXT_DELTA if node.get("context") == CONTEXT_DELTA else CONTEXT_FULL
+
+    def _delta_view(
+        self, job_id: str, node: Node, cur_v: int, sections: Mapping[str, str],
+    ) -> dict[str, str] | None:
+        """Дельта-вид узла или ``None`` (= полный контекст, fail-safe).
+
+        Структурное правило достаточности (``context_delta.decide_context_mode``):
+        ``changed`` — ``board.diff`` от версии доски, которую узел видел в
+        прошлый раз (маркер ledger ``board_seen:{node}``; на каждом чтении
+        обновляется), до текущей; ``referenced`` — охват предыдущей критики
+        (``_critique_scope``). Достаточно (``referenced ⊆ changed``) → узел
+        получает изменённые секции + предыдущую критику; иначе/неопределённо →
+        ``None`` и вызывающий ``_inputs`` идёт полным путём.
+
+        Недостаточность решает ДВИЖОК, не модель (стоп-сигнал Ф1.0:
+        ``escalation_rate = 0.00`` — 7B не эскалируется, а выдаёт ложный
+        PASS). Любой сбой (нет маркера/снапшота, битый diff) → полный
+        контекст: дельта — оптимизация, полный вид — корректность.
+        """
+        wanted = [str(x) for x in (node.get("inputs") or [])]
+        if not all(name in sections for name in wanted):
+            return None  # fail-closed остаётся на полном пути (_inputs поднимет ошибку)
+        prev = self.ledger.get(job_id, f"board_seen:{node.id}")
+        # маркер читается КАЖДЫЙ раз: узел «видел» доску в этой версии —
+        # окно следующей дельты отсчитывается от этого чтения.
+        self.ledger.put(job_id, f"board_seen:{node.id}", {"v": int(cur_v)})
+        if prev is None:
+            return None  # первого состояния нет → полный контекст (0 изменений)
+        try:
+            changed = frozenset(self.boards.diff(int(prev.get("v", 0)), int(cur_v)))
+        except Exception:  # noqa: BLE001 — утерянный/битый снапшот не рушит прогон
+            return None
+        referenced = self._critique_scope(node, changed)
+        if decide_context_mode(changed, referenced) != CONTEXT_DELTA:
+            return None
+        view = {name: sections[name] for name in sorted(changed) if name in sections}
+        for feedback in self._feedback_sections(node.id):
+            # только СВЕЖАЯ критика (∈ changed) — симметрично ``_critique_scope``:
+            # старая (уже потреблённая) правка запечена в изменившемся выходе
+            # узла и в дельта-вид не тащится.
+            if feedback in changed and feedback in sections:
+                view[feedback] = sections[feedback]
+        return view
+
+    def _critique_scope(
+        self, node: Node, changed: AbstractSet[str],
+    ) -> frozenset[str] | None:
+        """Секции, к которым отсылает предыдущая критика (структурно, консервативно).
+
+        Источник — не текст вывода критика (парсинг прозы ненадёжен в обе
+        стороны), а ГРАФ: критика живёт в секции, которую пишет узел
+        ``critic-gate`` (``on_revise``/``on_edit`` → этот узел), и её охват по
+        построению ограничен объявленными ``inputs`` критика — чего критик не
+        читал, о том он не пишет. Учитывается только СВЕЖАЯ критика
+        (секция ∈ ``changed``): старая уже потреблена прежним входом узла и
+        запечена в его изменившемся выходе.
+
+        ``None`` (охват неопределим → полный контекст) когда: писатель секции —
+        ``human-gate`` (правка человека — свободная форма), писатель
+        неоднозначен, критик без объявленных ``inputs`` (видел весь борд).
+        """
+        scope: set[str] = set()
+        for feedback in self._feedback_sections(node.id):
+            if feedback not in changed:
+                continue  # несвежая/отсутствующая критика окно дельты не ограничивает
+            writers = [
+                other for other in self.graph.nodes.values()
+                if self._out_section(other) == feedback
+            ]
+            if len(writers) != 1:
+                return None
+            writer = writers[0]
+            if writer.kind != "critic-gate":
+                return None
+            inputs = writer.get("inputs")
+            if not inputs:
+                return None
+            scope |= {str(x) for x in inputs}
+        return frozenset(scope) or None
 
     def _prompt(self, node: Node, inputs: Mapping[str, str]) -> str:
         """Промпт узла: контракт роли → ``# РОЛЬ/# УЗЕЛ`` → секции-``inputs``.

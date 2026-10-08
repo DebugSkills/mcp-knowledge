@@ -14,8 +14,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from ai_workspace.orchestrator.context_delta import CONTEXT_MODES
+
 __all__ = [
     "CONTRACTS",
+    "CONTEXT_MODES",
     "NODE_KINDS",
     "REQUIRED_FIELDS",
     "Finding",
@@ -162,6 +165,16 @@ def validate_schema(doc: dict, registry: Any) -> list[Finding]:
                     )
                 seen_ids.add(node_id)
                 node_ids.add(node_id)
+            context = node.get("context")
+            if context is not None and context not in CONTEXT_MODES:
+                findings.append(
+                    _err(
+                        "S9",
+                        f"неизвестный context: {context!r}; ожидается один из "
+                        f"{sorted(CONTEXT_MODES)}",
+                        f"nodes[{i}].context",
+                    )
+                )
             if node.get("kind") not in NODE_KINDS:
                 findings.append(
                     _err(

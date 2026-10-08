@@ -1,4 +1,4 @@
-"""Offline-тесты линт-правил L1–L14 (Ф3.5a-3, L11 — Ф3.9, L13 — Ф6-a 6a.4; L14 — protected-принцип критика).
+"""Offline-тесты линт-правил L1–L15 (Ф3.5a-3; L11 — Ф3.9; L13 — Ф6-a 6a.4; L14 — protected-принцип критика; L15 — Ф1 дельта-контекст).
 
 Невакуумность: на каждый код — свой фикстур-нарушитель (ровно один код);
 валидный режим даёт пустой список; отдельные inline-мутации покрывают
@@ -61,6 +61,7 @@ def test_valid_mode_is_clean(registry: Registry):
         ("lint_L11_model_specific.yaml", "L11"),
         ("lint_L13_fork_join_unsupported.yaml", "L13"),
         ("lint_L14_critic_on_fast.yaml", "L14"),
+        ("lint_L15_delta_on_critic.yaml", "L15"),
     ],
 )
 def test_each_rule_fires_exactly_its_code(registry: Registry, fixture: str, code: str):
@@ -171,3 +172,31 @@ def test_cli_reports_lint_errors():
 
     assert main(["--file", str(FIXTURES / "lint_L1_cycle.yaml")]) == 1
     assert main(["--file", str(VALID)]) == 0
+
+
+def test_l15_message_names_protected_principle(registry: Registry):
+    """L15: сообщение называет protected-принцип и допустимые kind-ы."""
+    findings = validate_lint(
+        _load(FIXTURES / "lint_L15_delta_on_critic.yaml"),
+        registry,
+        base_dir=REPO_ROOT,
+    )
+    l15 = [f for f in findings if f.code == "L15"]
+    assert len(l15) == 1, f"ожидался ровно один L15, получен {[f.code for f in findings]}"
+    assert l15[0].path == "nodes.critic.context"
+    assert "protected-принцип" in l15[0].message
+    assert "llm-step/tool-step" in l15[0].message
+
+
+def test_l15_allows_consumer_kinds(registry: Registry):
+    """L15: context: delta легален на llm-step и tool-step (узлы-потребители)."""
+    doc = _load(VALID)
+    analyst = next(n for n in doc["nodes"] if n.get("id") == "analyst")
+    citer = next(n for n in doc["nodes"] if n.get("id") == "citer")
+    analyst["context"] = "delta"
+    citer["context"] = "delta"
+    assert "L15" not in _codes(doc, registry)
+    assert validate_schema(doc, registry) == []  # схема принимает delta (S9 чист)
+    human = next(n for n in doc["nodes"] if n.get("kind") == "human-gate")
+    human["context"] = "delta"
+    assert "L15" in _codes(doc, registry)
