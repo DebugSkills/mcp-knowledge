@@ -18,10 +18,11 @@ from ai_workspace.orchestrator.context_delta import CONTEXT_MODES
 
 __all__ = [
     "CALIBRATION_PIN_PARAMS",
-    "CONTRACTS",
     "CONTEXT_MODES",
+    "CONTRACTS",
     "NODE_KINDS",
     "REQUIRED_FIELDS",
+    "VARIANT_AXES",
     "Finding",
     "validate_schema",
 ]
@@ -48,6 +49,10 @@ REQUIRED_FIELDS: tuple[str, ...] = (
 CALIBRATION_PIN_PARAMS: frozenset[str] = frozenset(
     {"retries", "max_iterations", "context_mode"}
 )
+#: Ф7 Э4 (arch-2026-10-08-f7-calibration, §7.2): допустимые оси вариантов
+#: режимов (``modes/<mode>.<variant>.yaml``). «decomposition» — глубина
+#: декомпозиции задачи (единственная ось первого эксперимента H1).
+VARIANT_AXES: frozenset[str] = frozenset({"decomposition"})
 
 SEVERITY_ERROR = "error"
 
@@ -229,5 +234,33 @@ def validate_schema(doc: dict, registry: Any) -> list[Finding]:
                 findings.append(
                     _err("S5", f"конец edge не среди id узлов: {dst!r}", f"edges[{i}]")
                 )
+
+    # S11: конвенция mode-variant (Ф7 Э4, §7.2) — поля верхнего уровня документа.
+    # Задан variant_of → вся тройка обязательна и типизирована.
+    if "variant_of" in doc:
+        variant_of = doc.get("variant_of")
+        if not isinstance(variant_of, str) or not variant_of:
+            findings.append(
+                _err("S11", "variant_of должен быть непустой строкой (id базового режима)", "variant_of")
+            )
+        axis = doc.get("variant_axis")
+        if axis not in VARIANT_AXES:
+            findings.append(
+                _err(
+                    "S11",
+                    f"неизвестный variant_axis: {axis!r}; ожидается один из "
+                    f"{sorted(VARIANT_AXES)}",
+                    "variant_axis",
+                )
+            )
+        rationale = doc.get("variant_rationale")
+        if not isinstance(rationale, str) or not rationale:
+            findings.append(
+                _err(
+                    "S11",
+                    "variant_rationale должен быть непустой строкой — зачем этот вариант",
+                    "variant_rationale",
+                )
+            )
 
     return findings

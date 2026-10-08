@@ -1,0 +1,94 @@
+# Режим-вариант «статья.deep» — первый mode-variant AI-верстака (Ф7 Э4, ось «decomposition», эксперимент H1).
+# База: modes/statya.yaml (Ф3.6); конвенция варианта: дизайн Ф7 §7.2 (arch-2026-10-08-f7-calibration);
+# реестр решений: calibration/variants.yaml (§7.4); самопроверка: `make modes-validate` (S1–S11 + L1–L16).
+#
+# Отличие от базы — ось «глубже декомпозиция» (под слабую модель, H1):
+#   узел decompose ПЕРЕД analyst разбивает бриф на подзадачи (outline);
+#   analyst пишет черновик по brief+outline — один большой проход заменён двумя
+#   меньшими, и каждый шаг получает уже структурированный вход.
+# Остальное без изменений: shape/contract/zone/output/board, tool-set, узлы и
+# рёбра базы, два human-gate (structure/publish), ревизионная петля критика
+# (critic->analyst только как on_revise, max_iterations: 3).
+id: statya.deep
+version: 1
+variant_of: statya
+variant_axis: decomposition
+variant_rationale: "Под слабую модель: предварительная разбивка брифа на подзадачи до черновика (H1) — decompose строит outline, analyst пишет черновик по brief+outline, вместо одного тяжёлого прохода два меньших со структурированным входом."
+shape: analyst-critic-editor
+contract: document
+zone: public
+output: {type: article, citation_policy: required, sections: [document, document+refs]}
+board: {buffer: board.md, store: job}
+nodes:
+  - id: decompose
+    kind: llm-step
+    role: analyst
+    model_class: heavy
+    inputs: [brief]
+    outputs: [outline]
+    writes: [outline]
+    retry: 2
+  - id: analyst
+    kind: llm-step
+    role: analyst
+    model_class: heavy
+    inputs: [brief, outline]
+    outputs: [draft]
+    writes: [draft]
+    retry: 2
+  - id: structure
+    kind: human-gate
+    actor: operator
+    prompt: "Утвердить структуру статьи?"
+    timeout: 24h
+    on_timeout: sleep
+    on_approve: critic
+    on_edit: analyst
+    writes: [structure]
+  - id: critic
+    kind: critic-gate
+    role: critic
+    model_class: heavy
+    inputs: [draft]
+    verdicts: [PASS, REVISE]
+    threshold: 0.80
+    max_iterations: 3
+    on_max_iter: fail
+    on_revise: analyst
+    writes: [verdict]
+  - id: editor
+    kind: llm-step
+    role: editor
+    model_class: heavy
+    inputs: [draft, verdict]
+    outputs: [document]
+    writes: [document]
+    retry: 2
+  - id: citer
+    kind: tool-step
+    tool: mcp.citation_attach
+    policy: strict
+    inputs: [document]
+    outputs: [document+refs]
+    writes: [document+refs]
+  - id: publish
+    kind: human-gate
+    actor: operator
+    prompt: "Утвердить статью к публикации?"
+    timeout: 24h
+    on_timeout: sleep
+    on_approve: null
+    on_edit: editor
+    writes: [publish]
+edges:
+  - decompose->analyst
+  - analyst->structure
+  - structure->critic
+  - critic|PASS->editor
+  - critic->analyst
+  - editor->citer
+  - citer->publish
+gates:
+  structure: {type: human, blocks_output: false}
+  publish: {type: human, blocks_output: true}
+tools: [mcp.search_knowledge, mcp.get_entry, mcp.citation_attach]

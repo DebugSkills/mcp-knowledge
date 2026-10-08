@@ -6,18 +6,27 @@
 базового режима в ``modes_dir``, обязательность ``probe_pair{base,variant}``
 для ``promoted``/``rejected`` (решение оператора P5 опирается на пару
 ProbeReport §7.3).
+
+Э4-1: ``evaluate_promotion`` — критерий §7.3 (бумажка решения, НЕ решение:
+promotion всегда за оператором P5); ``record_decision`` — upsert записи в
+``variants.yaml`` с fail-closed ревалидацией реестра до записи.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 from ai_workspace.calibration.profiles import SEVERITY_ERROR, Finding
 
 __all__ = [
     "VARIANT_SCHEMA",
     "VARIANT_STATUSES",
+    "evaluate_promotion",
+    "record_decision",
     "validate_variants",
 ]
 
@@ -137,3 +146,142 @@ def validate_variants(doc: dict, modes_dir: Path | str) -> list[Finding]:
                 )
 
     return findings
+
+
+def evaluate_promotion(
+    base_report: Any,
+    variant_report: Any,
+    *,
+    quality_floor: float,
+    rub_cap: float | None = None,
+    wall_cap_s: float | None = None,
+) -> dict:
+    """Критерий promotion варианта (§7.3) по паре ProbeReport.
+
+    Возвращает ``{"passed": bool, "reasons": [...]}`` — какие условия НЕ
+    выполнены (``passed`` ⇔ ``reasons`` пуст). Это вход для решения
+    оператора (P5), а не само решение. Условия:
+
+      1. база проваливает пол: ``base.golden_median_score < quality_floor``
+         (вариант имеет смысл только у проваливающейся базы);
+      2. вариант проходит пол: ``variant.golden_median_score >= quality_floor``;
+      3. рамка D6: ``rub <= rub_cap`` И ``wall_s <= wall_cap_s`` (кап не
+         задан — не проверяется);
+      4. held-out подтверждает golden: ``|golden - heldout| <= dispersion``
+         (M5; нулевая дисперсия — с допуском 1e-9 против float-шума).
+    """
+    reasons: list[str] = []
+    if base_report.golden_median_score >= quality_floor:
+        reasons.append(
+            f"база не проваливает quality_floor: base golden_median_score="
+            f"{base_report.golden_median_score:.4f} >= floor={quality_floor:.4f}"
+        )
+    if variant_report.golden_median_score < quality_floor:
+        reasons.append(
+            f"вариант ниже quality_floor: variant golden_median_score="
+            f"{variant_report.golden_median_score:.4f} < floor={quality_floor:.4f}"
+        )
+    if rub_cap is not None and variant_report.rub > rub_cap:
+        reasons.append(
+            f"превышен rub_cap: rub={variant_report.rub:.4f} > rub_cap={rub_cap:.4f}"
+        )
+    if wall_cap_s is not None and variant_report.wall_s > wall_cap_s:
+        reasons.append(
+            f"превышен wall_cap_s: wall_s={variant_report.wall_s:.4f} "
+            f"> wall_cap_s={wall_cap_s:.4f}"
+        )
+    delta = abs(variant_report.golden_median_score - variant_report.heldout_score)
+    if delta > max(variant_report.golden_dispersion, 1e-9):
+        reasons.append(
+            f"held-out расходится с golden: |golden-heldout|={delta:.4f} > "
+            f"golden_dispersion={variant_report.golden_dispersion:.4f}"
+        )
+    return {"passed": not reasons, "reasons": reasons}
+
+
+def record_decision(
+    variants_path: Path | str,
+    variant: str,
+    status: str,
+    probe_pair: Mapping | None,
+    decided_by: str,
+    decided_at: str,
+) -> None:
+    """Upsert записи решения в ``variants.yaml`` (§7.4), fail-closed.
+
+    ``modes_dir`` выводится из layout SSOT: ``<ws>/calibration/variants.yaml``
+    → ``<ws>/modes``. Реестр валидируется ЦЕЛИКОМ (включая чужие записи) до
+    записи: любые findings → ``ValueError``, файл не трогаем. ``probe_pair``
+    обязателен для ``promoted``/``rejected`` (CV7); ``variant_of`` берётся из
+    существующей записи либо выводится из конвенции ``<mode>.<variant>``.
+    """
+    if status not in VARIANT_STATUSES:
+        raise ValueError(
+            f"неизвестный status: {status!r}; ожидается один из "
+            f"{sorted(VARIANT_STATUSES)}"
+        )
+    path = Path(variants_path)
+    doc: dict = {"schema": VARIANT_SCHEMA, "entries": []}
+    if path.is_file():
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, Mapping):
+            doc = dict(loaded)
+    doc.setdefault("schema", VARIANT_SCHEMA)
+    entries = doc.get("entries")
+    if not isinstance(entries, list):
+        entries = []
+        doc["entries"] = entries
+
+    existing = next(
+        (
+            e
+            for e in entries
+            if isinstance(e, Mapping) and e.get("variant") == variant
+        ),
+        None,
+    )
+    variant_of = (existing or {}).get("variant_of")  # type: ignore[union-attr]
+    if not isinstance(variant_of, str) or not variant_of:
+        variant_of = variant.rsplit(".", 1)[0] if "." in variant else variant
+
+    entry: dict = {
+        "variant": variant,
+        "variant_of": variant_of,
+        "status": status,
+    }
+    if probe_pair is not None:
+        entry["probe_pair"] = dict(probe_pair)
+    entry["decided_by"] = decided_by
+    entry["decided_at"] = decided_at
+
+    candidate = dict(doc)
+    candidate["entries"] = [
+        entry
+        if isinstance(e, Mapping) and e.get("variant") == variant
+        else e
+        for e in [*entries, entry]
+    ]
+    # Выше entry добавлена в конец; для upsert убираем прежнюю копию.
+    seen_variant = False
+    deduped: list = []
+    for e in candidate["entries"]:
+        if isinstance(e, Mapping) and e.get("variant") == variant:
+            if seen_variant:
+                continue
+            seen_variant = True
+        deduped.append(e)
+    candidate["entries"] = deduped
+
+    modes_dir = path.resolve().parent.parent / "modes"
+    findings = validate_variants(candidate, modes_dir)
+    if findings:
+        raise ValueError(
+            "реестр невалиден после записи: "
+            + "; ".join(f"{f.code}: {f.message}" for f in findings)
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(candidate, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )

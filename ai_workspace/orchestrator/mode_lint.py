@@ -1,11 +1,11 @@
-"""Runtime lint L1-L15 для режимов AI-верстака (Ф3.5a-3; L11 — Ф3.9; L12 — Ф6-a 6a.3; L13/L15 — Ф6-a 6a.4; L14 — protected-принцип критика).
+"""Runtime lint L1-L16 для режимов AI-верстака (Ф3.5a-3; L11 — Ф3.9; L12 — Ф6-a 6a.3; L13/L15 — Ф6-a 6a.4; L14 — protected-принцип критика; L16 — Ф7 Э4 mode-variant).
 
 Спека: plans/_provenance/arch-2026-10-05-ai-workspace/
        arch-2026-10-05-ai-workspace-mode-engine-spec.md §4б.
 
 Контракт: ``validate_lint(doc, registry, *, base_dir) -> list[Finding]``;
 ``Finding`` реиспользуется из ``mode_schema``; все severity — ``error``,
-коды ``L1..L15``. Каждое правило — чистая функция (кроме L2, читающей ФС).
+коды ``L1..L16``. Правила чистые, кроме L2/L16, читающих ФС.
 
 Правила:
   L1  DAG ацикличен (цикл допустим только у critic-gate с on_revise+max_iterations)
@@ -23,12 +23,15 @@
   L13 kind=fork/join не поддержан движком до Ф3 (engine.py:548)
   L14 critic-gate не на слабом классе: fast запрещён (heavy/local-only)
   L15 context: delta — только на llm-step/tool-step (защита critic-gate)
+  L16 mode-variant: база variant_of существует; zone наследует базе (I5)
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from ai_workspace.orchestrator.context_delta import CONTEXT_DELTA, DELTA_CONSUMER_KINDS
 from ai_workspace.orchestrator.mode_schema import Finding
@@ -73,14 +76,14 @@ def _effective_outputs(node: dict) -> set[str]:
 
 
 def validate_lint(doc: dict, registry: Any, *, base_dir: Path | None = None) -> list[Finding]:
-    """Запустить L1-L15; вернуть список Finding (severity=error)."""
+    """Запустить L1-L16; вернуть список Finding (severity=error)."""
     findings: list[Finding] = []
     # L13 выполняется ПЕРЕД L9 (Ф6-a 6a.4): «не поддержано движком» должно
     # идти раньше «не сбалансированы» — порядок findings детерминирован.
     for fn in (
         lint_l1, lint_l2, lint_l3, lint_l4, lint_l5,
         lint_l6, lint_l7, lint_l8, lint_l13, lint_l9,
-        lint_l10, lint_l11, lint_l12, lint_l14, lint_l15,
+        lint_l10, lint_l11, lint_l12, lint_l14, lint_l15, lint_l16,
     ):
         findings.extend(fn(doc, registry, base_dir))
     return findings
@@ -452,3 +455,53 @@ def lint_l15(doc: dict, registry: Any, base_dir: Path | None) -> list[Finding]:
             f"nodes.{node.get('id')}.context",
         ))
     return out
+
+
+def lint_l16(doc: dict, registry: Any, base_dir: Path | None) -> list[Finding]:
+    """Конвенция mode-variant (Ф7 Э4, §7.2): база существует + zone-наследование.
+
+    ``variant_of`` — поле документа (не узла), указывающее на базовый режим
+    ``modes/<variant_of>.yaml``. Типизацию тройки полей проверяет S11 (контур
+    (а)); здесь — ФС-факты: файл базы существует, а зона варианта наследует
+    зоне базы (I5: private-база → private-вариант), иначе private-контент
+    утекает в public-вариант. База не читается/битый YAML → зона считается
+    ``public`` (degradation безопасен: расхождение поймает zone-чек).
+
+    Каталог режимов: ``base_dir/modes`` (unit-деревья), а если его нет —
+    ``base_dir/ai_workspace/modes`` (прод-контур ``modes_validate`` передаёт
+    корень репозитория, режимы лежат в ``ai_workspace/modes``).
+    """
+    variant_of = doc.get("variant_of")
+    if not variant_of:
+        return []
+    root = Path(base_dir) if base_dir else _REPO_ROOT
+    modes_dir = root / "modes"
+    if not modes_dir.is_dir() and (root / "ai_workspace" / "modes").is_dir():
+        modes_dir = root / "ai_workspace" / "modes"
+    base_path = modes_dir / f"{variant_of}.yaml"
+    if not base_path.is_file():
+        return [
+            _f(
+                "L16",
+                f"базовый режим варианта не найден: {base_path}",
+                "variant_of",
+            )
+        ]
+    try:
+        base_doc = yaml.safe_load(base_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        base_doc = None
+    if not isinstance(base_doc, dict):
+        base_doc = {}
+    zone = doc.get("zone", "public")
+    base_zone = base_doc.get("zone", "public")
+    if zone != base_zone:
+        return [
+            _f(
+                "L16",
+                f"зона варианта ({zone!r}) должна наследовать зоне базы "
+                f"{variant_of!r} ({base_zone!r}) — правило I5",
+                "zone",
+            )
+        ]
+    return []

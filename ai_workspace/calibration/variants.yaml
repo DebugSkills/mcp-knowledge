@@ -1,0 +1,12 @@
+# Реестр mode-вариантов AI-верстака (Ф7, §7.4 дизайна arch-2026-10-08-f7-calibration).
+# SSOT promotion-решений: baseline — запись при старте эксперимента;
+# promoted/rejected — только оператор (P5) с парой ProbeReport §7.3
+# (probe_pair{base,variant}); записи пишет record_decision (variants.py).
+# Валидация: ai_workspace.calibration.variants.validate_variants (CV0–CV7).
+schema: calibration-variants/1
+entries:
+  - variant: statya.deep
+    variant_of: statya
+    status: baseline
+    decided_by: operator
+    decided_at: "2026-10-08"
