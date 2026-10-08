@@ -8,14 +8,18 @@
 
 ``model_class`` в профиле — привязка применения (какой класс калиброван),
 НЕ мутация узлов режимов (A4). ``validate_profile`` — чистая функция без I/O;
-чтение каталога профилей — ``load_profile``/``list_profiles``.
+чтение каталога профилей — ``load_profile``/``list_profiles``; запись —
+``write_profile`` (валидация fail-closed → файл); сборка draft-документа из
+``ProbeReport`` (Э3-2) — ``build_draft_profile``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -26,6 +30,8 @@ __all__ = [
     "list_profiles",
     "load_profile",
     "validate_profile",
+    "build_draft_profile",
+    "write_profile",
 ]
 
 #: Схема профилей калибровки (дизайн §5.1)
@@ -201,3 +207,126 @@ def list_profiles(profiles_dir: Path | str) -> list[str]:
     if not directory.is_dir():
         return []
     return sorted(path.stem for path in directory.glob("*.yaml") if path.is_file())
+
+
+# ── Э3-2: сборка draft-профиля из ProbeReport + запись (дизайн §5.1, §6.3) ──
+
+
+def _utc_iso(now: datetime) -> str:
+    """ISO-8601 UTC со секундами и суффиксом ``Z`` (стиль §5.1)."""
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc)
+        return now.isoformat(timespec="seconds").replace("+00:00", "Z")
+    return now.isoformat(timespec="seconds")
+
+
+def _model_slug(model_id: str) -> str:
+    """Слаг model_id для ``profile_id``: ``qwen2.5:7b`` → ``qwen25-7b`` (§5.1).
+
+    Точка выпадает (``qwen2.5`` → ``qwen25``), прочие не-алнум — дефисы;
+    повторы дефисов и крайние — схлопываются.
+    """
+    chars = []
+    for ch in model_id.strip().lower():
+        if ch.isalnum():
+            chars.append(ch)
+        elif ch != ".":
+            chars.append("-")
+    slug = "".join(chars)
+    return "-".join(part for part in slug.split("-") if part) or "unknown"
+
+
+def _draft_profile_id(report: Any, model_class: str) -> str:
+    """``cal-<class>-<model-slug>-<seq>`` (§5.1); seq — хвост ``run_id`` зонда.
+
+    Детерминирован по probe-прогону: один ProbeReport → один profile_id
+    (повторная запись того же draft идемпотентна по имени файла).
+    """
+    seq = report.run_id[-4:] if len(report.run_id) >= 4 else report.run_id
+    return f"cal-{model_class}-{_model_slug(str(report.model_id))}-{seq}"
+
+
+def build_draft_profile(
+    report: Any,
+    *,
+    model_class: str,
+    scalars: Mapping[str, Any],
+    quality_floor: float,
+    constraints: Mapping[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Собрать draft-документ профиля по схеме ``calibration-profile/1`` (§5.1).
+
+    - ``status: draft``, ``version: 1`` — утверждение в ``calibrated``
+      ставит ТОЛЬКО оператор (P5, §6.3);
+    - ``evidence`` — доказательная база замера: ``probe_run``/манифесты/метрики
+      (F6: golden и held-out раздельно) из ``ProbeReport``;
+    - ``scalars`` — ТОЛЬКО эффективные скаляры (``REQUIRED_SCALARS``);
+      посторонние ключи отбрасываются, отсутствие обязательного — ``ValueError``
+      (fail-closed: невалидный профиль не собирается молча);
+    - ``constraints`` — рамка D6: ``quality_floor`` + капы из ``constraints``
+      (эхо ``policy.propose_scalars``), только заданные значения;
+    - ``now`` инъектируется (детерминизм тестов); по умолчанию — текущий UTC.
+    """
+    # только эффективные скаляры схемы: посторонние ключи (зарезервированный
+    # critic_threshold P3-2 и прочие) в профиль v1 не попадают; отсутствие
+    # обязательного — ValueError (fail-closed, не KeyError вслепую)
+    missing = [key for key in REQUIRED_SCALARS if key not in scalars]
+    if missing:
+        raise ValueError(
+            f"scalars не содержит обязательные эффективные скаляры: {missing}; "
+            f"ожидались {list(REQUIRED_SCALARS)}"
+        )
+    scalars_out = {key: scalars[key] for key in REQUIRED_SCALARS}
+
+    constraints_out: dict[str, Any] = {"quality_floor": quality_floor}
+    if constraints is not None:
+        for key in ("rub_cap", "wall_cap_s"):
+            if constraints.get(key) is not None:
+                constraints_out[key] = constraints[key]
+
+    stamp = _utc_iso(now if now is not None else datetime.now(timezone.utc))
+    return {
+        "schema": PROFILE_SCHEMA,
+        "profile_id": _draft_profile_id(report, model_class),
+        "model_class": model_class,
+        "calibrated_for": {"model_id": str(report.model_id), "digest": str(report.digest)},
+        "status": "draft",
+        "version": 1,
+        "evidence": {
+            "probe_run": str(report.run_id),
+            "golden_manifest": str(report.golden_manifest),
+            "pricing_manifest": str(report.pricing_manifest),
+            "metrics": {
+                "golden_median_score": float(report.golden_median_score),
+                "heldout_score": float(report.heldout_score),
+                "parse_rate": float(report.parse_rate),
+                "rub": float(report.rub),
+                "wall_s": float(report.wall_s),
+            },
+        },
+        "scalars": scalars_out,
+        "constraints": constraints_out,
+        "created_at": stamp,
+        "updated_at": stamp,
+    }
+
+
+def write_profile(profiles_dir: Path | str, doc: dict) -> Path:
+    """Записать профиль валидно: ``validate_profile`` → ``<profile_id>.yaml``.
+
+    Fail-closed: любые findings схемы — ``ValueError`` ДО записи (невалидный
+    документ на носитель не попадает). Сериализация — ``yaml.safe_dump`` с
+    ``sort_keys=False`` (порядок полей — как в схеме §5.1, читаемый diff).
+    """
+    findings = validate_profile(doc)
+    if findings:
+        details = "; ".join(f"{f.path}: {f.message}" for f in findings)
+        raise ValueError(f"профиль не проходит схему {PROFILE_SCHEMA}: {details}")
+    directory = Path(profiles_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{doc['profile_id']}.yaml"
+    path.write_text(
+        yaml.safe_dump(doc, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    return path
