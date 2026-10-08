@@ -91,3 +91,24 @@ def test_s9_accepts_declared_context_values() -> None:
     doc["nodes"][0]["context"] = "delta"
     doc["nodes"][2]["context"] = "full"
     assert validate_schema(doc, Registry(REGISTRY_DIR)) == []
+
+
+def test_s10_rejects_unknown_pin_param() -> None:
+    doc = _load("valid_statya.yaml")
+    doc["nodes"][0]["calibration_pin"] = ["shaping"]  # shaping у узла нет — вне enum
+    findings = validate_schema(doc, Registry(REGISTRY_DIR))
+    assert _codes(findings) == {"S10"}, [str(f) for f in findings]
+    assert findings[0].path == "nodes[0].calibration_pin"
+
+
+def test_s10_rejects_non_list_pin() -> None:
+    doc = _load("valid_statya.yaml")
+    doc["nodes"][0]["calibration_pin"] = "retries"  # строка вместо списка
+    assert _codes(validate_schema(doc, Registry(REGISTRY_DIR))) == {"S10"}
+
+
+def test_s10_accepts_valid_pins() -> None:
+    doc = _load("valid_statya.yaml")
+    doc["nodes"][0]["calibration_pin"] = ["retries", "max_iterations", "context_mode"]
+    doc["nodes"][1]["calibration_pin"] = ["context_mode"]
+    assert validate_schema(doc, Registry(REGISTRY_DIR)) == []

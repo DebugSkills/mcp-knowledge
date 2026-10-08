@@ -62,6 +62,12 @@ from ai_workspace.orchestrator.context_delta import (
 )
 from ai_workspace.orchestrator.ledger import Ledger, MemoryLedger, RedisLedger
 
+try:  # Э1 Ф7 (arch-2026-10-08-f7-calibration): тонкий слой калибровки (режимы Б/П)
+    from ai_workspace.calibration.api import ResolvedScalars, resolve
+except ImportError:  # pragma: no cover — модуля нет -> режим Б (паритет F1)
+    ResolvedScalars = None  # type: ignore[assignment,misc]
+    resolve = None  # type: ignore[assignment]
+
 __all__ = [
     "SHAPING_DEFAULT_BUDGET",
     "SHAPING_FLOOR_CHARS",
@@ -354,6 +360,8 @@ class ModeEngine:
         usage_of: Callable[[str, str], int] | None = None,
         on_node_usage: Callable[[dict], None] | None = None,
         on_job_terminal: Callable[[str, float], None] | None = None,
+        calibration_profile: dict | None = None,
+        calibration_model_facts: Callable[[], Any] | None = None,
     ) -> None:
         self.jobs = jobs
         self.boards = boards
@@ -370,6 +378,14 @@ class ModeEngine:
         self.usage_of = usage_of if usage_of is not None else _chars4_usage
         self.on_node_usage = on_node_usage
         self.on_job_terminal = on_job_terminal
+        # Э1 Ф7 (arch-2026-10-08-f7-calibration): профиль калибровки (режим П);
+        # None / гейт не прошёл -> режим Б = вчерашняя семантика чтений (паритет F1).
+        self.calibration_profile = calibration_profile
+        # Э2-2 Ф7: провайдер фактов полки (callable -> ModelFacts|None) для
+        # гейта T1. None (провайдера нет) -> model_facts=None -> поведение
+        # Э1 в точности (паритет F1).
+        self.calibration_model_facts = calibration_model_facts
+        self._cal_scalars: dict[str, ResolvedScalars] = {}
 
     # ── публичный API ────────────────────────────────────────────────────
 
@@ -429,39 +445,45 @@ class ModeEngine:
                                         detail=f"исполнение отложено: admission={action} — квота/бюджет, job остаётся в очереди")
             rec = self.jobs.transition(job_id, JobState.RUNNING, expect_version=rec.version, epoch=epoch)
 
-        for _ in range(max_steps):
-            node = self.graph.node(rec.cursor or self.graph.start())
-            try:
-                self._beat(rec)
-                rec, verdict, next_id = self._run_node(job_id, rec, node, epoch)
-            except _Pause as pause:
-                cur = self.jobs.get(job_id)  # версия могла сдвинуться внутри узла
-                rec = self.jobs.transition(
-                    job_id, JobState.WAITING_HUMAN, expect_version=cur.version, epoch=epoch,
-                    patch={"cursor": pause.node_id},
-                )
-                # Политика паузы (P1-5, см. QuotaPort): слот не держим —
-                # ожидание человека не занимает личный параллелизм (D6).
-                self._quota_release(rec)
-                return EngineResult(status="paused", node=pause.node_id,
-                                    board_version=self._board_version(rec),
-                                    resume_token=pause.token, detail=pause.prompt)
-            except EngineError as exc:
-                cur = self.jobs.get(job_id)  # секция/версия могли обновиться до провала
-                rec = self.jobs.transition(job_id, JobState.FAILED, expect_version=cur.version,
-                                           epoch=epoch, patch={"cursor": node.id})
-                self._quota_finalize(rec)
-                return EngineResult(status="failed", node=node.id,
-                                    board_version=self._board_version(rec), detail=str(exc))
+        # Э1 Ф7: единственный resolve калибровки на проход job'а (НЕ per-node);
+        # режим Б / сбой резолвера -> {} -> чтения вчерашней семантикой (паритет F1).
+        self._cal_scalars = self._resolve_calibration()
+        try:
+            for _ in range(max_steps):
+                node = self.graph.node(rec.cursor or self.graph.start())
+                try:
+                    self._beat(rec)
+                    rec, verdict, next_id = self._run_node(job_id, rec, node, epoch)
+                except _Pause as pause:
+                    cur = self.jobs.get(job_id)  # версия могла сдвинуться внутри узла
+                    rec = self.jobs.transition(
+                        job_id, JobState.WAITING_HUMAN, expect_version=cur.version, epoch=epoch,
+                        patch={"cursor": pause.node_id},
+                    )
+                    # Политика паузы (P1-5, см. QuotaPort): слот не держим —
+                    # ожидание человека не занимает личный параллелизм (D6).
+                    self._quota_release(rec)
+                    return EngineResult(status="paused", node=pause.node_id,
+                                        board_version=self._board_version(rec),
+                                        resume_token=pause.token, detail=pause.prompt)
+                except EngineError as exc:
+                    cur = self.jobs.get(job_id)  # секция/версия могли обновиться до провала
+                    rec = self.jobs.transition(job_id, JobState.FAILED, expect_version=cur.version,
+                                               epoch=epoch, patch={"cursor": node.id})
+                    self._quota_finalize(rec)
+                    return EngineResult(status="failed", node=node.id,
+                                        board_version=self._board_version(rec), detail=str(exc))
 
-            if next_id is None:
-                rec = self.jobs.transition(job_id, JobState.DONE, expect_version=rec.version, epoch=epoch)
-                self._quota_finalize(rec)
-                return EngineResult(status="done", node=node.id,
-                                    board_version=self._board_version(rec), verdict=verdict,
-                                    artifact_id=self._persist_artifact(job_id, rec))
-            rec = self.jobs.patch(job_id, expect_version=rec.version, epoch=epoch,
-                                  patch={"cursor": next_id})
+                if next_id is None:
+                    rec = self.jobs.transition(job_id, JobState.DONE, expect_version=rec.version, epoch=epoch)
+                    self._quota_finalize(rec)
+                    return EngineResult(status="done", node=node.id,
+                                        board_version=self._board_version(rec), verdict=verdict,
+                                        artifact_id=self._persist_artifact(job_id, rec))
+                rec = self.jobs.patch(job_id, expect_version=rec.version, epoch=epoch,
+                                      patch={"cursor": next_id})
+        finally:
+            self._cal_scalars = {}  # скаляры не живут дольше прохода job'а
         return EngineResult(status="stopped", node=rec.cursor,
                             board_version=self._board_version(rec),
                             detail=f"предохранитель max_steps={max_steps}")
@@ -681,7 +703,8 @@ class ModeEngine:
         it_key = f"iter:{node.id}"
         counted = self.ledger.get(job_id, it_key) or {"n": 0}
         n = int(counted.get("n", 0)) + 1
-        max_iter = int(node.get("max_iterations", 1))
+        # Э1 Ф7: эффективный max_iter (режим П), иначе declared (паритет F1)
+        max_iter = int(self._scalar(node, "max_iterations", int(node.get("max_iterations", 1))))
         if n >= max_iter:
             raise NodeFailure(
                 f"critic-gate {node.id!r}: достигнут max_iterations={max_iter} "
@@ -859,6 +882,13 @@ class ModeEngine:
             estimated = True  # узел реально оценил chars/4 (usage нет)
         wall_s = self.clock() - t0
 
+        # Э1 Ф7 (arch-2026-10-08-f7-calibration): источники скаляров узла
+        # (pin|profile|node|class|default). Режим Б / узел вне гейта П ->
+        # пустые поля; ключи в СОБЫТИИ — только в режиме П (контракт формы
+        # mode-Б события неизменен, паритет F1).
+        sc = self._cal_scalars.get(node.id)
+        cal_active = getattr(sc, "profile_id", None) is not None
+
         agg = self.ledger.get(job_id, f"usage:{node.id}") or {}
         agg["calls"] = int(agg.get("calls", 0)) + 1
         agg["cached_calls"] = int(agg.get("cached_calls", 0)) + (1 if cached else 0)
@@ -871,11 +901,13 @@ class ModeEngine:
         agg["role"] = role
         agg["model_class"] = model_class
         agg["shelf"] = shelf
+        agg["scalars_sources"] = dict(sc.sources) if cal_active else {}
+        agg["scalars_stale"] = tuple(sc.stale_marks) if cal_active else ()
         self.ledger.put(job_id, f"usage:{node.id}", agg)
 
         if self.on_node_usage is not None:
             try:
-                self.on_node_usage({
+                event = {
                     "job": job_id,
                     "trace_id": f"{job_id}:{epoch}",
                     "node": node.id,
@@ -889,7 +921,11 @@ class ModeEngine:
                     "tokens": tokens,
                     "tokens_estimated": estimated,
                     "wall_s": wall_s,
-                })
+                }
+                if cal_active:  # Э1 Ф7: источники скаляров — только режим П
+                    event["scalars_sources"] = dict(agg["scalars_sources"])
+                    event["scalars_stale"] = tuple(agg["scalars_stale"])
+                self.on_node_usage(event)
             except Exception:  # best-effort: наблюдение не валит узел
                 logger.warning(
                     "on_node_usage(%s/%s) упал (best-effort, игнор)",
@@ -897,6 +933,55 @@ class ModeEngine:
                 )
 
     # ── вспомогательное ──────────────────────────────────────────────────
+
+    # ── калибровка (Э1 Ф7, arch-2026-10-08-f7-calibration) ────────────────
+
+    def _resolve_calibration(self) -> dict[str, ResolvedScalars]:
+        """Скаляры калибровки всех узлов: чистый ``calibration.api.resolve``.
+
+        Вызывается ОДИН раз на проход job'а (``_run_admitted``), не per-node.
+        Узлы передаются spec-отображениями — контракт резолвера рассчитан
+        на Mapping-узлы режимов. ``model_facts`` — от инъектируемого
+        провайдера ``calibration_model_facts`` (Э2-2); нет провайдера или
+        он упал (сеть, §6.2) -> ``None`` = полка не наблюдаема, поведение
+        Э1 в точности (паритет F1). Любой сбой -> ``{}`` = режим Б:
+        калибровка необязательна, паритет важнее (F1).
+        """
+        if resolve is None:
+            return {}
+        try:
+            nodes = {nid: node.spec for nid, node in self.graph.nodes.items()}
+            facts = None
+            if self.calibration_model_facts is not None:
+                try:  # сбой провайдера = сетевой сбой (§6.2): факты недоступны,
+                    facts = self.calibration_model_facts()  # это НЕ сбой job'а
+                except Exception:  # noqa: BLE001 — мягко: паритет важнее (F1)
+                    facts = None
+            return dict(resolve(nodes, self.registry, model_facts=facts,
+                                profile=self.calibration_profile))
+        except Exception:  # noqa: BLE001 — калибровка необязательна, паритет важнее
+            return {}
+
+    def _scalar(self, node: Node, param: str, default: Any = None):
+        """Эффективный скаляр узла (retries/max_iterations/shaping/context_mode).
+
+        Гейт П прошёл (профиль активен для класса узла) -> значение
+        резолвера (приоритет P>C>N>R>E); иначе (режим Б, узел вне гейта,
+        сбой) -> ``default`` = вчерашняя семантика чтения — поведение
+        байт-в-байт сегодняшнее (инвариант паритета F1). Классовые
+        ``retries``/``max_iterations`` без активного профиля НЕ читаются.
+        """
+        sc = self._cal_scalars.get(getattr(node, "id", None))
+        if sc is None or getattr(sc, "profile_id", None) is None:
+            return default
+        field = {
+            "retries": "retries",
+            "max_iterations": "max_iterations",
+            "shaping": "shaping",
+            "context_mode": "context_mode",
+        }[param]
+        val = getattr(sc, field, None)
+        return val if val is not None else default
 
     def shelf_for(self, model_class: str) -> str:
         """Полка по классу модели: реестр ``model_classes`` (heavy→ext, fast→local)."""
@@ -949,7 +1034,8 @@ class ModeEngine:
         model_class = str(node.get("model_class", "fast"))
         self._guard_zone(rec, node, self.shelf_for(model_class))
         params = self.decoding.as_params() if self.decoding is not None else {}
-        attempts = int(node.get("retry", 0))
+        # Э1 Ф7: эффективные попытки (режим П), иначе declared retry (паритет F1)
+        attempts = int(self._scalar(node, "retries", int(node.get("retry", 0))))
         last: Exception | None = None
         for _ in range(attempts + 1):
             self._beat(rec)  # lease жив перед КАЖДОЙ попыткой (P1-3/P1-5)
@@ -1066,18 +1152,33 @@ class ModeEngine:
     # ── дельта-контекст (Ф6-a 6a.4 Ф1, В3/в) ──────────────────────────────
 
     @staticmethod
-    def _context_mode(node: Node) -> str:
-        """Режим контекста узла: ``context`` из spec, ``full`` по умолчанию.
+    def _context_mode_static(node: Node) -> str:
+        """Статическая (бескалибровочная) версия — прежний контракт для
+        внешних статических вызовов; движок на исполнении использует
+        instance-метод ``_context_mode`` (Э1 Ф7)."""
+        if node.kind not in DELTA_CONSUMER_KINDS:
+            return CONTEXT_FULL
+        return CONTEXT_DELTA if node.get("context") == CONTEXT_DELTA else CONTEXT_FULL
+
+    def _context_mode(self, node: Node) -> str:
+        """Режим контекста узла: preference из калибровки (режим П) /
+        ``context`` из spec, ``full`` по умолчанию.
 
         ``delta`` действует только для узлов-потребителей (``llm-step`` /
         ``tool-step``): ``critic-gate`` защищён protected-принципом (вердикт
         качества — на полном контексте, стоп-сигнал Ф1.0), ``human-gate``
         промпт из секций не собирает. Неизвестное значение — ``full``
         (схема S9 ловит на статике, движок глух к мусору на исполнении).
+
+        Э1 Ф7: preference сначала из скаляров калибровки (``context_mode``;
+        действует только при активном профиле), иначе ``node.get("context")``
+        — вчерашняя семантика (паритет F1). Структурный kind-gate сильнее
+        любого профиля (P4): критик всегда на полном контексте.
         """
+        preference = self._scalar(node, "context_mode", node.get("context"))
         if node.kind not in DELTA_CONSUMER_KINDS:
             return CONTEXT_FULL
-        return CONTEXT_DELTA if node.get("context") == CONTEXT_DELTA else CONTEXT_FULL
+        return CONTEXT_DELTA if preference == CONTEXT_DELTA else CONTEXT_FULL
 
     def _delta_view(
         self, job_id: str, node: Node, cur_v: int, sections: Mapping[str, str],
@@ -1189,8 +1290,15 @@ class ModeEngine:
         # выше (контракт + хедер) неприкосновенно — стабильный префикс.
         # full-context и секции в пределах бюджета → байт-в-байт (no-op).
         shaping, budget = self.shaping_for(str(node.get("model_class", "fast")))
+        # Э1 Ф7: эффективный шейпинг узла — режим П может включить сжатие
+        # (или снять его) независимо от класса; бюджет — только классовый
+        # (D4): классовый full-context + профильный compressed -> дефолт.
+        # Режим Б: eff == классовое значение, байт-в-байт (паритет F1).
+        eff_shaping = self._scalar(node, "shaping", shaping)
+        if eff_shaping == "compressed" and budget == 0:
+            budget = SHAPING_DEFAULT_BUDGET
         for name, value in inputs.items():
-            if shaping == "compressed":
+            if eff_shaping == "compressed":
                 value = shape_section(str(value), budget=budget)
             parts.append(f"## {name}\n{value}")
         return "\n\n".join(parts)

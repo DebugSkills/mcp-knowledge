@@ -17,6 +17,7 @@ from typing import Any
 from ai_workspace.orchestrator.context_delta import CONTEXT_MODES
 
 __all__ = [
+    "CALIBRATION_PIN_PARAMS",
     "CONTRACTS",
     "CONTEXT_MODES",
     "NODE_KINDS",
@@ -41,6 +42,11 @@ REQUIRED_FIELDS: tuple[str, ...] = (
     "contract",
     "nodes",
     "edges",
+)
+#: Ф7 (arch-2026-10-08-f7-calibration): допустимые значения nodes[].calibration_pin.
+#: Пиновать можно только скаляры, живущие в узле (у узла нет shaping-ключа).
+CALIBRATION_PIN_PARAMS: frozenset[str] = frozenset(
+    {"retries", "max_iterations", "context_mode"}
 )
 
 SEVERITY_ERROR = "error"
@@ -173,6 +179,20 @@ def validate_schema(doc: dict, registry: Any) -> list[Finding]:
                         f"неизвестный context: {context!r}; ожидается один из "
                         f"{sorted(CONTEXT_MODES)}",
                         f"nodes[{i}].context",
+                    )
+                )
+            # S10: calibration_pin — list подмножества enum (Ф7, Э1).
+            pin = node.get("calibration_pin")
+            if pin is not None and (
+                not isinstance(pin, list)
+                or any(item not in CALIBRATION_PIN_PARAMS for item in pin)
+            ):
+                findings.append(
+                    _err(
+                        "S10",
+                        "calibration_pin должен быть списком из "
+                        f"{sorted(CALIBRATION_PIN_PARAMS)}, получено: {pin!r}",
+                        f"nodes[{i}].calibration_pin",
                     )
                 )
             if node.get("kind") not in NODE_KINDS:
