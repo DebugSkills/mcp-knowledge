@@ -8,10 +8,23 @@
 #                  по схеме «голова+хвост» с маркером […срезано N% …];
 #                  контракт роли и хедер # РОЛЬ/# УЗЕЛ НЕ сжимаются никогда;
 #                  секция в пределах бюджета — байт-в-байт без маркера (no-op).
+#
+# calibration_* (Ф7-0b, arch-2026-10-08-f7-calibration) — основа drift-детекта
+# калибровки: класс считается откалиброванным на конкретную модель; смена
+# model_id/digest у провайдера = drift -> класс возвращается в uncalibrated
+# и калибровка перезапускается. local-only (rule: zone) калибровке не подлежит.
+#   calibration_status: uncalibrated | calibrated (дефолт uncalibrated)
+#   calibrated_for: {model_id: <str>, digest: <str>} | null (дефолт null)
+#   active_profile: <profile_id> | null (Э2, дизайн §5.2 — ссылка на снимок
+#     calibration/profiles/<profile_id>.yaml; ставит оператор одновременно с
+#     calibration_status: calibrated, единая операция записи — F3)
 heavy:
   shelf: ext
   shaping: full-context
   retries: 2
+  calibration_status: uncalibrated
+  calibrated_for: null
+  active_profile: null
 fast:
   shelf: local
   shaping: compressed
@@ -19,5 +32,8 @@ fast:
   # калибровка по живому пилоту позже — см. plans/_provenance/…/Ф6a-3-shaping-check.md
   max_chars_per_section: 4000
   retries: 1
+  calibration_status: uncalibrated
+  calibrated_for: null
+  active_profile: null
 local-only:
   rule: zone

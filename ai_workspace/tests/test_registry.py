@@ -107,3 +107,65 @@ def test_missing_registry_file_raises(tmp_path: Path) -> None:
     with pytest.raises(RegistryError) as excinfo:
         reg.get("roles")
     assert "roles.yaml" in str(excinfo.value)
+
+
+# ── Ф7-0b (arch-2026-10-08-f7-calibration): поля-основа drift-детекта ──────
+
+
+def test_calibration_defaults_on_shelf_classes() -> None:
+    """heavy/fast: дефолты калибровки — uncalibrated + calibrated_for=null."""
+    classes = Registry(REGISTRY_DIR).get("model_classes")
+    for name in ("heavy", "fast"):
+        spec = classes[name]
+        assert spec.get("calibration_status") == "uncalibrated", name
+        assert spec.get("calibrated_for") is None, name
+
+
+def test_local_only_has_no_calibration_fields() -> None:
+    """local-only — зонное правило (rule: zone), калибровке не подлежит."""
+    spec = Registry(REGISTRY_DIR).get("model_classes")["local-only"]
+    assert spec == {"rule": "zone"}
+
+
+def test_calibration_fields_do_not_touch_f7_0a() -> None:
+    """Ф7-0b не меняет shaping/retries/max_chars_per_section (это Ф7-0a)."""
+    classes = Registry(REGISTRY_DIR).get("model_classes")
+    assert classes["heavy"]["shelf"] == "ext"
+    assert classes["heavy"]["shaping"] == "full-context"
+    assert classes["heavy"]["retries"] == 2
+    assert classes["fast"]["shelf"] == "local"
+    assert classes["fast"]["shaping"] == "compressed"
+    assert classes["fast"]["max_chars_per_section"] == 4000
+    assert classes["fast"]["retries"] == 1
+
+
+def test_registry_loads_without_calibration_fields(tmp_path: Path) -> None:
+    """Back-compat: YAML классов без новых полей (легаси-копии) грузится
+    без ошибок — валидатора набора полей model_classes нет (Ф3.5a-2
+    валидирует режимы, не реестры), Registry generic по построению."""
+    work = _copy_registry(tmp_path)
+    mc = work / "model_classes.yaml"
+    data = yaml.safe_load(mc.read_text(encoding="utf-8"))
+    for name in ("heavy", "fast"):
+        data[name].pop("calibration_status", None)
+        data[name].pop("calibrated_for", None)
+    mc.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    reg = Registry(work)
+    reg.load()  # RegistryError не ожидается: поля опциональны
+    assert reg.get("model_classes")["heavy"].get("calibration_status") is None
+    assert reg.get("model_classes")["fast"].get("calibrated_for") is None
+
+
+def test_calibrated_state_roundtrip(tmp_path: Path) -> None:
+    """Контракт calibrated-состояния: status=calibrated + {model_id, digest}
+    переживает загрузку реестра (основа drift-детекта Ф7)."""
+    work = _copy_registry(tmp_path)
+    mc = work / "model_classes.yaml"
+    data = yaml.safe_load(mc.read_text(encoding="utf-8"))
+    data["fast"]["calibration_status"] = "calibrated"
+    data["fast"]["calibrated_for"] = {"model_id": "qwen2.5:7b", "digest": "sha256:abc123"}
+    mc.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    spec = Registry(work).get("model_classes")["fast"]
+    assert spec["calibration_status"] == "calibrated"
+    assert spec["calibrated_for"]["model_id"] == "qwen2.5:7b"
+    assert spec["calibrated_for"]["digest"] == "sha256:abc123"
