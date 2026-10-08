@@ -353,6 +353,8 @@
           ansible.builtin.stat:
             path: /usr/sbin/ufw
           register: mcp_kb_host_prepare__ufw_bin
+          # firewall: проба нужна тегу firewall (иначе when ниже падает на undefined var).
+          tags: [firewall]
 
         - name: Узнать состояние ufw
           ansible.builtin.command:
@@ -361,6 +363,8 @@
           changed_when: false
           failed_when: false
           when: mcp_kb_host_prepare__ufw_bin.stat.exists
+          # firewall: проба нужна тегу firewall (иначе when ниже падает на undefined var).
+          tags: [firewall]
 
         - name: Разрешить доступ из LAN к портам сервисов (ufw)
           community.general.ufw:
@@ -374,6 +378,61 @@
           when:
             - mcp_kb_host_prepare__ufw_bin.stat.exists
             - "'Status: active' in (mcp_kb_host_prepare__ufw_status.stdout | default(''))"
+          # firewall: точечный запуск ufw-правил (make firewall) без остального verify-блока.
+          tags: [firewall]
+
+        # ─── Фаервол: MCP — фасад + закрытие прямого :8000 (F10, трасса arch-2026-10-05-ai-workspace) ───
+        # Участники ходят в MCP ТОЛЬКО через TLS-фасад :8444 (Caddy, backend 127.0.0.1:8000).
+        # Прямой :8000: allow локальным docker-подсетям выдаётся ПЕРВЫМ (до отзыва широких
+        # правил — контейнеры не теряют доступ), затем удаляются широкие правила :8000
+        # (Anywhere + LAN). ИНВАРИАНТЫ: БЕЗ ufw enable/disable/reset/reload, БЕЗ смены
+        # default-политик, НЕ трогаем 22/3389/80/8443/8765 и другие правила. Идемпотентно.
+        - name: MCP — фасад 8444 и закрытие прямого :8000 (F10)
+          tags: [host_prepare, firewall]
+          block:
+            - name: Разрешить прямой :8000 локальным подсетям (docker/loopback)
+              community.general.ufw:
+                rule: allow
+                port: "{{ item.1 }}"
+                proto: tcp
+                from_ip: "{{ item.0 }}"
+                comment: "MCP local (docker)"
+              loop: "{{ mcp_kb_host_prepare__mcp_local_cidrs | product(mcp_kb_host_prepare__mcp_direct_ports) | list }}"
+              when:
+                - mcp_kb_host_prepare__ufw_bin.stat.exists
+                - "'Status: active' in (mcp_kb_host_prepare__ufw_status.stdout | default(''))"
+
+            - name: Удалить широкое правило :8000 (Anywhere)
+              community.general.ufw:
+                rule: allow
+                port: "{{ item }}"
+                proto: tcp
+                delete: true
+              loop: "{{ mcp_kb_host_prepare__mcp_direct_ports }}"
+              when:
+                - mcp_kb_host_prepare__ufw_bin.stat.exists
+                - "'Status: active' in (mcp_kb_host_prepare__ufw_status.stdout | default(''))"
+
+            - name: Удалить прямой :8000 из LAN-подсетей
+              community.general.ufw:
+                rule: allow
+                port: "{{ item.1 }}"
+                proto: tcp
+                from_ip: "{{ item.0 }}"
+                delete: true
+              loop: "{{ mcp_kb_host_prepare__lan_cidr | product(mcp_kb_host_prepare__mcp_direct_ports) | list }}"
+              when:
+                - mcp_kb_host_prepare__ufw_bin.stat.exists
+                - "'Status: active' in (mcp_kb_host_prepare__ufw_status.stdout | default(''))"
+
+            - name: Сводка — MCP извне только через фасад 8444
+              ansible.builtin.debug:
+                msg: >-
+                  MCP: LAN/VPN → только фасад 8444;
+                  :8000 закрыт извне (Anywhere/LAN удалены), разрешён docker/loopback.
+              when:
+                - mcp_kb_host_prepare__ufw_bin.stat.exists
+                - "'Status: active' in (mcp_kb_host_prepare__ufw_status.stdout | default(''))"
 
         - name: ГОТОВО — хост подготовлен для mcp-knowledge
           ansible.builtin.debug:

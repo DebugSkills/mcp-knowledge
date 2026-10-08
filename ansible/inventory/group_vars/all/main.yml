@@ -85,9 +85,18 @@ mcp_kb_host_prepare__no_proxy: "{{ docker_no_proxy | default('localhost,127.0.0.
 # (диагностировано 2026-09-26: kb-console-tls:8443 и MCP:8000 недоступны с других машин).
 # Список подсетей должен включать ВСЕ подсети CONSOLE_LAN_CIDR из .env (allow-list
 # фасада, 033-F2: офисная LAN + VPN-подсеть операторов), иначе ufw режет VPN раньше
-# Caddy. Для доступа к самому MCP-серверу с других машин добавьте "8000" в список портов.
+# Caddy. MCP-доступ участникам — ТОЛЬКО через TLS-фасад 8444 (Caddy → 127.0.0.1:8000);
+# прямой :8000 намеренно закрывается для LAN/интернета (F10: блок firewall в
+# playbooks/host-prepare.yml удаляет широкие правила :8000).
 mcp_kb_host_prepare__lan_cidr: ["192.168.2.0/24", "10.8.2.0/24"]
-mcp_kb_host_prepare__lan_ports: ["8443"]
+mcp_kb_host_prepare__lan_ports: ["8443", "8444"]   # 8443 = kb-console (TLS), 8444 = MCP-фасад (TLS)
+
+# F10 (трасса arch-2026-10-05-ai-workspace): прямой :8000 остаётся разрешённым ТОЛЬКО
+# локальным docker-подсетям (контейнеры ходят на хост-порт :8000; loopback разрешён
+# в ufw по умолчанию). Широкие разрешения (Anywhere + LAN) для mcp_direct_ports
+# удаляются firewall-тасками в playbooks/host-prepare.yml — "8000" в lan_ports НЕ добавлять.
+mcp_kb_host_prepare__mcp_local_cidrs: ["172.17.0.0/16", "172.18.0.0/16", "172.26.0.0/16"]
+mcp_kb_host_prepare__mcp_direct_ports: ["8000"]
 
 # — Параметры клонирования репозиториев (бывшая роль mcp_kb_repos, инлайн в playbooks/deploy.yml) —
 # Все переменные имеют префикс mcp_kb_repos__

@@ -9,7 +9,7 @@ VAULT_ARGS := --vault-password-file $(VAULT_PASS_FILE)
 endif
 APB := ansible-playbook -i $(INVENTORY)
 .PHONY: deps test lint check run run-tag vault-create vault-edit \
-        update update-check update-local update-local-check update-airgap logs events health metrics stats \
+        update update-check update-local update-local-check update-airgap logs events health metrics stats firewall \
         backup backup-verify restore \
         errors errors-report errors-prune errors-cron-cleanup errors-sources
 deps:
@@ -117,6 +117,13 @@ metrics:
 	$(APB) $(OPS) --tags metrics
 stats:
 	$(APB) $(OPS) --tags stats
+
+# ─── Фаервол MCP-фасада (F10, трасса arch-2026-10-05-ai-workspace) ───
+# Применяет ТОЛЬКО ufw-правила из playbooks/host-prepare.yml (тег firewall): пробы ufw,
+# allow 8443/8444 из LAN, allow :8000 docker-подсетям, delete широких правил :8000.
+# Идемпотентно; требует sudo (become). НЕ трогает 22/3389/80/8443 и default-политики.
+firewall:
+	$(APB) playbooks/host-prepare.yml --tags firewall $(VAULT_ARGS)
 
 # ─── Ф3 (code-2026-09-22-002): бэкап/верификация/восстановление ───
 
