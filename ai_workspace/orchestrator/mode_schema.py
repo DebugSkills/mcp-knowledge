@@ -51,8 +51,9 @@ CALIBRATION_PIN_PARAMS: frozenset[str] = frozenset(
 )
 #: Ф7 Э4 (arch-2026-10-08-f7-calibration, §7.2): допустимые оси вариантов
 #: режимов (``modes/<mode>.<variant>.yaml``). «decomposition» — глубина
-#: декомпозиции задачи (единственная ось первого эксперимента H1).
-VARIANT_AXES: frozenset[str] = frozenset({"decomposition"})
+#: декомпозиции задачи (ось первого эксперимента H1); «shaping» — рычаг
+#: сжатия секций-входов (CC1, В2-B 2f: compressed-vs-full на одной полке).
+VARIANT_AXES: frozenset[str] = frozenset({"decomposition", "shaping"})
 
 SEVERITY_ERROR = "error"
 

@@ -35,5 +35,16 @@ fast:
   calibration_status: uncalibrated
   calibrated_for: null
   active_profile: null
+# CC1-плечо «full» (В2-B 2f, arch-2026-10-08-f7-calibration): локальная
+# полка, но БЕЗ сжатия секций; различие с fast ТОЛЬКО по shaping —
+# пара fast/fast-full = compressed-vs-full на ОДНОЙ 7B-модели (~0₽).
+fast-full:
+  shelf: local
+  shaping: full-context
+  retries: 1
+  calibration_status: uncalibrated
+  calibrated_for: null
+  active_profile: null
+
 local-only:
   rule: zone

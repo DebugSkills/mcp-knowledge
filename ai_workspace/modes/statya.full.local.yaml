@@ -1,0 +1,87 @@
+# Режим «статья» (CC1-плечо full — В2-B 2f, arch-2026-10-08-f7-calibration):
+# CC1-плечо full — тот же граф, что statya-local, отличие ТОЛЬКО shaping
+# (fast-full = full-context): вариант по оси «shaping» для negative-control
+# CC1 — воспроизведение инверсии compressed-vs-full на 7B без смены полки/модели
+# (обе полки local, ~0₽). llm-step → model_class: fast-full; critic-gate →
+# local-only (L14 protected-принцип: вердикт качества НЕ выносит weak-класс).
+# База варианта: modes/statya.local.yaml (id statya-local); конвенция §7.2;
+# самопроверка: `make modes-validate` (S1–S11 + L1–L16).
+#
+# Два human-gate (HITL-first):
+#   structure — утверждение структуры: approve → critic, edit → analyst (правка → переработка);
+#   publish   — утверждение публикации: approve → финал, edit → editor (правка текста).
+# Ревизионная петля критика: critic->analyst разрешена ТОЛЬКО как on_revise (max_iterations: 3).
+id: statya-full-local
+version: 1
+variant_of: statya-local
+variant_axis: shaping
+variant_rationale: "CC1 (2f): воспроизведение инверсии compressed-vs-full на 7B без смены полки/модели"
+shape: analyst-critic-editor
+contract: document
+zone: public
+output: {type: article, citation_policy: required, sections: [document, document+refs]}
+board: {buffer: board.md, store: job}
+nodes:
+  - id: analyst
+    kind: llm-step
+    role: analyst
+    model_class: fast-full
+    inputs: [brief]
+    outputs: [draft]
+    writes: [draft]
+    retry: 2
+  - id: structure
+    kind: human-gate
+    actor: operator
+    prompt: "Утвердить структуру статьи?"
+    timeout: 24h
+    on_timeout: sleep
+    on_approve: critic
+    on_edit: analyst
+    writes: [structure]
+  - id: critic
+    kind: critic-gate
+    role: critic
+    model_class: local-only   # L14: fast-критику запрещён; local-only → полка local (~0₽)
+    inputs: [draft]
+    verdicts: [PASS, REVISE]
+    threshold: 0.80
+    max_iterations: 3
+    on_max_iter: fail
+    on_revise: analyst
+    writes: [verdict]
+  - id: editor
+    kind: llm-step
+    role: editor
+    model_class: fast-full
+    inputs: [draft, verdict]
+    outputs: [document]
+    writes: [document]
+    retry: 2
+  - id: citer
+    kind: tool-step
+    tool: mcp.citation_attach
+    policy: strict
+    inputs: [document]
+    outputs: [document+refs]
+    writes: [document+refs]
+  - id: publish
+    kind: human-gate
+    actor: operator
+    prompt: "Утвердить статью к публикации?"
+    timeout: 24h
+    on_timeout: sleep
+    on_approve: null
+    on_edit: editor
+    writes: [publish]
+edges:
+  - analyst->structure
+  - structure->critic
+  - critic|PASS->editor
+  - critic->analyst
+  - editor->citer
+  - citer->publish
+gates:
+  structure: {type: human, blocks_output: false}
+  publish: {type: human, blocks_output: true}
+tools: [mcp.search_knowledge, mcp.get_entry, mcp.citation_attach]

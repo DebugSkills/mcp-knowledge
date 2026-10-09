@@ -21,7 +21,7 @@ EXPECTED_TOOLS = {
     "mcp.citation_attach",
 }
 EXPECTED_GATES = {"critic-gate", "human-gate"}
-EXPECTED_MODEL_CLASSES = {"heavy", "fast", "local-only"}
+EXPECTED_MODEL_CLASSES = {"heavy", "fast", "fast-full", "local-only"}
 EXPECTED_SHAPES = {
     "analyst-critic",
     "analyst-critic-editor",

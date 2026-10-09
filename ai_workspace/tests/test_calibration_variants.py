@@ -320,3 +320,31 @@ def test_record_decision_upsert_and_baseline(variants_path: Path):
     assert entries[0]["status"] == "promoted"
     assert "probe_pair" in entries[0]
     assert validate_variants(doc, variants_path.parent.parent / "modes") == []
+
+
+# ── CC1 (В2-B 2f): ось shaping (S11) + dash→dot резолв базы (L16) ───────────
+
+
+def test_s11_shaping_axis_accepted(registry: Registry):
+    """Ось «shaping» (CC1, В2-B 2f) в enum VARIANT_AXES — тройка валидна."""
+    assert validate_schema(_variant_doc(variant_axis="shaping"), registry) == []
+
+
+def test_l16_dash_id_resolves_dot_file(tmp_path: Path):
+    """variant_of — id режима (S11); id с дефисами → файл с точками
+    (statya-local → statya.local.yaml): база найдена, ошибки нет."""
+    modes = tmp_path / "modes"
+    modes.mkdir()
+    _write_mode(modes, "statya.local", "id: statya-local\n")
+    assert lint_l16({"variant_of": "statya-local"}, None, tmp_path) == []
+
+
+def test_l16_dash_id_zone_check_via_fallback(tmp_path: Path):
+    """Зона сверяется с базой, найденной по dash→dot (public-база +
+    private-вариант → ошибка зоны I5, а НЕ «база не найдена»)."""
+    modes = tmp_path / "modes"
+    modes.mkdir()
+    _write_mode(modes, "statya.local", "id: statya-local\n")
+    findings = lint_l16({"variant_of": "statya-local", "zone": "private"}, None, tmp_path)
+    assert [f.code for f in findings] == ["L16"]
+    assert findings[0].path == "zone"

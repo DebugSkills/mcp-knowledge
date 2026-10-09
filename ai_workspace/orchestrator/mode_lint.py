@@ -480,6 +480,14 @@ def lint_l16(doc: dict, registry: Any, base_dir: Path | None) -> list[Finding]:
         modes_dir = root / "ai_workspace" / "modes"
     base_path = modes_dir / f"{variant_of}.yaml"
     if not base_path.is_file():
+        # CC1 (В2-B 2f): variant_of — id режима (S11); конвенция файлов
+        # использует точки (statya.local.yaml), id — дефисы (statya-local).
+        # Прямое имя не нашлось → пробуем dash→dot; прежние режимы
+        # (statya.deep → statya.yaml) резолвятся прямым путём без изменений.
+        dotted = modes_dir / f"{variant_of.replace('-', '.')}.yaml"
+        if dotted.is_file():
+            base_path = dotted
+    if not base_path.is_file():
         return [
             _f(
                 "L16",
