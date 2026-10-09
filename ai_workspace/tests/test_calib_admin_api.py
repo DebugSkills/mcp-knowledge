@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -1160,3 +1161,131 @@ def test_markers_pair_and_record(tmp_path, capsys) -> None:
     assert "[CALIB-API] record-start variant=statya.deep status=promoted" in out
     assert "[CALIB-API] record-finish exit=0 status=promoted" in out
     assert KEY not in out  # key-hygiene
+
+# ── Ф4a: GET /calib/reports — история отчётов (mtime DESC, metrics-only) ───
+
+
+def _write_probe_report(reports_dir: Path, run_id: str, *, dt: float) -> Path:
+    """JSON-отчёт на носителе: метрики + запрещённое текстовое поле (I5)."""
+    doc = _pair_report_doc(run_id, 0.9, 0.88, dispersion=0.02)
+    path = reports_dir / f"{run_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    stamp = time.time() + dt
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_reports_empty_or_missing_dir_fail_soft(tmp_path) -> None:
+    """Нет/пустой reports_dir → {"reports": [], "total": 0} (fail-soft, не 500)."""
+    settings = _settings(tmp_path)  # каталог reports не существует
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = client.get("/calib/reports", headers=_headers())
+        assert r.status_code == 200
+        assert r.json() == {"reports": [], "total": 0}
+        settings.reports_dir.mkdir(parents=True)  # пустой существующий
+        assert client.get("/calib/reports", headers=_headers()).json() == {
+            "reports": [], "total": 0,
+        }
+
+
+def test_reports_desc_order_whitelist_fields_and_ts(tmp_path) -> None:
+    """Несколько отчётов: свежие сверху (mtime DESC); поля — только
+    whitelist + ts; ts — ISO-время mtime файла."""
+    settings = _settings(tmp_path)
+    reports = settings.reports_dir
+    _write_probe_report(reports, "probe-old000000001", dt=0.0)
+    newest = _write_probe_report(reports, "probe-new000000001", dt=10.0)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        body = client.get("/calib/reports", headers=_headers()).json()
+    assert body["total"] == 2
+    assert [r["run_id"] for r in body["reports"]] == [
+        "probe-new000000001", "probe-old000000001",
+    ]
+    first = body["reports"][0]
+    # metrics-only: только whitelist-поля + ts, ничего сверх
+    assert set(first) <= set(admin_api._REPORT_FIELDS) | {"ts"}
+    for key in ("run_id", "model_id", "digest", "golden_manifest",
+                "pricing_manifest", "golden_median_score",
+                "golden_dispersion", "heldout_score", "parse_rate",
+                "parse_rate_defined", "rub", "wall_s", "n_runs", "flags"):
+        assert key in first, f"нет метрики {key}"
+    ts = datetime.fromisoformat(first["ts"].replace("Z", "+00:00"))
+    assert abs(ts.timestamp() - newest.stat().st_mtime) < 1.0
+
+
+def test_reports_skip_partial_and_broken_json(tmp_path) -> None:
+    """partial-снапшоты, битый JSON и не-словарь пропускаются (fail-soft)."""
+    settings = _settings(tmp_path)
+    reports = settings.reports_dir
+    _write_probe_report(reports, "probe-good00000001", dt=5.0)
+    # partial живого прогона: матчится glob'ом probe-*.json — исключаем
+    (reports / "probe-live00000001.partial.json").write_text(
+        json.dumps({"segments": []}), encoding="utf-8"
+    )
+    (reports / "probe-broken000001.json").write_text(
+        "{битый json", encoding="utf-8"
+    )
+    (reports / "probe-notdict0001.json").write_text("[1, 2]", encoding="utf-8")
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = client.get("/calib/reports", headers=_headers())
+        assert r.status_code == 200  # битые носители ≠ 500
+        body = r.json()
+    assert body["total"] == 1
+    assert [x["run_id"] for x in body["reports"]] == ["probe-good00000001"]
+
+
+def test_reports_limit_clamp(tmp_path) -> None:
+    """limit: default 20; 0 → 1; 1000 → 200 (потолок); total — до limit."""
+    settings = _settings(tmp_path)
+    reports = settings.reports_dir
+    for i in range(205):
+        _write_probe_report(reports, f"probe-clamp{i:08d}", dt=float(i))
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        # default 20
+        body = client.get("/calib/reports", headers=_headers()).json()
+        assert body["total"] == 205 and len(body["reports"]) == 20
+        assert body["reports"][0]["run_id"] == "probe-clamp00000204"
+        # 0 → clamp к 1
+        body = client.get(
+            "/calib/reports", params={"limit": 0}, headers=_headers()
+        ).json()
+        assert body["total"] == 205 and len(body["reports"]) == 1
+        # 1000 → clamp к 200; срез сохраняет свежесть (mtime DESC)
+        body = client.get(
+            "/calib/reports", params={"limit": 1000}, headers=_headers()
+        ).json()
+        assert body["total"] == 205 and len(body["reports"]) == 200
+        assert body["reports"][0]["run_id"] == "probe-clamp00000204"
+        assert body["reports"][-1]["run_id"] == "probe-clamp00000005"
+
+
+def test_reports_metrics_only_no_text_leak(tmp_path) -> None:
+    """I5: секретное текстовое поле JSON-отчёта не утекает в историю."""
+    settings = _settings(tmp_path)
+    _write_probe_report(settings.reports_dir, "probe-secr00000001", dt=0.0)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = client.get("/calib/reports", headers=_headers())
+        assert r.status_code == 200
+    dumped = r.text
+    assert "SECRET-PAIR-TEXT" not in dumped
+    for forbidden in ("document", "draft", "critic_fragment", "q_report",
+                      "live_sample", "verdict"):
+        assert forbidden not in dumped, f"утёк {forbidden}"
+
+
+def test_reports_marker_and_key_hygiene(tmp_path, capsys) -> None:
+    """Маркер reports-list total=N (кол-во); ключ не попадает в маркеры."""
+    settings = _settings(tmp_path)
+    _write_probe_report(settings.reports_dir, "probe-mark00000001", dt=0.0)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        assert client.get("/calib/reports", headers=_headers()).status_code == 200
+    out = capsys.readouterr().out
+    assert "[CALIB-API] reports-list total=1" in out
+    assert KEY not in out

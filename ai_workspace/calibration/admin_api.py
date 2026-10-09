@@ -42,6 +42,13 @@ unit — ``ai_workspace/deploy/calib-admin-api.service``, runbook —
 ``confirm`` обязателен, API не решает); запись — CLI-канон с ``--record
 --confirm-record --resume`` на параметрах ПОСЛЕДНЕЙ пары (тот же run_id ⇒
 CV7-existing резолвит те же отчёты, пересчёта нет), fail-closed отказ → 422.
+
+Ф4a (история): ``GET /calib/reports`` — завершённые ``probe-*.json`` из
+``settings.reports_dir`` (partial/битый JSON — fail-soft пропуск, не 500),
+mtime DESC, элементы — whitelist ``_REPORT_FIELDS`` + ``ts`` (ISO mtime),
+``limit`` clamp 1..200; ``total`` — число отчётов ДО limit (хвост для
+UI); маркер ``reports-list`` (кол-во). Metrics-only (I5): тексты
+прогонов не едут в историю даже из старых отчётов.
 """
 
 from __future__ import annotations
@@ -303,6 +310,46 @@ def _newest_report_public(reports_dir: Path | str, since_ts: float | None) -> di
 def _report_public_fields(doc: dict) -> dict:
     """Whitelist метрик отчёта probe в ответах (R3/I5: НЕ зеркало JSON)."""
     return {key: doc[key] for key in _REPORT_FIELDS if key in doc}
+
+def _mtime_iso(epoch: float) -> str:
+    """ISO-8601 UTC mtime файла — тот же формат, что метки профилей."""
+    return profiles_mod._utc_iso(datetime.fromtimestamp(epoch, tz=timezone.utc))
+
+
+#: Потолок страницы истории (clamp 1..200 — UI не тянет весь каталог)
+_REPORTS_LIMIT_MAX = 200
+
+
+def _reports_history(reports_dir: Path | str, limit: int) -> dict:
+    """История завершённых отчётов probe (Ф4a) → ``{"reports", "total"}``.
+
+    Metrics-only (I5): каждый элемент — whitelist ``_REPORT_FIELDS`` +
+    ``ts`` (ISO mtime), НЕ зеркало JSON-носителя (переиспользование
+    ``_report_public_fields`` — ноль дублей whitelist). fail-soft: нет/
+    битый каталог, битый JSON, partial-снапшоты — пропуск, не 500.
+    Сортировка mtime DESC (свежие сверху; tie-break по имени —
+    детерминизм); ``limit`` clamp 1..200; ``total`` — полное число
+    завершённых отчётов ДО limit (UI знает хвост).
+    """
+    clamped = max(1, min(int(limit), _REPORTS_LIMIT_MAX))
+    entries: list[tuple[float, str, dict]] = []
+    for path in Path(reports_dir).glob("probe-*.json"):
+        if path.name.endswith(".partial.json") or not path.is_file():
+            continue
+        try:
+            mtime = path.stat().st_mtime
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue  # исчез/битый — fail-soft пропуск
+        if isinstance(doc, dict):
+            entries.append((mtime, path.name, doc))
+    entries.sort(key=lambda e: (e[0], e[1]), reverse=True)
+    reports = [
+        {**_report_public_fields(doc), "ts": _mtime_iso(mtime)}
+        for mtime, _name, doc in entries[:clamped]
+    ]
+    return {"reports": reports, "total": len(entries)}
+
 
 
 def _pair_report_docs(reports_dir: Path | str, since_ts: float | None) -> list[dict]:
@@ -580,6 +627,17 @@ def _register_routes(app: FastAPI, settings: CalibSettings) -> None:
         except Exception:  # noqa: BLE001 — ws-redis не наблюдаем ≠ отказ API
             gpu_slots = {"available": False}
         return {"ollama_ps": ollama_ps, "gpu_slots": gpu_slots}
+
+    @app.get("/calib/reports")
+    def calib_reports(limit: int = 20) -> dict:
+        """Ф4a: история отчётов probe — whitelist-метрики + ts, mtime DESC.
+
+        fail-soft (нет/битый каталог → пустой список, не 500); ``limit``
+        clamp 1..200; ``total`` — число завершённых отчётов до среза.
+        """
+        resp = _reports_history(settings.reports_dir, limit)
+        _log_event("reports-list", total=resp["total"])
+        return resp
 
     @app.post("/calib/probe/start", status_code=202)
     async def calib_probe_start(body: ProbeStartBody) -> JSONResponse:
