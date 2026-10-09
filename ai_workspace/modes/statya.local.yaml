@@ -1,0 +1,84 @@
+# Режим «статья» (local-вариант, Ф7 живой прогон — arch-2026-10-08-f7-calibration):
+# тот же граф/контракт/гейты, что у statya.yaml, но все LLM-узлы на local-полке
+# (~0₽) — режим для честного ЖИВОГО local-прогона probe-run --live (ollama
+# qwen2.5:7b): llm-step → model_class: fast; critic-gate → local-only
+# (L14 protected-принцип: вердикт качества НЕ выносит weak-класс fast;
+# local-only — разрешённая линтом local-альтернатива, shelf→local).
+# Это НЕ ось decomposition → без variant_of.
+# Схема: спека mode-engine §1; самопроверка: `make modes-validate` (S1–S8 + L1–L10).
+#
+# Два human-gate (HITL-first):
+#   structure — утверждение структуры: approve → critic, edit → analyst (правка → переработка);
+#   publish   — утверждение публикации: approve → финал, edit → editor (правка текста).
+# Ревизионная петля критика: critic->analyst разрешена ТОЛЬКО как on_revise (max_iterations: 3).
+id: statya-local
+version: 1
+shape: analyst-critic-editor
+contract: document
+zone: public
+output: {type: article, citation_policy: required, sections: [document, document+refs]}
+board: {buffer: board.md, store: job}
+nodes:
+  - id: analyst
+    kind: llm-step
+    role: analyst
+    model_class: fast
+    inputs: [brief]
+    outputs: [draft]
+    writes: [draft]
+    retry: 2
+  - id: structure
+    kind: human-gate
+    actor: operator
+    prompt: "Утвердить структуру статьи?"
+    timeout: 24h
+    on_timeout: sleep
+    on_approve: critic
+    on_edit: analyst
+    writes: [structure]
+  - id: critic
+    kind: critic-gate
+    role: critic
+    model_class: local-only   # L14: fast-критику запрещён; local-only → полка local (~0₽)
+    inputs: [draft]
+    verdicts: [PASS, REVISE]
+    threshold: 0.80
+    max_iterations: 3
+    on_max_iter: fail
+    on_revise: analyst
+    writes: [verdict]
+  - id: editor
+    kind: llm-step
+    role: editor
+    model_class: fast
+    inputs: [draft, verdict]
+    outputs: [document]
+    writes: [document]
+    retry: 2
+  - id: citer
+    kind: tool-step
+    tool: mcp.citation_attach
+    policy: strict
+    inputs: [document]
+    outputs: [document+refs]
+    writes: [document+refs]
+  - id: publish
+    kind: human-gate
+    actor: operator
+    prompt: "Утвердить статью к публикации?"
+    timeout: 24h
+    on_timeout: sleep
+    on_approve: null
+    on_edit: editor
+    writes: [publish]
+edges:
+  - analyst->structure
+  - structure->critic
+  - critic|PASS->editor
+  - critic->analyst
+  - editor->citer
+  - citer->publish
+gates:
+  structure: {type: human, blocks_output: false}
+  publish: {type: human, blocks_output: true}
+tools: [mcp.search_knowledge, mcp.get_entry, mcp.citation_attach]

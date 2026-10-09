@@ -31,6 +31,18 @@ DEFAULT_PROPOSED_SCALARS: dict[str, Any] = {
     "context_mode": "full",
 }
 
+#: 2e (В2-B «Достоверность», F-3i): порог needle_rate — рамка D6 получает
+#: четвёртое условие «retention длинного контекста» (M4). needle_rate —
+#: доля needle-фактов, найденных grep'ом в выводе измерителя (probe.py);
+#: ниже порога конфигурация теряет контекст → скаляры НЕ предлагаются
+#: (violations) и вариант НЕ promoted (variants.evaluate_promotion).
+#: ``needle_rate is None`` (needle-набор не прогонялся) → гейт НЕ срабатывает
+#: — обратная совместимость прогоны без --needle не ломает.
+#: Значение DRAFT (0.6): оператор утверждает/правит по итогам negative-control
+#: CC1 (2f, tests/golden/needle-negative-control-CC1.md) — до него порог
+#: только черновой ориентир «не терять больше 40% needle-фактов».
+NEEDLE_RATE_FLOOR: float = 0.6
+
 
 def propose_scalars(
     report: Any,
@@ -63,6 +75,14 @@ def propose_scalars(
         violations.append(
             f"превышен wall_cap_s: wall_s={report.wall_s:.4f} > wall_cap_s={wall_cap_s}"
         )
+    # 2e (В2-B, F-3i): needle_rate < порога → нарушение рамки; None
+    # (набор не прогонялся) → гейт не срабатывает — обратная совместимость
+    needle_rate = getattr(report, "needle_rate", None)
+    if needle_rate is not None and needle_rate < NEEDLE_RATE_FLOOR:
+        violations.append(
+            f"needle_rate={needle_rate:.4f} < NEEDLE_RATE_FLOOR="
+            f"{NEEDLE_RATE_FLOOR:.4f} (retention длинного контекста, M4)"
+        )
 
     constraints: dict[str, Any] = {"quality_floor": quality_floor}
     if rub_cap is not None:
@@ -91,6 +111,11 @@ def propose_scalars(
             + (
                 f", wall_s={report.wall_s:.4f} <= wall_cap_s={wall_cap_s}"
                 if wall_cap_s is not None else ""
+            )
+            + (
+                f", needle_rate={needle_rate:.4f} >= NEEDLE_RATE_FLOOR="
+                f"{NEEDLE_RATE_FLOOR:.4f}"
+                if needle_rate is not None else ""
             )
         ),
     }

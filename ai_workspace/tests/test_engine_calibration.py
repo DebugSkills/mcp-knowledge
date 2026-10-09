@@ -17,6 +17,10 @@
   "profile"`` (только в режиме П).
 - A3 — пин: ``calibration_pin: [retries]`` удерживает узловое ``retry`` при
   активном профиле (P > C): попыток — по узлу, не по профилю.
+- A4 (В1a.4, F-2б) — событие ``calibration.facts_unavailable``: калибровка
+  сконфигурирована + факты недоступны (нет провайдера / сбой / пусто) →
+  warning-событие в поток ``on_node_usage`` (``node=None``, reason-код);
+  без профиля события нет (паритет F1); факты доступны → тоже нет.
 """
 
 from __future__ import annotations
@@ -107,8 +111,10 @@ PROFILE_RETRIES2 = {
 
 
 def make_cal_engine(*, script=None, llm=None, graph=None, registry=None,
-                    calibration_profile=None, events=None) -> ModeEngine:
-    """Движок на фейках как ``make_engine`` в test_engine (+ реестр/профиль/события)."""
+                    calibration_profile=None, calibration_model_facts=None,
+                    events=None) -> ModeEngine:
+    """Движок на фейках как ``make_engine`` в test_engine (+ реестр/профиль/
+    провайдер фактов/события)."""
     jobs = FakeJobs()
     llm = llm or FakeLLM(script or {})
     ledger = MemoryLedger()
@@ -117,6 +123,7 @@ def make_cal_engine(*, script=None, llm=None, graph=None, registry=None,
         jobs=jobs, boards=boards, graph=graph or load_mode(VALID),
         llm=llm, mcp=FakeMCP(), ledger=ledger, registry=registry,
         calibration_profile=calibration_profile,
+        calibration_model_facts=calibration_model_facts,
         on_node_usage=events.append if events is not None else None,
     )
     engine.jobs.create("j1")
@@ -309,3 +316,99 @@ def test_a3_pin_keeps_node_retries_under_profile(tmp_path: Path) -> None:
     res_f = free.run("j1", epoch=EPOCH)
     assert res_f.status == "failed"
     assert free.llm.calls == ["analyst", "analyst", "analyst"]  # профиль 2 → 3 попытки
+
+# ------------------------------- A4: событие facts_unavailable (В1a.4, F-2б)
+
+#: Профиль со схемой §5.1 (calibrated_for) — для верификации фактов.
+PROFILE_VERIFIABLE = {
+    "profile_id": "p-heavy-1",
+    "status": "calibrated",
+    "calibrated_for": {"model_id": "qwen2.5:7b", "digest": "sha256:ok"},
+    "scalars": {"retries": 2},
+}
+
+FACTS_OK_DICT = {"model_id": "qwen2.5:7b", "digest": "sha256:ok"}
+
+
+def _facts_events(events: list[dict]) -> list[dict]:
+    return [e for e in events if e.get("kind") == "calibration.facts_unavailable"]
+
+
+def test_a4_event_without_provider_run_level() -> None:
+    """Калибровка сконфигурирована, провайдера нет → РОВНО ОДНО
+    warning-событие calibration.facts_unavailable (reason=no_provider,
+    node=None, trace_id=job:epoch) за проход; узловые события и режим П
+    не задеты (гейт Т1 без верификации — семантика Э1, fail-closed
+    отложен: Критик+оператор, A5)."""
+    events: list[dict] = []
+    engine = make_cal_engine(
+        script={"analyst": ["d"], "critic": ["PASS"], "editor": ["doc"]},
+        registry=_calibrated_registry(),
+        calibration_profile=PROFILE_VERIFIABLE,
+        events=events,
+    )
+    res = engine.run("j1", epoch=EPOCH)
+
+    assert res.status == "paused"  # прогон не роняем (наблюдение, не отказ)
+    warns = _facts_events(events)
+    assert len(warns) == 1, "одно событие на проход job'а"
+    w = warns[0]
+    assert w["reason"] == "no_provider"
+    assert w["profile_id"] == "p-heavy-1"
+    assert w["node"] is None and w["warning"] is True
+    assert w["trace_id"] == f"j1:{EPOCH}"
+    # узловые события: форма не тронута, режим П жив (источники profile)
+    critic_events = [e for e in events if e["node"] == "critic"]
+    assert critic_events, "узловые события на месте (событие их не заменило)"
+    assert critic_events[0]["scalars_sources"]["retries"] == "profile"
+
+
+def test_a4_reason_codes_provider_error_and_empty() -> None:
+    """Сбой провайдера → provider_error; честный None → empty (юнит-уровень
+    резолва; прогон в обоих случаях не роняется — режим П сохраняется)."""
+    def boom():
+        raise ConnectionError("ollama down")
+
+    for provider, reason in ((boom, "provider_error"), (lambda: None, "empty")):
+        events: list[dict] = []
+        engine = make_cal_engine(
+            registry=_calibrated_registry(),
+            calibration_profile=PROFILE_VERIFIABLE,
+            calibration_model_facts=provider,
+            events=events,
+        )
+        scalars = engine._resolve_calibration("j1", EPOCH)
+        assert scalars["critic"].profile_id == "p-heavy-1"  # Э1: facts=None
+        warns = _facts_events(events)
+        assert len(warns) == 1 and warns[0]["reason"] == reason
+
+
+def test_a4_no_event_without_calibration_profile() -> None:
+    """Паритет F1: без calibration_profile событие НЕ эмитится (даже при
+    «недоступных фактах») — поведение байт-в-байт, носитель предупреждения
+    только сконфигурированная калибровка."""
+    events: list[dict] = []
+    engine = make_cal_engine(
+        script={"analyst": ["d"], "critic": ["PASS"], "editor": ["doc"]},
+        registry=_calibrated_registry(),
+        calibration_model_facts=lambda: None,
+        events=events,
+    )
+    res = engine.run("j1", epoch=EPOCH)
+    assert res.status == "paused"
+    assert _facts_events(events) == []
+
+
+def test_a4_no_event_when_facts_available() -> None:
+    """Факты доступны и совпадают с calibrated_for → события нет (верификация
+    прошла, предупреждать не о чем); режим П с верификацией digest."""
+    events: list[dict] = []
+    engine = make_cal_engine(
+        registry=_calibrated_registry(),
+        calibration_profile=PROFILE_VERIFIABLE,
+        calibration_model_facts=lambda: FACTS_OK_DICT,
+        events=events,
+    )
+    scalars = engine._resolve_calibration("j1", EPOCH)
+    assert scalars["critic"].profile_id == "p-heavy-1"  # гейт Т1 пройден
+    assert _facts_events(events) == []

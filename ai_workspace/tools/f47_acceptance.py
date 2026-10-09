@@ -319,6 +319,18 @@ def _run_one_job(ctx: WorkspaceContext, port: Any, shelf: str, entry: dict[str, 
     """Прогнать admitted job реальным ModeEngine до терминала (HITL авто-approve)."""
     job_id = entry["job_id"]
     llm = _SlowStubShelfLLM(shelf, S1_ANSWER)
+    # В1a.1/В1a.2 Ф7 (arch-2026-10-08-f7-calibration): активный профиль
+    # калибровки для конструктора движка. Селектор — реестр model_classes
+    # (active_profile) того же реестра, что у движка, факт полки — провайдер
+    # (ollama /api/tags, Э2-2); нет профиля → (None, None) → паритет F1.
+    # Import ЛОКАЛЬНЫЙ — единообразие с golden_run/vp_ab_pilot (модель
+    # импорт-циклов описана в ai_workspace/calibration/runtime.py).
+    from ai_workspace.calibration.model_facts import urllib_http_get
+    from ai_workspace.calibration.runtime import DEFAULT_PROFILES_DIR, active_calibration
+
+    cal_profile, cal_facts = active_calibration(
+        ctx.registry.dir, DEFAULT_PROFILES_DIR, http_get=urllib_http_get,
+    )
     engine = ModeEngine(
         jobs=ctx.jobs,
         boards=BoardStore(ctx.client, job_id),
@@ -330,6 +342,10 @@ def _run_one_job(ctx: WorkspaceContext, port: Any, shelf: str, entry: dict[str, 
         registry=ctx.registry,
         decoding=DECODING_PIN,
         quota=port,
+        # В1a.2 Ф7: профиль/факты калибровки (см. выше); (None, None)
+        # без active_profile — паритет F1.
+        calibration_profile=cal_profile,
+        calibration_model_facts=cal_facts,
     )
     engine.seed(job_id, {"brief": S1_BRIEF}, epoch=1)
     step = engine.run(job_id, epoch=1)

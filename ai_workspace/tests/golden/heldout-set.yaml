@@ -1,0 +1,35 @@
+# Held-out сет Ф7 (arch-2026-10-08-f7-calibration): ЧЕРНОВИК — утверждает ОПЕРАТОР (R3).
+# Схема — golden-set.yaml (version/owner/decide_by/min_runs/floor/tasks); id h01..h05
+# НЕ пересекаются с g01..g05 golden-сета; весь zone: public — живой local-прогон
+# probe-run --live (statya.local, class fast). Решение о порогах/составе — оператор.
+version: 1
+owner: operator
+decide_by: "Ф7-живой-прогон-2026-10-08"   # R3: Operator Gate перед живым прогоном
+min_runs: 2                               # R6: одиночный прогон — не отчёт
+floor: {public: 0.80, private: 0.85}
+tasks:
+  - id: h01
+    zone: public
+    prompt: "Предложи план статьи про AI-верстак: вводные тезисы и логику изложения."
+    expect_keywords: ["план", "тезис", "статья"]
+    max_latency_s: 180
+  - id: h02
+    zone: public
+    prompt: "Напиши раздел про очередь задач и приоритеты планировщика верстака."
+    expect_keywords: ["очередь", "приоритет", "планировщик"]
+    max_latency_s: 300
+  - id: h03
+    zone: public
+    prompt: "Оформи библиографию раздела: ссылки на стандарты и страницы источников."
+    expect_keywords: ["библиография", "источник", "стандарт"]
+    max_latency_s: 240
+  - id: h04
+    zone: public
+    prompt: "Найди в базе знаний материал про зонный гейт и процитируй с локатором."
+    expect_keywords: ["зонный гейт", "цитата", "локатор"]
+    max_latency_s: 300
+  - id: h05
+    zone: public
+    prompt: "Собери саммари статьи для анонса: структура вывода и ключевые пункты."
+    expect_keywords: ["саммари", "анонс", "пункты"]
+    max_latency_s: 240

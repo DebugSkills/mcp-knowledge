@@ -6,9 +6,10 @@
 - ``build_draft_profile``: схема ``calibration-profile/1`` проходит
   ``validate_profile`` без findings; ``calibrated_for`` — из отчёта;
   ``write_profile`` → ``load_profile`` round-trip;
-- CLI ``probe_run``: dry-run по умолчанию (0 вызовов фабрики), ``--ext`` без
-  ``--confirm-live`` — отказ; живой путь — на инъектированной стаб-фабрике
-  (тот же контур, что test_calibration_probe; без живого LLM).
+- CLI ``probe_run``: dry-run по умолчанию (0 вызовов), ``--ext`` без
+  ``--confirm-live`` — отказ; живой путь — на инъектированном скриптованном
+  LLM-клиенте (контур fix §10 LIVE-PROBE-1: измеритель ``vp_ab_pilot.run_one``
+  сам собирает движок; без живого LLM).
 """
 from __future__ import annotations
 
@@ -25,12 +26,8 @@ from ai_workspace.calibration.profiles import (
     REQUIRED_SCALARS,
     validate_profile,
 )
-from ai_workspace.orchestrator.engine import ModeEngine, load_mode
-from ai_workspace.registry import Registry
-from ai_workspace.tests.test_engine import FakeBoards, FakeJobs, MemoryLedger
-from ai_workspace.tools import golden_run, probe_run
-from ai_workspace.tools.golden_run import StubMCP, StubShelfLLM
-from ai_workspace import conformance as cf
+from ai_workspace.orchestrator.engine import LLMResult
+from ai_workspace.tools import probe_run
 
 MODE = Path(__file__).resolve().parents[1] / "modes" / "statya.yaml"
 REGISTRY_DIR = Path(__file__).resolve().parents[1] / "registry"
@@ -41,20 +38,20 @@ NOW_ISO = "2026-10-08T12:00:00Z"
 
 def _report(**over) -> ProbeReport:
     """ProbeReport с качеством выше пола и нулевой ценой (по умолчанию)."""
-    base: dict = dict(
-        run_id="probe-abc123def456",
-        model_id="qwen2.5:7b",
-        digest="sha256:abc",
-        golden_manifest="g" * 64,
-        pricing_manifest="p" * 64,
-        golden_median_score=0.9,
-        golden_dispersion=0.05,
-        heldout_score=0.85,
-        parse_rate=1.0,
-        rub=5.0,
-        wall_s=100.0,
-        n_runs=3,
-    )
+    base: dict = {
+        "run_id": "probe-abc123def456",
+        "model_id": "qwen2.5:7b",
+        "digest": "sha256:abc",
+        "golden_manifest": "g" * 64,
+        "pricing_manifest": "p" * 64,
+        "golden_median_score": 0.9,
+        "golden_dispersion": 0.05,
+        "heldout_score": 0.85,
+        "parse_rate": 1.0,
+        "rub": 5.0,
+        "wall_s": 100.0,
+        "n_runs": 3,
+    }
     base.update(over)
     return ProbeReport(**base)
 
@@ -258,26 +255,28 @@ def test_write_profile_invalid_doc_is_value_error(tmp_path: Path) -> None:
 # ── CLI probe_run: dry-run по умолчанию, --ext-гейт, живой путь на стабах ──
 
 
-def _stub_factory(calls: list[str] | None = None):
-    """Фабрика движка на in-memory fakes (контур test_calibration_probe)."""
-    def factory(shelf, job_id, artifacts, answer, zone, mode_path) -> ModeEngine:
-        if calls is not None:
-            calls.append(job_id)
-        graph = load_mode(mode_path)
-        jobs, boards = FakeJobs(), FakeBoards()
-        jobs.create(job_id, zone=zone)
-        return ModeEngine(
-            jobs=jobs,
-            boards=boards,
-            graph=graph,
-            llm=StubShelfLLM(shelf, answer),
-            mcp=StubMCP(),
-            ledger=MemoryLedger(),
-            artifacts=artifacts,
-            registry=Registry(REGISTRY_DIR),
-            decoding=cf.DECODING_PIN,
-        )
-    return factory
+class _RepeatLLM:
+    """Скриптованный LLM-клиент probe (fix LIVE-PROBE-1): постоянные ответы по
+    ролям — измеритель ``vp_ab_pilot.run_one`` сам собирает движок на fakes.
+    ``answers`` — свой сценарий (например, провальный критик → скор 0)."""
+
+    def __init__(self, calls: list[str] | None = None,
+                 answers: dict[str, str] | None = None) -> None:
+        self._calls = calls
+        self._answers = answers if answers is not None else _ANSWERS
+
+    def complete(self, *, role, model_class, prompt, inputs, params=None,
+                 job_id=None) -> LLMResult:
+        if self._calls is not None:
+            self._calls.append(str(job_id or role))
+        return LLMResult(output=self._answers[role])
+
+
+_ANSWERS = {
+    "analyst": "План: 1) структура 2) черновик 3) цитаты.",
+    "critic": "PASS\nРУБРИКА: полнота 1.0",
+    "editor": "# Статья\n\n" + "Раздел с содержанием про MCP-RAG. src-0123 " * 60,
+}
 
 
 GOLDEN_TASKS = [
@@ -317,7 +316,7 @@ def test_cli_dry_run_starts_nothing_and_returns_zero(tmp_path: Path) -> None:
     calls: list[str] = []
     code = probe_run.main(
         _cli_args(tmp_path, "--dry-run", "--profiles-dir", str(tmp_path / "profiles")),
-        engine_factory=_stub_factory(calls),
+        llm=_RepeatLLM(calls),
     )
     assert code == 0
     assert calls == []                       # 0 вызовов фабрики: план не запускает
@@ -328,7 +327,7 @@ def test_cli_dry_run_is_default_without_confirm_live(tmp_path: Path) -> None:
     calls: list[str] = []
     code = probe_run.main(
         _cli_args(tmp_path, "--profiles-dir", str(tmp_path / "profiles")),
-        engine_factory=_stub_factory(calls),
+        llm=_RepeatLLM(calls),
     )
     assert code == 0
     assert calls == []                       # без --confirm-live тоже только план
@@ -338,7 +337,7 @@ def test_cli_ext_without_confirm_live_is_refused(tmp_path: Path) -> None:
     calls: list[str] = []
     code = probe_run.main(
         _cli_args(tmp_path, "--ext", "--profiles-dir", str(tmp_path / "profiles")),
-        engine_factory=_stub_factory(calls),
+        llm=_RepeatLLM(calls),
     )
     assert code == 2
     assert calls == []
@@ -352,7 +351,7 @@ def test_cli_live_writes_draft_profile(tmp_path: Path, capsys) -> None:
             tmp_path, "--confirm-live", "--quality-floor", "0.5",
             "--profiles-dir", str(profiles_dir),
         ),
-        engine_factory=_stub_factory(calls),
+        llm=_RepeatLLM(calls),
     )
     assert code == 0
     assert calls                                   # живой путь действительно гонял харнесс
@@ -373,12 +372,18 @@ def test_cli_live_writes_draft_profile(tmp_path: Path, capsys) -> None:
 def test_cli_live_below_floor_writes_nothing(tmp_path: Path, capsys) -> None:
     calls: list[str] = []
     profiles_dir = tmp_path / "profiles"
+    # провальный критик: вердикт не распознаётся → скор прогонов 0 < пола 0.99
+    bad_answers = {
+        "analyst": "План: …",
+        "critic": "Не могу оценить текст: не хватает деталей.",
+        "editor": "# Документ",
+    }
     code = probe_run.main(
         _cli_args(
             tmp_path, "--confirm-live", "--quality-floor", "0.99",   # недостижимо
             "--profiles-dir", str(profiles_dir),
         ),
-        engine_factory=_stub_factory(calls),
+        llm=_RepeatLLM(calls, answers=bad_answers),
     )
     assert code == 1
     assert calls

@@ -9,8 +9,8 @@
 ``model_class`` в профиле — привязка применения (какой класс калиброван),
 НЕ мутация узлов режимов (A4). ``validate_profile`` — чистая функция без I/O;
 чтение каталога профилей — ``load_profile``/``list_profiles``; запись —
-``write_profile`` (валидация fail-closed → файл); сборка draft-документа из
-``ProbeReport`` (Э3-2) — ``build_draft_profile``.
+``write_profile`` (валидация fail-closed → guard не-draft (F6) → файл);
+сборка draft-документа из ``ProbeReport`` (Э3-2) — ``build_draft_profile``.
 """
 
 from __future__ import annotations
@@ -246,6 +246,21 @@ def _draft_profile_id(report: Any, model_class: str) -> str:
     return f"cal-{model_class}-{_model_slug(str(report.model_id))}-{seq}"
 
 
+def _metrics_block(report: Any) -> dict[str, float]:
+    """Метрики замера: обязательные пять + additive ``needle_rate`` (2a, В2-B)."""
+    metrics: dict[str, float] = {
+        "golden_median_score": float(report.golden_median_score),
+        "heldout_score": float(report.heldout_score),
+        "parse_rate": float(report.parse_rate),
+        "rub": float(report.rub),
+        "wall_s": float(report.wall_s),
+    }
+    needle_rate = getattr(report, "needle_rate", None)
+    if needle_rate is not None:
+        metrics["needle_rate"] = float(needle_rate)
+    return metrics
+
+
 def build_draft_profile(
     report: Any,
     *,
@@ -297,13 +312,15 @@ def build_draft_profile(
             "probe_run": str(report.run_id),
             "golden_manifest": str(report.golden_manifest),
             "pricing_manifest": str(report.pricing_manifest),
-            "metrics": {
-                "golden_median_score": float(report.golden_median_score),
-                "heldout_score": float(report.heldout_score),
-                "parse_rate": float(report.parse_rate),
-                "rub": float(report.rub),
-                "wall_s": float(report.wall_s),
-            },
+            # 2a (В2-B): needle_rate — additive-ключ (стратегия Г6:
+            # presence-валидация extra-ключи не режет); None — needle-набор
+            # не прогонялся, ключа нет (паритет F1 со старыми отчётами)
+            "metrics": _metrics_block(report),
+            # 2b (В2-A «Достоверность»): флаги замера — additive-ключ в
+            # evidence (стратегия Г6: presence-валидация блоков их не режет);
+            # approve читает "ceiling" и без явного решения оператора
+            # (--ceiling-ok/--force + аудит) профиль не применяет.
+            "flags": [str(f) for f in (getattr(report, "flags", ()) or ())],
         },
         "scalars": scalars_out,
         "constraints": constraints_out,
@@ -312,18 +329,57 @@ def build_draft_profile(
     }
 
 
-def write_profile(profiles_dir: Path | str, doc: dict) -> Path:
-    """Записать профиль валидно: ``validate_profile`` → ``<profile_id>.yaml``.
+def write_profile(
+    profiles_dir: Path | str, doc: dict, *, bump_revision: bool = False,
+) -> Path:
+    """Записать профиль валидно: ``validate_profile`` → guard → ``<id>.yaml``.
 
     Fail-closed: любые findings схемы — ``ValueError`` ДО записи (невалидный
-    документ на носитель не попадает). Сериализация — ``yaml.safe_dump`` с
-    ``sort_keys=False`` (порядок полей — как в схеме §5.1, читаемый diff).
+    документ на носитель не попадает). Guard перезаписи (F6, В1-2 1e):
+    существующий НЕ-draft профиль (calibrated/stale) НЕ затирается — отказ
+    ``ValueError`` с подсказкой; escape — ``bump_revision``: новая ревизия
+    ``version+1`` со сохранением статуса носителя (никакого тихого downgrade
+    в ``draft/version:1``). Повторный probe того же ``profile_id`` (``run_id``
+    детерминирован) роняет только явно подтверждённую ревизию. Сериализация —
+    ``yaml.safe_dump`` с ``sort_keys=False`` (порядок полей — как в схеме
+    §5.1, читаемый diff).
     """
     findings = validate_profile(doc)
     if findings:
         details = "; ".join(f"{f.path}: {f.message}" for f in findings)
         raise ValueError(f"профиль не проходит схему {PROFILE_SCHEMA}: {details}")
     directory = Path(profiles_dir)
+    existing = load_profile(directory, doc["profile_id"])
+    if existing is not None:
+        if not isinstance(existing, Mapping):
+            raise ValueError(
+                f"файл профиля {doc['profile_id']!r} — не YAML-отображение; "
+                "носитель повреждён, перезапись запрещена (разрешите вручную)"
+            )
+        if existing.get("status") != "draft":
+            if not bump_revision:
+                raise ValueError(
+                    f"профиль {doc['profile_id']!r} на носителе уже не draft "
+                    f"(status={existing.get('status')!r}, "
+                    f"version={existing.get('version')!r}); перезапись запрещена "
+                    "(F6) — новая ревизия: bump_revision=True (CLI probe-run: "
+                    "--bump-revision)"
+                )
+            doc = dict(doc)
+            doc["status"] = existing["status"]  # статус сохраняется, не сбрасывается
+            try:
+                doc["version"] = int(existing.get("version", 1)) + 1
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"некорректная version существующего профиля: "
+                    f"{existing.get('version')!r}"
+                ) from None
+            findings = validate_profile(doc)  # ревизия обязана проходить схему
+            if findings:
+                details = "; ".join(f"{f.path}: {f.message}" for f in findings)
+                raise ValueError(
+                    f"ревизия профиля не проходит схему {PROFILE_SCHEMA}: {details}"
+                )
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{doc['profile_id']}.yaml"
     path.write_text(

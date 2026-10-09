@@ -477,6 +477,21 @@ def _default_engine_factory(config: RunConfig) -> EngineFactory:
 
     registry = Registry(AI_WORKSPACE_DIR / "registry")
 
+    # В1a.1/В1a.2 Ф7 (arch-2026-10-08-f7-calibration): активный профиль
+    # калибровки для конструктора движка. Селектор — реестр model_classes
+    # (active_profile), факт полки — провайдер (ollama /api/tags, Э2-2);
+    # нет профиля → (None, None) → паритет F1 (поведение Э1 байт-в-байт).
+    # Import ЛОКАЛЬНЫЙ: runtime → model_facts → vp_ab_pilot → golden_run
+    # (StubMCP) — топ-уровень дал бы циклический импорт.
+    from ai_workspace.calibration.model_facts import urllib_http_get
+    from ai_workspace.calibration.runtime import DEFAULT_PROFILES_DIR, active_calibration
+
+    cal_profile, cal_facts = active_calibration(
+        AI_WORKSPACE_DIR / "registry",
+        DEFAULT_PROFILES_DIR,
+        http_get=urllib_http_get,
+    )
+
     def factory(
         shelf: str, job_id: str, artifacts: ArtifactStore, answer: str,
         zone: str, mode_path: Path,
@@ -509,6 +524,10 @@ def _default_engine_factory(config: RunConfig) -> EngineFactory:
             # из job.meta доносятся до node-события (job без meta → эмит
             # без изменений, обратная совместимость).
             on_node_usage=make_on_node_usage(client, store=jobs),
+            # В1a.2 Ф7: профиль/факты калибровки (см. _default_engine_factory);
+            # (None, None) без active_profile — паритет F1.
+            calibration_profile=cal_profile,
+            calibration_model_facts=cal_facts,
         )
 
     return factory

@@ -10,14 +10,25 @@ last-known-fallback (§6.2): сетевой сбой ≠ drift — возвра�
 ``ModelFacts.get`` — Mapping-совместимый доступ: резолвер Э1
 (``calibration.api``) читает факты через ``.get("model_id")/.get("digest")``,
 dataclass проходит гейт T1 без конверсии.
+
+В1-1b (F-9): endpoint фактов един со всей полкой — ``DEFAULT_TAGS_ENDPOINT``
+деривируется из ``OLLAMA_MODELS_URL`` полки ``OllamaClient`` (:11435, прежний
+литерал :11434 указывал на host-ollama других проектов); net-провайдер по
+умолчанию — ``urllib_http_get`` (stdlib urlopen → json, паттерн
+``OllamaClient.ping``).
 """
 
 from __future__ import annotations
 
+import json
 import time
+import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
+
+from ai_workspace.tools.vp_ab_pilot import OLLAMA_MODELS_URL
 
 __all__ = [
     "DEFAULT_TAGS_ENDPOINT",
@@ -25,10 +36,36 @@ __all__ = [
     "ModelFactsCache",
     "facts_for",
     "fetch_local_facts",
+    "tags_endpoint_from_models_url",
+    "urllib_http_get",
 ]
 
-#: Штатный endpoint списка моделей локальной полки (ollama /api/tags)
-DEFAULT_TAGS_ENDPOINT = "http://localhost:11434/api/tags"
+def tags_endpoint_from_models_url(models_url: str) -> str:
+    """Endpoint ``/api/tags`` той же полки, что ``models_url`` (F-9).
+
+    В1-1b: единый источник endpoint — ``OLLAMA_MODELS_URL`` полки
+    ``OllamaClient`` (``vp_ab_pilot``): scheme/host/port сохраняются, путь
+    заменяется на нативный ollama ``/api/tags`` (digest есть только там).
+    """
+    parts = urlsplit(models_url)
+    return f"{parts.scheme}://{parts.netloc}/api/tags"
+
+
+def urllib_http_get(url: str, timeout_s: float = 10.0) -> dict:
+    """Net-провайдер фактов: GET → JSON (stdlib; паттерн ``OllamaClient.ping``).
+
+    Ошибки сети/парса НЕ ловит: их семантику задаёт вызывающий
+    (``fetch_local_facts`` трактует сбой как «факта нет», §6.2).
+    """
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+#: Штатный endpoint списка моделей локальной полки (ollama /api/tags).
+#: В1-1b (F-9): деривируется из ``OLLAMA_MODELS_URL`` полки ``OllamaClient``
+#: (:11435); прежний литерал :11434 указывал на host-ollama ДРУГИХ проектов.
+DEFAULT_TAGS_ENDPOINT = tags_endpoint_from_models_url(OLLAMA_MODELS_URL)
 
 #: Ключи тега в записях /api/tags (ollama отдаёт name, совместимо — model)
 _TAG_KEYS: tuple[str, ...] = ("name", "model")

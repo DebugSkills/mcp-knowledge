@@ -447,7 +447,8 @@ class ModeEngine:
 
         # Э1 Ф7: единственный resolve калибровки на проход job'а (НЕ per-node);
         # режим Б / сбой резолвера -> {} -> чтения вчерашней семантикой (паритет F1).
-        self._cal_scalars = self._resolve_calibration()
+        # В1a.4: job_id/epoch — в trace_id события facts_unavailable (если будет).
+        self._cal_scalars = self._resolve_calibration(job_id, epoch)
         try:
             for _ in range(max_steps):
                 node = self.graph.node(rec.cursor or self.graph.start())
@@ -936,31 +937,96 @@ class ModeEngine:
 
     # ── калибровка (Э1 Ф7, arch-2026-10-08-f7-calibration) ────────────────
 
-    def _resolve_calibration(self) -> dict[str, ResolvedScalars]:
+    def _resolve_calibration(
+        self, job_id: str | None = None, epoch: int = 0
+    ) -> dict[str, ResolvedScalars]:
         """Скаляры калибровки всех узлов: чистый ``calibration.api.resolve``.
 
-        Вызывается ОДИН раз на проход job'а (``_run_admitted``), не per-node.
-        Узлы передаются spec-отображениями — контракт резолвера рассчитан
+        Вызывается ОДИН раз на проход job'а (``_run_admitted``), не per-node
+        (``job_id``/``epoch`` — опциональные, для trace_id события В1a.4;
+        прямые юнит-вызовы без аргументов остаются валидными). Узлы
+        передаются spec-отображениями — контракт резолвера рассчитан
         на Mapping-узлы режимов. ``model_facts`` — от инъектируемого
         провайдера ``calibration_model_facts`` (Э2-2); нет провайдера или
         он упал (сеть, §6.2) -> ``None`` = полка не наблюдаема, поведение
         Э1 в точности (паритет F1). Любой сбой -> ``{}`` = режим Б:
         калибровка необязательна, паритет важнее (F1).
+
+        В1a.4 (F-2б): калибровка сконфигурирована (``calibration_profile``
+        не None), а факты недоступны (провайдера нет / сбой / пустой
+        результат) -> событие ``calibration.facts_unavailable``
+        (``_emit_facts_unavailable``) — наблюдаемо, не тишина. Без
+        профиля событие НЕ эмитится — поведение байт-в-байт (паритет F1).
         """
         if resolve is None:
             return {}
         try:
             nodes = {nid: node.spec for nid, node in self.graph.nodes.items()}
             facts = None
+            reason = "no_provider"  # В1a.4: почему факты недоступны (для события)
             if self.calibration_model_facts is not None:
                 try:  # сбой провайдера = сетевой сбой (§6.2): факты недоступны,
                     facts = self.calibration_model_facts()  # это НЕ сбой job'а
+                    reason = "empty" if facts is None else None
                 except Exception:  # noqa: BLE001 — мягко: паритет важнее (F1)
                     facts = None
+                    reason = "provider_error"
+            if facts is None and self.calibration_profile is not None:
+                self._emit_facts_unavailable(job_id, epoch, reason)
             return dict(resolve(nodes, self.registry, model_facts=facts,
                                 profile=self.calibration_profile))
         except Exception:  # noqa: BLE001 — калибровка необязательна, паритет важнее
             return {}
+
+    def _emit_facts_unavailable(
+        self, job_id: str | None, epoch: int, reason: str
+    ) -> None:
+        """В1a.4 (F-2б): warning-событие ``calibration.facts_unavailable``.
+
+        Эмитится ОДИН раз на проход job'а (из ``_resolve_calibration``),
+        когда калибровка сконфигурирована (``calibration_profile is not
+        None``), а факты полки недоступны: провайдера нет
+        (``no_provider``), он упал (``provider_error`` — сетевой сбой
+        §6.2) или честно вернул None (``empty`` — тега на полке нет).
+        Носитель — ТОТ ЖЕ поток событий, что и ``scalars_sources``/
+        ``scalars_stale``: колбэк ``on_node_usage`` (прод-проводка
+        ``wiring.make_on_node_usage`` -> ``ws:quota:events``).
+        ``node=None``: резолв — на проход job'а, не на узел (подписчики,
+        фильтрующие по ``event["node"]``, событие прозрачно пропускают).
+
+        Fail-closed (жёсткий отказ режима П при неверифицируемом digest)
+        отложен ОСОЗНАННО: минимум, не ломающий прод, — наблюдаемое
+        событие вместо тихого None; ужесточение до отказа — отдельное
+        решение Критика+оператора (приёмка A5, анализ Ф7 §3 В1a.4).
+        Сейчас гейт Т1 при ``facts=None`` проходит без верификации
+        (``api._calibrated_for_matches``), режим П сохраняется.
+
+        Best-effort: сбой колбэка НЕ валит прогон (warning, дальше).
+        ``job_id=None`` (прямые юнит-вызовы резолва) — событие без
+        ``trace_id``.
+        """
+        if self.on_node_usage is None:
+            return
+        pid = None
+        if isinstance(self.calibration_profile, Mapping):
+            pid = self.calibration_profile.get("profile_id")
+        event: dict[str, Any] = {
+            "job": job_id,
+            "node": None,
+            "kind": "calibration.facts_unavailable",
+            "reason": reason,
+            "profile_id": pid,
+            "warning": True,
+        }
+        if job_id is not None:
+            event["trace_id"] = f"{job_id}:{epoch}"
+        try:
+            self.on_node_usage(event)
+        except Exception:  # best-effort: наблюдение не валит проход job'а
+            logger.warning(
+                "on_node_usage(facts_unavailable, job=%s) упал "
+                "(best-effort, игнор)", job_id, exc_info=True,
+            )
 
     def _scalar(self, node: Node, param: str, default: Any = None):
         """Эффективный скаляр узла (retries/max_iterations/shaping/context_mode).

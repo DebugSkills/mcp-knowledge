@@ -82,3 +82,8 @@ kb-console-quality-after-deploy-011-2026-09-24.png
 
 # Draft/scratch space (черновики, ревизии, критики) — не в репу
 .tmp/
+
+# В3-A Ф7 (arch-2026-10-08-f7-calibration): probe-отчёты калибровки —
+# метрики живых прогонов (probe-<run_id>.json + <run_id>.partial.json),
+# приватность I5: снапшоты не для публичной репы, каталог не трекается
+ai_workspace/calibration/reports/

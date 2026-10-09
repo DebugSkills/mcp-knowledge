@@ -62,6 +62,7 @@ from ai_workspace.tests.test_engine import FakeBoards, FakeJobs
 from ai_workspace.tools.golden_run import StubMCP
 
 __all__ = [
+    "BASE_VARIANT",
     "VARIANTS",
     "OllamaClient",
     "RunOutcome",
@@ -88,6 +89,11 @@ OLLAMA_MODEL = "qwen2.5:7b"
 
 VARIANTS: tuple[str, ...] = ("empty", "full", "contract")
 """Порядок вариантов в отчёте; contract — текущее поведение (6a.2a)."""
+
+BASE_VARIANT = "base"
+"""Не-A/B вариант: роли реестра как есть, без подделки (probe Ф7, fix §10
+LIVE-PROBE-1 — «base»-прогон калибровки). В ``VARIANTS`` НЕ входит: A/B-пилот
+«base» отдельным вариантом не гоняет."""
 
 MIN_DOC_CHARS, MAX_DOC_CHARS = 400, 12000
 CITATION_MARKER = "src-"
@@ -236,9 +242,15 @@ def build_variant_registry(
     base: Registry, variant: str,
     *, seed_reader: Callable[[str], str] = load_seed_text,
 ) -> VariantRegistry:
-    """Реестр-подделка варианта: empty/full/contract по метам roles.yaml."""
-    if variant not in VARIANTS:
-        raise ValueError(f"неизвестный вариант {variant!r}; ожидается {VARIANTS}")
+    """Реестр-подделка варианта: empty/full/contract по метам roles.yaml.
+
+    ``BASE_VARIANT`` ("base") — роли реестра как есть (без модификаций):
+    базовый прогон probe-измерителя Ф7; тот же passthrough, что у "contract".
+    """
+    if variant not in VARIANTS and variant != BASE_VARIANT:
+        raise ValueError(
+            f"неизвестный вариант {variant!r}; ожидается {VARIANTS} или {BASE_VARIANT!r}"
+        )
     roles: dict[str, Any] = {}
     for role, meta in base.get("roles").items():
         meta = dict(meta)
@@ -317,9 +329,20 @@ class RunOutcome:
     llm_wall_s: float = 0.0
     prompt_chars: int = 0
     tokens: int = 0
+    # 2c (В2-A «Достоверность»): in/out-разбивка из usage ответов сервера —
+    # журнал llm.calls несёт живой факт (OllamaClient пишет usage каждого
+    # вызова); без usage (стабы/FakeLLM) остаются 0 → probe честно падает
+    # обратно на нижнюю оценку «все токены входные».
+    tokens_in: int = 0
+    tokens_out: int = 0
     node_events: list[dict[str, Any]] = field(default_factory=list)
     live_sample: dict[str, Any] = field(default_factory=dict)
     critic_fragment: str = ""
+    # В3-A 3b (Ф7, приватность I5): структурные критерии прогона — булевы
+    # для partial-снапшота probe (тексты document/draft в снапшот не едут,
+    # пересчёт из них невозможен — критерии несут сам прогон); error-прогон
+    # оставляет None (критерии не вычислены).
+    checks: DocumentChecks | None = None
 
 
 def _critic_node(graph: Any) -> Node | None:
@@ -345,6 +368,18 @@ def run_one(
     вариант×задание×run — fx-кэш не переносится между вариантами).
     """
     base = base_registry or Registry(AI_WORKSPACE_DIR / "registry")
+    # В1a.1/В1a.2 Ф7 (arch-2026-10-08-f7-calibration): активный профиль
+    # калибровки для конструктора движка. Селектор — реестр model_classes
+    # базового реестра (active_profile), факт полки — провайдер (ollama
+    # /api/tags, Э2-2); нет профиля → (None, None) → паритет F1. Import
+    # ЛОКАЛЬНЫЙ: model_facts импортирует OLLAMA_MODELS_URL из этого модуля
+    # — топ-уровень дал бы циклический импорт.
+    from ai_workspace.calibration.model_facts import urllib_http_get
+    from ai_workspace.calibration.runtime import DEFAULT_PROFILES_DIR, active_calibration
+
+    cal_profile, cal_facts = active_calibration(
+        base.dir, DEFAULT_PROFILES_DIR, http_get=urllib_http_get,
+    )
     graph = load_mode(mode_path)
     job_id = f"vp-{variant}-{task['id']}-{run_idx}"
     outcome = RunOutcome(
@@ -352,6 +387,11 @@ def run_one(
         run=run_idx, status="error",
     )
     events: list[dict[str, Any]] = []
+    # 2c (В2-A): журнал вызовов клиента (OllamaClient.calls) несёт usage из
+    # ответов; клиент ОДИН на все прогоны probe → снапшот длины ДО прогона,
+    # чтобы посчитать только вызовы этого run_one.
+    journal = getattr(llm, "calls", None)
+    journal_start = len(journal) if isinstance(journal, list) else 0
     t0 = time.monotonic()
     try:
         jobs = FakeJobs()
@@ -367,6 +407,10 @@ def run_one(
             registry=build_variant_registry(base, variant, seed_reader=seed_reader),
             decoding=cf.DECODING_PIN,
             on_node_usage=events.append,
+            # В1a.2 Ф7: профиль/факты калибровки (см. выше); (None, None)
+            # без active_profile — паритет F1.
+            calibration_profile=cal_profile,
+            calibration_model_facts=cal_facts,
         )
         engine.seed(job_id, {"brief": str(task["prompt"])}, epoch=1)
         step = engine.run(job_id, epoch=1)
@@ -399,6 +443,7 @@ def run_one(
         outcome.score = score_run(
             verdict_parse_ok=outcome.verdict_parse_ok, checks=checks
         )
+        outcome.checks = checks  # В3-A 3b: булевы критерии для partial-снапшота
     except Exception as exc:  # noqa: BLE001 — один сбой не валит пилот
         outcome.status = "error"
         outcome.detail = f"{type(exc).__name__}: {exc}"
@@ -408,6 +453,15 @@ def run_one(
     outcome.node_events = events
     outcome.prompt_chars = sum(int(e["prompt_chars"]) for e in llm_events)
     outcome.tokens = sum(int(e["tokens"]) for e in llm_events)
+    # 2c (В2-A): in/out из usage НОВЫХ записей журнала (записи без usage —
+    # стабы/FakeLLM, чужие строки-роли — пропускаются; тогда разбивки нет и
+    # M6 probe идёт нижней оценкой, как до В2-A).
+    if isinstance(journal, list):
+        for call in journal[journal_start:]:
+            usage = call.get("usage") if isinstance(call, dict) else None
+            if isinstance(usage, Mapping):
+                outcome.tokens_in += int(usage.get("prompt_tokens") or 0)
+                outcome.tokens_out += int(usage.get("completion_tokens") or 0)
     outcome.llm_wall_s = round(sum(float(e["wall_s"]) for e in llm_events), 3)
     if isinstance(llm, OllamaClient) and llm.calls:
         outcome.live_sample = dict(llm.calls[-1])

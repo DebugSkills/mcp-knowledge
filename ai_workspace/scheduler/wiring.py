@@ -18,6 +18,11 @@ scheduler/park.py (сквозной модуль над JobStore/Queue/admission
   ``charge`` ДОПОЛНИТЕЛЬНО списывает деньги (``budget.charge_budget``:
   микро-₽, журнал; P0-1) — та же точка, что и ``charge_tokens`` (терминал
   job через ``engine._quota_finalize``), дубля списания нет;
+- ``build_mode_engine`` — порт сборки боевого движка с проводкой
+  калибровки (В1a.3 Ф7, arch-2026-10-08-f7-calibration): инъектирует
+  ``calibration_profile``/``calibration_model_facts`` из
+  ``calibration.runtime.active_calibration`` в конструктор ``ModeEngine``
+  (см. докстроку функции — подключение в job-раннере + вопрос Г7);
 - ``QuotaWiring.sweep_all`` — глобальный свип истёкших conc-резервов
   (P1-3): пользователи перечисляются по job-store (SCAN ``ws:job:*`` →
   HGET user; SSOT пользователей — job-store, НЕ ключи квот), по каждому
@@ -46,6 +51,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -73,6 +79,7 @@ from ai_workspace.scheduler.prio import (
 __all__ = [
     "QuotaWiring",
     "RedisQuotaPort",
+    "build_mode_engine",
     "make_on_job_terminal",
     "make_on_node_usage",
     "make_on_queue_change",
@@ -168,6 +175,86 @@ def make_on_node_usage(
         incr_node_metrics(client, event)
 
     return _on_node_usage
+
+
+#: Реестр калибровки по умолчанию для ``build_mode_engine``: упакованный
+#: реестр AI-верстака (``ai_workspace/registry`` — тот же, что golden-run).
+_DEFAULT_CAL_REGISTRY_DIR = Path(__file__).resolve().parents[1] / "registry"
+
+
+def build_mode_engine(
+    *,
+    jobs: Any,
+    boards: Any,
+    graph: Any,
+    llm: Any,
+    mcp: Any,
+    ledger: Any,
+    cal_registry_path: Path | str | None = None,
+    cal_profiles_dir: Path | str | None = None,
+    cal_http_get: Callable[[str], dict] | None = None,
+    **engine_kwargs: Any,
+) -> Any:
+    """Порт сборки боевого движка с проводкой калибровки (В1a.3 Ф7).
+
+    Назначенная прод-точка сборки ``ModeEngine`` для job-раннера
+    оркестратора: читает активный профиль (``active_calibration`` —
+    селектор ``active_profile`` реестра ``model_classes``, факт полки —
+    ленивый провайдер ollama ``/api/tags``, Э2-2) и ИНЪЕКТИРУЕТ
+    ``calibration_profile``/``calibration_model_facts`` в конструктор.
+    Боевого ctor-call сегодня нет (n1: вне tools/тестов вызовов
+    ``ModeEngine(`` нет, прод-воркера в репо нет — R1) — поэтому порт
+    обязан оставаться вызываемым и покрытым тестом, а не мёртвым кодом.
+
+    Подключение в job-раннере: ``orchestrator/job.py`` — владелец
+    статуса («Mode engine»), движок получает ИНЪЕКЦИЕЙ — воркер/раннер
+    строит его через этот порт и передаёт готовый инстанс в исполнение
+    job'а (как три tools-конструктора В1a.2: golden_run / vp_ab_pilot /
+    f47_acceptance). Порты ETA/трейса/квот того же контура —
+    ``make_on_job_terminal`` / ``make_on_node_usage`` / ``QuotaWiring.make_port``.
+
+    Г7 (открытый вопрос): ``active_calibration`` выбирает ПЕРВЫЙ класс
+    с непустым ``active_profile`` по порядку файла реестра; сегодня
+    калибруется один класс — стратегию выбора при НЕСКОЛЬКИХ
+    откалиброванных классах решает Г7 (анализ Ф7 §4).
+
+    Дефолты: ``cal_registry_path`` — упакованный реестр
+    ``ai_workspace/registry``; ``cal_profiles_dir`` —
+    ``DEFAULT_PROFILES_DIR``; ``cal_http_get=None`` — прод-провайдер
+    ``urllib_http_get`` (порт — прод-точка: полка наблюдаема
+    по умолчанию; тесты передают фейк, «выключить» сеть — заглушкой).
+
+    Паритет F1: нет ``active_profile`` / файла профиля -> helper даёт
+    ``(None, None)`` -> конструктор получает прежние дефолты ->
+    поведение Э1 байт-в-байт.
+
+    Прочие kwargs движка (``registry``, ``quota``, ``decoding``,
+    ``on_node_usage``, ...) проходят насквозь (``**engine_kwargs``).
+    Import ЛОКАЛЬНЫЙ: calibration-цепочка тянет tools (импорт-цикл,
+    см. ``calibration/runtime.py``) — топ-уровень wiring её не грузит.
+    """
+    from ai_workspace.calibration.model_facts import urllib_http_get
+    from ai_workspace.calibration.runtime import DEFAULT_PROFILES_DIR, active_calibration
+    from ai_workspace.orchestrator.engine import ModeEngine
+
+    cal_profile, cal_facts = active_calibration(
+        cal_registry_path if cal_registry_path is not None
+        else _DEFAULT_CAL_REGISTRY_DIR,
+        cal_profiles_dir if cal_profiles_dir is not None
+        else DEFAULT_PROFILES_DIR,
+        http_get=cal_http_get if cal_http_get is not None else urllib_http_get,
+    )
+    return ModeEngine(
+        jobs=jobs,
+        boards=boards,
+        graph=graph,
+        llm=llm,
+        mcp=mcp,
+        ledger=ledger,
+        calibration_profile=cal_profile,
+        calibration_model_facts=cal_facts,
+        **engine_kwargs,
+    )
 
 
 def _require_pricing(shelf: str, pricing: Any) -> None:

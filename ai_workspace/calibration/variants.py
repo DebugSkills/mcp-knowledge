@@ -5,7 +5,12 @@
 обязательные поля записи, статус-enum, существование файлов варианта и
 базового режима в ``modes_dir``, обязательность ``probe_pair{base,variant}``
 для ``promoted``/``rejected`` (решение оператора P5 опирается на пару
-ProbeReport §7.3).
+ProbeReport §7.3). В3-A 3a (F-5): при переданном ``reports_dir`` CV7
+ДОПОЛНИТЕЛЬНО резолвит файл отчёта ``probe-<run_id>.json`` по каждому ключу
+пары (``probe.report_filename`` — тот же канон, что ``write_report``) и
+требует его существования — promotion не может опираться на несуществующий
+отчёт (обещание дизайна §7.4). Без ``reports_dir`` — паритет: проверка
+только наличия ключей.
 
 Э4-1: ``evaluate_promotion`` — критерий §7.3 (бумажка решения, НЕ решение:
 promotion всегда за оператором P5); ``record_decision`` — upsert записи в
@@ -20,6 +25,8 @@ from typing import Any
 
 import yaml
 
+from ai_workspace.calibration.policy import NEEDLE_RATE_FLOOR
+from ai_workspace.calibration.probe import report_filename
 from ai_workspace.calibration.profiles import SEVERITY_ERROR, Finding
 
 __all__ = [
@@ -66,8 +73,16 @@ def _check_mode_file(
         )
 
 
-def validate_variants(doc: dict, modes_dir: Path | str) -> list[Finding]:
-    """Проверить реестр вариантов по §7.4; ``modes_dir`` — каталог mode-YAML."""
+def validate_variants(
+    doc: dict, modes_dir: Path | str, reports_dir: Path | str | None = None,
+) -> list[Finding]:
+    """Проверить реестр вариантов по §7.4; ``modes_dir`` — каталог mode-YAML.
+
+    ``reports_dir`` (В3-A 3a, F-5) — включает CV7-existing: значения
+    ``probe_pair{base,variant}`` обязаны быть run_id СУЩЕСТВУЮЩИХ отчётов
+    probe (``probe-<run_id>.json`` в ``reports_dir``). ``None`` — паритет:
+    только наличие ключей пары (прошлое поведение).
+    """
     findings: list[Finding] = []
     if not isinstance(doc, Mapping):
         return [_err("CV0", "реестр вариантов должен быть YAML-отображением (mapping)", "$")]
@@ -132,7 +147,9 @@ def validate_variants(doc: dict, modes_dir: Path | str) -> list[Finding]:
                 findings, modes, entry.get("variant_of"), "variant_of", prefix, "CV6"
             )
 
-        # CV7: probe_pair{base,variant} обязателен для promoted/rejected.
+        # CV7: probe_pair{base,variant} обязателен для promoted/rejected;
+        # В3-A 3a (F-5): при заданном reports_dir ключи — run_id отчётов
+        # probe, файл резолвится и обязан существовать (fail-closed).
         if status in DECIDED_STATUSES:
             pair = entry.get("probe_pair")
             if not isinstance(pair, Mapping) or any(k not in pair for k in REQUIRED_PROBE_PAIR):
@@ -144,6 +161,31 @@ def validate_variants(doc: dict, modes_dir: Path | str) -> list[Finding]:
                         f"{prefix}.probe_pair",
                     )
                 )
+            elif reports_dir is not None:
+                for key in REQUIRED_PROBE_PAIR:
+                    field = f"{prefix}.probe_pair.{key}"
+                    run_id = pair.get(key)
+                    if not isinstance(run_id, str) or not run_id.strip():
+                        findings.append(
+                            _err(
+                                "CV7",
+                                f"probe_pair.{key} должен быть непустым run_id "
+                                "отчёта probe",
+                                field,
+                            )
+                        )
+                        continue
+                    report_path = Path(reports_dir) / report_filename(run_id)
+                    if not report_path.is_file():
+                        findings.append(
+                            _err(
+                                "CV7",
+                                f"отчёт probe не существует: {report_path} "
+                                f"(run_id {run_id!r}) — promotion не может "
+                                "опираться на несуществующий отчёт (§7.4)",
+                                field,
+                            )
+                        )
 
     return findings
 
@@ -196,6 +238,22 @@ def evaluate_promotion(
             f"held-out расходится с golden: |golden-heldout|={delta:.4f} > "
             f"golden_dispersion={variant_report.golden_dispersion:.4f}"
         )
+    # 2e (В2-B, F-3i): promoted требует needle_rate >= порога у ВАРИАНТА;
+    # None — needle-набор не прогонялся, условие не проверивается
+    needle_rate = getattr(variant_report, "needle_rate", None)
+    if needle_rate is not None and needle_rate < NEEDLE_RATE_FLOOR:
+        reasons.append(
+            f"needle_rate ниже порога: {needle_rate:.4f} < "
+            f"{NEEDLE_RATE_FLOOR:.4f} (retention длинного контекста, M4)"
+        )
+    # 2b/2e (В2-B): ceiling — golden score 1.0/disp 0 не различает
+    # конфигурации; promotion по неотличимому замеру не применяется
+    if "ceiling" in (getattr(variant_report, "flags", None) or ()):
+        reasons.append(
+            "ceiling-флаг варианта: golden score=1.0 при disp=0 — замер не "
+            "различает конфигурации, promoted требует иного замера/решения "
+            "оператора"
+        )
     return {"passed": not reasons, "reasons": reasons}
 
 
@@ -206,6 +264,7 @@ def record_decision(
     probe_pair: Mapping | None,
     decided_by: str,
     decided_at: str,
+    reports_dir: Path | str | None = None,
 ) -> None:
     """Upsert записи решения в ``variants.yaml`` (§7.4), fail-closed.
 
@@ -214,6 +273,9 @@ def record_decision(
     записи: любые findings → ``ValueError``, файл не трогаем. ``probe_pair``
     обязателен для ``promoted``/``rejected`` (CV7); ``variant_of`` берётся из
     существующей записи либо выводится из конвенции ``<mode>.<variant>``.
+    ``reports_dir`` (В3-A 3a, F-5) — включает CV7-existing: run_id пары
+    обязаны резолвиться в существующие ``probe-<run_id>.json``; ``None`` —
+    паритет (наличие ключей пары).
     """
     if status not in VARIANT_STATUSES:
         raise ValueError(
@@ -273,7 +335,7 @@ def record_decision(
     candidate["entries"] = deduped
 
     modes_dir = path.resolve().parent.parent / "modes"
-    findings = validate_variants(candidate, modes_dir)
+    findings = validate_variants(candidate, modes_dir, reports_dir=reports_dir)
     if findings:
         raise ValueError(
             "реестр невалиден после записи: "
