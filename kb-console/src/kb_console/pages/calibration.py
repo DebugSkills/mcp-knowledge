@@ -3,8 +3,10 @@
 arch-2026-10-09-calib-admin-ui Ф2: тонкий клиент host-side admin-API
 (``ai_workspace/calibration/admin_api.py``, bind 127.0.0.1:8700, заголовок
 ``X-Calib-Key``). Карточки модели/GPU → визард probe (two-step HITL) →
-поллинг статуса → approve. Ноль логики калибровки на стороне UI — все гейты
-живут в admin-API/CLI-канонах (``probe_run``/``profile_approve``).
+поллинг статуса → approve; Ф3b — live-пара base↔variant (``/calib/pair/*``)
++ запись решения P5 (``/calib/record``). Ноль логики калибровки на стороне
+UI — все гейты живут в admin-API/CLI-канонах (``probe_run``/
+``profile_approve``/``variant_pair``).
 
 Инварианты (план §«protected», НЕ ослаблять):
 
@@ -47,6 +49,16 @@ NEEDLE_RATE_FLOOR: float = 0.5
 
 #: Минимум прогонов probe (SSOT: ai_workspace/calibration/probe.py MIN_RUNS)
 MIN_RUNS: int = 3
+
+#: Дефолтная пара mode-YAML (SSOT: ai_workspace/tools/variant_pair.py
+#: DEFAULT_BASE_MODE/DEFAULT_VARIANT_MODE — statya / statya.deep;
+#: kb-console не импортирует ai_workspace — зеркало, синхронизировать
+#: при смене конвенций §7.2)
+PAIR_BASE_DEFAULT: str = "ai_workspace/modes/statya.yaml"
+PAIR_VARIANT_DEFAULT: str = "ai_workspace/modes/statya.deep.yaml"
+
+#: Зона пары по умолчанию (PairStartBody.zone; выбора зоны в UI нет)
+PAIR_ZONE_DEFAULT: str = "public"
 
 #: Интервал поллинга статуса probe (сек; loopback — дёшево)
 PROBE_POLL_INTERVAL: float = 2.0
@@ -112,6 +124,20 @@ class CalibClient:
         resp = await self._client.post("/calib/approve", json=payload)
         return resp.status_code, _body_of(resp)
 
+    async def pair_start(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """POST /calib/pair/start → 202 accepted / 409 single-flight / 400 гейт."""
+        resp = await self._client.post("/calib/pair/start", json=payload)
+        return resp.status_code, _body_of(resp)
+
+    async def pair_status(self) -> dict[str, Any]:
+        """GET /calib/pair/status — статус + отчёты плеч (whitelist) + reasons."""
+        return await self._get_json("/calib/pair/status")
+
+    async def record(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """POST /calib/record → 200 / 400 гейт / 409 нет пары / 422 fail-closed."""
+        resp = await self._client.post("/calib/record", json=payload)
+        return resp.status_code, _body_of(resp)
+
 
 def _body_of(resp: httpx.Response) -> dict[str, Any]:
     """Тело ответа → dict (не-JSON → detail с текстом; fail-soft)."""
@@ -150,6 +176,60 @@ def probe_start_outcome(status_code: int, body: dict[str, Any]) -> dict[str, str
         "message": f"запуск отклонён ({status_code}): {_detail(body)}",
     }
 
+
+
+def pair_start_outcome(status_code: int, body: dict[str, Any]) -> dict[str, str]:
+    """202/409/400 → нормализованный исход визарда пары
+    (started/already_running/rejected)."""
+    if status_code == 202:
+        return {"outcome": "started", "message": "пара запущена"}
+    if status_code == 409:
+        return {
+            "outcome": "already_running",
+            "message": f"пара уже выполняется (single-flight): {_detail(body)}",
+        }
+    return {
+        "outcome": "rejected",
+        "message": f"запуск пары отклонён ({status_code}): {_detail(body)}",
+    }
+
+
+def record_outcome(status_code: int, body: dict[str, Any]) -> dict[str, str]:
+    """200/409/400/422 → (notify-тип, сообщение) записи P5 (fail-soft UI).
+
+    422 — fail-closed отказ CLI-гейтов: запись НЕ выполнена, причина
+    показывается оператору. 409 — нет завершённой пары.
+    """
+    if status_code == 200:
+        status = body.get("status") if isinstance(body, dict) else None
+        return {
+            "outcome": "recorded",
+            "notify": "positive",
+            "message": f"Решение P5 записано: {status}",
+        }
+    if status_code == 409:
+        return {
+            "outcome": "no_pair",
+            "notify": "warning",
+            "message": f"нет завершённой пары: {_detail(body)}",
+        }
+    if status_code == 422:
+        return {
+            "outcome": "refused",
+            "notify": "negative",
+            "message": f"запись НЕ выполнена (fail-closed): {_detail(body)}",
+        }
+    if status_code == 400:
+        return {
+            "outcome": "gate",
+            "notify": "negative",
+            "message": f"запись отклонена (400): {_detail(body)}",
+        }
+    return {
+        "outcome": "error",
+        "notify": "negative",
+        "message": f"ошибка записи ({status_code}): {_detail(body)}",
+    }
 
 def needle_evidence(report: dict[str, Any] | None) -> dict[str, Any]:
     """Needle-доказательство из отчёта probe (metrics-only).
@@ -269,6 +349,65 @@ def _approve_payload(profile_id: str, *, ceiling_ok: bool) -> dict[str, Any]:
         "reason": "kb-console /calibration (operator P5)",
     }
 
+
+def _validate_pair_params(params: dict[str, Any]) -> list[str]:
+    """Валидация визарда пары: обязательные поля, без ведущего '-'.
+
+    Зеркало отказов admin_api (400): значения с ведущим '-' не принимаются.
+    """
+    errors: list[str] = []
+    if not params.get("model_class"):
+        errors.append("заполните model_class")
+    if not params.get("heldout"):
+        errors.append("заполните heldout (путь)")
+    for key in ("base", "variant", "model_class", "heldout"):
+        if str(params.get(key, "")).startswith("-"):
+            errors.append(f"{key}: значение с ведущим '-' не принимается")
+    return errors
+
+
+def _pair_payload(
+    *,
+    base: str,
+    variant: str,
+    model_class: str,
+    heldout: str,
+    live: bool,
+    confirm_live: bool,
+) -> dict[str, Any]:
+    """Тело POST /calib/pair/start (зеркало PairStartBody admin_api.py).
+
+    ``runs``/``zone`` — канонические дефолты сервера (runs=MIN_RUNS —
+    медиана при N≥3; zone=public); выбор зоны в UI не выставляется.
+    ``confirm_live`` — Operator Gate шага 1 визарда (live-расход — шаг 2,
+    строже CLI по аналогии с probe-визардом).
+    """
+    return {
+        "base": base,
+        "variant": variant,
+        "model_class": model_class,
+        "heldout": heldout,
+        "runs": MIN_RUNS,
+        "zone": PAIR_ZONE_DEFAULT,
+        "live": live,
+        "confirm_live": confirm_live,
+    }
+
+
+def _record_payload(variant: str, status: str) -> dict[str, Any]:
+    """Тело POST /calib/record (зеркало RecordBody admin_api.py).
+
+    ``confirm=True`` — HITL-диалог пройден (без него запрос не
+    формируется). ``base``/``model_class`` не передаём: сервер берёт
+    параметры последней пары и сверяет variant (CV7 — запись обязана
+    ссылаться на её отчёты).
+    """
+    return {
+        "variant": variant,
+        "status": status,
+        "confirm": True,
+        "decided_by": "operator",
+    }
 
 # ── Рендер-хелперы (чистые, тестируемы на спарс-данных) ────────
 
@@ -549,6 +688,146 @@ def _render_probe_panel(state: dict[str, Any], client: CalibClient | None) -> No
             )
 
 
+def _render_pair_arm(title: str, arm: dict[str, Any] | None) -> None:
+    """Метрики одного плеча пары — metrics-only (whitelist _REPORT_FIELDS).
+
+    Плечо = рука прогона (base/variant); рендер через общий
+    ``_render_report_metrics`` — только whitelist-поля, тексты прогона
+    не отображаются никогда (приватность I5).
+    """
+    arm = arm if isinstance(arm, dict) else None
+    with ui.row().classes("items-center gap-2 q-mt-xs"):
+        ui.label(title).classes("text-subtitle2")
+        if arm is None:
+            ui.label("нет отчёта").classes("text-caption text-grey")
+    if arm is not None:
+        _render_report_metrics(arm)
+
+
+def _render_pair_panel(state: dict[str, Any], client: CalibClient | None) -> None:
+    """Панель пары base↔variant: статус · метрики плеч · reasons · ряд P5.
+
+    Перерисовывается поллингом (@ui.refreshable). Кнопки записи P5
+    активны ТОЛЬКО при status=done (409 «нет завершённой пары» — гейт
+    сервера; UI не слабее CLI). ``reasons`` — бумажка §7.3 (подсказка
+    оператору), НЕ решение: P5 всегда за оператором.
+    """
+    pair = state.get("pair") if isinstance(state.get("pair"), dict) else {}
+    status_value = str(pair.get("status") or "idle")
+
+    with ui.card().classes("w-full q-mb-md"):
+        ui.label("Пара base↔variant · метрики · решение P5").classes(
+            "text-h6 q-mb-sm"
+        )
+        badge_color = {"idle": "grey", "running": "blue", "done": "green", "failed": "red"}
+        ui.badge(f"pair: {status_value}").props(
+            f"color={badge_color.get(status_value, 'grey')}"
+        )
+        if status_value == "running":
+            ui.spinner("dots", size="sm")
+        if pair.get("run_id"):
+            ui.label(f"run_id: {pair['run_id']}").classes("text-caption text-grey")
+        if pair.get("started_at"):
+            ui.label(f"старт: {str(pair['started_at'])[:19]}").classes(
+                "text-caption text-grey"
+            )
+        if pair.get("finished_at"):
+            ui.label(f"финиш: {str(pair['finished_at'])[:19]}").classes(
+                "text-caption text-grey"
+            )
+        if pair.get("exit_code") is not None:
+            ui.label(f"exit: {pair.get('exit_code')}").classes("text-caption text-grey")
+        if pair.get("error"):
+            ui.label(f"ошибка: {pair['error']}").classes("text-negative text-caption")
+        progress = pair.get("progress") if isinstance(pair.get("progress"), dict) else None
+        if progress is not None:
+            if "segments_done" in progress:
+                ui.label(f"segments done: {progress.get('segments_done')}").classes(
+                    "text-caption text-grey"
+                )
+            if progress.get("partial_error"):
+                ui.label(
+                    f"partial битый: {progress['partial_error']}"
+                ).classes("text-caption text-orange")
+
+        _render_pair_arm("base", pair.get("base"))
+        _render_pair_arm("variant", pair.get("variant"))
+        if pair.get("base") is None and pair.get("variant") is None:
+            ui.label(
+                "Метрики плеч появятся по завершении пары "
+                "(metrics-only, без текстов)."
+            ).classes("text-caption text-grey")
+
+        passed = pair.get("passed")
+        if isinstance(passed, bool):
+            if passed:
+                ui.badge("критерий §7.3: passed").props("color=green")
+            else:
+                ui.badge("критерий §7.3: not passed").props("color=orange")
+        reasons = pair.get("reasons") if isinstance(pair.get("reasons"), list) else []
+        if reasons:
+            with ui.row().classes("gap-1 flex-wrap q-mt-xs"):
+                for reason in reasons:
+                    ui.chip(str(reason)).props("outline dense size=sm")
+
+        record_result = (
+            state.get("record_result")
+            if isinstance(state.get("record_result"), dict)
+            else None
+        )
+        if record_result is not None:
+            if record_result.get("code") == 200:
+                ui.badge(f"записано: {record_result.get('status')}").props(
+                    "color=green"
+                )
+            else:
+                body = (
+                    record_result.get("body")
+                    if isinstance(record_result.get("body"), dict)
+                    else {}
+                )
+                ui.label(
+                    f"запись НЕ выполнена ({record_result.get('code')}): "
+                    f"{_detail(body)}"
+                ).classes("text-negative text-caption")
+
+        ui.separator()
+
+        ui.label("Решение P5 (promoted/rejected) — всегда за оператором").classes(
+            "text-subtitle1 q-mb-xs"
+        )
+        ui.input(
+            "variant (mode-YAML записи)",
+            value=state.get("record_variant", ""),
+            on_change=lambda e: state.__setitem__("record_variant", e.value),
+        ).props("dense").classes("w-64").tooltip(
+            "должен совпадать с variant прогнанной пары (CV7)"
+        )
+        can_record = status_value == "done"
+
+        async def _on_promote() -> None:
+            if client is not None:
+                await _confirm_record(client, state, "promoted")
+
+        async def _on_reject() -> None:
+            if client is not None:
+                await _confirm_record(client, state, "rejected")
+
+        with ui.row().classes("gap-2"):
+            promote_btn = ui.button("⬆ promoted (P5)", on_click=_on_promote)
+            promote_btn.props("flat color=positive")
+            reject_btn = ui.button("⬇ rejected (P5)", on_click=_on_reject)
+            reject_btn.props("flat color=negative")
+            if can_record:
+                promote_btn.tooltip("HITL-подтверждение → POST /calib/record")
+                reject_btn.tooltip("HITL-подтверждение → POST /calib/record")
+            else:
+                promote_btn.disable()
+                reject_btn.disable()
+                promote_btn.tooltip("пара не завершена — запись только по done")
+                reject_btn.tooltip("пара не завершена — запись только по done")
+
+
 # ── Действия (module-level — тестируемо) ───────────────────────
 
 
@@ -710,6 +989,141 @@ async def _confirm_approve(client: CalibClient, state: dict[str, Any]) -> None:
     }
 
 
+async def _confirm_pair_launch(params: dict[str, Any]) -> bool:
+    """Визард two-step HITL пары: (1) confirm-live, (2) ОТДЕЛЬНО — live-расход.
+
+    Шаг 2 показывается ТОЛЬКО при live-запросе (реальный инференс ОБОИХ
+    плеч пары); True — все необходимые подтверждения получены. Bare await,
+    non-persistent (паттерн _confirm_probe_launch).
+    """
+    live_requested = bool(params.get("live"))
+    step1: dict[str, bool] = {"confirmed": False}
+    with ui.dialog() as dialog, ui.card().classes("q-pa-md"):
+        ui.label(
+            "Шаг 1 из 2 · Подтверждение пары base↔variant (confirm-live)"
+        ).classes("text-h6")
+        ui.label(
+            f"base: {params.get('base')}\nvariant: {params.get('variant')}\n"
+            f"класс: {params.get('model_class')} · heldout: {params.get('heldout')}\n"
+            f"live: {'да' if live_requested else 'нет'}"
+        ).classes("text-body2 q-mt-sm")
+        ui.label(
+            "Пара будет запущена — Operator Gate (аналог --confirm-live)."
+        ).classes("text-caption text-grey q-mt-sm q-mb-md")
+        with ui.row().classes("gap-2"):
+            ui.button("Отмена", on_click=dialog.close).props("flat")
+
+            def _confirm_step1(dlg=dialog) -> None:
+                step1["confirmed"] = True
+                dlg.close()
+
+            ui.button("✅ Подтверждаю запуск пары", on_click=_confirm_step1).props(
+                "flat color=warning"
+            )
+    await dialog
+    if not step1["confirmed"]:
+        return False
+    if not live_requested:
+        return True
+
+    # шаг 2 — ОТДЕЛЬНЫЙ диалог: live-расход обоих плеч (строже CLI)
+    step2: dict[str, bool] = {"confirmed": False}
+    with ui.dialog() as dialog2, ui.card().classes("q-pa-md"):
+        ui.label("Шаг 2 из 2 · Живой расход (live)").classes("text-h6")
+        ui.label(
+            "live-прогон гоняет РЕАЛЬНЫЙ инференс на ОБОИХ плечах пары "
+            "(base и variant) — отдельное подтверждение расхода."
+        ).classes("text-body2 q-mt-sm q-mb-md")
+        with ui.row().classes("gap-2"):
+            ui.button("Отмена", on_click=dialog2.close).props("flat")
+
+            def _confirm_step2(dlg=dialog2) -> None:
+                step2["confirmed"] = True
+                dlg.close()
+
+            ui.button(
+                "🔥 Подтверждаю live-расход обоих плеч", on_click=_confirm_step2
+            ).props("flat color=negative")
+    await dialog2
+    return step2["confirmed"]
+
+
+async def _start_pair(
+    client: CalibClient, payload: dict[str, Any], state: dict[str, Any]
+) -> None:
+    """POST /calib/pair/start + разбор 202/409/400 (панель обновит поллинг)."""
+    try:
+        code, body = await client.pair_start(payload)
+    except Exception as exc:
+        ui.notify(f"Сетевая ошибка запуска пары: {exc}", type="negative")
+        return
+    outcome = pair_start_outcome(code, body)
+    if outcome["outcome"] == "started":
+        ui.notify("Пара запущена — прогресс ниже", type="positive")
+    elif outcome["outcome"] == "already_running":
+        ui.notify(f"{outcome['message']} — текущая пара показана ниже", type="warning")
+    else:
+        ui.notify(outcome["message"], type="negative")
+    try:
+        state["pair"] = await client.pair_status()
+    except Exception:
+        pass  # поллинг-таймер подхватит статус следующим тиком (fail-soft)
+
+
+async def _confirm_record(
+    client: CalibClient, state: dict[str, Any], decision: str
+) -> None:
+    """Запись P5: HITL-диалог → POST /calib/record с confirm=true.
+
+    200 → positive + бейдж на панели; 422 → причина fail-closed отказа
+    (запись НЕ выполнена); 409 → нет завершённой пары; 400 → гейт.
+    Решение P5 — оператора: API только исполняет подтверждённое.
+    """
+    variant = (state.get("record_variant") or "").strip()
+    if not variant:
+        ui.notify("Укажите variant (mode-YAML) для записи", type="warning")
+        return
+    pair = state.get("pair") if isinstance(state.get("pair"), dict) else {}
+    confirmed: dict[str, bool] = {"ok": False}
+    with ui.dialog() as dialog, ui.card().classes("q-pa-md"):
+        ui.label(f"⚖ Решение P5: {decision}").classes("text-h6")
+        ui.label(f"variant: {variant}").classes("text-body2 q-mt-sm")
+        passed = pair.get("passed")
+        if isinstance(passed, bool):
+            ui.label(
+                f"Критерий §7.3: {'passed' if passed else 'not passed'} "
+                "(подсказка, НЕ решение)"
+            ).classes("text-caption text-grey")
+        reasons = pair.get("reasons") if isinstance(pair.get("reasons"), list) else []
+        for reason in reasons[:5]:
+            ui.label(f"· {reason}").classes("text-caption text-grey")
+        ui.label(
+            "Решение и ответственность — ваши; API только исполняет "
+            "(confirm=true)."
+        ).classes("text-caption text-grey q-mt-sm q-mb-md")
+        with ui.row().classes("gap-2"):
+            ui.button("Отмена", on_click=dialog.close).props("flat")
+
+            def _confirm(dlg=dialog) -> None:
+                confirmed["ok"] = True
+                dlg.close()
+
+            ui.button(f"✅ Записать {decision}", on_click=_confirm).props(
+                "flat color=warning"
+            )
+    await dialog
+    if not confirmed["ok"]:
+        return
+    try:
+        code, body = await client.record(_record_payload(variant, decision))
+    except Exception as exc:
+        ui.notify(f"Сетевая ошибка записи: {exc}", type="negative")
+        return
+    outcome = record_outcome(code, body)
+    ui.notify(outcome["message"], type=outcome["notify"])
+    state["record_result"] = {"code": code, "body": body, "status": decision}
+
+
 # ── Сборка страницы ─────────────────────────────────────────────
 
 
@@ -739,6 +1153,9 @@ def build_calibration() -> None:
         "probe": {},
         "profile_id": "",
         "approve_result": None,
+        "pair": {},
+        "record_variant": "",
+        "record_result": None,
     }
     client = CalibClient()
 
@@ -753,6 +1170,10 @@ def build_calibration() -> None:
     @ui.refreshable
     def render_probe_panel() -> None:
         _render_probe_panel(state, client)
+
+    @ui.refreshable
+    def render_pair_panel() -> None:
+        _render_pair_panel(state, client)
 
     async def refresh_facts() -> None:
         """Карточки модели/GPU: fail-soft — сетевая ошибка не роняет страницу."""
@@ -778,6 +1199,19 @@ def build_calibration() -> None:
         except Exception:
             return
         render_probe_panel.refresh()
+
+    async def poll_pair() -> None:
+        """Поллинг статуса пары (общий таймер): сбой — тихий пропуск тика."""
+        try:
+            state["pair"] = await client.pair_status()
+        except Exception:
+            return
+        render_pair_panel.refresh()
+
+    async def poll_both() -> None:
+        """Один таймер на обе секции (probe + pair) — cleanup тоже один."""
+        await poll_probe()
+        await poll_pair()
 
     # ── Карточки фактов ──
     render_model_card()
@@ -836,11 +1270,68 @@ def build_calibration() -> None:
     # ── Статус/метрики/approve (поллинг) ──
     render_probe_panel()
 
-    poll_timer = ui.timer(PROBE_POLL_INTERVAL, poll_probe)
+    # ── Визард пары base↔variant (two-step HITL) ──
+    with ui.card().classes("w-full q-mb-md"):
+        ui.label("Пара base↔variant (двухшаговое подтверждение)").classes(
+            "text-h6 q-mb-sm"
+        )
+        with ui.row().classes("items-center gap-2 flex-wrap"):
+            pair_base_input = (
+                ui.input("base (mode-YAML)", value=PAIR_BASE_DEFAULT)
+                .props("dense")
+                .classes("w-64")
+            )
+            pair_variant_input = (
+                ui.input("variant (mode-YAML)", value=PAIR_VARIANT_DEFAULT)
+                .props("dense")
+                .classes("w-64")
+            )
+            pair_class_input = (
+                ui.input("model_class", placeholder="например fast")
+                .props("dense")
+                .classes("w-40")
+            )
+            pair_heldout_input = (
+                ui.input("heldout (путь)", placeholder="/path/to/heldout")
+                .props("dense")
+                .classes("w-64")
+            )
+            pair_live_check = ui.checkbox("live").props("dense")
+
+        async def _on_pair_click() -> None:
+            params: dict[str, Any] = {
+                "base": (pair_base_input.value or "").strip() or PAIR_BASE_DEFAULT,
+                "variant": (pair_variant_input.value or "").strip()
+                or PAIR_VARIANT_DEFAULT,
+                "model_class": (pair_class_input.value or "").strip(),
+                "heldout": (pair_heldout_input.value or "").strip(),
+                "live": bool(pair_live_check.value),
+            }
+            errors = _validate_pair_params(params)
+            if errors:
+                ui.notify("; ".join(errors), type="warning")
+                return
+            confirmed = await _confirm_pair_launch(params)
+            if not confirmed:
+                ui.notify("Запуск пары не подтверждён (гейт отменён)", type="info")
+                return
+            state["record_variant"] = params["variant"]
+            await _start_pair(
+                client, _pair_payload(**params, confirm_live=True), state
+            )
+
+        ui.button("🚀 Запустить пару", on_click=_on_pair_click).props(
+            "flat color=warning"
+        )
+
+    # ── Статус/метрики пары + решение P5 (поллинг) ──
+    render_pair_panel()
+
+    poll_timer = ui.timer(PROBE_POLL_INTERVAL, poll_both)
 
     async def _bootstrap() -> None:
         await refresh_facts()
-        await poll_probe()
+        await poll_both()
 
     ui.timer(0.1, _bootstrap, once=True)
 

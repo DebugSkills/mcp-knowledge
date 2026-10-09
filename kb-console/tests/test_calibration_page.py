@@ -729,3 +729,397 @@ class TestFirstPaint:
             await user.open("/t-calib-403")
             await user.should_see("403")
         mock_cls.assert_not_called()
+
+
+# ── Ф3b: live-пара base↔variant + решение P5 ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_client_pair_start_202_sends_key_and_body():
+    """(e) POST /calib/pair/start: путь, X-Calib-Key, JSON-тело доходят."""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["key"] = request.headers.get("X-Calib-Key")
+        seen["json"] = json.loads(request.content)
+        return httpx.Response(
+            202, json={"status": "accepted", "poll": "/calib/pair/status"}
+        )
+
+    client = _client(handler)
+    payload = calibration._pair_payload(
+        base="modes/statya.yaml", variant="modes/statya.deep.yaml",
+        model_class="fast", heldout="/heldout", live=False, confirm_live=True,
+    )
+    code, body = await client.pair_start(payload)
+    await client.close()
+    assert code == 202
+    assert body["status"] == "accepted"
+    assert seen["path"] == "/calib/pair/start"
+    assert seen["key"] == "test-key"
+    assert seen["json"]["confirm_live"] is True  # Operator Gate пройден
+    assert seen["json"]["runs"] >= 3  # медиана при N≥3 (серверный ge=MIN_RUNS)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 409])
+async def test_client_pair_start_error_codes_pass_through(status: int):
+    """(a) 400 (нет confirm_live) / 409 (single-flight) — код+detail до UI."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"detail": f"причина-{status}"})
+
+    client = _client(handler)
+    code, body = await client.pair_start({})
+    await client.close()
+    assert code == status
+    assert body["detail"] == f"причина-{status}"
+
+
+@pytest.mark.asyncio
+async def test_client_pair_status_and_record_urls():
+    """(e) GET /calib/pair/status + POST /calib/record: метод/путь/ключ/тело."""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        entry: dict[str, Any] = {
+            "method": request.method,
+            "path": request.url.path,
+            "key": request.headers.get("X-Calib-Key"),
+        }
+        if request.method == "POST":
+            entry["json"] = json.loads(request.content)
+            seen.append(entry)
+            return httpx.Response(
+                200, json={"recorded": True, "status": "promoted", "output": ""}
+            )
+        seen.append(entry)
+        return httpx.Response(
+            200,
+            json={
+                "status": "idle", "run_id": None, "started_at": None,
+                "finished_at": None, "exit_code": None, "error": None,
+                "progress": None, "base": None, "variant": None,
+                "passed": None, "reasons": None,
+            },
+        )
+
+    client = _client(handler)
+    status = await client.pair_status()
+    code, body = await client.record(
+        calibration._record_payload("modes/statya.deep.yaml", "promoted")
+    )
+    await client.close()
+    assert status["status"] == "idle"  # реальная форма pair/status (idle-ответ)
+    assert code == 200 and body["recorded"] is True
+    assert seen[0] == {
+        "method": "GET", "path": "/calib/pair/status", "key": "test-key",
+    }
+    assert seen[1]["method"] == "POST"
+    assert seen[1]["path"] == "/calib/record"
+    assert seen[1]["key"] == "test-key"
+    assert seen[1]["json"] == {
+        "variant": "modes/statya.deep.yaml", "status": "promoted",
+        "confirm": True, "decided_by": "operator",
+    }
+
+
+def test_render_pair_panel_metrics_only_with_reasons():
+    """(б) метрики base/variant + reasons рендерятся; тексты прогона — НЕТ (I5)."""
+    state = {
+        "pair": {
+            "status": "done",
+            "run_id": "probe-x",
+            "base": {
+                "run_id": "probe-b", "model_id": "qwen2.5:7b",
+                "golden_median_score": 0.9, "needle_rate": 0.55,
+                "rub": 1.25, "wall_s": 60.0, "n_runs": 3, "flags": [],
+                "answer_text": "СЕКРЕТНЫЙ-ТЕКСТ-base",
+            },
+            "variant": {
+                "run_id": "probe-v", "golden_median_score": 0.93,
+                "needle_rate": 0.61, "flags": ["ceiling"],
+                "answer_text": "СЕКРЕТНЫЙ-ТЕКСТ-variant",
+            },
+            "passed": True,
+            "reasons": ["heldout: +0.03 ≥ кванта", "needle: superior"],
+        },
+        "record_variant": "modes/statya.deep.yaml",
+    }
+    with patch.object(calibration, "ui") as mock_ui:
+        calibration._render_pair_panel(state, client=None)
+    text = _all_text(mock_ui)
+    assert "base" in text and "variant" in text
+    assert "0.9000" in text  # метрика base (score)
+    assert "0.9300" in text  # метрика variant (score)
+    assert "passed" in text
+    assert "heldout: +0.03 ≥ кванта" in text  # reasons рендерятся
+    assert "СЕКРЕТНЫЙ-ТЕКСТ" not in text  # metrics-only: тексты НЕ рендерятся
+
+
+def test_render_pair_panel_record_disabled_until_done():
+    """Кнопки P5 disabled, пока пара не завершена (409-гейт сервера)."""
+    state = {"pair": {"status": "running"}, "record_variant": "v.yaml"}
+    with patch.object(calibration, "ui") as mock_ui:
+        calibration._render_pair_panel(state, client=None)
+    record_calls = [
+        c for c in mock_ui.button.call_args_list
+        if "promoted" in " ".join(map(str, c.args))
+        or "rejected" in " ".join(map(str, c.args))
+    ]
+    assert len(record_calls) == 2
+    for call in record_calls:
+        call.return_value.disable.assert_called_once()
+
+
+def test_render_pair_panel_record_enabled_when_done():
+    """done → обе кнопки P5 доступны (disable НЕ вызван)."""
+    state = {
+        "pair": {
+            "status": "done",
+            "base": {"golden_median_score": 0.9},
+            "variant": {"golden_median_score": 0.93},
+            "passed": False,
+            "reasons": ["needle: не превосходит"],
+        },
+        "record_variant": "v.yaml",
+    }
+    with patch.object(calibration, "ui") as mock_ui:
+        calibration._render_pair_panel(state, client=None)
+    record_calls = [
+        c for c in mock_ui.button.call_args_list
+        if "promoted" in " ".join(map(str, c.args))
+        or "rejected" in " ".join(map(str, c.args))
+    ]
+    assert len(record_calls) == 2
+    for call in record_calls:
+        call.return_value.disable.assert_not_called()
+
+
+def test_record_payload_always_confirmed():
+    """(c) тело записи всегда confirm=true — без HITL запрос не формируется."""
+    payload = calibration._record_payload("modes/statya.deep.yaml", "rejected")
+    assert payload == {
+        "variant": "modes/statya.deep.yaml",
+        "status": "rejected",
+        "confirm": True,
+        "decided_by": "operator",
+    }
+
+
+@pytest.mark.asyncio
+async def test_confirm_record_cancelled_not_sent():
+    """(c) оператор отменил HITL-диалог → POST /calib/record НЕ отправляется."""
+    state = {
+        "record_variant": "modes/statya.deep.yaml",
+        "pair": {"status": "done", "passed": True, "reasons": []},
+    }
+    client = MagicMock()
+    client.record = AsyncMock()
+
+    class _CancelledDialog:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def close(self):
+            return None
+
+        def __await__(self):
+            async def _run() -> None:
+                pass  # «Отмена» — подтверждение не нажато
+
+            return _run().__await__()
+
+    with patch.object(calibration, "ui") as mock_ui:
+        mock_ui.dialog.return_value = _CancelledDialog()
+        await calibration._confirm_record(client, state, "promoted")
+    client.record.assert_not_awaited()
+    assert "record_result" not in state
+
+
+@pytest.mark.asyncio
+async def test_confirm_record_422_shows_reason_not_recorded():
+    """(д) 422 fail-closed: видимое сообщение-причина; запись НЕ выполнена."""
+    state = {
+        "record_variant": "modes/statya.deep.yaml",
+        "pair": {"status": "done", "passed": True, "reasons": ["r1"]},
+    }
+    client = MagicMock()
+    client.record = AsyncMock(
+        return_value=(422, {"detail": "CV7: отчёты пары не найдены"})
+    )
+    click_handlers: dict[str, Any] = {}
+
+    class _FakeDialog:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def close(self):
+            return None
+
+        def __await__(self):
+            async def _run() -> None:
+                handler = click_handlers.get("✅ Записать promoted")
+                if handler is not None:
+                    handler()
+
+            return _run().__await__()
+
+    with patch.object(calibration, "ui") as mock_ui:
+
+        def _button(label, on_click=None, **_kw):
+            click_handlers[str(label)] = on_click
+            return MagicMock()
+
+        mock_ui.button.side_effect = _button
+        mock_ui.dialog.return_value = _FakeDialog()
+        await calibration._confirm_record(client, state, "promoted")
+
+    types = [c.kwargs.get("type") for c in mock_ui.notify.call_args_list]
+    assert "negative" in types
+    msgs = " ".join(str(a) for c in mock_ui.notify.call_args_list for a in c.args)
+    assert "CV7" in msgs  # причина видна оператору
+    sent = client.record.call_args.args[0]
+    assert sent["confirm"] is True  # HITL пройден → запись, не dry-run
+    assert sent["status"] == "promoted"
+    assert state["record_result"]["code"] == 422  # запись НЕ выполнена
+
+
+@pytest.mark.asyncio
+async def test_confirm_record_200_positive():
+    """200: positive-уведомление + результат записи в state (бейдж на панели)."""
+    state = {
+        "record_variant": "modes/statya.deep.yaml",
+        "pair": {"status": "done"},
+    }
+    client = MagicMock()
+    client.record = AsyncMock(
+        return_value=(200, {"recorded": True, "status": "rejected", "output": ""})
+    )
+    click_handlers: dict[str, Any] = {}
+
+    class _FakeDialog:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def close(self):
+            return None
+
+        def __await__(self):
+            async def _run() -> None:
+                handler = click_handlers.get("✅ Записать rejected")
+                if handler is not None:
+                    handler()
+
+            return _run().__await__()
+
+    with patch.object(calibration, "ui") as mock_ui:
+
+        def _button(label, on_click=None, **_kw):
+            click_handlers[str(label)] = on_click
+            return MagicMock()
+
+        mock_ui.button.side_effect = _button
+        mock_ui.dialog.return_value = _FakeDialog()
+        await calibration._confirm_record(client, state, "rejected")
+
+    types = [c.kwargs.get("type") for c in mock_ui.notify.call_args_list]
+    assert "positive" in types
+    assert state["record_result"]["code"] == 200
+    assert state["record_result"]["status"] == "rejected"
+
+
+def test_pair_start_outcome_distinguishes_codes():
+    """202→started, 409→already_running (single-flight), 400→rejected."""
+    assert calibration.pair_start_outcome(202, {})["outcome"] == "started"
+    assert (
+        calibration.pair_start_outcome(409, {"detail": "x"})["outcome"]
+        == "already_running"
+    )
+    rejected = calibration.pair_start_outcome(400, {"detail": "нет confirm_live"})
+    assert rejected["outcome"] == "rejected"
+    assert "confirm_live" in rejected["message"]
+
+
+def test_record_outcome_distinguishes_codes():
+    """200→positive; 409→warning «нет пары»; 422→negative fail-closed."""
+    assert (
+        calibration.record_outcome(200, {"status": "promoted"})["notify"]
+        == "positive"
+    )
+    no_pair = calibration.record_outcome(409, {"detail": "нет завершённой пары"})
+    assert no_pair["notify"] == "warning"
+    assert "нет завершённой пары" in no_pair["message"]
+    refused = calibration.record_outcome(422, {"detail": "CV7"})
+    assert refused["notify"] == "negative"
+    assert "не выполнена" in refused["message"].lower()
+    assert calibration.record_outcome(400, {"detail": "confirm"})["outcome"] == "gate"
+
+
+def test_validate_pair_params():
+    """Обязательные model_class/heldout; ведущий '-' — отказ (зеркало 400)."""
+    errors = calibration._validate_pair_params(
+        {"base": "b.yaml", "variant": "v.yaml", "model_class": "", "heldout": ""}
+    )
+    assert any("model_class" in e for e in errors)
+    assert any("heldout" in e for e in errors)
+    bad = calibration._validate_pair_params(
+        {"base": "-x", "variant": "v.yaml", "model_class": "fast", "heldout": "/h"}
+    )
+    assert any("ведущим" in e for e in bad)
+    ok = calibration._validate_pair_params(
+        {"base": "b.yaml", "variant": "v.yaml", "model_class": "fast", "heldout": "/h"}
+    )
+    assert ok == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("live", "dialogs_expected"), [(False, 1), (True, 2)])
+async def test_pair_wizard_two_step_live(live: bool, dialogs_expected: int):
+    """two-step confirm-live: без live — 1 диалог; с live — отдельный расход."""
+    params = {
+        "base": "b.yaml", "variant": "v.yaml", "model_class": "fast",
+        "heldout": "/h", "live": live,
+    }
+    click_handlers: dict[str, Any] = {}
+
+    class _ConfirmAllDialog:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def close(self):
+            return None
+
+        def __await__(self):
+            async def _run() -> None:
+                for handler in click_handlers.values():
+                    if handler is not None:
+                        handler()
+
+            return _run().__await__()
+
+    with patch.object(calibration, "ui") as mock_ui:
+
+        def _button(label, on_click=None, **_kw):
+            click_handlers[str(label)] = on_click
+            return MagicMock()
+
+        mock_ui.button.side_effect = _button
+        mock_ui.dialog.return_value = _ConfirmAllDialog()
+        confirmed = await calibration._confirm_pair_launch(params)
+
+    assert confirmed is True
+    assert mock_ui.dialog.call_count == dialogs_expected
