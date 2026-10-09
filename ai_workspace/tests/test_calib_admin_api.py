@@ -734,6 +734,45 @@ def test_log_event_marker_format_and_key_hygiene(capsys) -> None:
     assert KEY not in out
 
 
+def test_start_marker_in_create_app_once_no_key(tmp_path, capsys, monkeypatch) -> None:
+    """Регресс observability: systemd/uvicorn зовёт ``create_app --factory``
+    БЕЗ main() — маркер старта пишет само построение приложения: ровно один
+    раз, host/port/workers, БЕЗ значения ключа (runbook §6, key-hygiene)."""
+    monkeypatch.delenv(admin_api.CALIB_API_PORT_ENV, raising=False)
+    app = admin_api.create_app(_settings(tmp_path))
+    assert app is not None
+    out = capsys.readouterr().out
+    assert out.count("[CALIB-API] start") == 1  # ровно один, не дважды
+    assert out.splitlines() == [
+        f"[CALIB-API] start host=127.0.0.1 port={admin_api.DEFAULT_PORT} workers=1"
+    ]
+    assert KEY not in out  # секрет — никогда в маркерах
+
+
+def test_start_marker_port_env_valid_and_garbage_safe(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    """Порт из env; мусор в env НЕ роняет построение — дефолт."""
+    monkeypatch.setenv(admin_api.CALIB_API_PORT_ENV, "9701")
+    admin_api.create_app(_settings(tmp_path))
+    out = capsys.readouterr().out
+    assert out.count("[CALIB-API] start") == 1
+    assert "port=9701" in out
+
+    monkeypatch.setenv(admin_api.CALIB_API_PORT_ENV, "junk-not-a-port")
+    admin_api.create_app(_settings(tmp_path))
+    out = capsys.readouterr().out
+    assert out.count("[CALIB-API] start") == 1
+    assert f"port={admin_api.DEFAULT_PORT}" in out
+
+
+def test_main_does_not_duplicate_start_marker() -> None:
+    """main() вызывает create_app() — дубль маркера убран (source-гвард)."""
+    source = Path(admin_api.__file__).read_text(encoding="utf-8")
+    main_src = source.split("def main()", 1)[1]
+    assert '_log_event("start"' not in main_src
+
+
 def test_markers_auth_refused_probe_start_finish(tmp_path, capsys) -> None:
     """401 → auth-refused; 202 → probe-start; финиш → probe-finish exit=0."""
     settings = _settings(tmp_path, probe_runner=lambda argv: 0)

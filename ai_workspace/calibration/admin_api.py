@@ -541,6 +541,10 @@ def create_app(settings: CalibSettings | None = None) -> FastAPI:
     app.state.calib_probe = _ProbeState()
     app.state.calib_pair = _PairState()
     _register_routes(app, settings)
+    # Маркер старта — ЗДЕСЬ, не в main(): systemd стартует uvicorn
+    # ``create_app --factory`` БЕЗ main(), иначе маркер не попадал в
+    # journald (дефект observability; runbook §6). Один лог на построение.
+    _log_event("start", host=BIND_HOST, port=_resolve_port(), workers=1)
     return app
 
 
@@ -1115,6 +1119,20 @@ async def _pair_background(
         _log_event("pair-finish", exit=code)
 
 
+def _resolve_port() -> int:
+    """Порт из env ``CALIB_API_PORT``; пусто/мусор/вне диапазона → дефолт.
+
+    Безопасный разбор: некорректное значение в env НЕ роняет старт
+    сервиса (bind и observability-маркер уходят на ``DEFAULT_PORT``).
+    """
+    raw = (os.environ.get(CALIB_API_PORT_ENV) or "").strip()
+    try:
+        port = int(raw)
+    except ValueError:
+        return DEFAULT_PORT
+    return port if 0 < port < 65536 else DEFAULT_PORT
+
+
 def main() -> None:
     """Entrypoint uvicorn: bind 127.0.0.1, СТРОГО ``workers=1``.
 
@@ -1125,8 +1143,7 @@ def main() -> None:
         raise SystemExit(
             f"{CALIB_API_KEY_ENV} не задан — отказ старта (fail-closed)"
         )
-    port = int(os.environ.get(CALIB_API_PORT_ENV, str(DEFAULT_PORT)))
-    _log_event("start", host=BIND_HOST, port=port, workers=1)
+    port = _resolve_port()  # маркер старта — в create_app (ровно один)
     import uvicorn
 
     uvicorn.run(create_app(), host=BIND_HOST, port=port, workers=1)
