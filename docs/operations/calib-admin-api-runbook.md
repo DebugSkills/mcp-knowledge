@@ -61,7 +61,18 @@ sudo chmod 600 /etc/calib-admin-api.env
 ## 4. Установка и запуск (Operator Gate)
 
 Unit лежит в репо: `ai_workspace/deploy/calib-admin-api.service`. Установка —
-вручную оператором (в ansible-деплой НЕ входит):
+вручную оператором (в ansible-деплой НЕ входит).
+
+**Удобно — скрипт-обёртка** делает §3+§4 идемпотентно (ключ генерится один раз,
+нигде не печатается; `--sync-env` кладёт тот же ключ в repo `.env` для kb-console;
+`--rotate-key` — сменить; `--uninstall` — снять):
+
+```bash
+sudo ai_workspace/deploy/install-calib-admin-api.sh --sync-env
+docker compose up -d --force-recreate kb-console    # чтобы консоль взяла ключ
+```
+
+Ручные шаги (эквивалент):
 
 ```bash
 sudo cp ai_workspace/deploy/calib-admin-api.service /etc/systemd/system/
@@ -150,3 +161,5 @@ drift-карточка + история (Ф4) — `plans/arch-2026-10-09-calib-a
 
 ---
 **v1.0** | 2026-10-09 | Ф1b: unit + runbook + E5-строка + маркеры [CALIB-API] | trace: arch-2026-10-09-calib-admin-ui
+
+**v1.1** | 2026-10-10 | +скрипт-обёртка `install-calib-admin-api.sh` (§4, идемпотентно) | trace: arch-2026-10-09-calib-admin-ui
