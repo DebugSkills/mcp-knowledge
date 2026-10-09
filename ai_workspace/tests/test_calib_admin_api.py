@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import threading
 import time
 from dataclasses import asdict
@@ -781,3 +783,380 @@ def test_markers_approve_start_finish(tmp_path, capsys) -> None:
     assert "[CALIB-API] approve-start profile_id=cal-fast-test-0001 confirm=False" in out
     assert "secret-reason-must-not-leak" not in out
     assert "[CALIB-API] approve-finish exit=0 applied=False" in out
+
+# ── Ф3a: пара base↔variant (/calib/pair/*) + запись P5 (/calib/record) ──────
+
+VARIANT = Path(__file__).resolve().parents[1] / "modes" / "statya.deep.yaml"
+
+
+def _pair_body(**extra) -> dict:
+    """Тело pair/start: явные base/variant + обязательные class/heldout."""
+    body = {
+        "base": str(MODE), "variant": str(VARIANT),
+        "model_class": "fast", "heldout": "/tmp/heldout.yaml",
+        "confirm_live": True,
+    }
+    body.update(extra)
+    return body
+
+
+def _wait_pair_status(client: TestClient, expected: str,
+                      timeout_s: float = 60.0) -> dict:
+    """Поллинг /calib/pair/status до ожидаемого статуса (bg в executor)."""
+    deadline = time.monotonic() + timeout_s
+    last: dict = {}
+    while time.monotonic() < deadline:
+        last = client.get("/calib/pair/status", headers=_headers()).json()
+        if last.get("status") == expected:
+            return last
+        time.sleep(0.05)
+    pytest.fail(f"pair-статус не достигнут {expected!r} за {timeout_s}s: {last}")
+
+
+def _pair_report_doc(run_id: str, golden: float, heldout: float,
+                     dispersion: float = 0.0, extra: dict | None = None) -> dict:
+    """JSON-отчёт плеча: метрики + ЗАПРЕЩЁННОЕ текстовое поле (негатив I5)."""
+    doc = {
+        "run_id": run_id, "model_id": "qwen2.5:7b", "digest": "sha256:abc",
+        "golden_manifest": "g" * 64, "pricing_manifest": "p" * 64,
+        "golden_median_score": golden, "golden_dispersion": dispersion,
+        "heldout_score": heldout, "parse_rate": 1.0, "parse_rate_defined": True,
+        "rub": 0.0, "wall_s": 1.0, "n_runs": 3, "flags": [],
+        "document": "SECRET-PAIR-TEXT",  # вне whitelist — не должно утекать
+    }
+    doc.update(extra or {})
+    return doc
+
+
+def _pair_writer_runner(docs: tuple[dict, ...], reports_dir: Path):
+    """Fake pair_runner: пишет отчёты плеч на носитель (как variant_pair)."""
+    def runner(argv: list[str]) -> int:
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        for i, doc in enumerate(docs):
+            path = reports_dir / f"{doc['run_id']}.json"
+            path.write_text(json.dumps(doc), encoding="utf-8")
+            stamp = time.time() + i  # base раньше variant (порядок плеч)
+            os.utime(path, (stamp, stamp))
+        return 0
+    return runner
+
+
+def test_pair_status_idle_initially(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        body = client.get("/calib/pair/status", headers=_headers()).json()
+        assert body["status"] == "idle"
+        assert body["base"] is None and body["variant"] is None
+        assert body["reasons"] is None and body["passed"] is None
+        assert body["progress"] is None and "report" not in body
+
+
+def test_pair_start_gates_confirm_live_and_injection(tmp_path) -> None:
+    """Нет confirm_live → 400; путь с ведущим '-' → 400; runs<3 → 422."""
+    settings = _settings(tmp_path)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = client.post(
+            "/calib/pair/start",
+            json=_pair_body(confirm_live=False), headers=_headers(),
+        )
+        assert r.status_code == 400
+        assert "confirm_live" in r.json()["detail"]
+        r = client.post(
+            "/calib/pair/start",
+            json=_pair_body(base="--inject"), headers=_headers(),
+        )
+        assert r.status_code == 400
+        r = client.post(
+            "/calib/pair/start", json=_pair_body(runs=2), headers=_headers(),
+        )
+        assert r.status_code == 422
+        # гейты не тронули состояние — пара не стартовала
+        assert (
+            client.get("/calib/pair/status", headers=_headers()).json()["status"]
+            == "idle"
+        )
+
+
+def test_pair_start_single_flight_independent_from_probe(tmp_path) -> None:
+    """202 → повтор 409 (свой single-flight); probe-состояние НЕ делится."""
+    pair_argv: list[str] = []
+    probe_argv: list[str] = []
+    pair_started, pair_release = threading.Event(), threading.Event()
+    probe_started, probe_release = threading.Event(), threading.Event()
+    settings = _settings(
+        tmp_path,
+        pair_runner=_blocked_runner(pair_argv, pair_started, pair_release),
+        probe_runner=_blocked_runner(probe_argv, probe_started, probe_release),
+    )
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r1 = client.post("/calib/pair/start", json=_pair_body(), headers=_headers())
+        assert r1.status_code == 202
+        assert r1.json() == {"status": "accepted", "poll": "/calib/pair/status"}
+        assert pair_started.wait(timeout=10)  # bg вошёл в runner
+
+        # пара занята → 409 (single-flight); статус running
+        r2 = client.post("/calib/pair/start", json=_pair_body(), headers=_headers())
+        assert r2.status_code == 409
+        assert (
+            client.get("/calib/pair/status", headers=_headers()).json()["status"]
+            == "running"
+        )
+        # probe-состояние независимо: старт probe при живой паре → 202
+        rp = client.post(
+            "/calib/probe/start",
+            json={"model_class": "fast", "heldout": "h.yaml",
+                  "confirm_live": True},
+            headers=_headers(),
+        )
+        assert rp.status_code == 202
+        assert probe_started.wait(timeout=10)
+
+        probe_release.set()
+        pair_release.set()
+        done = _wait_pair_status(client, "done")
+        assert done["exit_code"] == 0
+        _wait_status(client, "done")  # probe тоже завершился
+
+    # argv передан CLI-канону variant_pair (гейты API пройдены)
+    assert "--confirm-live" in pair_argv and "--reports-dir" in pair_argv
+    assert "--base" in pair_argv and "--variant" in pair_argv
+    assert "--class" in pair_argv and "fast" in pair_argv
+    assert "--heldout" in pair_argv and "/tmp/heldout.yaml" in pair_argv
+
+
+def test_pair_status_done_reports_and_reasons(tmp_path) -> None:
+    """done: отчёты плеч (whitelist) + reasons РЕАЛЬНОГО evaluate_promotion."""
+    base_doc = _pair_report_doc("probe-pairbase00001", 0.5, 0.5)
+    var_doc = _pair_report_doc(
+        "probe-pairvar00001", 0.9, 0.88, dispersion=0.05,
+        extra={"needle_rate": None},
+    )
+    settings = _settings(
+        tmp_path,
+        pair_runner=_pair_writer_runner(
+            (base_doc, var_doc), tmp_path / "reports"
+        ),
+    )
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = client.post(
+            "/calib/pair/start",
+            json=_pair_body(quality_floor=0.7), headers=_headers(),
+        )
+        assert r.status_code == 202
+        done = _wait_pair_status(client, "done")
+    assert done["exit_code"] == 0
+    # отчёты плеч — whitelist-метрики; base — первый по времени, variant — второй
+    for side, doc in (("base", base_doc), ("variant", var_doc)):
+        report = done[side]
+        assert report is not None, f"нет отчёта {side}: {done}"
+        for key in ("run_id", "golden_median_score", "heldout_score",
+                    "golden_dispersion", "rub", "wall_s", "flags"):
+            assert key in report, f"нет метрики {key}"
+        assert report["run_id"] == doc["run_id"]
+    # reasons — фактические поля критерия §7.3 (база ниже пола, вариант выше,
+    # heldout в дисперсии → passed; needle=None не гейтится без ceiling)
+    assert done["passed"] is True
+    assert done["reasons"] == []
+    assert done["run_id"] == "probe-pairvar00001"  # статус = плечо variant
+
+
+def test_pair_metrics_only_no_texts_leak(tmp_path) -> None:
+    """Негативная приватность I5: тексты отчётов не едут ни в плечи, ни в reasons."""
+    base_doc = _pair_report_doc("probe-privbase0001", 0.9, 0.9)  # база выше пола
+    var_doc = _pair_report_doc("probe-privvar0001", 0.9, 0.5, dispersion=0.05)
+    settings = _settings(
+        tmp_path,
+        pair_runner=_pair_writer_runner(
+            (base_doc, var_doc), tmp_path / "reports"
+        ),
+    )
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = client.post(
+            "/calib/pair/start",
+            json=_pair_body(quality_floor=0.7), headers=_headers(),
+        )
+        assert r.status_code == 202
+        done = _wait_pair_status(client, "done")
+    dumped = json.dumps(done)
+    assert "SECRET-PAIR-TEXT" not in dumped
+    for side in ("base", "variant"):
+        for forbidden in ("document", "draft", "critic_fragment",
+                          "q_report", "live_sample", "verdict"):
+            assert forbidden not in done[side], f"утёк {forbidden} в {side}"
+    # критерий честно НЕ пройден: база не проваливает пол + расхождение
+    # held-out; reasons — строки-метрики, без текстов прогона
+    assert done["passed"] is False
+    assert done["reasons"] and all(isinstance(x, str) for x in done["reasons"])
+    assert any("quality_floor" in x for x in done["reasons"])
+    assert any("held-out" in x for x in done["reasons"])
+    assert "SECRET-PAIR-TEXT" not in " ".join(done["reasons"])
+
+
+# ── POST /calib/record: P5 — только исполнение подтверждённого решения ─────
+
+
+def test_record_requires_confirm(tmp_path) -> None:
+    """P5: без confirm=true → 400 (гейт срабатывает ДО state-проверки)."""
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str]) -> int:
+        calls.append(argv)
+        return 0
+
+    settings = _settings(tmp_path, pair_runner=runner)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = client.post(
+            "/calib/record",
+            json={"variant": str(VARIANT), "status": "promoted"},
+            headers=_headers(),
+        )
+        assert r.status_code == 400
+        assert "confirm" in r.json()["detail"]
+    assert calls == []  # ничего не исполнялось
+
+
+def test_record_without_finished_pair_refused(tmp_path) -> None:
+    """Нет завершённой пары в процессе → 409 (запись ссылается на её отчёты)."""
+    settings = _settings(tmp_path, pair_runner=lambda argv: 0)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = client.post(
+            "/calib/record",
+            json={"variant": str(VARIANT), "status": "promoted",
+                  "confirm": True},
+            headers=_headers(),
+        )
+        assert r.status_code == 409
+
+
+def _record_env(tmp_path, record_runner=None):
+    """Завершённая пара (mock exit 0) + record-runner по '--record' в argv."""
+    def pair_and_record(argv: list[str]) -> int:
+        if "--record" in argv:
+            return record_runner(argv) if record_runner is not None else 0
+        return 0
+
+    settings = _settings(tmp_path, pair_runner=pair_and_record)
+    app = admin_api.create_app(settings)
+    return app
+
+
+def test_record_success_argv_and_response(tmp_path) -> None:
+    """confirm=true после пары → CLI-канон записи; 200 recorded/status/output."""
+    argv_log: list[str] = []
+
+    def record_runner(argv: list[str]) -> int:
+        argv_log.extend(argv)
+        print("решение записано")
+        return 0
+
+    app = _record_env(tmp_path, record_runner)
+    with TestClient(app) as client:
+        assert (
+            client.post(
+                "/calib/pair/start",
+                json=_pair_body(golden="/tmp/golden.yaml",
+                                needle="/tmp/needle.yaml", live=True),
+                headers=_headers(),
+            ).status_code
+            == 202
+        )
+        _wait_pair_status(client, "done")
+        r = client.post(
+            "/calib/record",
+            json={"variant": str(VARIANT), "status": "promoted",
+                  "confirm": True, "base": str(MODE),
+                  "model_class": "fast", "decided_by": "operator-andrey"},
+            headers=_headers(),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["recorded"] is True
+        assert body["status"] == "promoted"
+        assert "решение записано" in body["output"]
+    # argv: канон записи + параметры ПОСЛЕДНЕЙ пары (resume — без пересчёта)
+    for token in ("--record", "promoted", "--confirm-record", "--resume",
+                  "--confirm-live", "--reports-dir", "--heldout",
+                  "/tmp/heldout.yaml", "--golden", "/tmp/golden.yaml",
+                  "--needle", "/tmp/needle.yaml", "--live", "--class", "fast",
+                  "--decided-by", "operator-andrey"):
+        assert token in argv_log, f"нет {token} в argv записи"
+    assert "--dry-run" not in argv_log
+
+
+def test_record_fail_closed_exit2_to_422(tmp_path) -> None:
+    """fail-closed отказ CLI (exit 2: CV0–CV7) → 422 с деталью из stderr."""
+
+    def record_runner(argv: list[str]) -> int:
+        print("ОТКАЗ записи (реестр не тронут): CV7: отчёт probe не существует",
+              file=sys.stderr)
+        return 2
+
+    app = _record_env(tmp_path, record_runner)
+    with TestClient(app) as client:
+        assert (
+            client.post("/calib/pair/start", json=_pair_body(),
+                        headers=_headers()).status_code
+            == 202
+        )
+        _wait_pair_status(client, "done")
+        r = client.post(
+            "/calib/record",
+            json={"variant": str(VARIANT), "status": "rejected",
+                  "confirm": True},
+            headers=_headers(),
+        )
+        assert r.status_code == 422
+        assert "CV7" in r.json()["detail"]
+
+
+def test_record_mismatched_pair_refused(tmp_path) -> None:
+    """variant ≠ последняя пара → 400 (CV7: запись ссылается на её отчёты)."""
+    app = _record_env(tmp_path)
+    with TestClient(app) as client:
+        assert (
+            client.post("/calib/pair/start", json=_pair_body(),
+                        headers=_headers()).status_code
+            == 202
+        )
+        _wait_pair_status(client, "done")
+        other = str(MODE.with_name("statya.local.yaml"))
+        r = client.post(
+            "/calib/record",
+            json={"variant": other, "status": "promoted", "confirm": True},
+            headers=_headers(),
+        )
+        assert r.status_code == 400
+        assert "расходятся" in r.json()["detail"]
+
+
+def test_markers_pair_and_record(tmp_path, capsys) -> None:
+    """Маркеры Ф3a: pair-start/pair-finish/record-start/record-finish."""
+    settings = _settings(tmp_path, pair_runner=lambda argv: 0)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        assert (
+            client.post("/calib/pair/start", json=_pair_body(),
+                        headers=_headers()).status_code
+            == 202
+        )
+        _wait_pair_status(client, "done")
+        r = client.post(
+            "/calib/record",
+            json={"variant": str(VARIANT), "status": "promoted",
+                  "confirm": True},
+            headers=_headers(),
+        )
+        assert r.status_code == 200
+    out = capsys.readouterr().out
+    assert "[CALIB-API] pair-start model_class=fast runs=3 zone=public live=False" in out
+    assert "[CALIB-API] pair-finish exit=0" in out
+    assert "[CALIB-API] record-start variant=statya.deep status=promoted" in out
+    assert "[CALIB-API] record-finish exit=0 status=promoted" in out
+    assert KEY not in out  # key-hygiene
