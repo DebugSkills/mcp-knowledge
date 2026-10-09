@@ -211,6 +211,9 @@ services:
     environment:
       - MCP_SERVER_URL=http://localhost:8000
       - MCP_API_KEY=${MCP_API_KEY:-}
+      # calib-admin-ui Ф2: transport к host-side admin-API калибровки (loopback 127.0.0.1:8700)
+      - CALIB_API_URL=${CALIB_API_URL:-http://127.0.0.1:8700}
+      - CALIB_API_KEY=${CALIB_API_KEY:-}
       # kb-console-roles Ф3.1/Ф4: per-role ключи (fallback MCP_API_KEY — legacy)
       - MCP_API_KEY_ADMIN=${MCP_API_KEY_ADMIN:-}
       - MCP_API_KEY_EDITOR=${MCP_API_KEY_EDITOR:-}
