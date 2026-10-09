@@ -14,10 +14,14 @@ Fail-closed отказы (exit 2, НЕ пишется ничего — вклю�
 - профиля нет на носителе / файл не отображение / не проходит схему
   ``calibration-profile/1``;
 - ``evidence.flags`` содержит ``ceiling`` (В2-A 2b): замер на ceiling-сете
-  (``golden_median_score >= 0.999 ∧ golden_dispersion == 0``) НЕ различает
-  конфигурации — approve без явного решения оператора запрещён; обход —
-  ``--ceiling-ok`` (или ``--force``) с ``--reason`` и записью решения в
-  аудит ``profiles_dir/approve_audit.jsonl`` (append-only, ДО носителей);
+  (``golden_median_score >= 0.999 ∧ golden_dispersion == 0``) структурно
+  не различает конфигурации. α (2026-10-09, оператор P5, 2f негатив-3):
+  насыщение — свойство меры, не контента; approve при ceiling РАЗРЕШЁН
+  без флагов, если в ``evidence.metrics`` есть ``needle_rate >=
+  NEEDLE_RATE_FLOOR`` (needle-доказательство различимости, M4). Без
+  needle-доказательства — прежний гейт: обход только ``--ceiling-ok``
+  (или ``--force``) с ``--reason`` и записью решения в аудит
+  ``profiles_dir/approve_audit.jsonl`` (append-only, ДО носителей);
 - ``calibrated_for`` пуст или неполон: обязательны ``model_id`` И ``digest``
   (F-2а: approve без применимости легитимировал бы ложный «зелёный»);
 - ``--force`` (осознанный обход пустого факта) — только с ``--reason`` и
@@ -47,6 +51,7 @@ from ai_workspace.calibration.drift import (
     _write_yaml_atomic,
     t1_writeback,
 )
+from ai_workspace.calibration.policy import NEEDLE_RATE_FLOOR
 from ai_workspace.tools import golden_run
 
 __all__ = [
@@ -239,6 +244,22 @@ def _profile_flags(doc: Mapping) -> list[str]:
     return [str(f) for f in raw]
 
 
+def _profile_needle_rate(doc: Mapping) -> float | None:
+    """``needle_rate`` из ``evidence.metrics`` (2a); нет/не число → None.
+
+    α: needle-доказательство для ceiling-гейта approve — retention M4
+    заменяет структурную различимость при насыщении скор-меры.
+    """
+    evidence = doc.get("evidence")
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    metrics = evidence.get("metrics")
+    metrics = metrics if isinstance(metrics, Mapping) else {}
+    raw = metrics.get("needle_rate")
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return None
+    return float(raw)
+
+
 def _print_plan(
     args: argparse.Namespace, doc: Mapping, model_class: str, missing: list[str],
 ) -> None:
@@ -265,9 +286,16 @@ def _print_plan(
             print(f"  ⚠ calibrated_for неполон ({', '.join(missing)}) — путь --force: "
                   f"запись решения в аудит {args.profiles_dir / AUDIT_FILENAME}")
         if CEILING_FLAG in _profile_flags(doc):
-            print(f"  ⚠ замер на ceiling-сете ({CEILING_FLAG}: score>=0.999/disp=0 — "
-                  "не различает конфигурации) — путь --ceiling-ok: "
-                  f"запись решения в аудит {args.profiles_dir / AUDIT_FILENAME}")
+            nr = _profile_needle_rate(doc)
+            if nr is not None and nr >= NEEDLE_RATE_FLOOR:
+                # α: needle-доказательство — approve разрешён без флагов
+                print(f"  needle-доказательство (α): needle_rate={nr:.4f} >= "
+                      f"NEEDLE_RATE_FLOOR={NEEDLE_RATE_FLOOR:.4f} — замер на "
+                      "ceiling-сете одобряется по retention M4 (без --ceiling-ok)")
+            else:
+                print(f"  ⚠ замер на ceiling-сете ({CEILING_FLAG}: score>=0.999/disp=0 — "
+                      "не различает конфигурации) — путь --ceiling-ok: "
+                      f"запись решения в аудит {args.profiles_dir / AUDIT_FILENAME}")
     print("применить: --confirm (Operator Gate: решение оператора P5)")
 
 
@@ -332,10 +360,19 @@ def main(argv: list[str] | None = None, *, now: datetime | None = None) -> int:
             )
         forced = True
 
-    # ── 2b (В2-A «Достоверность»): ceiling-сет не различает конфигурации —
-    #    approve без явного решения оператора запрещён (dry-run тоже: не
-    #    планируем невыполнимый approve; ничего не пишется, включая аудит) ──
+    # ── 2b (В2-A «Достоверность») + α (2026-10-09, оператор P5): ceiling —
+    #    насыщение структурного скора (свойство меры, не контента, 2f
+    #    негатив-3). needle-доказательство (evidence.metrics.needle_rate >=
+    #    NEEDLE_RATE_FLOOR, M4) заменяет структурную различимость — approve
+    #    разрешён без флагов. Без needle — прежний гейт: только явное
+    #    решение оператора (dry-run тоже не планируем невыполнимый approve;
+    #    ничего не пишется, включая аудит) ──
     ceiling = CEILING_FLAG in _profile_flags(doc) and not args.stale
+    needle_proof = ceiling and (
+        (nr := _profile_needle_rate(doc)) is not None
+        and nr >= NEEDLE_RATE_FLOOR
+    )
+    ceiling = ceiling and not needle_proof
     ceiling_ok = False
     if ceiling:
         if not (args.ceiling_ok or args.force):

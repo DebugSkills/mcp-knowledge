@@ -6,6 +6,9 @@
   approve при ``ceiling`` — отказ (dry-run И ``--confirm``) без явного
   решения оператора; ``--ceiling-ok --reason`` — аудит ``ceiling_approve`` +
   носители применены; ``--stale`` ceiling не блокируется (понижение);
+  α (2026-10-09, оператор P5): ceiling + ``evidence.metrics.needle_rate >=
+  NEEDLE_RATE_FLOOR`` — approve разрешён БЕЗ флагов и аудита
+  (needle-доказательство различимости; needle < пола — прежний гейт);
 - 2c in/out-токены: ``RunOutcome.tokens_in/tokens_out`` из usage ответов
   (журнал клиента в форме ``OllamaClient.calls``); ₽ — точная оценка
   (вход 0.30 / выход 1.20 USD за 1M, pricing.yaml), local → 0.0;
@@ -16,12 +19,14 @@
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import yaml
 
+from ai_workspace.calibration import policy
 from ai_workspace.calibration import profiles as profiles_mod
 from ai_workspace.calibration import probe as probe_mod
 from ai_workspace.calibration.probe import run_probe
@@ -40,8 +45,6 @@ from ai_workspace.tests.test_profile_approve import (
 )
 from ai_workspace.tools import probe_run, profile_approve, vp_ab_pilot
 from ai_workspace.tools.vp_ab_pilot import RunOutcome, run_one
-
-import json
 
 MODE = Path(__file__).resolve().parents[1] / "modes" / "statya.yaml"
 REGISTRY_DIR = Path(__file__).resolve().parents[1] / "registry"
@@ -290,6 +293,96 @@ def test_approve_stale_not_blocked_by_ceiling(tmp_path, capsys) -> None:
     )
     assert code == 0
     assert _load(ppath)["status"] == "stale"
+
+
+def _ceiling_needle_profile_doc(rate: float = 0.5556) -> dict:
+    """Ceiling-профиль С needle-доказательством: metrics.needle_rate=rate
+    (контракт profiles._metrics_block: additive-ключ evidence.metrics)."""
+    doc = _profile_doc()
+    doc["evidence"] = {
+        **doc["evidence"], "flags": ["ceiling"],
+        "metrics": {**doc["evidence"]["metrics"], "needle_rate": rate},
+    }
+    return doc
+
+
+def test_approve_ceiling_with_needle_proof_applies_without_flags(
+    tmp_path, capsys,
+) -> None:
+    """α (2026-10-09, оператор P5): ceiling + needle_rate ≥
+    NEEDLE_RATE_FLOOR в метриках профиля → approve РАЗРЕШЁН без
+    --ceiling-ok/--force и БЕЗ аудита (needle-доказательство заменяет
+    структурную различимость при насыщении; живой кейс 2f: full 10/18)."""
+    profiles_dir, reg_path = _carriers(tmp_path)
+    ppath = _place_profile(profiles_dir, _ceiling_needle_profile_doc())
+    before_r = reg_path.read_bytes()
+
+    # dry-run: план без требования --ceiling-ok, с needle-доказательством
+    code = profile_approve.main(
+        _argv(profiles_dir, reg_path, "cal-fast-qwen25-7b-12ab"), now=FIXED_NOW,
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "needle-доказательство" in out
+    # старое предупреждение «путь --ceiling-ok» отсутствует: флаг не нужен
+    assert "путь --ceiling-ok" not in out
+    assert "⚠ замер на ceiling-сете" not in out
+
+    # --confirm: оба носителя применены, аудита НЕТ (штатный approve)
+    code = profile_approve.main(
+        _argv(profiles_dir, reg_path, "cal-fast-qwen25-7b-12ab", "--confirm"),
+        now=FIXED_NOW,
+    )
+    assert code == 0
+    assert _load(ppath)["status"] == "calibrated"
+    assert _load(reg_path)["model_classes"]["fast"][
+        "calibration_status"] == "calibrated"
+    assert not (profiles_dir / profile_approve.AUDIT_FILENAME).exists()
+    # needle-доказательство сохранено на носителе (метрики не затёрты)
+    assert _load(ppath)["evidence"]["metrics"]["needle_rate"] == pytest.approx(
+        0.5556
+    )
+    assert before_r != reg_path.read_bytes()  # реестр реально применён
+
+
+def test_approve_ceiling_needle_below_floor_still_requires_flag(
+    tmp_path, capsys,
+) -> None:
+    """α: needle_rate < пола — доказательства НЕТ: прежний гейт (отказ
+    exit 2 без --ceiling-ok; dry-run тоже ничего не планирует)."""
+    profiles_dir, reg_path = _carriers(tmp_path)
+    ppath = _place_profile(
+        profiles_dir, _ceiling_needle_profile_doc(rate=policy.NEEDLE_RATE_FLOOR - 0.2),
+    )
+    before = ppath.read_bytes()
+    for extra in ([], ["--confirm"]):
+        code = profile_approve.main(
+            _argv(profiles_dir, reg_path, "cal-fast-qwen25-7b-12ab", *extra),
+            now=FIXED_NOW,
+        )
+        assert code == 2
+        assert "ceiling" in capsys.readouterr().err
+    assert ppath.read_bytes() == before
+    assert not (profiles_dir / profile_approve.AUDIT_FILENAME).exists()
+
+
+def test_approve_ceiling_needle_proof_does_not_shadow_force_gate(
+    tmp_path, capsys,
+) -> None:
+    """α не расшатывает остальные гейты: needle-доказательство НЕ снимает
+    F-2а — пустой calibrated_for при ceiling+needle всё равно требует
+    --force --reason (применимость заявлять надо)."""
+    profiles_dir, reg_path = _carriers(tmp_path)
+    doc = _ceiling_needle_profile_doc()
+    doc["calibrated_for"] = {"model_id": "", "digest": ""}
+    ppath = _place_profile(profiles_dir, doc)
+    code = profile_approve.main(
+        _argv(profiles_dir, reg_path, "cal-fast-qwen25-7b-12ab", "--confirm"),
+        now=FIXED_NOW,
+    )
+    assert code == 2
+    assert "calibrated_for" in capsys.readouterr().err
+    assert _load(ppath)["status"] == "draft"
 
 
 # ── 2c: in/out-токены и точный ₽ ──────────────────────────────────────────

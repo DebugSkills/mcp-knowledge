@@ -197,6 +197,7 @@ def evaluate_promotion(
     quality_floor: float,
     rub_cap: float | None = None,
     wall_cap_s: float | None = None,
+    needle_quantum: float | None = None,
 ) -> dict:
     """Критерий promotion варианта (§7.3) по паре ProbeReport.
 
@@ -204,16 +205,71 @@ def evaluate_promotion(
     выполнены (``passed`` ⇔ ``reasons`` пуст). Это вход для решения
     оператора (P5), а не само решение. Условия:
 
-      1. база проваливает пол: ``base.golden_median_score < quality_floor``
-         (вариант имеет смысл только у проваливающейся базы);
+      1. база недостаточна: БЕЗ ceiling — ``base.golden_median_score <
+         quality_floor`` (вариант имеет смысл только у проваливающейся
+         базы); ПРИ ceiling — ``needle_rate(base) < NEEDLE_RATE_FLOOR``
+         (структурный скор насыщен ⇒ adequacy базы меряем по needle-M4);
+         ``needle_rate(base) is None`` при ceiling → не promoted (нечем
+         решать);
       2. вариант проходит пол: ``variant.golden_median_score >= quality_floor``;
       3. рамка D6: ``rub <= rub_cap`` И ``wall_s <= wall_cap_s`` (кап не
          задан — не проверяется);
       4. held-out подтверждает golden: ``|golden - heldout| <= dispersion``
          (M5; нулевая дисперсия — с допуском 1e-9 против float-шума).
+
+    α (2026-10-09, решение оператора P5 по итогам 2f негатив-3): флаг
+    ``ceiling`` у ЛЮБОГО из отчётов пары больше НЕ авто-reject — структурный
+    скор насыщен по построению (свойство меры, не контента) и различимость
+    даёт needle-M4 (2f: full 0.556 vs compressed 0.000). При ceiling
+    решение ПО NEEDLE: promoted требует ``needle_rate(variant) >=
+    NEEDLE_RATE_FLOOR`` И (если needle_rate базы доступен) маржу
+    ``needle_rate(variant) > needle_rate(base)`` — на ≥ 1 квант шума
+    ``1/(tasks×runs)`` (``needle_quantum``; не задан — строгое ``>``).
+    ceiling + ``needle_rate(variant) is None`` → не promoted: структурно
+    нечем решать. α-достройка (2026-10-09, живой 3c variant_pair: base
+    golden=1.0 >= floor блокировал promotion при base needle=0.00): при
+    ceiling И adequacy базы решается по needle — «база проваливает пол»
+    по golden не проверяется (насыщен всегда); сводно promotion ⇔
+    ``needle_rate(base) < NEEDLE_RATE_FLOOR`` ∧ ``needle_rate(variant) >=
+    NEEDLE_RATE_FLOOR`` ∧ маржа ≥ квант. Без ceiling — прежняя логика
+    (гейт только по needle_rate варианта, 2e; needle базы не участвует).
     """
     reasons: list[str] = []
-    if base_report.golden_median_score >= quality_floor:
+    # ── needle-гейты: 2e (без ceiling) и α (при ceiling) ──
+    needle_rate = getattr(variant_report, "needle_rate", None)
+    base_needle_rate = getattr(base_report, "needle_rate", None)
+    # α: ceiling у ЛЮБОГО плеча пары — структурный скор насыщен по
+    # построению (2f негатив-3: все 24 сегмента hard-наборов = 1.0) ⇒
+    # структурная мера не различает конфигурации ⇒ и adequacy базы, и
+    # превосходство варианта решаются по needle-M4
+    ceiling = (
+        "ceiling" in (getattr(base_report, "flags", None) or ())
+        or "ceiling" in (getattr(variant_report, "flags", None) or ())
+    )
+    # ── условие 1: база недостаточна (вариант имеет смысл только у
+    # недостаточной базы) ──
+    if ceiling:
+        # α-достройка (2026-10-09, живой 3c): структурный скор насыщен ⇒
+        # «база проваливает пол» по golden бессмысленна (golden=1.0 >=
+        # floor всегда ⇒ promotion недостижим). База недостаточна ⇔
+        # needle_rate(base) < NEEDLE_RATE_FLOOR; None → нечем решать.
+        if base_needle_rate is None:
+            reasons.append(
+                "структурный скор насыщен (ceiling) → база недостаточна "
+                "решается по needle: needle_rate базы неизвестен "
+                "(needle-набор не прогонялся) — нечем решать, promoted "
+                "невозможен"
+            )
+        elif base_needle_rate >= NEEDLE_RATE_FLOOR:
+            reasons.append(
+                "структурный скор насыщен (ceiling) → база достаточна по "
+                f"needle: base needle_rate={base_needle_rate:.4f} >= "
+                f"NEEDLE_RATE_FLOOR={NEEDLE_RATE_FLOOR:.4f} (база "
+                "недостаточна ⇔ needle_rate < пола) — вариант не закрывает "
+                "пробел базы"
+            )
+    elif base_report.golden_median_score >= quality_floor:
+        # без ceiling — прежняя логика (паритет F1): пол по golden
         reasons.append(
             f"база не проваливает quality_floor: base golden_median_score="
             f"{base_report.golden_median_score:.4f} >= floor={quality_floor:.4f}"
@@ -238,21 +294,43 @@ def evaluate_promotion(
             f"held-out расходится с golden: |golden-heldout|={delta:.4f} > "
             f"golden_dispersion={variant_report.golden_dispersion:.4f}"
         )
-    # 2e (В2-B, F-3i): promoted требует needle_rate >= порога у ВАРИАНТА;
-    # None — needle-набор не прогонялся, условие не проверивается
-    needle_rate = getattr(variant_report, "needle_rate", None)
-    if needle_rate is not None and needle_rate < NEEDLE_RATE_FLOOR:
+    if ceiling:
+        if needle_rate is None:
+            reasons.append(
+                "структурный скор насыщен (ceiling) → решение по needle: "
+                "needle_rate варианта неизвестен (needle-набор не "
+                "прогонялся) — нечем решать, promoted невозможен"
+            )
+        else:
+            if needle_rate < NEEDLE_RATE_FLOOR:
+                reasons.append(
+                    "структурный скор насыщен (ceiling) → решение по needle: "
+                    f"needle_rate варианта {needle_rate:.4f} < "
+                    f"NEEDLE_RATE_FLOOR={NEEDLE_RATE_FLOOR:.4f} (retention "
+                    "длинного контекста, M4)"
+                )
+            if base_needle_rate is not None:
+                quantum = needle_quantum if needle_quantum is not None else 0.0
+                margin = needle_rate - base_needle_rate
+                if needle_rate <= base_needle_rate or margin < quantum - 1e-9:
+                    reasons.append(
+                        "структурный скор насыщен (ceiling) → решение по "
+                        f"needle: вариант не лучше базы по retention: "
+                        f"needle {needle_rate:.4f} vs база "
+                        f"{base_needle_rate:.4f}, маржа {margin:.4f} < "
+                        f"требуемой {quantum:.4f}"
+                        + (
+                            f" (1 квант 1/(tasks×runs)={needle_quantum:.4f})"
+                            if needle_quantum is not None
+                            else " (строгое превосходство)"
+                        )
+                    )
+    elif needle_rate is not None and needle_rate < NEEDLE_RATE_FLOOR:
+        # 2e (В2-B, F-3i), прежняя логика без ceiling: promoted требует
+        # needle_rate >= порога у ВАРИАНТА; None — не проверяется
         reasons.append(
             f"needle_rate ниже порога: {needle_rate:.4f} < "
             f"{NEEDLE_RATE_FLOOR:.4f} (retention длинного контекста, M4)"
-        )
-    # 2b/2e (В2-B): ceiling — golden score 1.0/disp 0 не различает
-    # конфигурации; promotion по неотличимому замеру не применяется
-    if "ceiling" in (getattr(variant_report, "flags", None) or ()):
-        reasons.append(
-            "ceiling-флаг варианта: golden score=1.0 при disp=0 — замер не "
-            "различает конфигурации, promoted требует иного замера/решения "
-            "оператора"
         )
     return {"passed": not reasons, "reasons": reasons}
 

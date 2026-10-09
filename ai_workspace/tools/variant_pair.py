@@ -96,7 +96,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--needle", type=Path, default=None,
-        help="needle-set YAML (M4 retention; гейт promotion 2e — по ВАРИАНТУ)",
+        help="needle-set YAML (M4 retention; гейт promotion: вариант (2e),"
+             " при ceiling — и adequacy базы по needle, α)",
     )
     parser.add_argument(
         "--class", dest="model_class", required=True,
@@ -308,10 +309,18 @@ def main(argv: list[str] | None = None, *, llm: Any = None) -> int:
         if args.reports_dir is not None:
             probe_mod.write_report(reports[side], args.reports_dir)
 
+    # α: квант шума needle-метрики 1/(tasks×runs) — при ceiling маржа
+    # варианта над базой обязана быть ≥ кванта (иначе различие рук не
+    # доказано, 2f CC1). Без --needle квант не вычислить — evaluate_promotion
+    # падает на строгое превосходство (needle_quantum=None).
+    needle_quantum: float | None = None
+    if args.needle is not None:
+        needle_quantum = 1.0 / (len(probe_mod._load_tasks(args.needle)) * args.runs)
     verdict = variants_mod.evaluate_promotion(
         reports["base"], reports["variant"],
         quality_floor=quality_floor,
         rub_cap=args.rub_cap, wall_cap_s=args.wall_cap_s,
+        needle_quantum=needle_quantum,
     )
     print("== пара base-vs-variant ==")
     _print_side("base", args.base, reports["base"])

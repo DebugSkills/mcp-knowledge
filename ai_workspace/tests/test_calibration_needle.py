@@ -4,11 +4,17 @@
 golden-метрики M1/M5/M6/M7 не трогаются; детект — grep ``expect_needle`` в
 выводе измерителя (``RunOutcome.document``/``draft``, без LLM-оценщика);
 ``needle_rate`` — доля найденных (задание × прогон), ``None`` без набора.
-2e (F-3i): ``propose_scalars`` — ``needle_rate < NEEDLE_RATE_FLOOR`` →
+2e (F-3i): ``propose_scalars`` — ``needle_rate < policy.NEEDLE_RATE_FLOOR`` →
 violations (None → гейт молчит, обратная совместимость);
 ``evaluate_promotion`` — promoted требует ``needle_rate >= порога`` у
-варианта, ceiling-флаг ⇒ не promoted. Профиль: ``needle_rate`` — additive
-ключ ``evidence.metrics`` (Г6: presence-валидация не режет).
+варианта. α (2026-10-09, оператор P5, 2f негатив-3): ceiling-флаг больше
+НЕ авто-reject — структурный скор насыщен по построению (свойство меры);
+при ceiling (у любого плеча) решение ПО NEEDLE: база недостаточна ⇔
+needle базы < пола (α-достройка 3c: структурный пол golden насыщен
+всегда), вариант ≥ пола И > базы на ≥ 1 квант 1/(tasks×runs); needle
+отсутствует (у любой руки) → не promoted («нечем решать»). Профиль:
+``needle_rate`` —
+additive ключ ``evidence.metrics`` (Г6: presence-валидация не режет).
 """
 from __future__ import annotations
 
@@ -252,8 +258,12 @@ def test_promotion_variant_needle_ok_passes() -> None:
     assert res == {"passed": True, "reasons": []}
 
 
-def test_promotion_variant_ceiling_not_applied() -> None:
-    """ceiling (score=1.0/disp=0) ⇒ promoted невозможно без оператора."""
+def test_promotion_variant_ceiling_not_promoted() -> None:
+    """α (осознанное обновление 2026-10-09): прежде ceiling ⇒ авто-reject
+    («замер не различает конфигурации»); по решению оператора P5 (2f
+    негатив-3: структурный скор насыщен ПО ПОСТРОЕНИЮ — свойство меры, не
+    контента) авто-reject снят: при ceiling решение ПО NEEDLE. Needle нет
+    (needle_rate=None) → не promoted — структурно нечем решать."""
     from ai_workspace.calibration.variants import evaluate_promotion
     res = evaluate_promotion(
         _vreport(0.7, 0.7), _vreport(flags=("ceiling",)),
@@ -261,6 +271,194 @@ def test_promotion_variant_ceiling_not_applied() -> None:
     )
     assert res["passed"] is False
     assert any("ceiling" in r for r in res["reasons"])
+    assert any("решение по needle" in r for r in res["reasons"])
+
+
+def test_promotion_ceiling_needle_decides_promoted() -> None:
+    """α: ceiling у обеих рук + needle варианта ≥ пола и > базы на ≥ 1
+    кванта 1/(tasks×runs) → promoted (живой кейс 2f v3: full 10/18 vs
+    compressed 0/18 — маржа 10 квантов)."""
+    from ai_workspace.calibration.variants import evaluate_promotion
+    res = evaluate_promotion(
+        _vreport(0.7, 0.7, flags=("ceiling",), needle_rate=0.0),
+        _vreport(flags=("ceiling",), needle_rate=10 / 18),
+        quality_floor=0.8, needle_quantum=1 / 18,
+    )
+    assert res == {"passed": True, "reasons": []}
+
+
+def test_promotion_ceiling_base_flag_needle_absent_not_promoted() -> None:
+    """α: ceiling только у БАЗЫ + needle ВАРИАНТА не прогонялся → не
+    promoted: гейт решает по needle варианта, его нет — нечем решать
+    (needle базы 0.9 внизу — не спасает: смотрит вариант)."""
+    from ai_workspace.calibration.variants import evaluate_promotion
+    res = evaluate_promotion(
+        _vreport(0.7, 0.7, flags=("ceiling",), needle_rate=0.9),
+        _vreport(),
+        quality_floor=0.8,
+    )
+    assert res["passed"] is False
+    assert any("нечем решать" in r for r in res["reasons"])
+
+
+def test_promotion_ceiling_base_flag_variant_needle_ok_promoted() -> None:
+    """α: ceiling только у базы (вариант различим структурно) — α-путь всё
+    равно включён: база недостаточна по needle (0.3 < пола), вариант ≥
+    пола (маржа строго > 0 — квант не задан)."""
+    from ai_workspace.calibration.variants import evaluate_promotion
+    res = evaluate_promotion(
+        _vreport(0.7, 0.7, flags=("ceiling",), needle_rate=0.3),
+        _vreport(needle_rate=policy.NEEDLE_RATE_FLOOR + 0.1),
+        quality_floor=0.8,
+    )
+    assert res == {"passed": True, "reasons": []}
+
+
+def test_promotion_ceiling_needle_below_floor_not_promoted() -> None:
+    """α: ceiling + needle варианта < policy.NEEDLE_RATE_FLOOR → не promoted;
+    причина называет насыщение структурного скора."""
+    from ai_workspace.calibration.variants import evaluate_promotion
+    res = evaluate_promotion(
+        _vreport(0.7, 0.7, flags=("ceiling",), needle_rate=0.0),
+        _vreport(flags=("ceiling",), needle_rate=policy.NEEDLE_RATE_FLOOR - 0.05),
+        quality_floor=0.8,
+    )
+    assert res["passed"] is False
+    assert any(
+        "структурный скор насыщен" in r and "NEEDLE_RATE_FLOOR" in r
+        for r in res["reasons"]
+    )
+
+
+def test_promotion_ceiling_needle_margin_required() -> None:
+    """α: needle варианта ≥ пола, но НЕ лучше базы (равенство) → не
+    promoted: без превосходства по retention различие рук не доказано
+    (негатив-2 CC1: 0.833/0.833)."""
+    from ai_workspace.calibration.variants import evaluate_promotion
+    res = evaluate_promotion(
+        _vreport(0.7, 0.7, flags=("ceiling",), needle_rate=0.6),
+        _vreport(flags=("ceiling",), needle_rate=0.6),
+        quality_floor=0.8, needle_quantum=1 / 18,
+    )
+    assert res["passed"] is False
+    assert any("не лучше базы" in r for r in res["reasons"])
+
+
+def test_promotion_ceiling_needle_margin_below_quantum_not_promoted() -> None:
+    """α: маржа строго положительна, но < 1 кванта 1/(tasks×runs) → не
+    promoted: различие объяснимо единичным срабатыванием (граничный
+    негатив-1 CC1: Δ=1/9 ровно один квант)."""
+    from ai_workspace.calibration.variants import evaluate_promotion
+    res = evaluate_promotion(
+        _vreport(0.7, 0.7, flags=("ceiling",), needle_rate=0.5),
+        _vreport(flags=("ceiling",), needle_rate=0.51),
+        quality_floor=0.8, needle_quantum=1 / 18,
+    )
+    assert res["passed"] is False
+    assert any("маржа" in r and "квант" in r for r in res["reasons"])
+
+
+def test_promotion_ceiling_needle_strict_margin_without_quantum() -> None:
+    """α: needle_quantum не задан → маржа — строгое превосходство
+    (0.51 > 0.4 базы проходит; база 0.4 < пола — недостаточна); паритет
+    для вызовов без кванта."""
+    from ai_workspace.calibration.variants import evaluate_promotion
+    res = evaluate_promotion(
+        _vreport(0.7, 0.7, flags=("ceiling",), needle_rate=0.4),
+        _vreport(flags=("ceiling",), needle_rate=0.51),
+        quality_floor=0.8,
+    )
+    assert res == {"passed": True, "reasons": []}
+
+
+def test_promotion_ceiling_base_needle_unknown_not_promoted() -> None:
+    """α-достройка: ceiling + needle базы неизвестен (база без --needle) →
+    не promoted: adequacy базы по needle нечем решать (структурный скор
+    насыщен, golden не различает)."""
+    from ai_workspace.calibration.variants import evaluate_promotion
+    res = evaluate_promotion(
+        _vreport(0.7, 0.7, flags=("ceiling",)),
+        _vreport(flags=("ceiling",), needle_rate=policy.NEEDLE_RATE_FLOOR),
+        quality_floor=0.8, needle_quantum=1 / 18,
+    )
+    assert res["passed"] is False
+    assert any(
+        "ceiling" in r and "needle_rate базы неизвестен" in r
+        for r in res["reasons"]
+    )
+
+
+# ── α-достройка (2026-10-09, живой 3c): при ceiling база недостаточна ПО
+# NEEDLE — структурный пол golden насыщен всегда, прежняя ветка «база
+# проваливает пол» по golden делала promotion недостижимым ───────────────
+
+
+def test_promotion_ceiling_base_by_needle_promoted_live_3c() -> None:
+    """α-достройка (живой 3c: base statya.local golden=1.0 needle=0.00 vs
+    variant statya.full.local needle=0.56): ceiling у обеих рук ⇒ adequacy
+    базы по needle — 0.0 < пола, вариант 10/18 ≥ пола, маржа 10 квантов →
+    promoted (прежде блокировалось «база не проваливает quality_floor:
+    golden=1.0000 >= 0.8000»)."""
+    from ai_workspace.calibration.variants import evaluate_promotion
+    res = evaluate_promotion(
+        _vreport(1.0, 1.0, flags=("ceiling",), needle_rate=0.0),
+        _vreport(1.0, 1.0, flags=("ceiling",), needle_rate=10 / 18),
+        quality_floor=0.8, needle_quantum=1 / 18,
+    )
+    assert res == {"passed": True, "reasons": []}
+
+
+def test_promotion_ceiling_base_needle_above_floor_not_promoted() -> None:
+    """α-достройка: ceiling + база достаточна по needle (0.56 ≥ пола 0.5) →
+    не promoted с ЕДИНСТВЕННОЙ причиной «база достаточна по needle» —
+    вариант имеет смысл только у недостаточной базы."""
+    from ai_workspace.calibration.variants import evaluate_promotion
+    res = evaluate_promotion(
+        _vreport(1.0, 1.0, flags=("ceiling",), needle_rate=0.56),
+        _vreport(1.0, 1.0, flags=("ceiling",), needle_rate=0.9),
+        quality_floor=0.8, needle_quantum=1 / 18,
+    )
+    assert res["passed"] is False
+    assert len(res["reasons"]) == 1
+    assert "база достаточна по needle" in res["reasons"][0]
+
+
+def test_promotion_no_ceiling_parity_old_needle_gate() -> None:
+    """Паритет F1: без ceiling — прежняя логика 2e (гейт только по needle
+    варианта; needle базы не участвует, авто-reject по ceiling нет)."""
+    from ai_workspace.calibration.variants import evaluate_promotion
+    res = evaluate_promotion(
+        _vreport(0.7, 0.7, needle_rate=0.0),
+        _vreport(needle_rate=1.0),
+        quality_floor=0.8, needle_quantum=1 / 18,
+    )
+    assert res == {"passed": True, "reasons": []}
+
+
+# ── 2e/α: propose_scalars — ceiling НЕ блокирует D6, needle < пола — да ────
+
+
+def test_propose_ceiling_does_not_block() -> None:
+    """α: флаг ceiling замера (структурный скор насыщен по построению)
+    НЕ блокирует предложение скаляров Сам По Себе — различимость даёт
+    needle; содержательные гейты — needle/пол/капы."""
+    result = policy.propose_scalars(
+        _report(flags=("ceiling",), needle_rate=policy.NEEDLE_RATE_FLOOR),
+        quality_floor=0.8,
+    )
+    assert result["applied"] is True
+    assert result["scalars"] == policy.DEFAULT_PROPOSED_SCALARS
+
+
+def test_propose_ceiling_with_low_needle_blocks_on_needle() -> None:
+    """α: ceiling + needle ниже пола → NOT applied именно ПО NEEDLE
+    (нарушение рамки D6), не по ceiling."""
+    result = policy.propose_scalars(
+        _report(flags=("ceiling",), needle_rate=0.25), quality_floor=0.8,
+    )
+    assert result["applied"] is False
+    assert "needle_rate=0.2500" in result["reason"]
+    assert "ceiling" not in result["reason"]
 
 
 def test_promotion_base_needle_irrelevant() -> None:
