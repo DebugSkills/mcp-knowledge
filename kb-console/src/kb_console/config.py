@@ -185,6 +185,16 @@ def access_request_template() -> str:
     return "\n".join(lines)
 
 
+# ── arch-2026-10-09-calib-admin-ui Ф2: admin-API калибровки ──
+
+CALIB_API_URL: str = os.environ.get("CALIB_API_URL", "http://127.0.0.1:8700")
+"""URL admin-API калибровки (host-side, bind 127.0.0.1, порт CALIB_API_PORT
+admin-API — default 8700; прецедент loopback-транспорта MCP_SERVER_URL)."""
+
+CALIB_API_KEY: str = os.environ.get("CALIB_API_KEY", "")
+"""Ключ admin-API калибровки (заголовок X-Calib-Key; пусто → API откажет,
+страница «Калибровка» деградирует в fail-soft баннер — не падает)."""
+
 # ── kb-console-roles Ф3.1: маппинг роль→MCP-ключ ────────────
 
 MCP_API_KEY_ADMIN: str = os.environ.get("MCP_API_KEY_ADMIN", "")

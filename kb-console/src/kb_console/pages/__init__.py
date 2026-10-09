@@ -15,6 +15,7 @@ from collections.abc import Callable
 
 from . import (
     books,
+    calibration,
     chat,
     documents,
     import_page,
@@ -43,6 +44,7 @@ ROUTES: list[tuple[str, str, Callable[[], None], str]] = [
     ("/requests", "Заявки", requests_page.build_requests, "admin"),  # 036 Ф2
     ("/documents", "Документы", documents.build_documents, "admin"),  # bibliography Ф5c1
     ("/quotas", "Квоты", quotas.build_quotas, "admin"),  # Ф4.5c-2 ai-workspace
+    ("/calibration", "Калибровка", calibration.build_calibration, "admin"),  # calib-admin-ui Ф2
 ]
 
 # PAGES оставлен для обратной совместимости (если где-то ещё используется).

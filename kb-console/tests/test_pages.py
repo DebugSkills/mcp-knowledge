@@ -130,7 +130,7 @@ def test_routes_registry_exists():
     """ROUTES должен существовать в pages/__init__.py после реализации."""
     from kb_console.pages import ROUTES
     assert isinstance(ROUTES, list)
-    assert len(ROUTES) == 12  # +/chat (Ф2), +/queue (Ф4.4b), +/quotas (Ф4.5c-2)
+    assert len(ROUTES) == 13  # +/chat (Ф2), +/queue (Ф4.4b), +/quotas, +/calibration
     paths = {r[0] for r in ROUTES}
     assert paths == {
         "/status", "/books", "/import", "/search", "/quality", "/tokens", "/users",
@@ -139,6 +139,7 @@ def test_routes_registry_exists():
         "/chat",  # Ф2 ai-workspace #1
         "/queue",  # Ф4.4b ai-workspace
         "/quotas",  # Ф4.5c-2 ai-workspace
+        "/calibration",  # arch-2026-10-09-calib-admin-ui Ф2
     }
     labels = {r[1] for r in ROUTES}
     assert labels == {
@@ -148,6 +149,7 @@ def test_routes_registry_exists():
         "Чат",
         "Очередь",
         "Квоты",  # Ф4.5c-2 ai-workspace
+        "Калибровка",  # arch-2026-10-09-calib-admin-ui Ф2
     }
 
 

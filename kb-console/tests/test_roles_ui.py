@@ -22,7 +22,8 @@ class TestRoutesMatrix:
             "/requests",
             "/documents",
             "/quotas",  # Ф4.5c-2 ai-workspace
-        }  # 036 Ф2 + Ф5c1 + Ф4.5c-2
+            "/calibration",  # arch-2026-10-09-calib-admin-ui Ф2
+        }  # 036 Ф2 + Ф5c1 + Ф4.5c-2 + calib-admin-ui
 
     def test_common_pages_contributor(self):
         common = {p for p, _, _, mr in ROUTES if mr == "contributor"}
