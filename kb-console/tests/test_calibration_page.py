@@ -1123,3 +1123,153 @@ async def test_pair_wizard_two_step_live(live: bool, dialogs_expected: int):
 
     assert confirmed is True
     assert mock_ui.dialog.call_count == dialogs_expected
+
+
+# ── Ф4b: /calib/reports (история) + drift-кнопка «ре-калибровать» ──
+
+
+@pytest.mark.asyncio
+async def test_client_reports_url_limit_and_key():
+    """(а) GET /calib/reports: limit — query-параметр, ключ — заголовок."""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["limit"] = request.url.params.get("limit")
+        seen["key"] = request.headers.get("X-Calib-Key")
+        return httpx.Response(
+            200,
+            json={
+                "reports": [
+                    {"run_id": "probe-20261009-0001", "ts": "2026-10-09T12:00:00+00:00"}
+                ],
+                "total": 1,
+            },
+        )
+
+    client = _client(handler)
+    data = await client.reports(limit=50)
+    await client.close()
+    assert data is not None
+    assert data["total"] == 1
+    assert seen["path"] == "/calib/reports"
+    assert seen["limit"] == "50"
+    assert seen["key"] == "test-key"
+
+
+@pytest.mark.asyncio
+async def test_client_reports_fail_soft_network_and_bad_payload():
+    """Сетевая ошибка / не-dict JSON → None («нет отчётов»), не исключение."""
+    def handler_500(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    client = _client(handler_500)
+    assert await client.reports() is None
+    await client.close()
+
+    def handler_list(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[1, 2, 3])
+
+    client2 = _client(handler_list)
+    assert await client2.reports() is None
+    await client2.close()
+
+
+def test_render_reports_panel_metrics_only_no_secret_texts():
+    """(b) история — только whitelist-поля; тексты прогона — НИКОГДА (I5)."""
+    data = {
+        "reports": [
+            {
+                "ts": "2026-10-09T12:34:56+00:00",
+                "run_id": "probe-20261009-0001",
+                "model_id": "qwen2.5:7b",
+                "golden_median_score": 0.9123,
+                "heldout_score": 0.88,
+                "needle_rate": 0.556,
+                "flags": ["ceiling"],
+                "rub": 1.25,
+                "wall_s": 612.3,
+                "n_runs": 3,
+                # «загрязняющие» ключи — контрактом запрещены в ответах API;
+                # если вдруг окажутся, история рендерить их не должна (I5):
+                "document": "SECRET-DOCUMENT-TEXT",
+                "draft": "SECRET-DRAFT-TEXT",
+            }
+        ],
+        "total": 1,
+    }
+    with patch.object(calibration, "ui") as mock_ui:
+        calibration._render_reports_panel(data)
+    assert mock_ui.table.called
+    table_kwargs = mock_ui.table.call_args.kwargs
+    assert [c["name"] for c in table_kwargs["columns"]] == list(
+        calibration.REPORTS_TABLE_FIELDS
+    )
+    rows = table_kwargs["rows"]
+    assert len(rows) == 1
+    assert set(rows[0]) == set(calibration.REPORTS_TABLE_FIELDS)
+    assert rows[0]["run_id"] == "probe-20261009-0001"
+    assert rows[0]["golden_median_score"] == "0.9123"
+    assert rows[0]["ts"] == "2026-10-09T12:34:56"
+    assert rows[0]["flags"] == "ceiling"
+    blob = json.dumps(rows, default=str) + _all_text(mock_ui)
+    for secret in ("SECRET-DOCUMENT-TEXT", "SECRET-DRAFT-TEXT"):
+        assert secret not in blob
+
+
+def test_render_reports_panel_empty_shows_placeholder():
+    """(c) пустой список / None → «нет отчётов», таблица не строится."""
+    with patch.object(calibration, "ui") as mock_ui:
+        calibration._render_reports_panel({"reports": [], "total": 0})
+        calibration._render_reports_panel(None)
+    assert not mock_ui.table.called
+    assert "нет отчётов" in _all_text(mock_ui)
+
+
+def test_recalibrate_click_prefills_wizard_without_launch():
+    """(d) «Ре-калибровать» предзаполняет model_class визарда; запуск — НЕТ."""
+    model = {"active": {"model_class": "fast", "profile_id": "p1"}}
+    wizard_input = MagicMock()
+    with patch.object(calibration, "ui") as mock_ui:
+        calibration._on_recalibrate_click(model, wizard_input)
+    wizard_input.set_value.assert_called_once_with("fast")
+    assert mock_ui.notify.call_count == 1
+    assert mock_ui.notify.call_args.kwargs.get("type") == "info"
+
+    # нет активного класса → предзаполнения нет, предупреждение оператору
+    wizard2 = MagicMock()
+    with patch.object(calibration, "ui") as mock_ui2:
+        calibration._on_recalibrate_click({"active": {}}, wizard2)
+    wizard2.set_value.assert_not_called()
+    assert mock_ui2.notify.call_args.kwargs.get("type") == "warning"
+
+
+def test_render_model_card_recalibrate_button_wired_with_accent():
+    """Кнопка «Ре-калибровать» в drift-блоке: on_click подключён; при
+    blocked/t1|t2|t3 — негативный акцент, при ok — нейтральная."""
+    def _render(drift: dict) -> None:
+        model = {
+            "shelf": {"model_id": "qwen2.5:7b", "digest": "abc123"},
+            "active": {"model_class": "fast"},
+            "drift": drift,
+            "classes": {},
+        }
+        cb = MagicMock()
+        with patch.object(calibration, "ui") as mock_ui:
+            calibration._render_model_card(model, None, on_recalibrate=cb)
+        buttons = [
+            c for c in mock_ui.button.call_args_list if "калибр" in str(c.args).lower()
+        ]
+        assert len(buttons) == 1
+        assert buttons[0].kwargs.get("on_click") is cb
+        return mock_ui.button.return_value.props.call_args.args[0]
+
+    assert "color=negative" in _render(
+        {"status": "t2", "blocked": False, "marks": [], "live_probe": "ok"}
+    )
+    assert "color=negative" in _render(
+        {"status": "ok", "blocked": True, "marks": [], "live_probe": "blocked"}
+    )
+    assert "color=grey" in _render(
+        {"status": "ok", "blocked": False, "marks": [], "live_probe": "ok"}
+    )

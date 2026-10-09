@@ -4,7 +4,9 @@ arch-2026-10-09-calib-admin-ui Ф2: тонкий клиент host-side admin-AP
 (``ai_workspace/calibration/admin_api.py``, bind 127.0.0.1:8700, заголовок
 ``X-Calib-Key``). Карточки модели/GPU → визард probe (two-step HITL) →
 поллинг статуса → approve; Ф3b — live-пара base↔variant (``/calib/pair/*``)
-+ запись решения P5 (``/calib/record``). Ноль логики калибровки на стороне
++ запись решения P5 (``/calib/record``); Ф4b — кнопка «ре-калибровать»
+(предзаполнение визарда probe, БЕЗ запуска) + история отчётов
+(``/calib/reports``). Ноль логики калибровки на стороне
 UI — все гейты живут в admin-API/CLI-канонах (``probe_run``/
 ``profile_approve``/``variant_pair``).
 
@@ -137,6 +139,23 @@ class CalibClient:
         """POST /calib/record → 200 / 400 гейт / 409 нет пары / 422 fail-closed."""
         resp = await self._client.post("/calib/record", json=payload)
         return resp.status_code, _body_of(resp)
+
+    async def reports(self, limit: int = 20) -> dict[str, Any] | None:
+        """GET /calib/reports?limit=N — история отчётов (Ф4b, fail-soft).
+
+        Намеренное отклонение от контракта «ошибки пробрасываются»:
+        история — вторичная панель, сетевой сбой/не-dict → None
+        («нет отчётов»), карточки модели/GPU живут своим контрактом.
+        """
+        try:
+            resp = await self._client.get(
+                "/calib/reports", params={"limit": int(limit)}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
 
 
 def _body_of(resp: httpx.Response) -> dict[str, Any]:
@@ -412,8 +431,16 @@ def _record_payload(variant: str, status: str) -> dict[str, Any]:
 # ── Рендер-хелперы (чистые, тестируемы на спарс-данных) ────────
 
 
-def _render_model_card(model: dict[str, Any] | None, error: str | None) -> None:
+def _render_model_card(
+    model: dict[str, Any] | None,
+    error: str | None,
+    on_recalibrate: Any = None,
+) -> None:
     """Карточка «Текущая модель»: полка (id/digest), активный профиль, drift T1–T3.
+
+    Ф4b: при drift-акценте (``blocked``/``t1|t2|t3``) кнопка «Ре-калибровать»
+    подсвечена негативно; клик предзаполняет визард probe классом активной
+    модели — прогон НЕ запускается (Operator Gate в визарде).
 
     Форма — реальный ответ GET /calib/model (admin_api.calib_model):
     shelf{model_id,digest}|null · active{model_class,profile_id,profile_status,
@@ -469,6 +496,18 @@ def _render_model_card(model: dict[str, Any] | None, error: str | None) -> None:
                 ui.chip(str(mark)).props("outline dense size=sm")
         if drift.get("reason"):
             ui.label(f"причина: {drift['reason']}").classes("text-caption text-grey")
+
+        # Ф4b: акцент + «Ре-калибровать» (предзаполнение визарда, НЕ запуск)
+        if on_recalibrate is not None:
+            drift_accent = bool(drift.get("blocked")) or status in {"t1", "t2", "t3"}
+            recal_btn = ui.button("♻ Ре-калибровать", on_click=on_recalibrate)
+            recal_btn.props(
+                "dense flat color=" + ("negative" if drift_accent else "grey")
+            )
+            recal_btn.tooltip(
+                "Предзаполнить визард probe классом активной модели; запуск — "
+                "Operator Gate в визарде (two-step confirm)"
+            )
 
         classes = model.get("classes") if isinstance(model.get("classes"), dict) else {}
         if classes:
@@ -828,6 +867,117 @@ def _render_pair_panel(state: dict[str, Any], client: CalibClient | None) -> Non
                 reject_btn.tooltip("пара не завершена — запись только по done")
 
 
+# ── Ф4b: «ре-калибровать» + история отчётов (module-level — тестируемо) ──
+
+
+def recalibrate_prefill(model: dict[str, Any] | None) -> dict[str, str] | None:
+    """Предзаполнение визарда probe из /calib/model (Ф4b).
+
+    Класс АКТИВНОГО профиля → ``{"model_class": ...}``; нет активного
+    профиля/класса → None (предзаполнять нечем). Прогон НЕ запускается —
+    Operator Gate (two-step confirm) остаётся за оператором.
+    """
+    model = model if isinstance(model, dict) else {}
+    active = model.get("active") if isinstance(model.get("active"), dict) else {}
+    cls = str(active.get("model_class") or "").strip()
+    return {"model_class": cls} if cls else None
+
+
+def _on_recalibrate_click(model: dict[str, Any] | None, class_input: Any) -> None:
+    """Клик «Ре-калибровать»: предзаполнить визард, НЕ запускать прогон."""
+    prefill = recalibrate_prefill(model)
+    if prefill is None or class_input is None:
+        ui.notify(
+            "Нет активного класса модели — заполните визард вручную",
+            type="warning",
+        )
+        return
+    class_input.set_value(prefill["model_class"])
+    ui.notify(
+        f"Визард probe предзаполнен: model_class={prefill['model_class']}. "
+        "Запуск — за оператором (Operator Gate)",
+        type="info",
+    )
+
+
+#: Колонки истории (Ф4b): whitelist ``_REPORT_FIELDS`` admin_api + ``ts``;
+#: только эти поля рендерятся — тексты прогона не едут в историю (I5)
+REPORTS_TABLE_FIELDS: tuple[str, ...] = (
+    "ts", "run_id", "model_id", "golden_median_score", "heldout_score",
+    "needle_rate", "flags", "rub", "wall_s", "n_runs",
+)
+
+#: Формат чисел по колонкам истории (прочие — строка/«—»)
+_REPORTS_NUM_SPEC: dict[str, str] = {
+    "golden_median_score": ".4f",
+    "heldout_score": ".4f",
+    "needle_rate": ".4f",
+    "rub": ".2f",
+    "wall_s": ".1f",
+}
+
+#: Варианты limit истории («Обновить» перезабирает с выбранным)
+REPORTS_LIMIT_CHOICES: dict[int, str] = {10: "10", 20: "20", 50: "50"}
+
+#: limit по умолчанию (паритет default admin_api.calib_reports)
+REPORTS_LIMIT_DEFAULT: int = 20
+
+
+def _report_row(report: dict[str, Any]) -> dict[str, Any]:
+    """Строка таблицы истории — ТОЛЬКО колонки REPORTS_TABLE_FIELDS.
+
+    Числа — по _REPORTS_NUM_SPEC, flags — через запятую, ts — до секунд;
+    прочие ключи отчёта (тексты прогона) отбрасываются (metrics-only, I5).
+    """
+    row: dict[str, Any] = {}
+    for field in REPORTS_TABLE_FIELDS:
+        value = report.get(field)
+        if field in _REPORTS_NUM_SPEC:
+            row[field] = _num(value, _REPORTS_NUM_SPEC[field])
+        elif field == "flags":
+            row[field] = (
+                ",".join(str(f) for f in value)
+                if isinstance(value, (list, tuple)) and value
+                else "—"
+            )
+        elif field == "ts":
+            row[field] = str(value)[:19] if value else "—"
+        elif field == "n_runs":
+            row[field] = (
+                value
+                if isinstance(value, int) and not isinstance(value, bool)
+                else "—"
+            )
+        else:
+            row[field] = str(value) if value is not None else "—"
+    return row
+
+
+def _render_reports_panel(data: dict[str, Any] | None) -> None:
+    """История калибровок — таблица метрик (Ф4b, metrics-only).
+
+    Форма — реальный ответ GET /calib/reports (admin_api.calib_reports):
+    ``{"reports": [{..._REPORT_FIELDS..., "ts": ISO-mtime}], "total": N}``
+    (mtime DESC, limit clamp 1..200). Рендерятся ТОЛЬКО поля
+    REPORTS_TABLE_FIELDS; любые прочие ключи (тексты прогона) на экран
+    не попадают (приватность I5). None/пусто → «нет отчётов» (fail-soft).
+    """
+    data = data if isinstance(data, dict) else {}
+    reports = data.get("reports") if isinstance(data.get("reports"), list) else []
+    if not reports:
+        ui.label("нет отчётов").classes("text-caption text-grey")
+        return
+    rows = [_report_row(r) for r in reports if isinstance(r, dict)]
+    columns = [
+        {"name": f, "label": f, "field": f, "align": "left"}
+        for f in REPORTS_TABLE_FIELDS
+    ]
+    ui.table(columns=columns, rows=rows, row_key="run_id").classes("w-full")
+    total = data.get("total")
+    if isinstance(total, int):
+        ui.label(f"всего отчётов: {total}").classes("text-caption text-grey")
+
+
 # ── Действия (module-level — тестируемо) ───────────────────────
 
 
@@ -1156,12 +1306,25 @@ def build_calibration() -> None:
         "pair": {},
         "record_variant": "",
         "record_result": None,
+        "reports": None,
+        "reports_limit": REPORTS_LIMIT_DEFAULT,
     }
     client = CalibClient()
 
+    # Ф4b: holder ссылок на поля визарда (class_input создаётся ниже;
+    # клик «Ре-калибровать» резолвит input в момент клика, не сборки)
+    wizard_refs: dict[str, Any] = {}
+
+    def _on_recalibrate() -> None:
+        _on_recalibrate_click(state.get("model"), wizard_refs.get("class_input"))
+
     @ui.refreshable
     def render_model_card() -> None:
-        _render_model_card(state.get("model"), state.get("model_error"))
+        _render_model_card(
+            state.get("model"),
+            state.get("model_error"),
+            on_recalibrate=_on_recalibrate,
+        )
 
     @ui.refreshable
     def render_gpu_card() -> None:
@@ -1226,6 +1389,7 @@ def build_calibration() -> None:
                 .props("dense")
                 .classes("w-40")
             )
+            wizard_refs["class_input"] = class_input
             heldout_input = (
                 ui.input("heldout (путь)", placeholder="/path/to/heldout")
                 .props("dense")
@@ -1327,11 +1491,44 @@ def build_calibration() -> None:
     # ── Статус/метрики пары + решение P5 (поллинг) ──
     render_pair_panel()
 
+    # ── История калибровок (Ф4b: /calib/reports, metrics-only) ──
+    @ui.refreshable
+    def render_reports_panel() -> None:
+        _render_reports_panel(state.get("reports"))
+
+    async def refresh_reports() -> None:
+        """История: fail-soft — сбой запроса не роняет страницу."""
+        try:
+            state["reports"] = await client.reports(
+                limit=int(state.get("reports_limit") or REPORTS_LIMIT_DEFAULT)
+            )
+        except Exception:
+            state["reports"] = None
+        render_reports_panel.refresh()
+
+    with ui.card().classes("w-full q-mb-md"):
+        with ui.row().classes("items-center gap-2 q-mb-sm"):
+            ui.label("История калибровок").classes("text-h6")
+            limit_select = (
+                ui.select(REPORTS_LIMIT_CHOICES, value=REPORTS_LIMIT_DEFAULT)
+                .props("dense")
+                .classes("w-20")
+            )
+            ui.button("Обновить", on_click=refresh_reports).props("flat")
+
+        async def _on_limit_change(e: Any) -> None:
+            state["reports_limit"] = int(e.value)
+            await refresh_reports()
+
+        limit_select.on_value_change(_on_limit_change)
+        render_reports_panel()
+
     poll_timer = ui.timer(PROBE_POLL_INTERVAL, poll_both)
 
     async def _bootstrap() -> None:
         await refresh_facts()
         await poll_both()
+        await refresh_reports()
 
     ui.timer(0.1, _bootstrap, once=True)
 
