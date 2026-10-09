@@ -69,6 +69,12 @@
 | service:ollama-prod | docker-compose.prod.yml (mcp-knowledge-ollama-prod) | sink: — (air-gap-бандл) | gap: air-gap-контур; аналогично qdrant-prod (P2-7) |
 | source:docker_events | docker events die/oom/restart/health_status | sink: errors_collect.py collect_docker_events | covered |
 
+## Host-сервисы (systemd)
+
+| source_id | источник | sink: путь-механизм | статус |
+|---|---|---|---|
+| service:calib-admin-api | systemd unit calib-admin-api.service (ai_workspace/deploy/, Ф1 arch-2026-10-09-calib-admin-ui; uvicorn host 127.0.0.1 workers=1, маркеры [CALIB-API]: start/auth-refused/probe-start/probe-finish/approve-start/approve-finish) | sink: — | gap: host-unit — stdout в journald, вне docker_logs-сбора errors_collect.py; диагностика journalctl -u calib-admin-api (runbook calib-admin-api-runbook.md §6); при автоматизации добавить journald-source в коллектор |
+
 ## Host-пороги
 
 | source_id | источник | sink: путь-механизм | статус |

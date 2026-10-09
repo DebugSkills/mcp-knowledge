@@ -1,0 +1,39 @@
+# calib-admin-api — host-сервис admin-API калибровки AI-верстака
+# (Ф1, arch-2026-10-09-calib-admin-ui). Канон установки/запуска —
+# docs/operations/calib-admin-api-runbook.md (Operator Gate: сервис
+# устанавливает и стартует оператор ВРУЧНУЮ по runbook; файл в репо =
+# источник для копирования, НЕ автостарт).
+#
+# Инварианты: bind строго 127.0.0.1 (kb-console host-net, UFW не нужен);
+# workers=1 (asyncio.Lock НЕ межпроцессный — single-flight 409-гейт);
+# ключ CALIB_API_KEY — только в EnvironmentFile (0600), НИКОГДА не в логах.
+
+[Unit]
+Description=calib-admin-api — admin-API калибровки AI-верстака (127.0.0.1, workers=1)
+Documentation=file:///kvm/mcp-knowledge/mcp-knowledge/docs/operations/calib-admin-api-runbook.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ladmin
+Group=ladmin
+WorkingDirectory=/kvm/mcp-knowledge/mcp-knowledge
+# Файл создаёт оператор по runbook (root:root 0600 — systemd читает его
+# сам, до понижения привилегий; отсутствие файла = отказ старта, fail-closed)
+EnvironmentFile=/etc/calib-admin-api.env
+ExecStart=/kvm/mcp-knowledge/mcp-knowledge/.venv/bin/python -m uvicorn ai_workspace.calibration.admin_api:create_app --factory --host 127.0.0.1 --port ${CALIB_API_PORT} --workers 1
+Restart=on-failure
+RestartSec=5
+# Hardening: сервис пишет только в репо (/kvm) и приватный /tmp;
+# /usr,/boot,/etc — только чтение. ProtectHome НЕ ставим: git-writeback
+# (approve/probe) читает ~/.gitconfig.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+# stdout/stderr → journald: маркеры [CALIB-API] (journalctl -u calib-admin-api)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

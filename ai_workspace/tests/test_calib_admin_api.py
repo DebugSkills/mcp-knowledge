@@ -1,0 +1,783 @@
+"""Ф1a-тесты admin-API калибровки (arch-2026-10-09-calib-admin-ui).
+
+Без живого LLM: probe-runner/approve-runner инъектируются (single-flight,
+гейты), approve идёт по РЕАЛЬНОМУ ``profile_approve.main`` на tmp-носителях
+(реальный контракт fail-closed), полный chain — реальный ``probe_run.main``
+на контурном стабе (без ``--live``), модель/GPU — фейки ``http_get``/``gpu_status``.
+
+Чек-лист задачи: auth fail-closed (+``compare_digest`` по источнику);
+параллельный ``probe/start`` → 202+409 (single-flight); approve fail-closed
+(ceiling без needle; неполный ``calibrated_for``); контракт ``/calib/model``
+и ``/calib/gpu`` (мок); метрики без текстов (негативная приватность, I5).
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+import pytest
+import yaml
+from fastapi.testclient import TestClient
+
+import ai_workspace.calibration.admin_api as admin_api
+from ai_workspace.calibration import policy, profiles
+from ai_workspace.gpu import GpuStatus
+
+KEY = "test-calib-key-0123"
+MODE = Path(__file__).resolve().parents[1] / "modes" / "statya.yaml"
+
+GOLDEN_TASKS = [
+    {"id": "g01", "zone": "public", "prompt": "Структура статьи про MCP-RAG.",
+     "expect_keywords": ["структура"]},
+    {"id": "g02", "zone": "public", "prompt": "Черновик раздела про VRAM.",
+     "expect_keywords": ["VRAM"]},
+]
+HELDOUT_TASKS = [
+    {"id": "h01", "zone": "public", "prompt": "Процитируй источники.",
+     "expect_keywords": ["источник"]},
+]
+
+
+# ── фикстуры/хелперы ───────────────────────────────────────────────────────
+
+
+def _write_yaml(path: Path, doc: dict) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(doc, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+    return path
+
+
+def _write_tasks(path: Path, tasks: list[dict]) -> Path:
+    return _write_yaml(path, {"version": 1, "tasks": tasks})
+
+
+def _classes(spec: dict | None = None) -> dict:
+    base = {
+        "shelf": "local",
+        "shaping": "compressed",
+        "retries": 1,
+        "calibration_status": "uncalibrated",
+        "calibrated_for": None,
+        "active_profile": None,
+    }
+    base.update(spec or {})
+    return base
+
+
+def _registry_doc(classes: dict) -> dict:
+    return {"model_classes": classes}
+
+
+def _profile_doc(
+    profile_id: str = "cal-fast-test-0001",
+    *,
+    model_class: str = "fast",
+    status: str = "draft",
+    calibrated_for: dict | None = None,
+    flags: tuple[str, ...] = (),
+    metrics_extra: dict | None = None,
+) -> dict:
+    cal = (
+        calibrated_for
+        if calibrated_for is not None
+        else {"model_id": "qwen2.5:7b", "digest": "sha256:abc"}
+    )
+    metrics: dict = {
+        "golden_median_score": 1.0,
+        "heldout_score": 1.0,
+        "parse_rate": 1.0,
+        "rub": 0.0,
+        "wall_s": 1.0,
+    }
+    metrics.update(metrics_extra or {})
+    return {
+        "schema": "calibration-profile/1",
+        "profile_id": profile_id,
+        "model_class": model_class,
+        "calibrated_for": cal,
+        "status": status,
+        "version": 1,
+        "evidence": {
+            "probe_run": "probe-test00000000",
+            "golden_manifest": "g" * 64,
+            "pricing_manifest": "p" * 64,
+            "metrics": metrics,
+            "flags": list(flags),
+        },
+        "scalars": {
+            "retries": 0,
+            "max_iterations": 1,
+            "shaping": "full-context",
+            "context_mode": "full",
+        },
+        "constraints": {"quality_floor": 0.5},
+        "created_at": "2026-10-09T00:00:00Z",
+        "updated_at": "2026-10-09T00:00:00Z",
+    }
+
+
+def _settings(tmp_path: Path, **kw) -> admin_api.CalibSettings:
+    params = dict(
+        api_key=KEY,
+        profiles_dir=tmp_path / "profiles",
+        registry_path=tmp_path / "registry" / "model_classes.yaml",
+        reports_dir=tmp_path / "reports",
+    )
+    params.update(kw)
+    return admin_api.CalibSettings(**params)
+
+
+def _fake_tags_http(models: list[dict]):
+    def http_get(url: str) -> dict:
+        return {"models": models}
+    return http_get
+
+
+def _headers(key: str = KEY) -> dict:
+    return {"X-Calib-Key": key}
+
+
+def _wait_status(client: TestClient, expected: str, timeout_s: float = 60.0) -> dict:
+    """Поллинг /calib/probe/status до ожидаемого статуса (bg в executor)."""
+    deadline = time.monotonic() + timeout_s
+    last: dict = {}
+    while time.monotonic() < deadline:
+        last = client.get("/calib/probe/status", headers=_headers()).json()
+        if last.get("status") == expected:
+            return last
+        time.sleep(0.05)
+    pytest.fail(f"статус не достигнут {expected!r} за {timeout_s}s: {last}")
+
+
+# ── auth fail-closed (F7): пустой ключ / неверный ключ / compare_digest ────
+
+
+def test_create_app_refuses_empty_key_fail_closed() -> None:
+    """Нет CALIB_API_KEY → отказ создания приложения (fail-closed старт)."""
+    with pytest.raises(RuntimeError, match="CALIB_API_KEY"):
+        admin_api.create_app(admin_api.CalibSettings(api_key="   "))
+    with pytest.raises(RuntimeError, match="fail-closed"):
+        admin_api.create_app()  # env не задан (delenv ниже — страховка)
+
+
+def test_auth_missing_or_wrong_key_refused(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv(admin_api.CALIB_API_KEY_ENV, raising=False)
+    app = admin_api.create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        # без заголовка → 401
+        r = client.get("/calib/model")
+        assert r.status_code == 401
+        # неверный ключ → 401; ключ неутекаем (нет в теле ответа)
+        r = client.get("/calib/model", headers=_headers(key="wrong-key"))
+        assert r.status_code == 401
+        assert "wrong-key" not in r.text and KEY not in r.text
+        # верный ключ → не 401
+        r = client.get("/calib/model", headers=_headers())
+        assert r.status_code == 200
+
+
+def test_auth_uses_constant_time_compare_digest(monkeypatch, tmp_path) -> None:
+    """Сравнение ключа — secrets.compare_digest (источник, key-hygiene)."""
+    source = Path(admin_api.__file__).read_text(encoding="utf-8")
+    assert "secrets.compare_digest" in source
+    # bind строго loopback; workers=1 — инвариант single-flight (§2.3)
+    assert 'BIND_HOST = "127.0.0.1"' in source
+    assert "workers=1" in source
+
+    calls: list[tuple[bytes, bytes]] = []
+
+    def spy(a: bytes, b: bytes) -> bool:
+        calls.append((a, b))
+        return a == b
+
+    monkeypatch.setattr(admin_api.secrets, "compare_digest", spy)
+    app = admin_api.create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        assert client.get("/calib/model", headers=_headers()).status_code == 200
+    assert calls and calls[0][1].decode() == KEY  # сравнили с настройкой, не ==
+
+
+# ── POST /calib/probe/start: гейты + single-flight (202+409) ───────────────
+
+
+def _blocked_runner(argv_log: list[str], started: threading.Event,
+                    release: threading.Event):
+    def runner(argv: list[str]) -> int:
+        argv_log.extend(argv)
+        started.set()
+        assert release.wait(timeout=30), "runner не отпущен тестом"
+        return 0
+    return runner
+
+
+def test_probe_start_gates_operator_gate(tmp_path) -> None:
+    """Без confirm_live / без отдельного confirm_ext (₽, строже CLI) → 400."""
+    settings = _settings(tmp_path)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        base = {"model_class": "fast", "heldout": "heldout.yaml"}
+        # нет confirm_live → 400 (Operator Gate, аналог --confirm-live)
+        r = client.post("/calib/probe/start", json=base, headers=_headers())
+        assert r.status_code == 400
+        assert "confirm_live" in r.json()["detail"]
+        # ext без confirm_ext → 400 (отдельный флаг, СТРОЖЕ CLI)
+        r = client.post(
+            "/calib/probe/start",
+            json={**base, "confirm_live": True, "ext": True},
+            headers=_headers(),
+        )
+        assert r.status_code == 400
+        assert "confirm_ext" in r.json()["detail"]
+        # runs < MIN_RUNS → 422 (валидация pydantic, спека N>=3)
+        r = client.post(
+            "/calib/probe/start",
+            json={**base, "confirm_live": True, "runs": 2},
+            headers=_headers(),
+        )
+        assert r.status_code == 422
+        # аргумент-путь с ведущим '-' → 400 (не argparse-инъекция)
+        r = client.post(
+            "/calib/probe/start",
+            json={**base, "confirm_live": True, "heldout": "--inject"},
+            headers=_headers(),
+        )
+        assert r.status_code == 400
+
+
+def test_probe_start_single_flight_202_then_409(tmp_path) -> None:
+    """Параллельный старт: первый 202, второй 409; после завершения — снова 202."""
+    argv_log: list[str] = []
+    started, release = threading.Event(), threading.Event()
+    settings = _settings(
+        tmp_path, probe_runner=_blocked_runner(argv_log, started, release)
+    )
+    app = admin_api.create_app(settings)
+    body = {
+        "model_class": "fast",
+        "heldout": "/tmp/heldout.yaml",
+        "confirm_live": True,
+        "live": True,
+        "ext": True,
+        "confirm_ext": True,
+        "runs": 3,
+        "zone": "private",
+    }
+    with TestClient(app) as client:
+        r1 = client.post("/calib/probe/start", json=body, headers=_headers())
+        assert r1.status_code == 202
+        assert r1.json()["status"] == "accepted"
+        assert started.wait(timeout=10)  # bg действительно вошёл в runner
+
+        # второй старт, пока первый жив → 409 (single-flight)
+        r2 = client.post("/calib/probe/start", json=body, headers=_headers())
+        assert r2.status_code == 409
+        # статус показывает running, ничего не упало
+        assert (
+            client.get("/calib/probe/status", headers=_headers()).json()["status"]
+            == "running"
+        )
+
+        release.set()  # отпускаем прогон
+        done = _wait_status(client, "done")
+        assert done["exit_code"] == 0
+        assert done["report"] is None  # отчёта не писалось (fake-runner)
+
+        # после завершения следующий старт снова 202 (lock освобождён)
+        r3 = client.post("/calib/probe/start", json=body, headers=_headers())
+        assert r3.status_code == 202
+        release.set()  # уже отпущен — runner вернётся сразу
+        _wait_status(client, "done")
+
+    # argv передан CLI-канону с гейтами API (не dry-run)
+    assert "--confirm-live" in argv_log
+    assert "--live" in argv_log and "--ext" in argv_log
+    assert "--class" in argv_log and "fast" in argv_log
+    assert "--reports-dir" in argv_log and "--profiles-dir" in argv_log
+
+
+def test_probe_start_runner_exception_marks_failed(tmp_path) -> None:
+    """Сбой обвязки (исключение runner) → статус failed, не «зависший» running."""
+
+    def boom(argv: list[str]) -> int:
+        raise RuntimeError("executor died")
+
+    settings = _settings(tmp_path, probe_runner=boom)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = client.post(
+            "/calib/probe/start",
+            json={"model_class": "fast", "heldout": "h.yaml", "confirm_live": True},
+            headers=_headers(),
+        )
+        assert r.status_code == 202
+        failed = _wait_status(client, "failed")
+        assert "executor died" in failed["error"]
+
+
+def test_probe_start_full_chain_stub_metrics_only(tmp_path) -> None:
+    """Полный chain через РЕАЛЬНЫЙ probe_run.main (контурный стаб, без --live):
+    отчёт записан, статус done, ответ — whitelist метрик БЕЗ текстов (I5)."""
+    golden = _write_tasks(tmp_path / "golden.yaml", GOLDEN_TASKS)
+    heldout = _write_tasks(tmp_path / "heldout.yaml", HELDOUT_TASKS)
+    settings = _settings(tmp_path)  # probe_runner=None → реальный CLI-канон
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = client.post(
+            "/calib/probe/start",
+            json={
+                "model_class": "fast",
+                "mode": str(MODE),
+                "golden": str(golden),
+                "heldout": str(heldout),
+                "runs": 3,
+                "confirm_live": True,  # стаб (live=False): движок не живой
+            },
+            headers=_headers(),
+        )
+        assert r.status_code == 202
+        done = _wait_status(client, "done", timeout_s=180)
+        assert done["exit_code"] in (0, 1)  # 1 = рамка D6 не применена — норма
+        report = done["report"]
+        assert report is not None, f"отчёт не прочитан: {done}"
+        # контракт M1–M7: whitelist-поля итогового ProbeReport
+        for key in (
+            "run_id", "model_id", "digest", "golden_median_score",
+            "golden_dispersion", "heldout_score", "parse_rate", "rub",
+            "wall_s", "n_runs", "flags",
+        ):
+            assert key in report, f"нет метрики {key}"
+        assert report["run_id"].startswith("probe-")
+        # приватность I5 (негатив): тексты прогона не едут никуда
+        for forbidden in ("document", "draft", "critic_fragment",
+                          "verdict", "detail", "node_events", "live_sample",
+                          "q_report"):
+            assert forbidden not in report
+        assert "Контурный стаб-ответ" not in json.dumps(done)  # тексты стаба
+        # прогресс из partial: сегменты посчитаны через load_partial
+        progress = done["progress"]
+        assert progress is not None
+        assert progress.get("segments_done", 0) >= 9  # (2 golden + 1 heldout)×3
+
+
+# ── POST /calib/approve: fail-closed через реальный profile_approve.main ───
+
+
+def _approve_env(tmp_path: Path, profile: dict, classes: dict | None = None):
+    """tmp-носители: профиль + реестр; возвращает настройки и пути."""
+    if classes is None:
+        classes = _registry_doc(
+            {"fast": _classes({"shelf": "local"})}
+        )
+    reg_path = _write_yaml(tmp_path / "registry" / "model_classes.yaml", classes)
+    profile_path = _write_yaml(
+        tmp_path / "profiles" / f"{profile['profile_id']}.yaml", profile
+    )
+    settings = _settings(
+        tmp_path,
+        profiles_dir=tmp_path / "profiles",
+        registry_path=reg_path,
+    )
+    return settings, profile_path, reg_path
+
+
+def _post_approve(client: TestClient, body: dict):
+    return client.post("/calib/approve", json=body, headers=_headers())
+
+
+def test_approve_ceiling_without_needle_refused(tmp_path) -> None:
+    """F-2а: ceiling-флаг без needle-доказательства → 422, носители не тронуты."""
+    profile = _profile_doc(flags=("ceiling",))  # needle_rate нет
+    settings, profile_path, reg_path = _approve_env(tmp_path, profile)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = _post_approve(client, {"profile_id": profile["profile_id"], "confirm": True})
+        assert r.status_code == 422
+        assert "ceiling" in r.json()["detail"]
+    # fail-closed: НИЧЕГО не написано — профиль draft v1, реестр не тронут,
+    # аудита нет (решение не было легитимным)
+    doc = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    assert doc["status"] == "draft" and doc["version"] == 1
+    reg = yaml.safe_load(reg_path.read_text(encoding="utf-8"))
+    assert reg["model_classes"]["fast"]["calibration_status"] == "uncalibrated"
+    assert not (tmp_path / "profiles" / "approve_audit.jsonl").exists()
+
+
+def test_approve_ceiling_with_needle_proof_applied(tmp_path) -> None:
+    """α: needle_rate >= NEEDLE_RATE_FLOOR — ceiling-профиль применяется
+    без escape-флагов (needle-доказательство различимости, M4)."""
+    profile = _profile_doc(
+        flags=("ceiling",),
+        metrics_extra={"needle_rate": policy.NEEDLE_RATE_FLOOR + 0.1},
+    )
+    settings, profile_path, reg_path = _approve_env(tmp_path, profile)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = _post_approve(client, {"profile_id": profile["profile_id"], "confirm": True})
+        assert r.status_code == 200
+        assert r.json()["applied"] is True
+    doc = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    assert doc["status"] == "calibrated" and doc["version"] == 2
+    reg = yaml.safe_load(reg_path.read_text(encoding="utf-8"))
+    cls = reg["model_classes"]["fast"]
+    assert cls["calibration_status"] == "calibrated"
+    assert cls["active_profile"] == profile["profile_id"]
+    assert cls["calibrated_for"] == {"model_id": "qwen2.5:7b", "digest": "sha256:abc"}
+
+
+def test_approve_ceiling_ok_escape_audited(tmp_path) -> None:
+    """Escape (аналог --ceiling-ok) с reason → применение + аудит ДО носителей."""
+    profile = _profile_doc(flags=("ceiling",))
+    settings, profile_path, _ = _approve_env(tmp_path, profile)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = _post_approve(
+            client,
+            {
+                "profile_id": profile["profile_id"],
+                "confirm": True,
+                "ceiling_ok": True,
+                "reason": "оператор осознанно применяет ceiling-замер",
+            },
+        )
+        assert r.status_code == 200
+    audit = tmp_path / "profiles" / "approve_audit.jsonl"
+    assert audit.is_file()
+    record = json.loads(audit.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert record["action"] == "ceiling_approve"
+    assert record["profile_id"] == profile["profile_id"]
+    assert yaml.safe_load(profile_path.read_text(encoding="utf-8"))["status"] == "calibrated"
+
+
+def test_approve_incomplete_calibrated_for_refused(tmp_path) -> None:
+    """F-2а: пустой model_id/digest → 422; --force+reason (аудит) → применение."""
+    profile = _profile_doc(calibrated_for={"model_id": "", "digest": ""})
+    settings, profile_path, _ = _approve_env(tmp_path, profile)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = _post_approve(client, {"profile_id": profile["profile_id"], "confirm": True})
+        assert r.status_code == 422
+        assert "calibrated_for" in r.json()["detail"]
+        assert yaml.safe_load(profile_path.read_text(encoding="utf-8"))["status"] == "draft"
+
+        # escape: force + reason (зеркаро CLI) → применение с аудитом
+        r = _post_approve(
+            client,
+            {
+                "profile_id": profile["profile_id"],
+                "confirm": True,
+                "force": True,
+                "reason": "факт полки не наблюдаем, применяется осознанно",
+            },
+        )
+        assert r.status_code == 200
+    record = json.loads(
+        (tmp_path / "profiles" / "approve_audit.jsonl")
+        .read_text(encoding="utf-8").strip().splitlines()[-1]
+    )
+    assert record["action"] == "force_approve"
+
+
+def test_approve_unknown_profile_refused_and_dry_run_default(tmp_path) -> None:
+    """Неизвестный профиль → 422; без confirm — dry-run: план, носители целы."""
+    profile = _profile_doc()
+    settings, profile_path, reg_path = _approve_env(tmp_path, profile)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = _post_approve(client, {"profile_id": "cal-missing-0000", "confirm": True})
+        assert r.status_code == 422
+        # dry-run по умолчанию: exit 0, ничего не применено
+        r = _post_approve(client, {"profile_id": profile["profile_id"]})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["applied"] is False and "ПЛАН" in body["output"]
+    assert yaml.safe_load(profile_path.read_text(encoding="utf-8"))["status"] == "draft"
+    reg = yaml.safe_load(reg_path.read_text(encoding="utf-8"))
+    assert reg["model_classes"]["fast"]["active_profile"] is None
+
+
+# ── GET /calib/model и /calib/gpu: контракт (моки) + приватность ────────────
+
+
+def _model_env(tmp_path: Path, *, digest: str = "sha256:abc"):
+    """Активная калибровка fast + профиль calibrated + совпадающая полка.
+
+    Реестр — ПЛОСКИЙ (прод-контракт ``registry/model_classes.yaml`` для
+    ``Registry``/``runtime.active_calibration``); approve-эндпоинт тестируется
+    отдельно на ОБЁРНУТОЙ форме (контракт profile_approve CLI).
+    """
+    profile = _profile_doc(status="calibrated")
+    flat = {
+        "fast": _classes(
+            {
+                "calibration_status": "calibrated",
+                "active_profile": profile["profile_id"],
+                "calibrated_for": {
+                    "model_id": "qwen2.5:7b", "digest": digest,
+                },
+            }
+        )
+    }
+    reg_path = _write_yaml(tmp_path / "registry" / "model_classes.yaml", flat)
+    _write_yaml(
+        tmp_path / "profiles" / f"{profile['profile_id']}.yaml", profile
+    )
+    tags = _fake_tags_http([{"name": "qwen2.5:7b", "digest": digest}])
+    settings = _settings(
+        tmp_path,
+        registry_path=reg_path,
+        profiles_dir=tmp_path / "profiles",
+        http_get=tags,
+    )
+    return settings, profile
+
+
+def test_model_endpoint_contract_ok_drift(tmp_path) -> None:
+    settings, profile = _model_env(tmp_path)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = client.get("/calib/model", headers=_headers())
+        assert r.status_code == 200
+        body = r.json()
+        # контракт S1: полка + активный профиль + drift + классы
+        assert body["shelf"] == {"model_id": "qwen2.5:7b", "digest": "sha256:abc"}
+        assert body["active"]["model_class"] == "fast"
+        assert body["active"]["profile_id"] == profile["profile_id"]
+        assert body["active"]["profile_status"] == "calibrated"
+        assert body["drift"]["status"] == "ok"
+        assert body["drift"]["blocked"] is False
+        assert body["drift"]["live_probe"] == "ok"
+        cls = body["classes"]["fast"]
+        assert cls["shelf"] == "local"
+        assert cls["calibration_status"] == "calibrated"
+        # приватность: только whitelist-поля, никаких текстов
+        dumped = json.dumps(body)
+        for forbidden in ("document", "draft", "critic_fragment", "prompt"):
+            assert forbidden not in dumped
+
+
+def test_model_endpoint_drift_t1_blocks_live_probe(tmp_path) -> None:
+    """Digest полки ≠ calibrated_for → T1: live_probe=blocked (F8: запрет)."""
+    settings, _ = _model_env(tmp_path, digest="sha256:OTHER")
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        body = client.get("/calib/model", headers=_headers()).json()
+        assert body["drift"]["status"] == "t1"
+        assert body["drift"]["reason"] == "digest_mismatch"
+        assert body["drift"]["live_probe"] == "blocked"
+
+
+def test_model_endpoint_without_active_profile(tmp_path) -> None:
+    """Нет активного профиля → active=None, drift ok (паритет F1)."""
+    reg_path = _write_yaml(
+        tmp_path / "registry" / "model_classes.yaml",
+        {"fast": _classes()},  # плоская форма (прод-контракт)
+    )
+    settings = _settings(
+        tmp_path,
+        registry_path=reg_path,
+        http_get=_fake_tags_http([{"name": "qwen2.5:7b", "digest": "sha256:abc"}]),
+    )
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        body = client.get("/calib/model", headers=_headers()).json()
+        assert body["active"] is None
+        assert body["drift"]["status"] == "ok"
+        assert body["shelf"]["model_id"] == "qwen2.5:7b"
+
+
+def test_model_endpoint_accepts_wrapped_registry_shape(tmp_path) -> None:
+    """Обёрнутая форма файла (контракт approve CLI) читается так же —
+    ``_read_classes`` нормализует обе формы носителя."""
+    profile = _profile_doc(status="calibrated")
+    wrapped = _registry_doc(
+        {
+            "fast": _classes(
+                {
+                    "calibration_status": "calibrated",
+                    "active_profile": profile["profile_id"],
+                    "calibrated_for": {"model_id": "qwen2.5:7b", "digest": "sha256:abc"},
+                }
+            )
+        }
+    )
+    reg_path = _write_yaml(tmp_path / "registry" / "model_classes.yaml", wrapped)
+    _write_yaml(tmp_path / "profiles" / f"{profile['profile_id']}.yaml", profile)
+    settings = _settings(
+        tmp_path,
+        registry_path=reg_path,
+        profiles_dir=tmp_path / "profiles",
+        http_get=_fake_tags_http([{"name": "qwen2.5:7b", "digest": "sha256:abc"}]),
+    )
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        body = client.get("/calib/model", headers=_headers()).json()
+        assert body["active"]["profile_id"] == profile["profile_id"]
+        assert body["drift"]["status"] == "ok"
+
+
+def test_model_endpoint_reads_real_prod_flat_registry(tmp_path) -> None:
+    """Дефолтный путь (РЕАЛЬНЫЙ прод model_classes.yaml, плоская форма):
+    классы на месте, без активного профиля — active=None, drift ok.
+    http_get — фейк (герметичность; полка не трогается)."""
+    real_registry = (
+        Path(__file__).resolve().parents[1] / "registry" / "model_classes.yaml"
+    )
+    settings = _settings(
+        tmp_path,
+        registry_path=real_registry,
+        http_get=_fake_tags_http([{"name": "qwen2.5:7b", "digest": "sha256:x"}]),
+    )
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        body = client.get("/calib/model", headers=_headers()).json()
+        assert set(body["classes"]) >= {"fast", "heavy", "fast-full"}
+        assert body["classes"]["fast"]["shelf"] == "local"
+        assert body["classes"]["local-only"] == {"rule": "zone", "calibrated_for": None}
+        # в прод-реестре сейчас нет active_profile → паритет F1
+        assert body["active"] is None
+        assert body["drift"]["status"] == "ok"
+
+
+def test_gpu_endpoint_contract_and_failsoft(tmp_path) -> None:
+    """R1-preflight: ollama /api/ps + ws-lease слоты; оба источника fail-soft."""
+    ps_payload = {
+        "models": [
+            {
+                "name": "qwen2.5:7b", "digest": "sha256:z", "size": 9,
+                "size_vram": 5_300_000_000, "expires_at": "2026-10-09T20:00:00Z",
+            },
+            {"junk": True},  # битая запись отбрасывается, не роняет эндпоинт
+        ]
+    }
+
+    def http_get(url: str) -> dict:
+        assert url.endswith("/api/ps")
+        return ps_payload
+
+    gpu = GpuStatus(
+        capacity=1, used=1, free=0, lease_ms=90_000,
+        holdings={"embed": ["nightly-video"], "vision": [], "reindex": []},
+    )
+    settings = _settings(tmp_path, http_get=http_get, gpu_status=lambda: gpu)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        body = client.get("/calib/gpu", headers=_headers()).json()
+        assert body["ollama_ps"]["available"] is True
+        model = body["ollama_ps"]["models"][0]
+        assert model["name"] == "qwen2.5:7b"
+        assert model["size_vram"] == 5_300_000_000
+        assert "expires_at" in model and "digest" in model
+        slots = body["gpu_slots"]
+        assert slots["available"] is True
+        assert slots["used"] == 1 and slots["free"] == 0
+        assert slots["holdings"]["embed"] == ["nightly-video"]
+
+
+def test_gpu_endpoint_fail_soft_when_sources_down(tmp_path) -> None:
+    """Полка/ws-redis недоступны → available:false у источника, не 5xx."""
+
+    def http_get(url: str) -> dict:
+        raise OSError("ollama down")
+
+    def gpu_down() -> GpuStatus:
+        raise ConnectionError("ws-redis down")
+
+    settings = _settings(tmp_path, http_get=http_get, gpu_status=gpu_down)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = client.get("/calib/gpu", headers=_headers())
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ollama_ps"] == {"available": False}
+        assert body["gpu_slots"] == {"available": False}
+
+
+def test_probe_status_idle_initially(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        body = client.get("/calib/probe/status", headers=_headers()).json()
+        assert body["status"] == "idle"
+        assert body["report"] is None and body["progress"] is None
+
+
+def test_admin_api_reuses_canonical_modules_not_copies() -> None:
+    """DBD: дефолтные раннеры — сами CLI-каноны (ноль дублей логики)."""
+    source = Path(admin_api.__file__).read_text(encoding="utf-8")
+    assert "probe_run.main" in source
+    assert "profile_approve.main" in source
+    assert "drift_mod.detect" in source or "drift.detect" in source
+    assert "facts_for" in source and "load_partial" in source
+    #asic: никто не копирует NEEDLE_RATE_FLOOR значением — гейт живёт в CLI
+    assert "NEEDLE_RATE_FLOOR = 0" not in source
+
+
+# ── Ф1b: маркеры наблюдаемости [CALIB-API] (E5, journald) ──────────────────
+
+
+def test_log_event_marker_format_and_key_hygiene(capsys) -> None:
+    """Единый префикс [CALIB-API] k=v; ключ в маркеры не попадает."""
+    admin_api._log_event("auth-refused")
+    admin_api._log_event("probe-start", model_class="fast", runs=3)
+    out = capsys.readouterr().out
+    assert out.count("[CALIB-API] auth-refused\n") == 1
+    assert "[CALIB-API] probe-start model_class=fast runs=3\n" in out
+    assert KEY not in out
+
+
+def test_markers_auth_refused_probe_start_finish(tmp_path, capsys) -> None:
+    """401 → auth-refused; 202 → probe-start; финиш → probe-finish exit=0."""
+    settings = _settings(tmp_path, probe_runner=lambda argv: 0)
+    app = admin_api.create_app(settings)
+    body = {
+        "model_class": "fast",
+        "heldout": "heldout.yaml",
+        "confirm_live": True,
+        "runs": 3,
+    }
+    with TestClient(app) as client:
+        r = client.get("/calib/model", headers=_headers(key="wrong"))
+        assert r.status_code == 401
+        capsys.readouterr()  # отсечь всё до прогонов-событий
+        r = client.post("/calib/probe/start", json=body, headers=_headers())
+        assert r.status_code == 202
+        _wait_status(client, "done")
+    out = capsys.readouterr().out
+    assert "[CALIB-API] auth-refused" not in out  # отсечён (до readouterr)
+    assert "[CALIB-API] probe-start model_class=fast runs=3" in out
+    assert "[CALIB-API] probe-start" in out and "heldout" not in out.split(
+        "[CALIB-API] probe-start"
+    )[1].splitlines()[0]
+    assert "[CALIB-API] probe-finish exit=0" in out
+    assert KEY not in out  # key-hygiene: секрет — никогда в маркерах
+
+
+def test_markers_approve_start_finish(tmp_path, capsys) -> None:
+    """approve: approve-start (без reason) + approve-finish exit/applied."""
+    settings = _settings(tmp_path)
+    _write_tasks(settings.reports_dir / "x.yaml", HELDOUT_TASKS)  # шум-каталог
+    profile = _profile_doc()
+    _write_yaml(settings.profiles_dir / "cal-fast-test-0001.yaml", profile)
+    _write_yaml(
+        settings.registry_path,
+        _registry_doc({"fast": _classes({"active_profile": "cal-fast-test-0001"})}),
+    )
+    app = admin_api.create_app(settings)
+    with TestClient(app) as client:
+        r = client.post(
+            "/calib/approve",
+            json={"profile_id": "cal-fast-test-0001", "confirm": False,
+                  "reason": "secret-reason-must-not-leak"},
+            headers=_headers(),
+        )
+        assert r.status_code == 200, r.text
+    out = capsys.readouterr().out
+    assert "[CALIB-API] approve-start profile_id=cal-fast-test-0001 confirm=False" in out
+    assert "secret-reason-must-not-leak" not in out
+    assert "[CALIB-API] approve-finish exit=0 applied=False" in out
