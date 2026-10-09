@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     CONSOLE_LAN_CIDR: str = ""
     CONSOLE_ADMIN_USER: str = ""
     CONSOLE_ADMIN_PASSWORD: str = ""
+    # calib-admin-ui (arch-2026-10-09): транспорт kb-console → host-side admin-API
+    # калибровки (loopback :8700). Сервер их НЕ использует; поля нужны, чтобы
+    # pydantic не валился на extra_forbidden при чтении общего .env.
+    CALIB_API_URL: str = ""
+    CALIB_API_KEY: str = ""
     # LLM-шлюз (arch-2026-10-05-ai-workspace): LITELLM_MASTER_KEY — мастер-ключ
     # litellm-шлюза (сам шлюз + scripts/gateway_canary.py), DEEPSEEK_API_KEY —
     # ключ апстрим-провайдера шлюза; оба лежат в общем .env. Сервер их НЕ
