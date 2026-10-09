@@ -555,7 +555,8 @@ def test_needle_set_yaml_v3_contract() -> None:
     задания сравняет руки)."""
     doc = yaml.safe_load(NEEDLE_SET_YAML.read_text(encoding="utf-8"))
     assert doc["version"] == 3
-    assert doc["status"] == "draft"
+    # утверждён оператором 2026-10-09 (CC1 v3: различимость доказана)
+    assert doc["status"] in {"draft", "approved"}
     assert doc["owner"] == "operator"
     assert doc["min_runs"] == 3
     tasks = doc["tasks"]
