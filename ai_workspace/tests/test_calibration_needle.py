@@ -12,6 +12,7 @@ violations (None → гейт молчит, обратная совместим�
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -330,3 +331,128 @@ def test_cli_dry_run_plan_mentions_needle(tmp_path, capsys) -> None:
     assert code == 0
     out = capsys.readouterr().out
     assert "needle" in out
+
+
+# ── 2a v3: needle-set.yaml v3 (инверсия CC1, подготовка повтора 2f) ────────
+
+
+def _material_sections(prompt: str) -> list[str]:
+    """Куски промпта по '## '-заголовкам (заголовок — часть куска)."""
+    return [c for c in re.split(r"(?m)^(?=## )", prompt) if c.startswith("## ")]
+
+
+def _fast_section_budget() -> int:
+    """Бюджет сжатия секции класса fast — из реестра (SSOT, не константа)."""
+    classes = Registry(REGISTRY_DIR).get("model_classes") or {}
+    return int(classes["fast"]["max_chars_per_section"])
+
+
+def test_needle_set_yaml_v3_contract() -> None:
+    """v3 (корень негатива-2 CC1): 6 заданий; в каждом — секция материала
+    ДОЛЬШЕ бюджета сжатия 4000 (иначе shaping compressed — no-op: секция в
+    бюджете идёт байт-в-байт, engine.shape_section, и руки CC1 идентичны —
+    0.833/0.833). Needle — ровно один раз, в средней трети [0.3, 0.7]
+    длинной секции; блок «## Задание» несёт ЯВНУЮ инструкцию дословного
+    переноса и НЕ содержит литерал needle (иначе recency-копирование из
+    задания сравняет руки)."""
+    doc = yaml.safe_load(NEEDLE_SET_YAML.read_text(encoding="utf-8"))
+    assert doc["version"] == 3
+    assert doc["status"] == "draft"
+    assert doc["owner"] == "operator"
+    assert doc["min_runs"] == 3
+    tasks = doc["tasks"]
+    assert len(tasks) == 6
+    assert [t["id"][:3] for t in tasks] == [f"n0{k}" for k in range(1, 7)]
+    needles = [str(t["expect_needle"]).strip() for t in tasks]
+    assert all(needles) and len(set(needles)) == 6
+    for task, needle in zip(tasks, needles):
+        prompt = str(task["prompt"])
+        # весь вход — длинный: сжатие промпта-секции точно не no-op
+        assert len(prompt) >= 7000, task["id"]
+        sections = _material_sections(prompt)
+        assert len(sections) >= 4, task["id"]  # материал + «## Задание»
+        material = [s for s in sections if not s.startswith("## Задание")]
+        long_sec = max(material, key=len)
+        assert len(long_sec) > 4000, task["id"]
+        # needle спрятан в толще длинной секции: один раз, средняя треть
+        assert prompt.count(needle) == 1, task["id"]
+        frac = long_sec.index(needle) / len(long_sec)
+        assert 0.3 <= frac <= 0.7, (task["id"], frac)
+        # задание: явная инструкция дословного переноса, без литерала
+        instr = prompt.split("## Задание", 1)[1]
+        assert "дословно" in instr, task["id"]
+        assert "раздел" in instr, task["id"]
+        assert needle not in instr, task["id"]
+
+
+def test_needle_set_yaml_v3_compressed_actually_cuts_needle() -> None:
+    """Механика инверсии CC1: промпт задания едет в движок ОДНОЙ секцией-
+    входом brief (vp_ab_pilot.run_one: engine.seed({"brief": prompt})), и
+    compressed-рука класса fast режет его по схеме «голова+хвост»
+    (head_share 0.8: head 3200 / tail 800 при бюджете 4000). Проверка на
+    самом engine.shape_section: needle ЦЕЛИКОМ в зоне среза — full-рука
+    сохраняет факт, compressed-рука теряет (различие рук возможно)."""
+    from ai_workspace.orchestrator.engine import SHAPING_HEAD_SHARE, shape_section
+
+    budget = _fast_section_budget()
+    head = max(1, int(budget * SHAPING_HEAD_SHARE))
+    tail = max(1, budget - head)
+    doc = yaml.safe_load(NEEDLE_SET_YAML.read_text(encoding="utf-8"))
+    for task in doc["tasks"]:
+        needle = str(task["expect_needle"])
+        prompt = str(task["prompt"])
+        assert needle in prompt, task["id"]
+        pos = prompt.index(needle)
+        assert pos >= head, task["id"]  # вне сохраняемой головы
+        assert pos + len(needle) <= len(prompt) - tail, task["id"]  # вне хвоста
+        # ground truth: сжатая секция НЕ содержит needle дословно
+        assert needle not in shape_section(prompt, budget=budget), task["id"]
+
+
+def test_needle_set_yaml_v3_needle_types_diverse() -> None:
+    """Типы needle разведены (преемственность v2): код, десятичное число,
+    имя, ISO-дата, semver, hex — по одному на задание."""
+    doc = yaml.safe_load(NEEDLE_SET_YAML.read_text(encoding="utf-8"))
+    needles = [str(t["expect_needle"]) for t in doc["tasks"]]
+    joined = " ".join(needles)
+    for needle in (
+        "TG-7741-DELTA",   # код бюджетной заявки
+        "0.4173",          # десятичное число (коэффициент)
+        "Синяя-нить-7",    # имя протокола
+        "2027-03-14",      # ISO-дата
+        "v3.9.2-rc1",      # semver релиз-кандидата
+        "0xDEADBEEF",      # hex-маркер формата
+    ):
+        assert needle in joined, needle
+
+
+def test_needle_set_v3_load_tasks_and_detect(tmp_path, monkeypatch) -> None:
+    """_load_tasks + grep-детект на committed v3-наборе (синтетический
+    вывод, без LLM): needle_rate = found/total по (задание × прогон),
+    found учитывается и в document, и в draft; пустой вывод — missed."""
+    tasks = probe_mod._load_tasks(NEEDLE_SET_YAML)
+    assert len(tasks) == 6
+    assert all(str(t.get("expect_needle") or "").strip() for t in tasks)
+
+    golden = _write_set(tmp_path / "golden.yaml", GOLDEN_TASKS)
+    heldout = _write_set(tmp_path / "heldout.yaml", HELDOUT_TASKS)
+    script = {
+        # found в document / только в draft / missed (пустой вывод) — итого 5/6
+        ("n01-budget-code", 1): {"document": "заявка TG-7741-DELTA одобрена"},
+        ("n02-metric-decimal", 1): {"draft": "коэффициент: 0.4173"},
+        ("n03-failover-protocol", 1): {"document": "", "draft": ""},
+        ("n04-migration-date", 1): {"document": "старт переноса: 2027-03-14"},
+        ("n05-release-semver", 1): {"document": "кандидат v3.9.2-rc1 готов"},
+        ("n06-marker-hex", 1): {"draft": "маркер записи 0xDEADBEEF"},
+    }
+    monkeypatch.setattr(probe_mod, "run_one", _fake_run_one(script))
+
+    report = run_probe(
+        mode=MODE, golden=golden, heldout=heldout, needle=NEEDLE_SET_YAML,
+        model_class="fast", registry=Registry(REGISTRY_DIR), llm=object(),
+        runs=1,
+    )
+
+    assert report.needle_rate == pytest.approx(5 / 6)
+    # golden-метрики от needle-набора не зависят (M1 — только golden-скоры)
+    assert report.golden_median_score == pytest.approx(0.8)
