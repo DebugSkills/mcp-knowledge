@@ -457,6 +457,26 @@ def lint_l15(doc: dict, registry: Any, base_dir: Path | None) -> list[Finding]:
     return out
 
 
+def resolve_mode_file(modes_dir: Path, mode_id: str) -> Path:
+    """Резолв файла режима по id: прямой путь, затем dash→dot fallback.
+
+    CC1 (В2-B 2f): id режима — дефисы (statya-local), конвенция файлов —
+    точки (statya.local.yaml). Прямое имя не нашлось → пробуем dash→dot;
+    прежние режимы (statya.deep → statya.yaml) резолвятся прямым путём без
+    изменений. Если не нашёл ни один кандидат — возвращает прямой путь:
+    вызывающий решает fail-closed. Единый канон для L16 (здесь) и CV6
+    (calibration/variants.py, P1-fix критики 3c-promotion) — без
+    разъезжающихся копий логики.
+    """
+    direct = modes_dir / f"{mode_id}.yaml"
+    if direct.is_file():
+        return direct
+    dotted = modes_dir / f"{mode_id.replace('-', '.')}.yaml"
+    if dotted.is_file():
+        return dotted
+    return direct
+
+
 def lint_l16(doc: dict, registry: Any, base_dir: Path | None) -> list[Finding]:
     """Конвенция mode-variant (Ф7 Э4, §7.2): база существует + zone-наследование.
 
@@ -478,15 +498,7 @@ def lint_l16(doc: dict, registry: Any, base_dir: Path | None) -> list[Finding]:
     modes_dir = root / "modes"
     if not modes_dir.is_dir() and (root / "ai_workspace" / "modes").is_dir():
         modes_dir = root / "ai_workspace" / "modes"
-    base_path = modes_dir / f"{variant_of}.yaml"
-    if not base_path.is_file():
-        # CC1 (В2-B 2f): variant_of — id режима (S11); конвенция файлов
-        # использует точки (statya.local.yaml), id — дефисы (statya-local).
-        # Прямое имя не нашлось → пробуем dash→dot; прежние режимы
-        # (statya.deep → statya.yaml) резолвятся прямым путём без изменений.
-        dotted = modes_dir / f"{variant_of.replace('-', '.')}.yaml"
-        if dotted.is_file():
-            base_path = dotted
+    base_path = resolve_mode_file(modes_dir, variant_of)
     if not base_path.is_file():
         return [
             _f(

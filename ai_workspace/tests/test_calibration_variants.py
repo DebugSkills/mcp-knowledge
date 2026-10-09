@@ -348,3 +348,142 @@ def test_l16_dash_id_zone_check_via_fallback(tmp_path: Path):
     findings = lint_l16({"variant_of": "statya-local", "zone": "private"}, None, tmp_path)
     assert [f.code for f in findings] == ["L16"]
     assert findings[0].path == "zone"
+
+
+# ── P1-fix (критика 3c-promotion, REVISE 2026-10-09): variant_of из mode-файла
+#    + CV6 dash→dot (паритет L16) ──────────────────────────────────────────────
+
+
+@pytest.fixture()
+def shape_variants_path(tmp_path: Path) -> Path:
+    """tmp-дерево shape-варианта CC1: statya.full.local (variant_of:
+    statya-local) поверх базы statya.local — как реальные mode-файлы."""
+    modes = tmp_path / "modes"
+    modes.mkdir()
+    _write_mode(modes, "statya.local", "id: statya-local\n")
+    _write_mode(
+        modes,
+        "statya.full.local",
+        "id: statya-full-local\nvariant_of: statya-local\n",
+    )
+    return tmp_path / "calibration" / "variants.yaml"
+
+
+def test_record_decision_shape_variant_executable(shape_variants_path: Path):
+    """P1: запись для statya.full.local ИСПОЛНИМА — variant_of из mode-файла
+    (statya-local), CV6 резолвит dash→dot в statya.local.yaml; CV0–CV7
+    чистые, запись на носителе валидна (tmp-реестр, не реальный)."""
+    record_decision(
+        shape_variants_path,
+        "statya.full.local",
+        "promoted",
+        _PROBE_PAIR,
+        "operator",
+        "2026-10-09T12:00:00Z",
+    )
+    doc = yaml.safe_load(shape_variants_path.read_text(encoding="utf-8"))
+    entry = doc["entries"][0]
+    assert entry["variant"] == "statya.full.local"
+    assert entry["variant_of"] == "statya-local"  # из mode-файла, не rsplit
+    assert entry["status"] == "promoted"
+    assert validate_variants(doc, shape_variants_path.parent.parent / "modes") == []
+
+
+def test_record_decision_cv6_fail_closed_missing_base(tmp_path: Path):
+    """CV6 fail-closed НЕ ослаблен: база не найдена после ОБОИХ кандидатов
+    имени (ghost-base / ghost.base.yaml нет) → ValueError, реестр не тронут."""
+    modes = tmp_path / "modes"
+    modes.mkdir()
+    _write_mode(
+        modes, "statya.full.local", "id: statya-full-local\nvariant_of: ghost-base\n"
+    )
+    variants_path = tmp_path / "calibration" / "variants.yaml"
+    with pytest.raises(ValueError, match="CV6"):
+        record_decision(
+            variants_path,
+            "statya.full.local",
+            "promoted",
+            _PROBE_PAIR,
+            "operator",
+            "2026-10-09T12:00:00Z",
+        )
+    assert not variants_path.exists()
+
+
+def test_record_decision_variant_of_field_over_filename(tmp_path: Path):
+    """Источник истины — ПОЛЕ mode-файла: имя и поле расходятся, ОБЕ базы
+    существуют (rsplit-кандидат statya.full валиден, но НЕ база) —
+    записывается variant_of из mode-файла (statya-local)."""
+    modes = tmp_path / "modes"
+    modes.mkdir()
+    _write_mode(modes, "statya.full")  # rsplit-кандидат: существует, но не база
+    _write_mode(modes, "statya.local", "id: statya-local\n")
+    _write_mode(
+        modes,
+        "statya.full.local",
+        "id: statya-full-local\nvariant_of: statya-local\n",
+    )
+    variants_path = tmp_path / "calibration" / "variants.yaml"
+    record_decision(
+        variants_path,
+        "statya.full.local",
+        "baseline",
+        None,
+        "operator",
+        "2026-10-09T12:00:00Z",
+    )
+    doc = yaml.safe_load(variants_path.read_text(encoding="utf-8"))
+    assert doc["entries"][0]["variant_of"] == "statya-local"
+
+
+def test_cv6_dash_id_resolves_dot_file(tmp_path: Path):
+    """CV6 напрямую: variant_of — id с дефисами (statya-local) → файл с
+    точками (statya.local.yaml) резолвится — паритет L16 (dash→dot)."""
+    modes = tmp_path / "modes"
+    modes.mkdir()
+    _write_mode(modes, "statya.local", "id: statya-local\n")
+    _write_mode(modes, "statya.full.local", "id: statya-full-local\n")
+    doc = {
+        "schema": "calibration-variants/1",
+        "entries": [
+            {
+                "variant": "statya.full.local",
+                "variant_of": "statya-local",
+                "status": "baseline",
+                "decided_by": "operator",
+                "decided_at": "2026-10-09",
+            }
+        ],
+    }
+    assert validate_variants(doc, modes) == []
+
+
+def test_record_decision_legacy_mode_without_field_keeps_convention(
+    variants_path: Path,
+):
+    """Паритет F1: mode-файл без variant_of (legacy/не-вариант) — прежняя
+    цепочка (запись реестра → конвенция rsplit) работает без изменений."""
+    record_decision(
+        variants_path, "statya.deep", "baseline", None, "operator", "2026-10-09T12:00:00Z"
+    )
+    doc = yaml.safe_load(variants_path.read_text(encoding="utf-8"))
+    assert doc["entries"][0]["variant_of"] == "statya"
+
+
+def test_record_decision_mode_file_broken_yaml_fail_closed(tmp_path: Path):
+    """Битый YAML mode-файла → fail-closed ValueError (variant_of невыводим),
+    а НЕ молчаливый rsplit-вывод возможной неверной базы."""
+    modes = tmp_path / "modes"
+    modes.mkdir()
+    _write_mode(modes, "statya.full.local", "id: [unclosed\n  variant_of: statya-local\n")
+    variants_path = tmp_path / "calibration" / "variants.yaml"
+    with pytest.raises(ValueError, match="не читается"):
+        record_decision(
+            variants_path,
+            "statya.full.local",
+            "baseline",
+            None,
+            "operator",
+            "2026-10-09T12:00:00Z",
+        )
+    assert not variants_path.exists()

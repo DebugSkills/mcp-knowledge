@@ -3,7 +3,9 @@
 ``calibration/variants.yaml`` — SSOT promotion-решений вариантов режимов
 (``modes/<mode>.<variant>.yaml``, конвенция §7.2). Валидатор fail-closed:
 обязательные поля записи, статус-enum, существование файлов варианта и
-базового режима в ``modes_dir``, обязательность ``probe_pair{base,variant}``
+базового режима в ``modes_dir`` (CV6: id базы с дефисами резолвится
+dash→dot через ``resolve_mode_file`` — тот же fallback, что L16
+mode_lint; P1-fix критики 3c-promotion), обязательность ``probe_pair{base,variant}``
 для ``promoted``/``rejected`` (решение оператора P5 опирается на пару
 ProbeReport §7.3). В3-A 3a (F-5): при переданном ``reports_dir`` CV7
 ДОПОЛНИТЕЛЬНО резолвит файл отчёта ``probe-<run_id>.json`` по каждому ключу
@@ -26,6 +28,7 @@ from typing import Any
 import yaml
 
 from ai_workspace.calibration.policy import NEEDLE_RATE_FLOOR
+from ai_workspace.orchestrator.mode_lint import resolve_mode_file
 from ai_workspace.calibration.probe import report_filename
 from ai_workspace.calibration.profiles import SEVERITY_ERROR, Finding
 
@@ -61,16 +64,28 @@ def _err(code: str, message: str, path: str) -> Finding:
 
 
 def _check_mode_file(
-    findings: list[Finding], modes: Path, value: object, field: str, prefix: str, code: str
+    findings: list[Finding],
+    modes: Path,
+    value: object,
+    field: str,
+    prefix: str,
+    code: str,
+    *,
+    dash_fallback: bool = False,
 ) -> None:
-    """Файл ``modes/<value>.yaml`` существует (value — непустая строка)."""
+    """Файл режима существует (value — непустая строка).
+
+    ``dash_fallback`` (CV6, P1-fix критики 3c-promotion): value — id режима
+    (дефисы), файл — точки; резолв через ``resolve_mode_file`` — тот же
+    dash→dot fallback, что L16 (mode_lint.py). Прямой путь проверяется
+    первым — прежние записи (stem-имена) не затронуты.
+    """
     if not isinstance(value, str) or not value:
         findings.append(_err(code, f"{field} должен быть непустой строкой", f"{prefix}.{field}"))
         return
-    if not (modes / f"{value}.yaml").is_file():
-        findings.append(
-            _err(code, f"файл режима не найден: {modes / (value + '.yaml')}", f"{prefix}.{field}")
-        )
+    mode_path = resolve_mode_file(modes, value) if dash_fallback else modes / f"{value}.yaml"
+    if not mode_path.is_file():
+        findings.append(_err(code, f"файл режима не найден: {mode_path}", f"{prefix}.{field}"))
 
 
 def validate_variants(
@@ -141,10 +156,12 @@ def validate_variants(
         if "variant" in entry:
             _check_mode_file(findings, modes, entry.get("variant"), "variant", prefix, "CV5")
 
-        # CV6: variant_of указывает на существующий базовый режим.
+        # CV6: variant_of указывает на существующий базовый режим; id —
+        # дефисы → dash→dot fallback (паритет L16, P1-fix критики 3c).
         if "variant_of" in entry:
             _check_mode_file(
-                findings, modes, entry.get("variant_of"), "variant_of", prefix, "CV6"
+                findings, modes, entry.get("variant_of"), "variant_of", prefix, "CV6",
+                dash_fallback=True,
             )
 
         # CV7: probe_pair{base,variant} обязателен для promoted/rejected;
@@ -335,6 +352,37 @@ def evaluate_promotion(
     return {"passed": not reasons, "reasons": reasons}
 
 
+def _mode_file_variant_of(modes_dir: Path, variant: str) -> str | None:
+    """``variant_of`` из самого mode-файла варианта — канон (S11/L16).
+
+    P1-fix (критика 3c-promotion): именно поле mode-файла — источник истины
+    о базе варианта; вывод из имени файла по rsplit для statya.full.local
+    давал несуществующую базу statya.full → ложный CV6-отказ записи.
+    Файла нет / без поля → ``None`` (вызывающий идёт по legacy-цепочке);
+    битый YAML / не-mapping → ``ValueError`` (fail-closed: variant_of
+    невыводим, запись с невыводимой базой запрещена).
+    """
+    mode_path = resolve_mode_file(modes_dir, variant)
+    if not mode_path.is_file():
+        return None
+    try:
+        doc = yaml.safe_load(mode_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(
+            f"mode-файл варианта не читается: {mode_path} ({exc}) — "
+            "variant_of невыводим, запись запрещена (fail-closed)"
+        ) from exc
+    if not isinstance(doc, Mapping):
+        raise ValueError(
+            f"mode-файл варианта должен быть YAML-отображением: {mode_path} — "
+            "variant_of невыводим, запись запрещена (fail-closed)"
+        )
+    value = doc.get("variant_of")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
 def record_decision(
     variants_path: Path | str,
     variant: str,
@@ -350,7 +398,11 @@ def record_decision(
     → ``<ws>/modes``. Реестр валидируется ЦЕЛИКОМ (включая чужие записи) до
     записи: любые findings → ``ValueError``, файл не трогаем. ``probe_pair``
     обязателен для ``promoted``/``rejected`` (CV7); ``variant_of`` берётся из
-    существующей записи либо выводится из конвенции ``<mode>.<variant>``.
+    самого mode-файла варианта (канон, P1-fix критики 3c-promotion), при
+    отсутствии поля — из существующей записи либо из конвенции
+    ``<mode>.<variant>``. CV6 резолвит id базы с dash→dot fallback
+    (``resolve_mode_file``, паритет L16) и остаётся fail-closed, если база
+    не найдена после обоих кандидатов имени.
     ``reports_dir`` (В3-A 3a, F-5) — включает CV7-existing: run_id пары
     обязаны резолвиться в существующие ``probe-<run_id>.json``; ``None`` —
     паритет (наличие ключей пары).
@@ -372,6 +424,7 @@ def record_decision(
         entries = []
         doc["entries"] = entries
 
+    modes_dir = path.resolve().parent.parent / "modes"
     existing = next(
         (
             e
@@ -380,7 +433,15 @@ def record_decision(
         ),
         None,
     )
-    variant_of = (existing or {}).get("variant_of")  # type: ignore[union-attr]
+    # P1-fix (критика 3c-promotion): канонический источник variant_of — сам
+    # mode-файл варианта (поле variant_of, как читают его S11/L16), НЕ вывод
+    # из имени по rsplit: statya.full.local.yaml → variant_of: statya-local
+    # (rsplit давал несуществующий statya.full → CV6-отказ записи). Цепочка:
+    # mode-файл → прежняя запись реестра → конвенция <mode>.<variant>
+    # (legacy-режимы без поля variant_of в mode-файле).
+    variant_of = _mode_file_variant_of(modes_dir, variant)
+    if variant_of is None:
+        variant_of = (existing or {}).get("variant_of")  # type: ignore[union-attr]
     if not isinstance(variant_of, str) or not variant_of:
         variant_of = variant.rsplit(".", 1)[0] if "." in variant else variant
 
@@ -412,7 +473,6 @@ def record_decision(
         deduped.append(e)
     candidate["entries"] = deduped
 
-    modes_dir = path.resolve().parent.parent / "modes"
     findings = validate_variants(candidate, modes_dir, reports_dir=reports_dir)
     if findings:
         raise ValueError(
