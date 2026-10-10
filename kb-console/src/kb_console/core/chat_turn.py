@@ -5,7 +5,7 @@
 """
 
 from .llm_stream import run_turn_stream
-from .tool_loop import run_turn
+from .tool_loop import run_turn, text_tool_call_display_hold
 
 
 async def chat_turn(
@@ -31,9 +31,25 @@ async def chat_turn(
     else:
 
         async def _tee(msgs, **kwargs):
+            # Ф6-5/S1: tool-итерация в текстовой форме (деградация LiteLLM
+            # stream+tools) не показывается — on_delta получает только дельты
+            # естественно-языкового ответа; носитель гарантирован fallback'ом
+            # страницы (пустой acc → показ финального text).
+            mode: str | None = None  # None = решаем; далее "stream" | "hold"
+            buf = ""
             async for event in base_stream(msgs, **kwargs):
-                if isinstance(event, str):
-                    on_delta(event)
+                if isinstance(event, str) and event:
+                    if mode is None:
+                        buf += event
+                        verdict = text_tool_call_display_hold(buf)
+                        if verdict is False:
+                            mode = "stream"
+                            on_delta(buf)
+                            buf = ""
+                        elif verdict is True:
+                            mode = "hold"
+                    elif mode == "stream":
+                        on_delta(event)
                 yield event
 
         stream = _tee

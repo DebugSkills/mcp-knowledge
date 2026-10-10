@@ -1,9 +1,11 @@
 """Тесты chat_turn: on_delta-стрим, fail-soft персист, проброс kwargs в run_turn."""
 
 import asyncio
+from typing import Any
 
 from kb_console.core import chat_turn as chat_turn_mod
 from kb_console.core.chat_turn import chat_turn
+from kb_console.core.mcp_client import MCPClient
 
 USER_MSG = {"role": "user", "content": "привет"}
 
@@ -151,3 +153,56 @@ def test_run_turn_receives_kwargs(monkeypatch):
     assert kw["max_iters"] == 7
     assert kw["mcp_client"] is mcp
     assert fake.calls[0]["messages"] == [USER_MSG]
+
+
+# ── (Ф6-5/S1) отображение: tool-итерация НЕ стримится пользователю ──
+
+
+class _RecordingMCP(MCPClient):
+    """Fake MCPClient (isinstance — настоящий тип): пишет вызовы."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        super().__init__(base_url="http://fake", api_key="")
+
+    async def tools_call(  # type: ignore[override]
+        self, name: str, params: dict | None = None, timeout: float | None = None
+    ) -> Any:
+        self.calls.append((name, dict(params or {})))
+        return {"results": [{"knowledge_id": "kb-1", "title": "T"}]}
+
+
+def test_text_tool_call_iteration_not_displayed() -> None:
+    """S1: текстовая форма tool-call исполняется, но её JSON не показывается
+    в стриме — on_delta получает только дельты финального ответа
+    (live-деградация LiteLLM stream+tools, см. test_tool_loop Ф6-5)."""
+    mcp = _RecordingMCP()
+    calls: list[list[dict]] = []
+
+    async def llm(messages, **kwargs):  # type: ignore[no-untyped-def]
+        idx = len(calls)
+        calls.append([dict(m) for m in messages])
+        script = [
+            ['{"name": "', 'search_knowledge", "arguments": {"query": "x"}}'],
+            ["Ответ ", "модели"],
+        ]
+        for event in script[idx]:
+            yield event
+
+    got: list[str] = []
+    result = asyncio.run(
+        chat_turn(
+            [USER_MSG],
+            session_id="s-text-display",
+            zone="public",
+            mcp_client=mcp,
+            llm_stream=llm,
+            on_delta=got.append,
+        )
+    )
+    assert "".join(got) == "Ответ модели", "в отображение утёк tool-call JSON"
+    assert result["text"] == "Ответ модели"
+    assert len(mcp.calls) == 1
+    # tool-результат реально в контексте второй итерации
+    tool_msgs = [m for m in calls[1] if m.get("role") == "tool"]
+    assert tool_msgs and "kb-1" in str(tool_msgs[0].get("content"))

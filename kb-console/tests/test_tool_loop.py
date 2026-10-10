@@ -282,3 +282,82 @@ async def test_mcp_429_maps_to_domain_error() -> None:
         )
     assert ei.value.kind == "rate_limit"
     assert ei.value.status == 429
+
+
+# ── (Ф6-5/S1) текстовая форма tool-call: live-деградация LiteLLM stream+tools ──
+# Носители (arch-2026-10-10-ai-ws-acceptance, сессия 5): ollama direct и
+# LiteLLM non-stream отдают нативные tool_calls; LiteLLM 1.104 stream+tools
+# кладёт вызов в content текстом. run_turn обязан распознавать обе текстовые
+# формы, иначе MCP не вызывается, а JSON уходит пользователю как «ответ».
+
+
+async def test_text_form_tool_call_envelope_executes_search() -> None:
+    """Envelope-форма: стрим-дельты собираются в ``{"name": …, "arguments": …}``
+    — вызов исполняется, финальный текст — ответ итерации 2."""
+    fake_mcp = FakeMCP(result={"results": [{"knowledge_id": "kb-1", "title": "T"}]})
+    llm = FakeLLM(
+        [
+            [
+                '{"name": "',
+                "search_knowledge",
+                '", "arguments": ',
+                '{"query": "MCP", "top_k": 3}}',
+            ],
+            ["Нашёл: T"],
+        ]
+    )
+    text = await run_turn(
+        [{"role": "user", "content": "найди MCP"}],
+        session_id="t-text-envelope",
+        zone="public",
+        mcp_client=fake_mcp,
+        llm_stream=llm,
+    )
+    assert text == "Нашёл: T"
+    assert len(fake_mcp.calls) == 1, "текстовый tool-call не исполнен"
+    name, params = fake_mcp.calls[0]
+    assert name == SEARCH_TOOL_NAME
+    assert params == {"query": "MCP", "top_k": 3, "zone": "public"}
+
+
+async def test_text_form_tool_call_fenced_args_only_executes_search() -> None:
+    """Args-only форма: fenced JSON с аргументами + комментарий модели —
+    вызов исполняется, сопроводительный текст отбрасывается."""
+    fake_mcp = FakeMCP(result={"results": []})
+    llm = FakeLLM(
+        [
+            [
+                "```json\n",
+                '{"query": "тест", "top_k": 2}',
+                "\n```\n",
+                "Дождитесь ответа от инструмента `search_knowledge`.",
+            ],
+            ["Готово"],
+        ]
+    )
+    text = await run_turn(
+        [{"role": "user", "content": "тест"}],
+        session_id="t-text-fenced",
+        zone="public",
+        mcp_client=fake_mcp,
+        llm_stream=llm,
+    )
+    assert text == "Готово"
+    assert len(fake_mcp.calls) == 1
+    _, params = fake_mcp.calls[0]
+    assert params == {"query": "тест", "top_k": 2, "zone": "public"}
+
+
+async def test_plain_answer_without_json_not_tool_call() -> None:
+    """No-false-positive: обычный текстовый ответ НЕ распознаётся как вызов."""
+    fake_mcp = FakeMCP()
+    llm = FakeLLM([["Обычный ответ", " без JSON-вызовов"]])
+    text = await run_turn(
+        [{"role": "user", "content": "привет"}],
+        session_id="t-plain",
+        zone="public",
+        mcp_client=fake_mcp,
+        llm_stream=llm,
+    )
+    assert text == "Обычный ответ без JSON-вызовов"
+    assert fake_mcp.calls == []

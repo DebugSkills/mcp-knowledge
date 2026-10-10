@@ -257,12 +257,19 @@ airgap-apply:  ## Air-gap (УЗЕЛ aikb): применить пакет-обн�
 # kb-console (Фаза 13.7) — NiceGUI-клиент (диагностика + импорт + поиск)
 # ═══════════════════════════════════════════════════════════════
 
-.PHONY: console-build console-test
+.PHONY: console-build console-test console-e2e
 console-build:  ## Собрать образ kb-console:prod
 	docker build -t kb-console:prod ./kb-console
 
 console-test:  ## Юнит + smoke тесты kb-console (нужен установленный пакет)
 	.venv/bin/python -m pytest kb-console/tests -v
+
+console-e2e:  ## e2e kb-console (Ф6): self-инстансы legacy+per-user (дефолт) или KB_CONSOLE_URL=<внешний контур>
+	@bash -c 'set -a; \
+	for k in CONSOLE_PASSWORD KB_CONSOLE_E2E_USER KB_CONSOLE_E2E_PASSWORD CALIB_API_KEY MCP_API_KEY LITELLM_MASTER_KEY; do \
+	v=$$(grep -m1 -E "^$$k=" .env 2>/dev/null | cut -d= -f2-); [ -n "$$v" ] && export "$$k=$$v"; \
+	done; set +a; \
+	KB_CONSOLE_E2E=1 exec .venv/bin/python -m pytest kb-console/tests/e2e -q'
 
 # ═══════════════════════════════════════════════════════════════
 # Torch GPU/CPU установка (Фаза 8.1)
@@ -580,7 +587,16 @@ ws-up-test: ## Ф3.1: ws-redis с test-only overlay (127.0.0.1:6390, loopback)
 ws-test: ## Ф3.1: unit-тесты ai_workspace (без Redis; integration авто-skip)
 	.venv/bin/python -m pytest ai_workspace/tests -q
 
-ws-test-integration: ## Ф3.1: integration-тесты (сначала make ws-up-test)
+ws-test-integration: ## Ф3.1/Ф1-acceptance: integration-тесты (сначала make ws-up-test); ждёт готовность ws-redis по $(WS_TEST_REDIS_URL) до 20×1с, затем fail-loud (НЕ молча skip)
+	@READY=; for i in $$(seq 1 20); do \
+		if WS_REDIS_URL=$(WS_TEST_REDIS_URL) .venv/bin/python -c "import os, redis; redis.Redis.from_url(os.environ['WS_REDIS_URL'], socket_connect_timeout=1, socket_timeout=1).ping()" 2>/dev/null; then \
+			echo "ws-redis готов (попытка $$i/20)"; READY=1; break; \
+		fi; \
+		sleep 1; \
+	done; \
+	if [ -z "$$READY" ]; then \
+		echo "ОШИБКА: ws-redis не стал доступен за 20с по $(WS_TEST_REDIS_URL) — сначала make ws-up-test"; exit 1; \
+	fi
 	WS_REDIS_URL=$(WS_TEST_REDIS_URL) .venv/bin/python -m pytest ai_workspace/tests -q -m integration
 
 ws-budget-reconcile: ## Ф4-rev P0-1: ночная сверка ws:budget:* с журналом (WS_REDIS_URL — ПРОД ws-redis, дефолта НЕТ; владелец — оператор, nightly)

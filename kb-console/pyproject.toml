@@ -22,6 +22,9 @@ dev = [
     "ruff>=0.8",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    # e2e (Ф6 arch-2026-10-10-ai-ws-acceptance): Playwright-раннер tests/e2e
+    # (chromium; браузер ставится отдельно: playwright install chromium)
+    "pytest-playwright>=0.10",
 ]
 
 [tool.setuptools.packages.find]
@@ -35,4 +38,15 @@ where = ["src"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests/"]
-addopts = "--strict-markers"
+# e2e (Ф6 arch-2026-10-10-ai-ws-acceptance): browser-e2e исключены из юнит-прогонов
+# (console-test / preflight G3) — паттерн mcp_server/tests/e2e; запуск: make console-e2e.
+addopts = "--strict-markers -m 'not e2e'"
+markers = [
+    "e2e: browser e2e kb-console — живой стек (KB_CONSOLE_URL); запуск `make console-e2e`",
+    # Ф6-1: e2e-тестами НЕ используется. Коллекция tests/ заходит и в tests/e2e/
+    # (модули импортируются до deselect -m 'not e2e'); test_s3 тянет цепочку
+    # admin_api → tools.vp_ab_pilot → ai_workspace.tests.test_engine с
+    # @pytest.mark.integration — pytest 9 при --strict-markers валидирует маркер
+    # в момент транзитивного импорта. Регистрируем, чтобы коллекция не падала.
+    "integration: ai_workspace integration-тесты (транзитивный импорт из e2e; см. комментарий выше)",
+]

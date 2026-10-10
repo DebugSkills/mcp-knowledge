@@ -153,6 +153,21 @@ def page_quotas() -> None:
     build_quotas()
 
 
+@ui.page("/calibration")
+def page_calibration() -> None:
+    """Страница «Калибровка» — admin-UI калибровки системы (calib-admin-ui Ф2).
+
+    Проводка маршрута (arch-2026-10-10-ai-ws-acceptance Ф6-1): ROUTES-строка
+    и builder были (824a274), регистрация @ui.page отсутствовала — /calibration
+    отдавал 404 при видимой admin-кнопке навигации. Гейт роли живёт внутри
+    build_calibration (403-заглушка, паттерн documents.py); здесь только
+    проводка (паттерн /quotas).
+    """
+    render_header("calibration")
+    from .pages.calibration import build_calibration
+    build_calibration()
+
+
 # ── Start ───────────────────────────────────────────────────
 
 # kb-console-roles Ф2: users-стор + bootstrap админа из env (идемпотентно).

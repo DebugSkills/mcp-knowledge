@@ -31,6 +31,7 @@ import inspect
 import json
 import logging
 import os
+import re
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any
 
@@ -248,6 +249,111 @@ def _default_mcp_client() -> MCPClient:
     )
 
 
+
+# ── Текстовая форма tool-call (Ф6-5/S1: LiteLLM stream+tools) ──────
+# Носители: ollama direct и LiteLLM non-stream отдают нативные tool_calls;
+# LiteLLM 1.104 при stream=true+tools кладёт вызов в content текстом
+# (envelope ``{"name": …, "arguments": …}`` либо fenced/голый JSON с
+# аргументами). Обе формы обязаны исполняться, иначе MCP не вызывается,
+# а сырой JSON уходит пользователю как «ответ».
+
+_JSON_OBJECT_RE = re.compile(r"\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}")
+_FENCE_RE = re.compile(r"```[a-zA-Z]*[ \t]*\r?\n?(.*?)```", re.DOTALL)
+
+#: Ключи args-only формы (подмножество схемы search_knowledge без zone —
+#: зону инжектит сервер, модель её не видит).
+_TEXT_CALL_ARG_KEYS = frozenset({"query", "top_k"})
+
+
+def _iter_text_call_candidates(text: str) -> list[str]:
+    """Кандидаты JSON-объектов из текста итерации: весь текст (обрезанный),
+    содержимое ```-fence'ов и вложенные JSON-объекты (до 3 уровней)."""
+    candidates = [text.strip()]
+    candidates += [m.group(1).strip() for m in _FENCE_RE.finditer(text)]
+    candidates += [m.group(0) for m in _JSON_OBJECT_RE.finditer(text)]
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for cand in candidates:
+        if cand and cand not in seen:
+            seen.add(cand)
+            uniq.append(cand)
+    return uniq
+
+
+def parse_text_tool_calls(text: str) -> list[dict[str, Any]]:
+    """Распознать текстовую форму вызова ``search_knowledge`` (Ф6-5/S1).
+
+    Формы (реальные live-наблюдения через LiteLLM stream+tools):
+      - envelope: ``{"name": "search_knowledge", "arguments": {…}}``;
+      - args-only: JSON из ключей схемы ``{"query": …, "top_k": …}``
+        (голый или в ```-fence, возможно с сопроводительным текстом модели).
+    Возврат — нормализованные вызовы (контракт ``_normalize_tool_calls``);
+    аргументы проходят серверную валидацию ``_search_params`` (зона —
+    ТОЛЬКО из сервера, I5/I6 не затронуты). Ограничение ложных срабатываний:
+    имя инструмента строго search_knowledge; args-only — только ключи схемы;
+    зацикливание ограничено max_iters вызывающего.
+    """
+    calls: list[dict[str, Any]] = []
+    seen_args: list[dict[str, Any]] = []
+    for candidate in _iter_text_call_candidates(text):
+        try:
+            parsed = json.loads(candidate)
+        except ValueError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        arguments: dict[str, Any] | None = None
+        if (
+            parsed.get("name") == SEARCH_TOOL_NAME
+            and isinstance(parsed.get("arguments"), dict)
+        ):
+            arguments = parsed["arguments"]
+        elif (
+            isinstance(parsed.get("query"), str)
+            and set(parsed) <= _TEXT_CALL_ARG_KEYS
+        ):
+            arguments = parsed
+        if arguments is None or arguments in seen_args:
+            continue
+        seen_args.append(arguments)
+        calls.append(
+            {
+                "id": f"text_{len(calls)}",
+                "name": SEARCH_TOOL_NAME,
+                "arguments": arguments,
+                "parse_error": False,
+            }
+        )
+    return calls
+
+
+def text_tool_call_display_hold(buffer: str) -> bool | None:
+    """Вердикт отображения начала итерации для стрим-tee (Ф6-5/S1).
+
+    True — держать (похоже на текстовый tool-call: после ws/```-fence
+    начинается ``{`` — не показывать), False — стримить пользователю,
+    None — решить позже (только пробелы / незавершённый fence-префикс).
+    Естественноязычные ответы никогда не начинаются с ``{`` после
+    json-fence, поэтому подавление не задевает нормальный стрим; если
+    «held»-текст не оказался вызовом, носитель гарантирует fallback
+    страницы (``acc`` пуст → показ финального text).
+    """
+    s = buffer.lstrip()
+    if s.startswith("`"):
+        return None  # незавершённый fence-префикс
+    if s.startswith("```"):
+        s = s[3:]
+        if s[:4].lower() == "json":
+            s = s[4:]
+        s = s.lstrip()
+        if not s:
+            return None
+        return s.startswith("{")
+    if not s:
+        return None
+    return s.startswith("{")
+
+
 # ── Публичный API ───────────────────────────────────────────────────
 
 
@@ -290,6 +396,12 @@ async def run_turn(
             ]
             for _ in range(iterations):
                 text, tool_calls = await _drain_llm(llm_stream, working)
+                if not tool_calls:
+                    # Ф6-5/S1 (arch-2026-10-10-ai-ws-acceptance): LiteLLM
+                    # stream+tools деградирует вызов до текста в content —
+                    # распознаём текстовую форму (gateway-агностик; нативные
+                    # delta.tool_calls остаются приоритетом).
+                    tool_calls = parse_text_tool_calls(text)
                 if not tool_calls:
                     return text
                 assistant: dict[str, Any] = {"role": "assistant", "content": text}
