@@ -196,7 +196,7 @@ airgap-pack:  ## [internal] Air-gap: пакет-подмножество (код
 airgap:  ## Air-gap: ЕДИНЫЙ диспетчер 3 режимов — MODE=full-usb|full-net|code-net [STEP=pack|ship|all] [OUT=] [USB=] [HOST=] [PIPE=] [RSYNC_PATH=] [DRY=1]
 	@ARGS='$(ARGS)' bash scripts/deploy-modes.sh MODE=$(MODE) STEP=$(STEP) \
 	  $(if $(OUT),--out $(OUT)) $(if $(USB),--usb $(USB)) \
-	  $(if $(HOST),--host $(HOST)) $(if $(PIPE),--pipe-via $(PIPE)) \
+	  $(if $(HOST),--host $(HOST)) $(if $(PIPE),--pipe-via $(PIPE)) $(if $(DEST),--dest $(DEST)) \
 	  $(if $(RSYNC_PATH),--rsync-path '$(RSYNC_PATH)') $(if $(DRY),--dry-run)
 
 # ─── Air-gap апдейт узла ОДНОЙ командой: playbook берётся ИЗ ПАКЕТА (O24-proof) ───

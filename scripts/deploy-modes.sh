@@ -24,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GIT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 MODE=""; MODE_GIVEN=0; STEP="all"; OUT="$GIT_ROOT/artifacts"
-USB=""; HOST=""; PIPE_VIA=""; RSYNC_PATH_ARG=""; MATRIX=0; DRY=0
+USB=""; HOST=""; PIPE_VIA=""; RSYNC_PATH_ARG=""; DEST=""; MATRIX=0; DRY=0
 EXTRA="${ARGS:-}"
 ALLOW_MODEL_DRIFT="${AIRGAP_ALLOW_MODEL_DRIFT:-0}"
 
@@ -51,6 +51,7 @@ while [ $# -gt 0 ]; do
     --host) shift; HOST="${1:-}" ;;
     --pipe-via) shift; PIPE_VIA="${1:-}" ;;
     --rsync-path) shift; RSYNC_PATH_ARG="${1:-}" ;;
+    --dest) shift; DEST="${1:-}" ;;
     --dry-run) DRY=1 ;;
     --matrix) MATRIX=1 ;;
     --help|-h) usage; exit 0 ;;
@@ -153,12 +154,14 @@ case "$MODE" in
     PACK=( "$SCRIPT_DIR/airgap-bundle-pack.sh" --out "$OUT" )
     SHIP=( "$SCRIPT_DIR/airgap-bundle-ship.sh" --src "$OUT" )
     if [ -n "$HOST" ]; then SHIP+=( --host "$HOST" ); fi
-    if [ -n "$PIPE_VIA" ]; then SHIP+=( --pipe-via "$PIPE_VIA" ); fi ;;
+    if [ -n "$PIPE_VIA" ]; then SHIP+=( --pipe-via "$PIPE_VIA" ); fi
+    if [ -n "$DEST" ]; then SHIP+=( --dest "$DEST" ); fi ;;
   code-net)
     PACK=( "$SCRIPT_DIR/airgap-pack-subset.sh" --out "$OUT" )
     SHIP=( "$SCRIPT_DIR/airgap-bundle-ship.sh" --src "$OUT" --files 'mcp-kb-update-*.tar.gz' )
     if [ -n "$HOST" ]; then SHIP+=( --host "$HOST" ); fi
-    if [ -n "$PIPE_VIA" ]; then SHIP+=( --pipe-via "$PIPE_VIA" ); fi ;;
+    if [ -n "$PIPE_VIA" ]; then SHIP+=( --pipe-via "$PIPE_VIA" ); fi
+    if [ -n "$DEST" ]; then SHIP+=( --dest "$DEST" ); fi ;;
 esac
 if [ -n "$RSYNC_PATH_ARG" ]; then SHIP+=( --rsync-path "$RSYNC_PATH_ARG" ); fi
 if [ -n "$EXTRA" ]; then read -r -a _extra <<< "$EXTRA"; PACK+=( "${_extra[@]}" ); fi
