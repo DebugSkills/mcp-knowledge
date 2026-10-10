@@ -35,6 +35,7 @@ VERIFY_SH="$SCRIPT_DIR/offline-update.sh"
 
 OUT="$GIT_ROOT/artifacts"
 ONLY=""   # --only: не добавлять дефолтные образы (только явные --image)
+EXTRA=()  # образы из --image (мержатся с defaults, либо заменяют при --only)
 IMAGES=("mcp-knowledge-mcp-server:latest" "mcp-knowledge-kb-converter:latest" \
         "ghcr.io/berriai/litellm:main-stable@sha256:625981c83410a3ea68eb0697590a57ec1d764d634514d54fa5db0591077ee839" \
         "redis:7-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08")
@@ -46,7 +47,7 @@ info() { echo "[airgap-pack-subset] $*" >&2; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --out) shift; OUT="${1:-}" ;;
-        --image) shift; IMAGES+=("${1:-}") ;;
+        --image) shift; EXTRA+=("${1:-}") ;;
         --tag) shift; ISO="${1:-}" ;;
         --only) ONLY=1 ;;
         --help|-h)
@@ -56,8 +57,8 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-# --only: набор образов = только то, что задано --image (инкрементальный rollout)
-if [ -n "$ONLY" ]; then IMAGES=(); fi
+# --only: набор образов = только --image; иначе дефолты + --image (инкрементальный rollout)
+if [ -n "$ONLY" ]; then IMAGES=("${EXTRA[@]}"); else IMAGES+=("${EXTRA[@]}"); fi
 
 [ -n "$OUT" ] || die "--out пуст"
 [ -n "$ISO" ] || ISO="$(date -u +%Y%m%dT%H%M%SZ)"
