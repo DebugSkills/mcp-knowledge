@@ -23,7 +23,7 @@ lint:
 check:
 	$(APB) $(PLAYBOOK) --check --diff $(VAULT_ARGS)
 run:
-	$(APB) $(PLAYBOOK) $(VAULT_ARGS)
+	$(APB) $(PLAYBOOK) $(ARGS) $(VAULT_ARGS)
 # Запуск одного тега (dirs|repos|docker|cron|host_prepare|transfer) на одном хосте:
 #   make run-tag PLAYBOOK=playbooks/deploy.yml ROLE=docker HOST=aikb
 run-tag:

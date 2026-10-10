@@ -167,7 +167,7 @@ prod-verify:
 #        → (носитель)  make update-bundle-verify DIR=/media/…/mcp-kb-update-….tar.gz
 #        → (aikb)      make prod-update-local BUNDLE=/media/…/mcp-kb-update-….tar.gz
 
-.PHONY: update-bundle update-bundle-verify prod-update-local bundle-pack bundle-unpack bundle-ship-usb bundle-ship-net airgap-runbook airgap airgap-pack airgap-update
+.PHONY: update-bundle update-bundle-verify prod-update-local bundle-pack bundle-unpack bundle-ship-usb bundle-ship-net airgap-runbook airgap airgap-first airgap-apply airgap-pack airgap-update
 
 update-bundle:  ## 038: собрать пакет offline-обновления (интернет-машина; ARGS="--with-models")
 	./scripts/offline-update.sh pack $(ARGS)
@@ -204,7 +204,7 @@ airgap:  ## Air-gap: ЕДИНЫЙ диспетчер 3 режимов — MODE=f
 # inventory узла; SKIP_BACKUP=1 → -e update_skip_backup=true; CHECK=1 → --check --diff;
 # VERIFY=1 → пост-апдейтный verify (scripts/verify-deploy.sh из каталога узла).
 airgap-inventory ?= /root/mcp-knowledge/ansible/inventory/
-airgap-update:  ## Air-gap: апдейт узла одной командой (BUNDLE=… [SKIP_BACKUP=1] [CHECK=1] [VERIFY=1])
+airgap-update:  ## Air-gap: апдейт узла [DEPRECATED → airgap-apply] (BUNDLE=… [SKIP_BACKUP=1] [CHECK=1] [VERIFY=1])
 	@test -n "$(BUNDLE)" || { echo 'usage: make airgap-update BUNDLE=<пакет.tar.gz|каталог> [SKIP_BACKUP=1] [CHECK=1] [VERIFY=1]'; exit 1; }
 	$(MAKE) -C ansible update-airgap BUNDLE="$(BUNDLE)" INVENTORY_DIR="$(airgap-inventory)" \
 	  SKIP_BACKUP=$(SKIP_BACKUP) CHECK=$(CHECK)
@@ -227,6 +227,30 @@ bundle-ship-net:  ## 038: бандл → узел по сети (ARGS="--host JU
 
 airgap-runbook:  ## 038: напечатать полный ранбук air-gap (сборка→перенос→установка→приёмка)
 	@cat docs/operations/airgap-first-install.md
+
+# ─── Узловая сторона air-gap деплоя (УЗЕЛ aikb): развёртывание/приёмка из Makefile ───
+# Зеркало диспетчера lup (`make airgap`). Тонкие шимы над существующими ansible-целями
+# (O24: работают из старого клона узла — новых файлов не требуют).
+#   airgap-first — ПЕРВИЧНАЯ установка узла (обёртка deploy.yml; air-gap флаг --skip-tags repos)
+#   airgap-apply — применить пакет-обновление (update-airgap + VERIFY=1 по умолчанию)
+#   приёмка узла — `make verify-deploy` (post-apply, 7 проверок)
+# DRY=1 — напечатать план (команду) без исполнения.
+airgap-node-marker ?= /etc/mcp-knowledge/airgap-node
+
+airgap-first:  ## Air-gap (УЗЕЛ aikb): первичная установка — deploy.yml [CHECK=1 → --check --diff; DRY=1]
+	@if [ -z "$(DRY)" ] && [ ! -f "$(airgap-node-marker)" ]; then \
+		echo "⚠️  airgap-first: маркер узла ($(airgap-node-marker)) отсутствует — похоже, это ИСТОЧНИК (lup). Узловые цели — НА УЗЛЕ aikb."; \
+	fi
+	@cmd='$(MAKE) -C ansible run PLAYBOOK=playbooks/deploy.yml INVENTORY="$(airgap-inventory)" ARGS="--skip-tags repos $(if $(CHECK),--check --diff) $(EXTRA_VARS)"'; \
+	if [ -n "$(DRY)" ]; then echo "DRY: $$cmd"; else eval "$$cmd"; fi
+
+airgap-apply:  ## Air-gap (УЗЕЛ aikb): применить пакет-обновление [BUNDLE=… SKIP_BACKUP=1 CHECK=1 VERIFY=0 DRY=1]
+	@test -n "$(BUNDLE)" || { echo 'usage: make airgap-apply BUNDLE=<пакет.tar.gz|каталог> [SKIP_BACKUP=1] [CHECK=1] [VERIFY=0] [DRY=1]'; exit 1; }
+	@cmd='$(MAKE) -C ansible update-airgap BUNDLE="$(BUNDLE)" INVENTORY_DIR="$(airgap-inventory)" SKIP_BACKUP=$(SKIP_BACKUP) CHECK=$(CHECK)'; \
+	if [ -n "$(DRY)" ]; then echo "DRY: $$cmd"; else eval "$$cmd"; fi
+	@if [ -z "$(DRY)" ] && [ "$(VERIFY)" != "0" ]; then \
+		echo "~~~ post-apply verify (verify-deploy) …"; bash scripts/verify-deploy.sh || exit $$?; \
+	fi
 
 # ═══════════════════════════════════════════════════════════════
 # kb-console (Фаза 13.7) — NiceGUI-клиент (диагностика + импорт + поиск)
