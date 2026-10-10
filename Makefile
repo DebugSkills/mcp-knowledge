@@ -167,7 +167,7 @@ prod-verify:
 #        → (носитель)  make update-bundle-verify DIR=/media/…/mcp-kb-update-….tar.gz
 #        → (aikb)      make prod-update-local BUNDLE=/media/…/mcp-kb-update-….tar.gz
 
-.PHONY: update-bundle update-bundle-verify prod-update-local bundle-pack bundle-unpack bundle-ship-usb bundle-ship-net airgap-runbook airgap-pack airgap-update
+.PHONY: update-bundle update-bundle-verify prod-update-local bundle-pack bundle-unpack bundle-ship-usb bundle-ship-net airgap-runbook airgap airgap-pack airgap-update
 
 update-bundle:  ## 038: собрать пакет offline-обновления (интернет-машина; ARGS="--with-models")
 	./scripts/offline-update.sh pack $(ARGS)
@@ -185,6 +185,18 @@ prod-update-local:  ## 038: air-gap апдейт прода из пакета (B
 #   make airgap-pack ARGS="--image kb-console:prod --out /media/usb"
 airgap-pack:  ## Air-gap: пакет-подмножество (код + локальные образы) — ARGS="--image IMG --out DIR"
 	./scripts/airgap-pack-subset.sh $(ARGS)
+
+# ─── Единый диспетчер air-gap деплоя: 3 режима (code-2026-10-10-deploy-modes, Ф1) ───
+# Единый вход (источник lup) поверх движков 038; без MODE — печатает матрицу режимов.
+#   make airgap MODE=full-usb STEP=all USB=/media/usb
+#   make airgap MODE=full-net STEP=all HOST=aikb      # или PIPE=aikb (pipe-fallback)
+#   make airgap MODE=code-net STEP=pack
+# Узловая сторона (aikb): bundle-unpack (full-*) · airgap-update (code-net) — см. матрицу.
+airgap:  ## Air-gap: ЕДИНЫЙ диспетчер 3 режимов — MODE=full-usb|full-net|code-net [STEP=pack|ship|all] [OUT=] [USB=] [HOST=] [PIPE=] [DRY=1]
+	@ARGS='$(ARGS)' bash scripts/deploy-modes.sh MODE=$(MODE) STEP=$(STEP) \
+	  $(if $(OUT),--out $(OUT)) $(if $(USB),--usb $(USB)) \
+	  $(if $(HOST),--host $(HOST)) $(if $(PIPE),--pipe-via $(PIPE)) \
+	  $(if $(DRY),--dry-run)
 
 # ─── Air-gap апдейт узла ОДНОЙ командой: playbook берётся ИЗ ПАКЕТА (O24-proof) ───
 #   make airgap-update BUNDLE=/var/tmp/update-bundle/mcp-kb-update-<ISO>.tar.gz SKIP_BACKUP=1
