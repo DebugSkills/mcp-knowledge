@@ -443,6 +443,9 @@ hooks-uninstall:  ## Удалить pre-push hook (в .trash/, обратимо)
 # mcp-knowledge-prod-ops, docs/observability/self-improvement-loop.md §13.9
 # ═══════════════════════════════════════════════════════════════
 
+prod-diag:  ## Диагностика прод-стека с логом для агента (make prod-diag; лог: /var/log/mcp-knowledge/diag/prod-diag-latest.log)
+	@bash scripts/prod-diag.sh
+
 .PHONY: verify-deploy push push-fast
 
 verify-deploy:  ## Post-deploy проверки стека: /health + логи + MCP tools + консоль (auth-aware)
