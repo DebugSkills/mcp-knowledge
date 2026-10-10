@@ -584,6 +584,32 @@ ws-up: ## Ф3.1: поднять ws-redis (порт НЕ публикуется �
 ws-down: ## Ф3.1: остановить ws-redis (только его, не workspace-консоль)
 	docker compose -f $(WS_COMPOSE) stop ws-redis
 
+# ── Слои стека: единый путь через make (arch-2026-10-10-ws-airgap-layers) ──
+# L2 gateway (compose.gateway.yml) · L3 ws-redis + L4 ws-консоль (compose.workspace.yml).
+# AIRGAP=1 → + compose.airgap.yml + --no-build (I12: air-gap узел НЕ собирает).
+WS_AIRGAP_OVERLAY := compose.airgap.yml
+WS_LAYER_COMPOSE := -f $(WS_COMPOSE) -f $(GATEWAY_COMPOSE)
+WS_BUILD_FLAGS :=
+ifeq ($(AIRGAP),1)
+WS_LAYER_COMPOSE += -f $(WS_AIRGAP_OVERLAY)
+WS_BUILD_FLAGS := --no-build
+endif
+
+.PHONY: ws-console-up ws-console-down ws-stack-up ws-stack-down stack-up
+ws-console-up: ## L4: поднять ws-консоль (чат; internal-only; AIRGAP=1 → без сборки)
+	docker compose $(WS_LAYER_COMPOSE) up -d $(WS_BUILD_FLAGS) workspace
+
+ws-console-down: ## L4: остановить ws-консоль
+	docker compose $(WS_LAYER_COMPOSE) stop workspace
+
+ws-stack-up: gateway-up ws-up ## WS-слой целиком: шлюз(L2)+ws-redis(L3)+ws-консоль(L4) [AIRGAP=1]
+	docker compose $(WS_LAYER_COMPOSE) up -d $(WS_BUILD_FLAGS) workspace
+
+ws-stack-down: ## WS-слой: остановить целиком
+	docker compose $(WS_LAYER_COMPOSE) down
+
+stack-up: deploy ws-stack-up ## ВСЕ слои: L1 knowledge + WS (dev). Air-gap: airgap-apply → make ws-stack-up AIRGAP=1
+
 ws-up-test: ## Ф3.1: ws-redis с test-only overlay (127.0.0.1:6390, loopback)
 	docker compose -f $(WS_COMPOSE) -f $(WS_COMPOSE_TEST) up -d ws-redis
 
