@@ -163,13 +163,13 @@ prod-verify:
 	@$(MAKE) airgap-verify
 
 # ─── Offline-update (038 Ф3): полный пакет + идемпотентное применение ───
-# Поток: (интернет-машина) make update-bundle [ARGS="--with-ollama-image --with-models"]
+# Поток: (интернет-машина) make update-bundle [ARGS="--with-models"]
 #        → (носитель)  make update-bundle-verify DIR=/media/…/mcp-kb-update-….tar.gz
 #        → (aikb)      make prod-update-local BUNDLE=/media/…/mcp-kb-update-….tar.gz
 
 .PHONY: update-bundle update-bundle-verify prod-update-local bundle-pack bundle-unpack bundle-ship-usb bundle-ship-net airgap-runbook airgap-pack airgap-update
 
-update-bundle:  ## 038: собрать пакет offline-обновления (интернет-машина; ARGS="--with-ollama-image --with-models")
+update-bundle:  ## 038: собрать пакет offline-обновления (интернет-машина; ARGS="--with-models")
 	./scripts/offline-update.sh pack $(ARGS)
 
 update-bundle-verify:  ## 038: проверка пакета на носителе (sha256 + bundle + manifest)

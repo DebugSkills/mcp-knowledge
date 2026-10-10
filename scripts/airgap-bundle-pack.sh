@@ -61,7 +61,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
     echo "ПЛАН (--dry-run, ничего не выполняется):"
     echo "  [1/7] preflight      — docker/git/gzip + свободно ≥ ${FREE_MIN_GB} ГБ на --out"
     echo "  [2/7] чистая копия  — при грязном дереве: git clone --local → $OUT_DIR/.pack-src (существующий ПЕРЕЗАПИСЫВАЕТСЯ)"
-    echo "  [3/7] сборка пакета  — offline-update.sh pack --with-ollama-image$([ $NO_MODELS -eq 0 ] && echo ' --with-models') --out $OUT_DIR"
+    echo "  [3/7] сборка пакета  — offline-update.sh pack$([ $NO_MODELS -eq 0 ] && echo ' --with-models') --out $OUT_DIR"
     echo "  [4/7] carrier-образ  — mcp-kb-models:<ISO> → mcp-kb-models-<ISO>.tar.gz"
     echo "  [5/7] база python    — docker save $PY_BASE_IMAGE → python-3.11-slim.tar.gz"
     echo "  [6/7] верификация    — offline-update.sh inspect --check <pkg>"
@@ -125,7 +125,9 @@ elapsed clean-src
 
 # ─── [3/7] сборка пакета ───
 step 3 "сборка пакета (offline-update.sh pack)"
-PACK_FLAGS=(--with-ollama-image)
+# ollama — 6-й элемент BASE_IMAGES (arch-2026-10-10-ai-ws-p2-1 R2):
+# легаси-ollama-флаг удалён, базовый набор уже полный.
+PACK_FLAGS=()
 [ "$NO_MODELS" -eq 0 ] && PACK_FLAGS+=(--with-models)
 [ -z "$COMMIT" ] || PACK_FLAGS+=(--commit "$COMMIT")
 MODELS_SRC="${OLLAMA_MODELS:-$GIT_ROOT/data/ollama/models}"

@@ -3,8 +3,8 @@
 # offline-update.sh — Air-gap ОБНОВЛЕНИЕ изолированного контура (038, Ф1)
 #
 # Поток (полный пакет + идемпотентное применение «только то, что нужно»):
-#   1. Интернет-машина:  ./scripts/offline-update.sh pack [--with-ollama-image]
-#                        [--with-models] → mcp-kb-update-<ISO>.tar.gz
+#   1. Интернет-машина:  ./scripts/offline-update.sh pack [--with-models]
+#                        → mcp-kb-update-<ISO>.tar.gz
 #   2. Носитель:         ./scripts/offline-update.sh verify /media/…/mcp-kb-update-….tar.gz
 #   3. Изолированный aikb: ./scripts/offline-update.sh apply-stage <пакет> \
 #                          --clone /opt/mcp-knowledge/mcp-knowledge
@@ -39,12 +39,20 @@ UPDATE_MODELS_NEEDED=("mxbai-embed-large" "nomic-embed-text" "qwen2.5:7b")
 # qwen2.5:7b — chat-модель compose (OLLAMA_CHAT_MODEL); в 003-списке её не было
 # (аудит 038 №13): без неё analyze_content на air-gap без chat-модели.
 
+# 6-й элемент — ollama, composite ref «tag@digest» (arch-2026-10-10-ai-ws-p2-1 R1,
+# решение A1; digest = index/RepoDigest, НЕ платформо-специфичный amd64-манифест):
+# pack тянет ИМЕННО по digest — гарантия pinned-контента; pack-assert ниже сверяет
+# RepoDigests ДО save; save/TSV/manifest — по тег-части ${img%@*} — О-1.
+# ВНИМАНИЕ: внутри массива НЕ оставлять комментариев со скобками — ленивый regex
+# `_bash_array` в tests/test_airgap_* обрежет массив на первой «)» и 6-й элемент
+# станет невидим для стражей.
 BASE_IMAGES=(
     "mcp-knowledge-mcp-server:latest"
     "kb-console:prod"
     "mcp-knowledge-kb-converter:latest"
     "qdrant/qdrant:v1.13.4"
     "caddy:2-alpine"
+    "ollama/ollama:0.20.2@sha256:0455f166da85b1d07f694c33ba09278ca649603c0611ba8e46272b16eed7fccd"
 )
 # Образы с тегом :latest, для которых перед load делается ретег :prev (rollback).
 ROLLBACK_IMAGES=(
@@ -129,6 +137,27 @@ try:
 except Exception:
     pass
 PY
+}
+
+# ─── assert_image_pin IMG — pack-side pin-verify: RepoDigests образа ⊇ digest ───
+# Для composite ref (name:tag@sha256:…): локальный образ под тег-частью обязан
+# иметь pinned digest в RepoDigests (index). Вызов — pack-этап, ПОСЛЕ pull, ДО
+# docker save. Работает ТОЛЬКО на pack-машине (pull-контекст): после docker load
+# RepoDigests пуст (§6-проба 1, arch-2026-10-10-ai-ws-p2-1) — на узле пин
+# проверяет store-агностичный is_ok(.Id|mdig ↔ manifest.json), НЕ этот ассерт.
+assert_image_pin() {
+    local img="$1" localref want repodigests
+    case "$img" in
+        *@sha256:*) ;;
+        *) return 0 ;;
+    esac
+    localref="${img%@*}"     # тег-часть: под ней образ лежит в локальном store
+    want="${img##*@}"        # sha256:<hex>
+    repodigests="$(docker image inspect -f '{{join .RepoDigests " "}}' "$localref" 2>/dev/null || true)"
+    case " $repodigests " in
+        *"${want}"*) ;;
+        *) die "pack: образ $img не соответствует пину (RepoDigests тег-части '$localref': '${repodigests:-<пусто>}')" ;;
+    esac
 }
 
 # ─── image_id_acceptable NEW_ID MANIFEST_ID [MANIFEST_DIGEST] ───
@@ -232,13 +261,11 @@ ollama_models_dir() {
 # pack — сборка пакета на машине с интернетом
 # ═══════════════════════════════════════════════════════════════════════════
 cmd_pack() {
-    local with_ollama=0 with_models=0 explicit_commit="" out_dir="$GIT_ROOT/artifacts"
+    local with_models=0 explicit_commit="" out_dir="$GIT_ROOT/artifacts"
+    # Легаси-ollama-флаги удалены (arch-2026-10-10-ai-ws-p2-1 R2, Ф-A2):
+    # ollama — обязательный 6-й элемент BASE_IMAGES, флаг мёртв.
     while [ $# -gt 0 ]; do
         case "$1" in
-            --with-ollama-image) with_ollama=1 ;;
-            --with-externals)
-                echo "WARN: --with-externals устарел (P2-N3), используйте --with-ollama-image." >&2
-                with_ollama=1 ;;
             --with-models) with_models=1 ;;
             --commit) shift; explicit_commit="${1:-}" ;;
             --out) shift; out_dir="${1:-}" ;;
@@ -248,7 +275,6 @@ cmd_pack() {
     done
 
     local -a images=("${BASE_IMAGES[@]}")
-    [ "$with_ollama" -eq 1 ] && images+=("ollama/ollama:0.20.2")
 
     echo "=== [pack] Сборка offline-update пакета (машина с интернетом) ==="
 
@@ -281,17 +307,25 @@ manifest.target_commit. Закоммитьте правки ИЛИ переда�
     ( cd "$GIT_ROOT" && docker compose -p "$COMPOSE_PROJECT" -f docker-compose.yml \
         build mcp-server kb-console kb-converter ) || die "docker compose build FAILED"
 
-    # внешние образы: pull при отсутствии
+    # внешние образы: pull при отсутствии; composite ref (tag@digest, R1) — pull
+    # ВСЕГДА: резолв именно по digest (гарантия pinned-контента + (пере)назначение
+    # тега на него; идемпотентен — «Image is up to date» при совпадении)
     local img
     for img in "${images[@]}"; do
-        if ! docker image inspect "$img" >/dev/null 2>&1; then
-            case "$img" in
-                qdrant/*|caddy/*|ollama/*)
-                    info "pull $img (отсутствует локально) …"
-                    docker pull "$img" || die "docker pull $img FAILED" ;;
-                *) die "образ $img не найден локально (это свой образ — должен был собраться build)" ;;
-            esac
-        fi
+        case "$img" in
+            *@sha256:*)
+                info "pull $img (pinned by digest) …"
+                docker pull "$img" || die "docker pull $img FAILED" ;;
+            *)
+                if ! docker image inspect "$img" >/dev/null 2>&1; then
+                    case "$img" in
+                        qdrant/*|caddy/*|ollama/*)
+                            info "pull $img (отсутствует локально) …"
+                            docker pull "$img" || die "docker pull $img FAILED" ;;
+                        *) die "образ $img не найден локально (это свой образ — должен был собраться build)" ;;
+                    esac
+                fi ;;
+        esac
     done
 
     local iso staging
@@ -299,20 +333,34 @@ manifest.target_commit. Закоммитьте правки ИЛИ переда�
     staging="$out_dir/mcp-kb-update-$iso"
     mkdir -p "$staging/images"
 
-    # per-image docker save | gzip + факты для manifest
+    # per-image docker save | gzip + факты для manifest.
+    # О-1 (manifest-name seam): для composite ref (tag@digest) всё локальное — по
+    # тег-части localref="${img%@*}": docker save, image inspect и name в TSV/manifest.
+    # Composite name в manifest.json убил бы node-side «docker image inspect
+    # '{{img.name}}'» (update.yml:418, set -e): после docker load digest-рефы не
+    # резолвятся (RepoDigests пуст). Дубль тег-части в BASE_IMAGES (если когда
+    # появится) — один tar; pinned-ассерт при этом выполняется для КАЖДОЙ записи
+    # с @sha256: (порядок элементов не важен).
     local tsv="$staging/.images.tsv"; : > "$tsv"
+    local -a pin_seen=()
     for img in "${images[@]}"; do
-        local id file bytes sum mdig
-        id="$(docker image inspect -f '{{.Id}}' "$img")"
-        file="images/$(slug "$img").tar.gz"
-        info "docker save $img → $file …"
-        docker save "$img" | gzip -1 > "$staging/$file"
+        local id file bytes sum mdig localref
+        localref="${img%@*}"
+        assert_image_pin "$img"
+        case " ${pin_seen[*]-} " in
+            *" $localref "*) info "  ($img: тег-часть $localref уже сохранена — пропуск дубля)"; continue ;;
+        esac
+        pin_seen+=("$localref")
+        id="$(docker image inspect -f '{{.Id}}' "$localref")"
+        file="images/$(slug "$localref").tar.gz"
+        info "docker save $localref → $file …"
+        docker save "$localref" | gzip -1 > "$staging/$file"
         bytes="$(stat -c%s "$staging/$file")"
         sum="$(sha256sum "$staging/$file" | awk '{print $1}')"
         mdig="$(image_manifest_digest "$staging/$file")"
-        [ -n "$mdig" ] || info "  ($img: index.json без manifests — сверка только по .Id)"
+        [ -n "$mdig" ] || info "  ($localref: index.json без manifests — сверка только по .Id)"
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$img" "$id" "$file" "$sum" "$bytes" "$mdig" >> "$tsv"
+            "$localref" "$id" "$file" "$sum" "$bytes" "$mdig" >> "$tsv"
     done
 
     # git bundle --all (полный: не требует знания prev-HEAD на pack-машине)
@@ -603,7 +651,7 @@ for l in m["layers"]:
 usage() {
     echo "Usage: $0 {pack|inspect|verify|apply-stage} …"
     echo ""
-    echo "  pack [--with-ollama-image] [--with-models] [--commit <sha>] [--out DIR]"
+    echo "  pack [--with-models] [--commit <sha>] [--out DIR]"
     echo "       собрать полный пакет обновления (интернет-машина)"
     echo "  inspect [--check] [--clone DIR] <пакет.tar.gz|каталог>"
     echo "       отчёт по manifest (--check = sha256+bundle+сверка)"
@@ -612,7 +660,8 @@ usage() {
     echo "  apply-stage <пакет> --clone DIR [--stage DIR] [--models-dir DIR]"
     echo "       идемпотентное применение: staging + load расходящихся + ff-only merge"
     echo ""
-    echo "  Флаги pack: --with-externals — deprecated-алиас --with-ollama-image."
+    echo "  Флаги pack: --with-models — добавить Ollama-модели; образ ollama входит"
+    echo "              всегда (6-й элемент BASE_IMAGES)."
 }
 
 # ─── wants_help ARGS… — 0, если среди аргументов есть -h/--help ───

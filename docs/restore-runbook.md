@@ -383,7 +383,7 @@ git remote add backup ssh://backup-host/path/to/repo.git
 
 ```bash
 # 1) Машина с интернетом — собрать полный пакет
-make update-bundle [ARGS="--with-ollama-image --with-models"]
+make update-bundle [ARGS="--with-models"]
 # 2) Носитель — проверка целостности пакета
 make update-bundle-verify DIR=/media/.../mcp-kb-update-<ISO>.tar.gz
 # 3) Изолированный хост — dry-run (план, 0 мутаций), затем применение

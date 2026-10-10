@@ -44,6 +44,10 @@ services:
 
   # ollama — LLM-движок проекта (эмбеддинги mxbai + chat qwen2.5vl) на GPU хоста.
   ollama:
+    # digest-пин (справочно): ollama/ollama:0.20.2@sha256:0455f166da85b1d07f694c33ba09278ca649603c0611ba8e46272b16eed7fccd
+    # Форма «тег + digest в комментарии» — прецедент compose.airgap.yml:8-12: на узле
+    # repo@digest не разрешается после docker load (air-gap). Строгий пин — composite ref
+    # в BASE_IMAGES offline-update.sh + pack-assert RepoDigests (arch-2026-10-10-ai-ws-p2-1 R1).
     image: ollama/ollama:0.20.2          # пиннинг = версия, КОТОРОЙ ПОСТРОЕН ИНДЕКС Qdrant (host 2026-08-19; host с тех пор 0.33.3 даёт другие векторы!)
     container_name: mcp-knowledge-ollama
     # НЕ host-net: host-ollama (другие проекты) остаётся на 11434. Внутри контейнера

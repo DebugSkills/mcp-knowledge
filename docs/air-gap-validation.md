@@ -617,14 +617,16 @@ mcp-kb-update-<ISO>/
 ├── images/                  # per-image docker save | gzip
 │   ├── mcp-knowledge-mcp-server_latest.tar.gz
 │   ├── kb-console_prod.tar.gz
+│   ├── mcp-knowledge-kb-converter_latest.tar.gz
 │   ├── qdrant_qdrant_v1.13.4.tar.gz
-│   └── caddy_2-alpine.tar.gz
+│   ├── caddy_2-alpine.tar.gz
+│   └── ollama_ollama_0.20.2.tar.gz   # всегда (BASE_IMAGES, digest-пин)
 ├── models/                  # опционально (--with-models): манифесты + blobs
 ├── manifest.json            # target_commit, images[].Id/sha256/bytes, models[].digest
 └── CHECKSUMS.sha256         # целостность всего пакета
 ```
 
-Опции: `--with-ollama-image` — добавить образ `ollama/ollama`; `--with-models` — добавить Ollama-модели (манифесты и blobs). Секреты (`.env`, keys) в пакет **не входят**.
+Опции: `--with-models` — добавить Ollama-модели (манифесты и blobs); образ `ollama/ollama` (6-й элемент `BASE_IMAGES`, digest-пин) входит в пакет всегда. Секреты (`.env`, keys) в пакет **не входят**.
 
 ### 7.3 How it differs from `make bundle`
 
@@ -653,7 +655,7 @@ mcp-kb-update-<ISO>/
 
 ```bash
 # 1) Машина с интернетом: собрать полный пакет
-make update-bundle                                  # + ARGS="--with-ollama-image --with-models"
+make update-bundle                                  # + ARGS="--with-models"
 # → artifacts/mcp-kb-update-<ISO>.tar.gz
 
 # 2) Носитель (флешка): после копирования — verify
