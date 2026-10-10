@@ -322,35 +322,19 @@ make airgap-update BUNDLE=/var/tmp/update-bundle/mcp-kb-update-<ISO>.tar.gz SKIP
 
 ## 🧱 Слои стека — всё через make-таргеты (arch-2026-10-10-ws-airgap-layers)
 
-Стек = слои; каждый поднимается своим таргетом (единый путь dev/air-gap). Никаких ручных
-`docker compose -f … up` — только цели make.
+Стек = слои; каждый — своим таргетом (единый путь dev/air-gap), ручных `docker compose up` нет.
 
-| Слой | Сервисы | Таргет | Порты |
-|------|---------|--------|-------|
-| **L1 knowledge** | mcp-server, kb-console, kb-console-tls, qdrant, ollama, kb-converter | `make deploy` | 8085↔**8443** (TLS-консоль), MCP↔**8444** (TLS) |
-| **L2 gateway** | litellm (шлюз LLM) | `make gateway-up` | internal :4000 |
-| **L3 ws-infra** | ws-redis | `make ws-up` | internal-only |
-| **L4 ws-консоль** | workspace (чат) + ws-console-tls | `make ws-console-up` | loopback **8095** ↔ **8445** (TLS) |
-| **WS-слой** | L2+L3+L4 | `make ws-stack-up` | — |
-| **Всё** | L1 + WS | `make stack-up` | — |
+| Слой | Таргет | Порты |
+|------|--------|-------|
+| L1 knowledge (mcp-server, kb-console, tls, qdrant, ollama, converter) | `make deploy` | 8085↔**8443**, MCP↔**8444** (TLS) |
+| L2 gateway (litellm) | `make gateway-up` | internal :4000 |
+| L3 ws-infra (ws-redis) | `make ws-up` | internal |
+| L4 ws-консоль (workspace + ws-console-tls) | `make ws-console-up` | loopback **8095**↔**8445** (TLS) |
+| WS-слой (L2+L3+L4) / всё (L1+WS) | `make ws-stack-up` / `make stack-up` | — |
 
-**Air-gap:** `make ws-stack-up AIRGAP=1` → `-f compose.airgap.yml` + `--no-build`
-(I12: узел НЕ собирает; образы приезжают в пакете). В `ansible/playbooks/update.yml` шаг
-выполняется автоматически после L1 при `ws_layer_enabled: true` (host_vars/aikb.yml).
-Пакет обязан нести WS-образы: `ghcr.io/berriai/litellm:main-stable@sha256:625981c8…` и
-`redis:7-alpine@sha256:bb186d08…` (уже в `BASE_IMAGES` offline-update.sh и в дефолтном
-`IMAGES` airgap-pack-subset.sh).
+**Air-gap:** `make ws-stack-up AIRGAP=1` → `-f compose.airgap.yml` + `--no-build` (I12). В `update.yml` — авто после L1 при `ws_layer_enabled: true`. Пакет несёт WS-образы: `ghcr.io/berriai/litellm:main-stable`, `redis:7-alpine` (в `BASE_IMAGES` + дефолт `IMAGES` pack-subset).
 
-**Доступ верстака (модель A — роли + fail-closed):** верстак = ТОТ ЖЕ образ kb-console,
-отдельные учётки (`CONSOLE_USERS_FILE` → volume `workspace/console`). Запуск с
-`CONSOLE_AUTH=required` и БЕЗ `CONSOLE_PASSWORD`: при пустом сторе процесс падает
-fail-fast (`resolve_auth_mode` RuntimeError → legacy-admin невозможен); непустой стор →
-per-user auth, роли из `users.jsonl` (обычный пользователь видит чат; admin-вкладки скрыты
-`min_role` + рантайм-гейт `is_admin()` → 403).
-
-**Фасад верстака:** `ws-console-tls` (Caddy, host-net) — общий локальный CA с
-`kb-console-tls` (volume `/data`), отдельный сайт **:8445** (8443=консоль, 8444=MCP-фасад).
-Firewall (host-prepare): `mcp_kb_host_prepare__lan_ports: ["8443","8444","8445"]`.
+**Доступ верстака (модель A):** тот же образ kb-console, свои учётки (`CONSOLE_USERS_FILE`→`workspace/console`). `CONSOLE_AUTH=required` + без `CONSOLE_PASSWORD` → при пустом сторе fail-fast (legacy-admin невозможен); иначе роли из `users.jsonl` (юзер = чат, admin-скрыт + `is_admin()` 403). Ключи верстака: `WS_MCP_KEY`(read+both), `WS_MCP_IMPORT_KEY`(import+both) — чеканить на узле `docker exec mcp-knowledge-server python -m mcp_server.cli token create ...`, класть в `.env`.
 
 ### Единый вход: 3 режима (`make airgap`) — трасса code-2026-10-10-deploy-modes
 

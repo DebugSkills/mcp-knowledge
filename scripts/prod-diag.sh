@@ -294,10 +294,15 @@ d26_units() {
 # ── D17: tool-loop smoke headless (F6-D-2) — реальный LLM+MCP внутри контейнера ──
 d17_toolloop() {
     command -v docker >/dev/null 2>&1 || { say_skip D17 tool-loop "docker недоступен"; return; }
-    local cn="${DIAG_CONSOLE_CONTAINER:-kb-console}"
-    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$cn"; then
-        cn="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'kb-console$' | head -1)"
+    # chat-контур верстака живёт в workspace (WS_*); kb-console — админ-UI без WS_*.
+    # Приоритет: DIAG_CONSOLE_CONTAINER > mcp-knowledge-workspace > kb-console.
+    local cn="${DIAG_CONSOLE_CONTAINER:-}"
+    if [ -z "$cn" ]; then
+        for cand in mcp-knowledge-workspace kb-console; do
+            docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$cand" && { cn="$cand"; break; }
+        done
     fi
+    [ -n "$cn" ] || cn="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'workspace$|kb-console$' | head -1)"
     [ -n "$cn" ] || { say_skip D17 tool-loop "контейнер kb-console не найден"; return; }
     local out
     out="$(timeout "${DIAG_TURN_TIMEOUT:-200}" docker exec -i "$cn" python - <<'PYEOF' 2>/dev/null | tail -1

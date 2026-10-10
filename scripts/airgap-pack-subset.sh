@@ -37,8 +37,8 @@ OUT="$GIT_ROOT/artifacts"
 ONLY=""   # --only: не добавлять дефолтные образы (только явные --image)
 EXTRA=()  # образы из --image (мержатся с defaults, либо заменяют при --only)
 IMAGES=("mcp-knowledge-mcp-server:latest" "mcp-knowledge-kb-converter:latest" \
-        "ghcr.io/berriai/litellm:main-stable@sha256:625981c83410a3ea68eb0697590a57ec1d764d634514d54fa5db0591077ee839" \
-        "redis:7-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08")
+        "ghcr.io/berriai/litellm:main-stable" \
+        "redis:7-alpine")
 ISO=""
 
 die() { echo "ОШИБКА: $*" >&2; exit 1; }

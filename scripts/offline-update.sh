@@ -52,8 +52,8 @@ BASE_IMAGES=(
     "mcp-knowledge-kb-converter:latest"
     "qdrant/qdrant:v1.13.4"
     "caddy:2-alpine"
-    "ghcr.io/berriai/litellm:main-stable@sha256:625981c83410a3ea68eb0697590a57ec1d764d634514d54fa5db0591077ee839"
-    "redis:7-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08"
+    "ghcr.io/berriai/litellm:main-stable"
+    "redis:7-alpine"
     "ollama/ollama:0.20.2@sha256:0455f166da85b1d07f694c33ba09278ca649603c0611ba8e46272b16eed7fccd"
 )
 # Образы с тегом :latest, для которых перед load делается ретег :prev (rollback).
