@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Unit-тесты gpu_k_detect.py (Ф-B, arch-2026-10-10-ai-ws-p2-1 R5).
 
 Контракты зафиксированы ЖИВЫМИ пробами на dev-машине 2026-10-10 (правило 10 —
@@ -71,7 +70,7 @@ def _run(tmp_path: Path, *args: str, path_dir: Path | None = None,
         env["PATH"] = "/nonexistent-gpu-k-test"
     return subprocess.run(
         [PY, str(SCRIPT), *args], capture_output=True, text=True,
-        env=env, timeout=60, cwd=str(tmp_path),
+        env=env, timeout=60, cwd=str(tmp_path), check=False,
     )
 
 
@@ -79,7 +78,7 @@ def _run(tmp_path: Path, *args: str, path_dir: Path | None = None,
 def tags_server():
     """Локальный HTTP-сервер с ЖИВОЙ формой /api/tags (реальный контракт)."""
     class H(BaseHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802
+        def do_GET(self):
             body = json.dumps(LIVE_TAGS).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -237,7 +236,7 @@ def test_weights_all_sources_fail_k1(tmp_path):
 def test_formula_import():
     sys.path.insert(0, str(ROOT / "scripts"))
     try:
-        import gpu_k_detect as g  # noqa: PLC0415
+        import gpu_k_detect as g
         assert g.compute_k(32000, 7000, 512, 1024, 1024) == 22
         assert g.compute_k(1000, 7000, 0, 1024, 1024) == 1    # клиппинг
         assert g.compute_k(32000, 7000, 0, 1024, 1024) == 23

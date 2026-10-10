@@ -68,6 +68,7 @@ def _run_smi(args: list[str]) -> str | None:
     try:
         cp = subprocess.run(
             [NVIDIA_SMI, *args], capture_output=True, text=True, timeout=15,
+            check=False,
         )
     except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError) as e:
         _warn(f"nvidia-smi недоступен ({e!r})")

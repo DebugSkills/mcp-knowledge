@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Рендер-механика litellm-шаблонов (Ф-B R3, arch-2026-10-10-ai-ws-p2-1).
 
 Проверяет семантику envsubst-рендера Makefile-цели gateway-render и ansible-таски:

@@ -180,8 +180,8 @@ class TestOllamaPinGuardsCatchMutations:
 
     @staticmethod
     def _base_pin():
-        ref = [i for i in _bash_array(_read(OFFLINE_UPDATE), "BASE_IMAGES")
-               if i.startswith(OLLAMA_PREFIX)][0]
+        ref = next(i for i in _bash_array(_read(OFFLINE_UPDATE), "BASE_IMAGES")
+                   if i.startswith(OLLAMA_PREFIX))
         return ref, ref.split("@sha256:", 1)
 
     @staticmethod
@@ -195,7 +195,7 @@ class TestOllamaPinGuardsCatchMutations:
 
     def test_wrong_tag_in_prod_compose_detected(self, tmp_path):
         """Тег 0.20.3 в image: prod-compose → страж (а) красный."""
-        ref, (tag, digest) = self._base_pin()
+        _ref, (tag, _digest) = self._base_pin()
         bad = self._mutated(tmp_path, COMPOSE_PROD, "docker-compose.prod.yml",
                             f"image: {tag}", f"image: {tag.replace('0.20.2', '0.20.3')}")
         with pytest.raises(AssertionError, match=r"\(а\)"):
@@ -203,14 +203,14 @@ class TestOllamaPinGuardsCatchMutations:
 
     def test_lost_digest_in_base_images_detected(self, tmp_path):
         """Потеря @sha256: у 6-го элемента BASE_IMAGES → страж (б) красный."""
-        ref, (tag, digest) = self._base_pin()
+        ref, (tag, _digest) = self._base_pin()
         bad = self._mutated(tmp_path, OFFLINE_UPDATE, "offline-update.sh", ref, tag)
         with pytest.raises(AssertionError, match=r"\(б\)"):
             _assert_ollama_pin(bad, COMPOSE_DEV, COMPOSE_PROD)
 
     def test_wrong_hex_in_compose_comment_detected(self, tmp_path):
         """Другой hex в digest-комментарии prod-compose → страж (в) красный."""
-        ref, (tag, digest) = self._base_pin()
+        _ref, (_tag, digest) = self._base_pin()
         bad = self._mutated(tmp_path, COMPOSE_PROD, "docker-compose.prod.yml",
                             f"@sha256:{digest}", f"@sha256:{'f' * 64}")
         with pytest.raises(AssertionError, match=r"\(в\)"):

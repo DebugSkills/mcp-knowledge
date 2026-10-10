@@ -525,7 +525,8 @@
             envsubst '${LITELLM_MAX_PARALLEL}' < "$t.in" > "$t"
           else
             # О-7: узел без gettext-base — python-замена (тот же whitelist из одного имени)
-            python3 -c 'import os,sys; sys.stdout.write(sys.stdin.read().replace("${LITELLM_MAX_PARALLEL}", os.environ["LITELLM_MAX_PARALLEL"]))' < "$t.in" > "$t"
+            python3 -c 'import os,sys; sys.stdout.write(sys.stdin.read().replace("${LITELLM_MAX_PARALLEL}", \
+              os.environ["LITELLM_MAX_PARALLEL"]))' < "$t.in" > "$t"
           fi
         done
         echo "[GPU-K] отрендерено с K={{ gpu_k }}"
