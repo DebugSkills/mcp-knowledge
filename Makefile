@@ -531,21 +531,26 @@ LITELLM_MAX_PARALLEL ?=
 # deploy поднимает только mcp-стек; шлюз — отдельный путь). Шаблоны .in = SSOT,
 # отрендеренные litellm*.config.yaml — gitignored-артефакты. Fail-safe: пусто/мусор/
 # нет nvidia-smi → K=1 (I13; не пустой литерал).
-gateway-render: ## Ф-B (R3): рендер litellm*.config.yaml из .in (K: LITELLM_MAX_PARALLEL > gpu_k_detect; fail→1)
+WS_LOCAL_MODEL_DEFAULT := qwen3:30b-a3b-instruct-2507-q4_K_M
+gateway-render: ## Ф-B: рендер litellm*.config.yaml из .in (K: LITELLM_MAX_PARALLEL>gpu_k_detect→1; local: WS_LOCAL_MODEL>env>.env→default)
 	@set -eu; \
 	k='$(LITELLM_MAX_PARALLEL)'; \
 	[ -n "$$k" ] || k="$${LITELLM_MAX_PARALLEL:-}"; \
 	[ -n "$$k" ] || k="$$(python3 scripts/gpu_k_detect.py --k-only 2>/dev/null || true)"; \
 	case "$$k" in ''|*[!0-9]*) k=1 ;; esac; \
 	[ "$$k" -ge 1 ] 2>/dev/null || k=1; \
-	echo "[gateway-render] K=$$k -> litellm.config.yaml + litellm.local_only.config.yaml"; \
-	export LITELLM_MAX_PARALLEL="$$k"; \
+	m='$(WS_LOCAL_MODEL)'; \
+	[ -n "$$m" ] || m="$${WS_LOCAL_MODEL:-}"; \
+	[ -n "$$m" ] || m="$$(grep -m1 '^WS_LOCAL_MODEL=' .env 2>/dev/null | cut -d= -f2-)"; \
+	[ -n "$$m" ] || m="$(WS_LOCAL_MODEL_DEFAULT)"; \
+	echo "[gateway-render] K=$$k local=$$m -> litellm.config.yaml + litellm.local_only.config.yaml"; \
+	export LITELLM_MAX_PARALLEL="$$k" WS_LOCAL_MODEL="$$m"; \
 	for t in litellm.config.yaml litellm.local_only.config.yaml; do \
 	  if command -v envsubst >/dev/null 2>&1; then \
-	    envsubst '$${LITELLM_MAX_PARALLEL}' < "$$t.in" > "$$t"; \
+	    envsubst '$${LITELLM_MAX_PARALLEL} $${WS_LOCAL_MODEL}' < "$$t.in" > "$$t"; \
 	  else \
 	    echo "[gateway-render] WARN: envsubst отсутствует (пакет gettext-base) — python-fallback (О-7)"; \
-	    python3 -c 'import os,sys; sys.stdout.write(sys.stdin.read().replace("$${LITELLM_MAX_PARALLEL}", os.environ["LITELLM_MAX_PARALLEL"]))' < "$$t.in" > "$$t"; \
+	    python3 -c 'import os,sys; s=sys.stdin.read().replace("$${LITELLM_MAX_PARALLEL}", os.environ["LITELLM_MAX_PARALLEL"]).replace("$${WS_LOCAL_MODEL}", os.environ["WS_LOCAL_MODEL"]); sys.stdout.write(s)' < "$$t.in" > "$$t"; \
 	  fi; \
 	done
 
