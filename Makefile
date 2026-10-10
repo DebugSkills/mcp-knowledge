@@ -193,11 +193,11 @@ airgap-pack:  ## [internal] Air-gap: пакет-подмножество (код
 #   make airgap MODE=full-net STEP=all HOST=aikb      # или PIPE=aikb (pipe-fallback)
 #   make airgap MODE=code-net STEP=pack
 # Узловая сторона (aikb): bundle-unpack (full-*) · airgap-update (code-net) — см. матрицу.
-airgap:  ## Air-gap: ЕДИНЫЙ диспетчер 3 режимов — MODE=full-usb|full-net|code-net [STEP=pack|ship|all] [OUT=] [USB=] [HOST=] [PIPE=] [DRY=1]
+airgap:  ## Air-gap: ЕДИНЫЙ диспетчер 3 режимов — MODE=full-usb|full-net|code-net [STEP=pack|ship|all] [OUT=] [USB=] [HOST=] [PIPE=] [RSYNC_PATH=] [DRY=1]
 	@ARGS='$(ARGS)' bash scripts/deploy-modes.sh MODE=$(MODE) STEP=$(STEP) \
 	  $(if $(OUT),--out $(OUT)) $(if $(USB),--usb $(USB)) \
 	  $(if $(HOST),--host $(HOST)) $(if $(PIPE),--pipe-via $(PIPE)) \
-	  $(if $(DRY),--dry-run)
+	  $(if $(RSYNC_PATH),--rsync-path '$(RSYNC_PATH)') $(if $(DRY),--dry-run)
 
 # ─── Air-gap апдейт узла ОДНОЙ командой: playbook берётся ИЗ ПАКЕТА (O24-proof) ───
 #   make airgap-update BUNDLE=/var/tmp/update-bundle/mcp-kb-update-<ISO>.tar.gz SKIP_BACKUP=1

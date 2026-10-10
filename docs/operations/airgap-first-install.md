@@ -332,7 +332,7 @@ make airgap-update BUNDLE=/var/tmp/update-bundle/mcp-kb-update-<ISO>.tar.gz SKIP
 
 - Источник: `make airgap MODE=… [STEP=pack|ship|all] [USB=…] [HOST=…|PIPE=…]` (`make airgap` без MODE — эта матрица).
 - Узел: `make airgap-first` (первичная установка, `CHECK=1` — план) · `make airgap-apply BUNDLE=…` (приёмка `verify-deploy` включена) · `make airgap-update` — устаревающий алиас.
-- **rsync через ВЛОЖЕННЫЙ jump (канон для `full-net`/`code-net`):** дефолт `--host <jump>` + `--rsync-path rsync` пишет на JUMP-хост. Правильно — `--rsync-path "ssh aikb rsync"` (напр. `ARGS='--host <jump> --rsync-path "ssh aikb rsync"'`); `--pipe-via` — гарантированный fallback (rc=3 = STOP без авто-pipe). На aikb rsync 3.2.7 присутствует.
+- **rsync через ВЛОЖЕННЫЙ jump (канон для `full-net`/`code-net`):** дефолт `--host <jump>` + `--rsync-path rsync` пишет на JUMP-хост. Правильно — `--rsync-path "ssh aikb rsync"`: `make airgap MODE=full-net STEP=ship HOST=<jump> RSYNC_PATH="ssh aikb rsync"`; `--pipe-via` — гарантированный fallback (rc=3 = STOP без авто-pipe). На aikb rsync 3.2.7 присутствует.
 - Инвариант: едут ТОЛЬКО код и модели; корпус знаний и индексы Qdrant — НИКОГДА.
 
 ### Н9 — `DATA_ROOT` для `backup.sh` при запуске через ansible
