@@ -64,10 +64,10 @@ setup_log() {
 }
 # emit: строка в stdout И в лог
 emit() { printf '%s\n' "$*"; [ -n "$LOG" ] && printf '%s\n' "$*" >> "$LOG" 2>/dev/null; return 0; }
-say_pass() { PASSED=$((PASSED+1)); echo "${C_G}[PASS]${C_0} $1 $2 · $3"; [ -n "$LOG" ] && printf '[PASS] %s %s · %s\n' "$1" "$2" "$3" >> "$LOG"; }
-say_fail() { FAILED=$((FAILED+1)); FAILED_IDS+=("$1"); echo "${C_R}[FAIL]${C_0} $1 $2 · $3"; [ -n "$LOG" ] && printf '[FAIL] %s %s · %s\n' "$1" "$2" "$3" >> "$LOG"; }
-say_warn() { WARNED=$((WARNED+1)); WARN_IDS+=("$1"); echo "${C_Y}[WARN]${C_0} $1 $2 · $3"; [ -n "$LOG" ] && printf '[WARN] %s %s · %s\n' "$1" "$2" "$3" >> "$LOG"; }
-say_skip() { SKIPPED=$((SKIPPED+1)); echo "${C_Y}[SKIP]${C_0} $1 $2 · $3"; [ -n "$LOG" ] && printf '[SKIP] %s %s · %s\n' "$1" "$2" "$3" >> "$LOG"; }
+say_pass() { PASSED=$((PASSED+1)); echo "${C_G}[PASS]${C_0} $1 $2 · $3"; [ -n "$LOG" ] && printf '[PASS] %s %s · %s\n' "$1" "$2" "$3" >> "$LOG"; return 0; }
+say_fail() { FAILED=$((FAILED+1)); FAILED_IDS+=("$1"); echo "${C_R}[FAIL]${C_0} $1 $2 · $3"; [ -n "$LOG" ] && printf '[FAIL] %s %s · %s\n' "$1" "$2" "$3" >> "$LOG"; return 0; }
+say_warn() { WARNED=$((WARNED+1)); WARN_IDS+=("$1"); echo "${C_Y}[WARN]${C_0} $1 $2 · $3"; [ -n "$LOG" ] && printf '[WARN] %s %s · %s\n' "$1" "$2" "$3" >> "$LOG"; return 0; }
+say_skip() { SKIPPED=$((SKIPPED+1)); echo "${C_Y}[SKIP]${C_0} $1 $2 · $3"; [ -n "$LOG" ] && printf '[SKIP] %s %s · %s\n' "$1" "$2" "$3" >> "$LOG"; return 0; }
 note() { echo "    $*"; [ -n "$LOG" ] && printf '    %s\n' "$*" >> "$LOG"; return 0; }
 
 env_val() { [ -f "$ENV_FILE" ] || return 0; awk -v kv="$1=" 'index($0,kv)==1{print substr($0,length(kv)+1);exit}' "$ENV_FILE"; }
@@ -291,11 +291,49 @@ d26_units() {
     if [ -n "$u" ]; then note "$u"; say_pass D26 units "systemd-юниты: найдены"; else say_warn D26 units "юниты mcp/kb/ollama/qdrant не найдены (docker-only?)"; fi
 }
 
+# ── D17: tool-loop smoke headless (F6-D-2) — реальный LLM+MCP внутри контейнера ──
+d17_toolloop() {
+    command -v docker >/dev/null 2>&1 || { say_skip D17 tool-loop "docker недоступен"; return; }
+    local cn="${DIAG_CONSOLE_CONTAINER:-kb-console}"
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$cn"; then
+        cn="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'kb-console$' | head -1)"
+    fi
+    [ -n "$cn" ] || { say_skip D17 tool-loop "контейнер kb-console не найден"; return; }
+    local out
+    out="$(timeout "${DIAG_TURN_TIMEOUT:-200}" docker exec -i "$cn" python - <<'PYEOF' 2>/dev/null | tail -1
+import asyncio, json
+import kb_console.core.tool_loop as tl
+calls = []
+_orig = tl._execute_tool_call
+async def _wrap(mcp, call, zone):
+    try:
+        calls.append(((call or {}).get("function") or {}).get("name") or (call or {}).get("name"))
+    except Exception:
+        calls.append("?")
+    return await _orig(mcp, call, zone)
+tl._execute_tool_call = _wrap
+from kb_console.core.chat_turn import chat_turn
+msgs = [{"role": "user", "content": "Найди в базе знаний через инструмент search_knowledge материалы про протокол MCP и перечисли названия."}]
+try:
+    res = asyncio.run(chat_turn(msgs, session_id="prod-diag", zone="private", max_iters=4))
+    print(json.dumps({"tool_calls": [c for c in calls if c], "text_len": len((res or {}).get("text", "")), "ok": any(calls)}))
+except Exception as e:
+    print(json.dumps({"error": type(e).__name__, "msg": str(e)[:160], "ok": False}))
+PYEOF
+)"
+    if [ -z "$out" ]; then say_warn D17 tool-loop "нет ответа от контейнера $cn (LLM/MCP недоступны?)"; return; fi
+    local ok calls tl_; ok="$(printf '%s' "$out" | "$PY" -c 'import json,sys;print(json.load(sys.stdin).get("ok"))' 2>/dev/null)"
+    calls="$(printf '%s' "$out" | "$PY" -c 'import json,sys;d=json.load(sys.stdin);print(",".join(d.get("tool_calls",[])) or "-")' 2>/dev/null)"
+    tl_="$(printf '%s' "$out" | "$PY" -c 'import json,sys;d=json.load(sys.stdin);print(d.get("text_len", d.get("error","?")))' 2>/dev/null)"
+    if [ "$ok" = "True" ]; then say_pass D17 tool-loop "tool-loop сработал: инструмент($calls) вызван, ответ ~${tl_} симв."
+    else say_fail D17 tool-loop "инструмент НЕ вызван: $out"; fi
+}
+
 setup_log
 emit "${C_B}═══ mcp-knowledge prod-diag · $(date -Iseconds) · host=$(hostname) ═══${C_0}"
 emit "log=$LOG  root=$ROOT  compose=$(detect_compose)"
 echo ""
-emit "${C_B}── системный контур ──${C_0}"; d20_host; d21_disk; d22_gpu; d23_gpu_stack; d24_ollama; d25_docker; d26_units; emit "${C_B}── прикладной контур ──${C_0}"; d1_services; d2_health; d3_metrics; d4_tools; d5_console_auth; d6_routes; d7_calibration; d8_console_tls; d9_converter; d10_router; d11_data; d13_calib_api; d14_git; d15_images; d16_zone_gate
+emit "${C_B}── системный контур ──${C_0}"; d20_host; d21_disk; d22_gpu; d23_gpu_stack; d24_ollama; d25_docker; d26_units; emit "${C_B}── прикладной контур ──${C_0}"; d1_services; d2_health; d3_metrics; d4_tools; d5_console_auth; d6_routes; d7_calibration; d8_console_tls; d9_converter; d10_router; d11_data; d13_calib_api; d14_git; d15_images; d16_zone_gate; d17_toolloop
 emit ""
 emit "${C_B}═══ ИТОГ prod-diag: ${C_G}${PASSED} passed${C_0} / ${C_R}${FAILED} failed${C_0} (${FAILED_IDS[*]:-}) / ${C_Y}${WARNED} warn${C_0} (${WARN_IDS[*]:-}) / ${SKIPPED} skipped ═══${C_0}"
 if [ -n "$LOG" ]; then printf 'ИТОГ: %s passed / %s failed / %s warn / %s skipped\n' "$PASSED" "$FAILED" "$WARNED" "$SKIPPED" >> "$LOG"
