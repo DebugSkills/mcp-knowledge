@@ -47,7 +47,7 @@ docker compose up -d kb-console      # → http://localhost:8085
 ```
 
 Полезные цели Makefile: `make dev`, `make logs`, `make test`, `make lint`,
-`make bundle`, `make deploy`, `make e2e`, `make prod-verify`, `make console-test`.
+`make bundle`, `make deploy`, `make e2e`, `make airgap-verify`, `make console-test`.
 
 ---
 

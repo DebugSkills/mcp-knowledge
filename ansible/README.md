@@ -28,7 +28,7 @@ Ansible-обвязка стека mcp-knowledge: подготовка хоста
 
 Из корня клона те же операции — passthrough: `make prod-update`, `prod-update-check`, `prod-logs [S=…] [N=…]`, `prod-events [M=…]`, `prod-health`, `prod-metrics`, `prod-stats`, `prod-backup`, `prod-backup-verify`, `prod-restore [SCOPE=…] [RESTORE_CONFIRM=yes] [RESTORE_SNAPSHOT=…]`.
 
-**Air-gap / offline-update (038, root `Makefile`):** `make airgap-verify` (проверка изолированного контура — smoke + E2E S1-S19; **переименование** `prod-verify` → `airgap-verify`, старый таргет оставлен deprecation-алиасом на 1 релиз) · `make update-bundle [ARGS="--with-models"]` (собрать offline-пакет на интернет-машине) · `make update-bundle-verify DIR=<пакет.tar.gz>` (проверка пакета на носителе) · `make prod-update-local BUNDLE=<пакет.tar.gz>` (применение на изолированном хосте → `make -C ansible update-local`).
+**Air-gap / offline-update (038, root `Makefile`):** `make airgap-verify` (проверка изолированного контура — smoke + E2E S1-S19; **переименование** `prod-verify` → `airgap-verify`; deprecated-алиас `prod-verify` удалён (Ф3 трассы code-2026-10-10-deploy-modes) · `make update-bundle [ARGS="--with-models"]` (собрать offline-пакет на интернет-машине) · `make update-bundle-verify DIR=<пакет.tar.gz>` (проверка пакета на носителе) · `make prod-update-local BUNDLE=<пакет.tar.gz>` (применение на изолированном хосте → `make -C ansible update-local`).
 
 ## Структура каталога `ansible/`
 

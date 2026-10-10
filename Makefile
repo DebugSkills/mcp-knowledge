@@ -10,8 +10,14 @@ AIRGAP_NODE_MARKER ?= /etc/mcp-knowledge/airgap-node
 .PHONY: dev deploy down deploy-latest-log deploy-follow logs test lint clean dlq-replay reindex backup prereq-dirs errors-view errors-report errors-alert errors-notify-import errors-cron-install errors-cron-remove errors-cron-status errors-cron-cleanup prod-errors-cron-cleanup help
 
 # help: self-documenting список команд (docstring через `##` попадает сюда)
-help:  ## Список команд (docstring через ##)
-	@grep -hE '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | sort | \
+help:  ## Список команд (docstring через ##; внутренние движки — отдельной группой)
+	@echo "── Основные ────────────────────────────────────────────────"
+	@grep -hE '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | grep -vF '## [internal]' | sort | \
+		awk -F ':.*## ' '{printf "  %-24s %s\n", $$1, $$2}'
+	@echo ""
+	@echo "── Внутренние (движки 003/038; вызываются диспетчером make airgap) ──"
+	@grep -hE '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | grep -F '## [internal]' | \
+		sed 's/## \[internal\] /## /' | sort | \
 		awk -F ':.*## ' '{printf "  %-24s %s\n", $$1, $$2}'
 
 # Проверка и создание необходимых директорий перед запуском
@@ -151,16 +157,11 @@ e2e:  ## E2E-тесты ключевых решений (нужен запуще
 e2e-slow:  ## E2E + медленные сценарии (blue-green, GPU)
 	.venv/bin/python -m pytest mcp_server/tests/e2e -m "e2e or e2e_slow" -v
 
-bundle:  ## Собрать air-gap bundle для изолированного контура (машина с интернетом)
+bundle:  ## [internal] Собрать air-gap bundle для изолированного контура (машина с интернетом)
 	./scripts/offline-deploy.sh prepare
 
 airgap-verify:  ## Air-gap: проверка изолированного контура — smoke + E2E S1-S19 (offline-deploy.sh)
 	./scripts/offline-deploy.sh verify
-
-# Deprecated-alias (038 Ф3): оставить 1 релиз, чтобы не ломать привычку.
-prod-verify:
-	@echo "⚠️  prod-verify переименован в airgap-verify (038) — путаница с verify-deploy (post-deploy)."
-	@$(MAKE) airgap-verify
 
 # ─── Offline-update (038 Ф3): полный пакет + идемпотентное применение ───
 # Поток: (интернет-машина) make update-bundle [ARGS="--with-models"]
@@ -169,13 +170,13 @@ prod-verify:
 
 .PHONY: update-bundle update-bundle-verify prod-update-local bundle-pack bundle-unpack bundle-ship-usb bundle-ship-net airgap-runbook airgap airgap-first airgap-apply airgap-pack airgap-update
 
-update-bundle:  ## 038: собрать пакет offline-обновления (интернет-машина; ARGS="--with-models")
+update-bundle:  ## [internal] 038: собрать пакет offline-обновления (интернет-машина; ARGS="--with-models")
 	./scripts/offline-update.sh pack $(ARGS)
 
-update-bundle-verify:  ## 038: проверка пакета на носителе (sha256 + bundle + manifest)
+update-bundle-verify:  ## [internal] 038: проверка пакета на носителе (sha256 + bundle + manifest)
 	./scripts/offline-update.sh inspect --check $(DIR)
 
-prod-update-local:  ## 038: air-gap апдейт прода из пакета (BUNDLE=… [EXTRA_VARS="-e …"]; перед применением — update-local-check)
+prod-update-local:  ## [internal] 038: air-gap апдейт прода из пакета (BUNDLE=… [EXTRA_VARS="-e …"]; перед применением — update-local-check)
 	$(MAKE) -C ansible update-local BUNDLE=$(BUNDLE) $(EXTRA_VARS)
 
 # ─── Air-gap подмножество (038 Ф3+): пакет кода + ТОЛЬКО нужных образов ───
@@ -183,7 +184,7 @@ prod-update-local:  ## 038: air-gap апдейт прода из пакета (B
 # (qdrant/caddy) и моделей — для узла, где они уже стоят. Manifest несёт и id
 # (config-digest), и digest OCI-манифеста → сверка на узле store-агностична (Н11).
 #   make airgap-pack ARGS="--image kb-console:prod --out /media/usb"
-airgap-pack:  ## Air-gap: пакет-подмножество (код + локальные образы) — ARGS="--image IMG --out DIR"
+airgap-pack:  ## [internal] Air-gap: пакет-подмножество (код + локальные образы) — ARGS="--image IMG --out DIR"
 	./scripts/airgap-pack-subset.sh $(ARGS)
 
 # ─── Единый диспетчер air-gap деплоя: 3 режима (code-2026-10-10-deploy-modes, Ф1) ───
@@ -204,7 +205,7 @@ airgap:  ## Air-gap: ЕДИНЫЙ диспетчер 3 режимов — MODE=f
 # inventory узла; SKIP_BACKUP=1 → -e update_skip_backup=true; CHECK=1 → --check --diff;
 # VERIFY=1 → пост-апдейтный verify (scripts/verify-deploy.sh из каталога узла).
 airgap-inventory ?= /root/mcp-knowledge/ansible/inventory/
-airgap-update:  ## Air-gap: апдейт узла [DEPRECATED → airgap-apply] (BUNDLE=… [SKIP_BACKUP=1] [CHECK=1] [VERIFY=1])
+airgap-update:  ## [internal] Air-gap: апдейт узла [DEPRECATED → airgap-apply] (BUNDLE=… [SKIP_BACKUP=1] [CHECK=1] [VERIFY=1])
 	@test -n "$(BUNDLE)" || { echo 'usage: make airgap-update BUNDLE=<пакет.tar.gz|каталог> [SKIP_BACKUP=1] [CHECK=1] [VERIFY=1]'; exit 1; }
 	$(MAKE) -C ansible update-airgap BUNDLE="$(BUNDLE)" INVENTORY_DIR="$(airgap-inventory)" \
 	  SKIP_BACKUP=$(SKIP_BACKUP) CHECK=$(CHECK)
@@ -213,16 +214,16 @@ airgap-update:  ## Air-gap: апдейт узла [DEPRECATED → airgap-apply] 
 		bash scripts/verify-deploy.sh || exit $$?; \
 	fi
 
-bundle-pack:  ## 038: полный офлайн-бандл (образы+код+модели+carrier+python-база) — прогресс и лог (ARGS=…)
+bundle-pack:  ## [internal] 038: полный офлайн-бандл (образы+код+модели+carrier+python-база) — прогресс и лог (ARGS=…)
 	./scripts/airgap-bundle-pack.sh $(ARGS)
 
-bundle-unpack:  ## 038: распаковка бандла на узле (docker load + установка моделей) — прогресс и лог (BUNDLE=…)
+bundle-unpack:  ## [internal] 038: распаковка бандла на узле (docker load + установка моделей) — прогресс и лог (BUNDLE=…)
 	./scripts/airgap-bundle-unpack.sh --bundle "$(BUNDLE)" $(ARGS)
 
-bundle-ship-usb:  ## 038: бандл → USB (USB=/media/…) — прогресс, sha256-сверка, чек-лист узла (--checklist-only)
+bundle-ship-usb:  ## [internal] 038: бандл → USB (USB=/media/…) — прогресс, sha256-сверка, чек-лист узла (--checklist-only)
 	./scripts/airgap-bundle-ship.sh --usb "$(USB)" $(ARGS)
 
-bundle-ship-net:  ## 038: бандл → узел по сети (ARGS="--host JUMP" | ARGS="--pipe-via JUMP") — resumable (--checklist-only)
+bundle-ship-net:  ## [internal] 038: бандл → узел по сети (ARGS="--host JUMP" | ARGS="--pipe-via JUMP") — resumable (--checklist-only)
 	./scripts/airgap-bundle-ship.sh $(ARGS)
 
 airgap-runbook:  ## 038: напечатать полный ранбук air-gap (сборка→перенос→установка→приёмка)
