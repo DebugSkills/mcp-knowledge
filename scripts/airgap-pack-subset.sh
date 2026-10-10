@@ -23,6 +23,7 @@
 #                   + mcp-knowledge-kb-converter:latest — канонизатор Ф1+; прочие
 #                   sidecar'ы, напр. kb-console:prod, — через повторяемый --image)
 #     --tag ISO     явный ISO-суффикс имени пакета (default: date -u +%Y%m%dT%H%M%SZ)
+#     --only        НЕ добавлять дефолтные образы (только явные --image) — инкремент
 # Выход: <out>/mcp-kb-update-<ISO>.tar.gz (+ каталог) — самопроверка
 # `offline-update.sh verify` в конце; строки ISO/sha256/target/digest в stdout.
 # =============================================================================
@@ -33,6 +34,7 @@ GIT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VERIFY_SH="$SCRIPT_DIR/offline-update.sh"
 
 OUT="$GIT_ROOT/artifacts"
+ONLY=""   # --only: не добавлять дефолтные образы (только явные --image)
 IMAGES=("mcp-knowledge-mcp-server:latest" "mcp-knowledge-kb-converter:latest" \
         "ghcr.io/berriai/litellm:main-stable@sha256:625981c83410a3ea68eb0697590a57ec1d764d634514d54fa5db0591077ee839" \
         "redis:7-alpine@sha256:bb186d083732f669da90be8b0f975a37812b15e913465bb14d845db72a4e3e08")
@@ -46,6 +48,7 @@ while [ $# -gt 0 ]; do
         --out) shift; OUT="${1:-}" ;;
         --image) shift; IMAGES+=("${1:-}") ;;
         --tag) shift; ISO="${1:-}" ;;
+        --only) ONLY=1 ;;
         --help|-h)
             sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
@@ -53,6 +56,9 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+# --only: набор образов = только то, что задано --image (инкрементальный rollout)
+if [ -n "$ONLY" ]; then IMAGES=(); fi
+
 [ -n "$OUT" ] || die "--out пуст"
 [ -n "$ISO" ] || ISO="$(date -u +%Y%m%dT%H%M%SZ)"
 
