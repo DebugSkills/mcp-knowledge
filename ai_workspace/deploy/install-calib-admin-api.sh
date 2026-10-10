@@ -5,11 +5,15 @@
 # ЗАПУСК (нужен root):
 #   sudo ai_workspace/deploy/install-calib-admin-api.sh --sync-env
 #   sudo ai_workspace/deploy/install-calib-admin-api.sh --rotate-key --sync-env
+#   sudo ai_workspace/deploy/install-calib-admin-api.sh --gpu-k 2 --sync-env
 #   sudo ai_workspace/deploy/install-calib-admin-api.sh --uninstall
 #
 # ЧТО ДЕЛАЕТ (идемпотентно):
 #   1) ключ: переиспользует из /etc/calib-admin-api.env, иначе генерирует (openssl rand -hex 32)
 #   2) /etc/calib-admin-api.env (root:root 0600) — CALIB_API_KEY + CALIB_API_PORT=8700
+#      + WS_GPU_K=<K> (Ф-B, arch-2026-10-10-ai-ws-p2-1 R3): calib-admin-api —
+#      ЕДИНСТВЕННЫЙ рантайм-читатель WS_GPU_K (gpu.py env_gpu_k); K = --gpu-k N,
+#      иначе авто-детект scripts/gpu_k_detect.py (fail-мусор/нет nvidia-smi → 1, I13)
 #   3) [--sync-env] тот же ключ → repo .env (owner каталога, 0600); kb-console подхватит
 #   4) unit → /etc/systemd/system/ + daemon-reload + enable --now
 #   5) статус + probe 401 (сервис жив, auth включён)
@@ -24,12 +28,14 @@ ENV_FILE=/etc/calib-admin-api.env
 UNIT_DST="/etc/systemd/system/$SVC.service"
 PORT_DEFAULT=8700
 
-ROTATE=0; SYNC_ENV=0; UNINSTALL=0
+ROTATE=0; SYNC_ENV=0; UNINSTALL=0; GPU_K=""
 while [ $# -gt 0 ]; do case "$1" in
   --rotate-key) ROTATE=1 ;;
   --sync-env)   SYNC_ENV=1 ;;
+  --gpu-k)      [ $# -ge 2 ] || { echo "[install] --gpu-k требует значение (int >= 1)" >&2; exit 2; }
+                GPU_K="$2"; shift ;;
   --uninstall)  UNINSTALL=1 ;;
-  -h|--help)    sed -n '2,17p' "$0"; exit 0 ;;
+  -h|--help)    sed -n '2,19p' "$0"; exit 0 ;;
   *) echo "[install] неизвестный аргумент: $1" >&2; exit 2 ;;
 esac; shift; done
 
@@ -61,8 +67,18 @@ else
   log "ключ переиспользован из $ENV_FILE (--rotate-key чтобы сменить)"
 fi
 
+# K (Ф-B R3): --gpu-k > авто-детект gpu_k_detect.py > 1 (fail-safe, I13)
+if [ -z "$GPU_K" ]; then
+  GPU_K="$(python3 "$REPO_ROOT/scripts/gpu_k_detect.py" --k-only 2>/dev/null || true)"
+fi
+case "$GPU_K" in
+  ''|*[!0-9]*) GPU_K=1 ;;
+  *) [ "$GPU_K" -ge 1 ] 2>/dev/null || GPU_K=1 ;;
+esac
+log "WS_GPU_K=$GPU_K (--gpu-k чтобы переопределить; авто-детект gpu_k_detect.py)"
+
 umask 077
-printf 'CALIB_API_KEY=%s\nCALIB_API_PORT=%s\n' "$KEY" "${CALIB_API_PORT:-$PORT_DEFAULT}" > "$ENV_FILE"
+printf 'CALIB_API_KEY=%s\nCALIB_API_PORT=%s\nWS_GPU_K=%s\n' "$KEY" "${CALIB_API_PORT:-$PORT_DEFAULT}" "$GPU_K" > "$ENV_FILE"
 chown root:root "$ENV_FILE"; chmod 600 "$ENV_FILE"
 log "$ENV_FILE записан (root:root 0600)"
 umask 022

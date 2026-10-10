@@ -2,13 +2,17 @@
 # Зонная изоляция этим НЕ доказывается (→ Ф3); smoke-критерий: в /v1/models только local.
 # Использование: GATEWAY_CONFIG=litellm.local_only.config.yaml make gateway-up
 # Тест «egress-регресс зоны» (на узле, Ф1.E-ii): запрос model=ext через этот конфиг → 404 даже с ключом.
+#
+# ШАБЛОН (SSOT) — arch-2026-10-10-ai-ws-p2-1 Ф-B (R3): рендер envsubst (whitelist
+# переменной LITELLM_MAX_PARALLEL) → int-литерал (K); см. шапку litellm.config.yaml.in
+# (make gateway-render / ansible update.yml; fail-safe → K=1).
 
 model_list:
   - model_name: local
     litellm_params:
       model: ollama/qwen2.5:7b
       api_base: http://mcp-knowledge-ollama:11434
-      max_parallel_requests: 1   # = K (бенч K — см. litellm.config.yaml)
+      max_parallel_requests: ${LITELLM_MAX_PARALLEL}   # = K (int-литерал после рендера)
       timeout: 600
 
 router_settings:

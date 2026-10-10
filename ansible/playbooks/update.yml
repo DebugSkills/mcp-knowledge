@@ -490,6 +490,67 @@
         label: "{{ item.name }}"
       changed_when: true   # выполняется только когда манифест реально сменился
 
+    # ════════════════════ GPU-K (Ф-B, arch-2026-10-10-ai-ws-p2-1 R3/R5) ════════════════════
+    # Авто-детект K по free VRam ДО up: (1) рендер litellm*.config.yaml из .in-шаблонов
+    # (envsubst '${LITELLM_MAX_PARALLEL}' -> int-литерал; I12 — узел не собирает, только
+    # подстановка); (2) тот же K -> WS_GPU_K в .env клона (compose-интерполяция
+    # OLLAMA_NUM_PARALLEL=${WS_GPU_K:-1}, О-4); (3) WS_GPU_K -> /etc/calib-admin-api.env
+    # (единственный рантайм-читатель — calib-admin-api, R3 п.2). Fail-safe I13: детект-
+    # фейл/мусор/нет nvidia-smi -> K=1 (гарантировано скриптом + валидацией ниже).
+    - name: "GPU-K: авто-детект K по free VRAM (scripts/gpu_k_detect.py; fail->1)"
+      tags: [up]
+      ansible.builtin.command:
+        cmd: python3 scripts/gpu_k_detect.py --k-only --models-dir {{ data_root }}/ollama/models
+        chdir: "{{ clone_dir }}"
+      register: gpu_k_raw
+      changed_when: false
+      failed_when: false   # fail-safe внутри скрипта: всегда exit 0, k=1 при проблемах
+      check_mode: false    # safe in check: read-only probe (nvidia-smi + обход blobs)
+
+    - name: "GPU-K: валидация детекта (int >= 1, иначе 1)"
+      tags: [up]
+      ansible.builtin.set_fact:
+        # чистые фильтры (без ansible-теста regex): мусор/пусто/отрицательное -> 0 -> max(...,1)=1
+        gpu_k: "{{ [gpu_k_raw.stdout | default('') | trim | int(0), 1] | max }}"
+      changed_when: false
+
+    - name: "GPU-K: рендер litellm-конфигов из .in-шаблонов (envsubst whitelist; fallback python)"
+      tags: [up]
+      ansible.builtin.shell: |
+        set -eu
+        cd {{ clone_dir }}
+        export LITELLM_MAX_PARALLEL='{{ gpu_k }}'
+        for t in litellm.config.yaml litellm.local_only.config.yaml; do
+          if command -v envsubst >/dev/null 2>&1; then
+            envsubst '${LITELLM_MAX_PARALLEL}' < "$t.in" > "$t"
+          else
+            # О-7: узел без gettext-base — python-замена (тот же whitelist из одного имени)
+            python3 -c 'import os,sys; sys.stdout.write(sys.stdin.read().replace("${LITELLM_MAX_PARALLEL}", os.environ["LITELLM_MAX_PARALLEL"]))' < "$t.in" > "$t"
+          fi
+        done
+        echo "[GPU-K] отрендерено с K={{ gpu_k }}"
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: "GPU-K: WS_GPU_K -> .env клона (канал OLLAMA_NUM_PARALLEL, О-4)"
+      tags: [up]
+      ansible.builtin.lineinfile:
+        path: "{{ clone_dir }}/.env"
+        regexp: '^WS_GPU_K='
+        line: "WS_GPU_K={{ gpu_k }}"
+        create: true
+        mode: '0600'
+
+    - name: "GPU-K: WS_GPU_K -> /etc/calib-admin-api.env (calib-admin-api — рантайм-читатель)"
+      tags: [up]
+      ansible.builtin.lineinfile:
+        path: /etc/calib-admin-api.env
+        regexp: '^WS_GPU_K='
+        line: "WS_GPU_K={{ gpu_k }}"
+        create: true
+        mode: '0600'
+
     # ════════════════════ up ════════════════════
     - name: "Up: перезапустить стек (up -d --wait)"
       tags: [up]

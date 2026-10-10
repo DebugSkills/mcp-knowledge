@@ -75,6 +75,13 @@ services:
       # =2 — только если host-runner освободит VRAM (проверить nvidia-smi), риск OOM.
       - OLLAMA_KEEP_ALIVE=30m
       - OLLAMA_MAX_LOADED_MODELS=1
+      # Ф-B (arch-2026-10-10-ai-ws-p2-1 R3, I7): K ollama = OLLAMA_NUM_PARALLEL,
+      # ЯВНО (0.20.2 при unset дефолтит 1 — явная установка = единственный способ
+      # получить K>=2; §6b резолюция в). Канал (О-4): compose-интерполяция WS_GPU_K
+      # из окружения/.env клона — dev: .env (оператор) или дефолт 1; air-gap узел:
+      # ansible update.yml apply-этап пишет WS_GPU_K в .env + рендерит litellm* тем
+      # же K (один источник — gpu_k_detect.py). Дефолт :-1 = fail-safe (I13).
+      - OLLAMA_NUM_PARALLEL=${WS_GPU_K:-1}
     volumes:
       # ОТДЕЛЬНЫЙ от host-ollama каталог (/usr/share/ollama/.ollama НЕ трогаем):
       # блобы 2 моделей ~6.64GB (mxbai 0.67 + qwen2.5vl 5.97); контейнер работает от root → root-owned файлы, ок

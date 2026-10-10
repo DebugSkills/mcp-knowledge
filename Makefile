@@ -473,10 +473,36 @@ push-fast:  ## Пуш+деплой config/docs-правок (fail-safe: код-�
 GATEWAY_COMPOSE := compose.gateway.yml
 GATEWAY_CONTAINER := mcp-knowledge-litellm
 GATEWAY_CONFIG ?= litellm.config.yaml
+# GATEWAY_K — K канарейки (gateway-canary --k). K РЕНДЕРА конфига — отдельный канал:
+# LITELLM_MAX_PARALLEL (make/env) > авто-детект scripts/gpu_k_detect.py (Ф-B R3/R5);
+# тест-рендер K=2: make gateway-render LITELLM_MAX_PARALLEL=2 → make gateway-up → canary K=2
 GATEWAY_K ?= 1
+LITELLM_MAX_PARALLEL ?=
 
-.PHONY: gateway-up gateway-down gateway-logs gateway-health gateway-canary
-gateway-up: ## Ф1: поднять LLM-шлюз (start_period до 120s → проверь make gateway-health)
+.PHONY: gateway-render gateway-up gateway-down gateway-logs gateway-health gateway-canary
+# Ф-B (arch-2026-10-10-ai-ws-p2-1 R3, О-3): рендер — prereq gateway-up (НЕ make deploy:
+# deploy поднимает только mcp-стек; шлюз — отдельный путь). Шаблоны .in = SSOT,
+# отрендеренные litellm*.config.yaml — gitignored-артефакты. Fail-safe: пусто/мусор/
+# нет nvidia-smi → K=1 (I13; не пустой литерал).
+gateway-render: ## Ф-B (R3): рендер litellm*.config.yaml из .in (K: LITELLM_MAX_PARALLEL > gpu_k_detect; fail→1)
+	@set -eu; \
+	k='$(LITELLM_MAX_PARALLEL)'; \
+	[ -n "$$k" ] || k="$${LITELLM_MAX_PARALLEL:-}"; \
+	[ -n "$$k" ] || k="$$(python3 scripts/gpu_k_detect.py --k-only 2>/dev/null || true)"; \
+	case "$$k" in ''|*[!0-9]*) k=1 ;; esac; \
+	[ "$$k" -ge 1 ] 2>/dev/null || k=1; \
+	echo "[gateway-render] K=$$k -> litellm.config.yaml + litellm.local_only.config.yaml"; \
+	export LITELLM_MAX_PARALLEL="$$k"; \
+	for t in litellm.config.yaml litellm.local_only.config.yaml; do \
+	  if command -v envsubst >/dev/null 2>&1; then \
+	    envsubst '$${LITELLM_MAX_PARALLEL}' < "$$t.in" > "$$t"; \
+	  else \
+	    echo "[gateway-render] WARN: envsubst отсутствует (пакет gettext-base) — python-fallback (О-7)"; \
+	    python3 -c 'import os,sys; sys.stdout.write(sys.stdin.read().replace("$${LITELLM_MAX_PARALLEL}", os.environ["LITELLM_MAX_PARALLEL"]))' < "$$t.in" > "$$t"; \
+	  fi; \
+	done
+
+gateway-up: gateway-render ## Ф1: поднять LLM-шлюз (start_period до 120s → проверь make gateway-health). Ф-B: prereq gateway-render (рендер K)
 	docker compose -f $(GATEWAY_COMPOSE) up -d
 
 gateway-down: ## Ф1: остановить LLM-шлюз
@@ -493,7 +519,7 @@ gateway-health: ## Ф1: liveliness + per-deployment /health (изнутри ко
 	  "import os,urllib.request; req=urllib.request.Request('http://localhost:4000/health',headers={'Authorization':'Bearer '+os.environ['LITELLM_MASTER_KEY']}); print(urllib.request.urlopen(req,timeout=120).read().decode()[:800])" \
 	  || echo "⚠️  /health partial (ext unhealthy без DEEPSEEK_API_KEY — допустимо, Ф1.E-i)"
 
-gateway-canary: ## Ф1: K+1-проба → 429 throttling_error (fail-closed W==1). K: make gateway-canary K=2
+gateway-canary: ## Ф1: K+1-проба → 429 throttling_error (fail-closed W==1). K: make gateway-canary K=2 (тест-рендер того же K: make gateway-render LITELLM_MAX_PARALLEL=2)
 	docker exec -i $(GATEWAY_CONTAINER) python3 - --k $(GATEWAY_K) --model local \
 	  --base-url http://127.0.0.1:4000 < scripts/gateway_canary.py
 

@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -174,9 +175,25 @@ def test_signature_tiebreak_lex_name_insertion_independent(env):
     assert q2.dequeue(now=NOW, limit=2) == [a, b]  # порядок вставки не влияет
 
 
+def _rendered_gateway_yaml(name: str = "litellm.config.yaml", k: int = 1) -> str:
+    """Конфиг шлюза: дефолт-рендер шаблона .in с K=1 (I13) — Ф-B R3.
+
+    SSOT = ``<name>.in``; отрендеренный ``<name>`` — gitignored-артефакт (make
+    gateway-render / ansible update.yml), на диске может отсутствовать или нести
+    K!=1 (канареечный рендер) — тест опирается на ДЕФОЛТНЫЙ рендер K=1, чтобы
+    инвариант «K local == 1 в дефолте» не флапал от локального рендера.
+    Явная проверка конкретного артефакта: env GATEWAY_TEST_RENDERED=<путь>.
+    """
+    env_path = os.environ.get("GATEWAY_TEST_RENDERED")
+    if env_path:
+        return Path(env_path).read_text("utf-8")
+    tpl = (ROOT / f"{name}.in").read_text("utf-8")
+    return tpl.replace("${LITELLM_MAX_PARALLEL}", str(k))
+
+
 def test_signature_gateway_config_is_router_not_queue():
     """Шлюз — роутер, не очередь: сигнатуру порядка даёт наш policy.pick_best."""
-    doc = yaml.safe_load((ROOT / "litellm.config.yaml").read_text("utf-8"))
+    doc = yaml.safe_load(_rendered_gateway_yaml("litellm.config.yaml"))
     assert "queue" not in doc and "scheduler" not in doc
     rs = doc.get("router_settings", {})
     assert rs.get("num_retries") == 0  # 429 отдаём сразу (retry — наш слой)
@@ -188,12 +205,18 @@ def test_signature_gateway_config_is_router_not_queue():
     local = next(m for m in doc["model_list"] if m["model_name"] == "local")
     assert local["litellm_params"]["max_parallel_requests"] == 1  # K local
 
-    doc2 = yaml.safe_load(
-        (ROOT / "litellm.local_only.config.yaml").read_text("utf-8")
-    )
+    doc2 = yaml.safe_load(_rendered_gateway_yaml("litellm.local_only.config.yaml"))
     assert doc2["router_settings"].get("num_retries") == 0
     assert [m["model_name"] for m in doc2["model_list"]] == ["local"]
 
     compose = (ROOT / "compose.gateway.yml").read_text("utf-8")
     assert "--num_workers 1" in compose  # cap per-worker -> W==1
     assert "ports:" not in compose       # порт 4000 не публикуется (I1/I6)
+
+    # Ф-B (R3) стражи шаблонов: K живёт ТОЛЬКО в плейсхолдере ${LITELLM_MAX_PARALLEL}
+    # (int-литерал появляется только после рендера — дефолт-рендер K=1 выше)
+    for name in ("litellm.config.yaml", "litellm.local_only.config.yaml"):
+        tpl_text = (ROOT / f"{name}.in").read_text("utf-8")
+        assert "max_parallel_requests: ${LITELLM_MAX_PARALLEL}" in tpl_text, (
+            f"{name}.in: K обязан быть плейсхолдером ${{LITELLM_MAX_PARALLEL}} (SSOT-рендер)"
+        )

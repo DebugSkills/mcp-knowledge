@@ -1,10 +1,17 @@
 # Ф1 (arch-2026-10-05-ai-workspace): 2 полки LiteLLM — local (ollama) + ext (deepseek).
 # Инварианты: I5 — fallbacks НЕТ (private не должен уехать на ext); I12 — pin образа в compose.gateway.yml.
 #
-# K-параметризация (max_parallel_requests = K для полки local):
-#   сейчас K=1 (консервативно). Повышение — после бенча (план Ф1 TODO #6):
-#   бенч 1→2 → max_parallel_requests: 2 → канарейка `make gateway-canary K=2`
-#   → reconcile с OLLAMA_NUM_PARALLEL (unified ws:gpu — Ф3, I7).
+# ШАБЛОН (SSOT) — arch-2026-10-10-ai-ws-p2-1 Ф-B (R3): НЕ редактировать отрендеренный
+# litellm.config.yaml (gitignored-артефакт). Рендер: envsubst с whitelist ИМЕННО
+# переменной LITELLM_MAX_PARALLEL (другие плейсхолдеры не трогаются)
+# → int-литерал в max_parallel_requests.
+#   dev:     make gateway-render (prereq цели gateway-up; НЕ внутри make deploy — О-3)
+#   air-gap: ansible apply-этап update.yml (после детекта K, до up)
+# Источник K — scripts/gpu_k_detect.py (авто-детект free VRAM, R5); fail-safe: пусто/
+# мусор/нет nvidia-smi → K=1 (не пустой литерал). Ручной тест-рендер K=2:
+#   make gateway-render LITELLM_MAX_PARALLEL=2 → канарейка make gateway-canary K=2
+#   → сверка с OLLAMA_NUM_PARALLEL (I7: один K в 4 носителях — litellm×2, WS_GPU_K,
+#   OLLAMA_NUM_PARALLEL в compose×2).
 #   ⚠️ Cap действует per-worker → в compose.gateway.yml обязан оставаться --num_workers 1.
 
 model_list:
@@ -13,7 +20,7 @@ model_list:
     litellm_params:
       model: ollama/qwen2.5:7b
       api_base: http://mcp-knowledge-ollama:11434
-      max_parallel_requests: 1   # = K
+      max_parallel_requests: ${LITELLM_MAX_PARALLEL}   # = K (int-литерал после рендера)
       timeout: 600
 
   # ── Полка ext: DeepSeek flash (внешний контур; ключ НЕ коммитится) ──

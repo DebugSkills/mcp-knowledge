@@ -24,6 +24,12 @@ mcp-kb-airgap-bundle.tar.gz
 .env
 !.env.example
 
+# Ф-B (arch-2026-10-10-ai-ws-p2-1 R3): отрендеренные litellm-конфиги — АРТЕФАКТЫ
+# (SSOT = .in-шаблоны; рендер make gateway-render / ansible update.yml).
+# При коммите: git rm --cached litellm.config.yaml litellm.local_only.config.yaml
+/litellm.config.yaml
+/litellm.local_only.config.yaml
+
 # IDE
 .vscode/
 .idea/
