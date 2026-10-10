@@ -520,19 +520,28 @@
         set -eu
         cd {{ clone_dir }}
         export LITELLM_MAX_PARALLEL='{{ gpu_k }}'
+        changed=0
         for t in litellm.config.yaml litellm.local_only.config.yaml; do
           if command -v envsubst >/dev/null 2>&1; then
-            envsubst '${LITELLM_MAX_PARALLEL}' < "$t.in" > "$t"
+            envsubst '${LITELLM_MAX_PARALLEL}' < "$t.in" > "$t.new"
           else
             # О-7: узел без gettext-base — python-замена (тот же whitelist из одного имени)
             python3 -c 'import os,sys; sys.stdout.write(sys.stdin.read().replace("${LITELLM_MAX_PARALLEL}", \
-              os.environ["LITELLM_MAX_PARALLEL"]))' < "$t.in" > "$t"
+              os.environ["LITELLM_MAX_PARALLEL"]))' < "$t.in" > "$t.new"
+          fi
+          # идемпотентность: пишем только при фактическом отличии (иначе changed=0)
+          if [ -f "$t" ] && cmp -s "$t" "$t.new"; then
+            rm -f "$t.new"
+          else
+            mv "$t.new" "$t"
+            changed=1
           fi
         done
-        echo "[GPU-K] отрендерено с K={{ gpu_k }}"
+        echo "[GPU-K] рендер K={{ gpu_k }} changed=$changed"
       args:
         executable: /bin/bash
-      changed_when: true
+      register: gpu_k_render
+      changed_when: "'changed=1' in gpu_k_render.stdout"
 
     - name: "GPU-K: WS_GPU_K -> .env клона (канал OLLAMA_NUM_PARALLEL, О-4)"
       tags: [up]
