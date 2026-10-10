@@ -120,6 +120,7 @@
 | script:airgap-clean-src.sh | 038: чистая локальная копия (git clone --local) для сборки бандла — хелпер airgap-bundle-pack.sh, ручной | sink: — | gap: ручной (air-gap-контур вне прода; FAIL → exit≠0) |
 | script:airgap-bundle-ship.sh | 038: передача бандла на узел (USB / rsync / pipe-via jump), resumable, ручной | sink: — | gap: ручной (air-gap-контур вне прода; FAIL → exit≠0 + лог ship-<ts>.log) |
 | script:airgap-pack-subset.sh | 038: air-gap ПОДМНОЖЕСТВО-пакет (обновление-дельта), ручной | sink: — | gap: ручной (air-gap-контур вне прода; fail → exit≠0 + лог) |
+| script:deploy-modes.sh | Ф1 deploy-modes (2026-10-10): единый диспетчер 3 режимов air-gap деплоя (full-usb/full-net/code-net) — валидатор MODE, маппинг на движки 038 (pack/subset/ship), fail-closed guard режима code-net при изменении моделей, ручной | sink: — | gap: ручной (air-gap-контур вне прода; FAIL → exit≠0 + матрица/STOP-сообщение) |
 | script:cutover.py | blue-green своп алиасов (reindex), разовый деструктив, ручной | sink: — | gap: ручной (разовый деструктив-cutover, запуск оператором; fail → exit≠0 + отчёт) |
 | script:seed_knowledge.py | разовый сид, ручной | sink: — | gap: разовый; через cron_wrap.sh при использовании |
 | script:backfill_sequence_payload.py | миграция payload, ручной | sink: — | gap: ручной; через cron_wrap.sh (конвенция update-флоу) |
