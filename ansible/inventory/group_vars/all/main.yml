@@ -160,8 +160,10 @@ errors_guard_burst_abs: 50        # burst-порог: абсолютных со�
 # WS-слой верстака (arch-2026-10-10-ws-airgap-layers): локальная модель контура
 # litellm 'local' → ollama. НЕ секрет → не в vault. Оверрайд по хосту — host_vars/<host>.yml
 # (у узлов разные наборы моделей). См. ansible/templates/.env.j2 → WS_LOCAL_MODEL.
-ws_local_model: "qwen3:30b-a3b-instruct-2507-q4_K_M"
+_ws_settings: "{{ (lookup('file', playbook_dir ~ '/../../stack.settings.yaml', errors='ignore') or '{}') | from_yaml }}"
+# Ф5: значение из stack.settings.yaml (R1 lookup, НЕ include_vars); host_vars выше (R8a).
+ws_local_model: "{{ (_ws_settings.get('ws') or {}).get('local_model') | default('qwen3:30b-a3b-instruct-2507-q4_K_M', true) }}"
 
 # Адрес ollama контура local верстака: host.docker.internal:11434 (host-ollama, мощные
 # модели) для прод-узла; на dev — mcp-knowledge-ollama:11434 (контейнер). НЕ секрет.
-ws_local_ollama_base: "host.docker.internal:11434"
+ws_local_ollama_base: "{{ (_ws_settings.get('ws') or {}).get('local_ollama_base') | default('host.docker.internal:11434', true) }}"

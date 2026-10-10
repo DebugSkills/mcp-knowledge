@@ -532,21 +532,26 @@ LITELLM_MAX_PARALLEL ?=
 # отрендеренные litellm*.config.yaml — gitignored-артефакты. Fail-safe: пусто/мусор/
 # нет nvidia-smi → K=1 (I13; не пустой литерал).
 WS_LOCAL_MODEL_DEFAULT := qwen3:30b-a3b-instruct-2507-q4_K_M
-gateway-render: ## Ф-B: рендер litellm*.config.yaml из .in (K: LITELLM_MAX_PARALLEL>gpu_k_detect→1; local: WS_LOCAL_MODEL>env>.env→default)
+WS_LOCAL_OLLAMA_BASE_DEFAULT := mcp-knowledge-ollama:11434
+gateway-render: ## Ф-B: рендер litellm*.config.yaml из .in (K: LITELLM_MAX_PARALLEL>env>stack.settings>gpu_k_detect→1; local: WS_LOCAL_MODEL>env>stack.settings>.env→default)
 	@set -eu; \
+	_get() { python3 scripts/stack_config.py get "$$1" --quiet 2>/dev/null || true; }; \
 	k='$(LITELLM_MAX_PARALLEL)'; \
 	[ -n "$$k" ] || k="$${LITELLM_MAX_PARALLEL:-}"; \
+	[ -n "$$k" ] || k="$$(_get gateway.max_parallel)"; \
 	[ -n "$$k" ] || k="$$(python3 scripts/gpu_k_detect.py --k-only 2>/dev/null || true)"; \
 	case "$$k" in ''|*[!0-9]*) k=1 ;; esac; \
 	[ "$$k" -ge 1 ] 2>/dev/null || k=1; \
 	m='$(WS_LOCAL_MODEL)'; \
 	[ -n "$$m" ] || m="$${WS_LOCAL_MODEL:-}"; \
+	[ -n "$$m" ] || m="$$(_get ws.local_model)"; \
 	[ -n "$$m" ] || m="$$(grep -m1 '^WS_LOCAL_MODEL=' .env 2>/dev/null | cut -d= -f2-)"; \
 	[ -n "$$m" ] || m="$(WS_LOCAL_MODEL_DEFAULT)"; \
 	o='$(WS_LOCAL_OLLAMA_BASE)'; \
 	[ -n "$$o" ] || o="$${WS_LOCAL_OLLAMA_BASE:-}"; \
+	[ -n "$$o" ] || o="$$(_get ws.local_ollama_base)"; \
 	[ -n "$$o" ] || o="$$(grep -m1 '^WS_LOCAL_OLLAMA_BASE=' .env 2>/dev/null | cut -d= -f2-)"; \
-	[ -n "$$o" ] || o="mcp-knowledge-ollama:11434"; \
+	[ -n "$$o" ] || o="$(WS_LOCAL_OLLAMA_BASE_DEFAULT)"; \
 	echo "[gateway-render] K=$$k local=$$m @ $$o -> litellm.config.yaml + litellm.local_only.config.yaml"; \
 	export LITELLM_MAX_PARALLEL="$$k" WS_LOCAL_MODEL="$$m" WS_LOCAL_OLLAMA_BASE="$$o"; \
 	for t in litellm.config.yaml litellm.local_only.config.yaml; do \

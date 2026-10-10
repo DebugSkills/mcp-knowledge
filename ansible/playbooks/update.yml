@@ -113,6 +113,9 @@
       ansible.builtin.command:
         cmd: docker compose -f {{ compose_file }} config --format json
         chdir: "{{ clone_dir }}"
+      environment:   # R8b (Ф5): env-слой ВЫШЕ stack.settings.yaml (Q1 без пересмотра)
+        WS_LOCAL_MODEL: "{{ ws_local_model }}"
+        WS_LOCAL_OLLAMA_BASE: "{{ ws_local_ollama_base }}"
       register: compose_cfg
       changed_when: false
       check_mode: false   # safe in check: read-only fact (038 §5.5)

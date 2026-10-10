@@ -95,3 +95,8 @@ docker_no_proxy: "localhost,127.0.0.1,::1"
 
 # WS-слой верстака (arch-2026-10-10-ws-airgap-layers): поднимать вместе с обновлением.
 ws_layer_enabled: true
+
+# R8a (Ф5 arch-2026-10-10-ws-airgap-layers): контурный override адреса ollama WS-слоя.
+# host_vars > group_vars(file-каскад stack.settings.yaml): узел всегда получает host-ollama,
+# даже когда stack.settings.yaml приехал в air-gap пакете с dev-значением.
+ws_local_ollama_base: "host.docker.internal:11434"

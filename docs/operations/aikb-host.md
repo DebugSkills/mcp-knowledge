@@ -57,6 +57,9 @@ LAN-порты: `["8443","8444","8445"]`. `11434`/`11435` — **internal**; уб
 
 ## Эксплуатация
 - Диагностика: `sudo -n make -C /opt/mcp-knowledge/mcp-knowledge prod-diag` → лог `/var/log/mcp-knowledge/diag/prod-diag-latest.log` (0644). Ожидаемо **21 passed / 0 failed / 3 warn**.
+- **Единый конфиг стека (Ф5):** `make stack-config` (эффективный конфиг + источник каждого ключа) / `make stack-config-set ARGS="ws.local_model=… --apply"` (правка `stack.settings.yaml`).
+- ⚠️ **Ручные make-таргеты WS-слоя на узле — только с env (R11):** `WS_LOCAL_OLLAMA_BASE=host.docker.internal:11434 make gateway-render` — иначе file-слой `stack.settings.yaml` отдаст dev-алиас `mcp-knowledge-ollama:11434`. Штатный путь — ansible-apply (`update.yml` R8b несёт env).
+
 - WARN-и по ошибке/дизайну: `D10` (LiteLLM :4000 не публикуется — internal), `D13` (`:8700` calib-api не слушает — fail-soft), `D16` (zone-gate — поведенческая проба вне HTTP).
 - Обновление: `airgap-first-install.md`; секреты/несекретное — см. «Env и секреты».
 - ⚠️ **litellm:** читает `litellm.config.yaml` ТОЛЬКО на старте; при смене конфига `gateway-up` делает `--force-recreate` (по sha256 в `.gateway-config.sha`).
