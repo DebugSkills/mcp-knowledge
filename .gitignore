@@ -96,3 +96,6 @@ ai_workspace/calibration/reports/
 
 # Playwright e2e артефакты (Ф6): скриншоты/трейсы упавших kb-console e2e
 kb-console/tests/e2e/test-results/
+
+# gateway-up: хэш рендер-конфига (какой конфиг сейчас в litellm)
+.gateway-config.sha

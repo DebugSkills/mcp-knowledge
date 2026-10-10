@@ -554,8 +554,18 @@ gateway-render: ## Ф-B: рендер litellm*.config.yaml из .in (K: LITELLM_
 	  fi; \
 	done
 
-gateway-up: gateway-render ## Ф1: поднять LLM-шлюз (start_period до 120s → проверь make gateway-health). Ф-B: prereq gateway-render (рендер K)
-	docker compose -f $(GATEWAY_COMPOSE) up -d
+gateway-up: gateway-render ## Ф1: поднять LLM-шлюз; при смене рендер-конфига --force-recreate (litellm читает конфиг ТОЛЬКО на старте)
+	@set -eu; \
+	new="$$(cat litellm.config.yaml litellm.local_only.config.yaml 2>/dev/null | sha256sum | cut -d' ' -f1)"; \
+	old="$$(cat .gateway-config.sha 2>/dev/null || true)"; \
+	if [ "$$new" != "$$old" ]; then \
+	  echo "[gateway-up] рендер-конфиг изменился → --force-recreate"; \
+	  docker compose -f $(GATEWAY_COMPOSE) up -d --force-recreate; \
+	  printf '%s\n' "$$new" > .gateway-config.sha; \
+	else \
+	  echo "[gateway-up] конфиг без изменений → up -d"; \
+	  docker compose -f $(GATEWAY_COMPOSE) up -d; \
+	fi
 
 gateway-down: ## Ф1: остановить LLM-шлюз
 	docker compose -f $(GATEWAY_COMPOSE) down
