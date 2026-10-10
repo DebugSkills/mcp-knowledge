@@ -301,7 +301,8 @@ d17_toolloop() {
     [ -n "$cn" ] || { say_skip D17 tool-loop "контейнер kb-console не найден"; return; }
     local out
     out="$(timeout "${DIAG_TURN_TIMEOUT:-200}" docker exec -i "$cn" python - <<'PYEOF' 2>/dev/null | tail -1
-import asyncio, json
+import asyncio, json, os, traceback
+diag = {"ws_llm_set": bool(os.environ.get("WS_LLM_URL")), "ws_mcp_set": bool(os.environ.get("WS_MCP_URL")), "ws_mcp_key_set": bool(os.environ.get("WS_MCP_KEY"))}
 import kb_console.core.tool_loop as tl
 calls = []
 _orig = tl._execute_tool_call
@@ -316,9 +317,10 @@ from kb_console.core.chat_turn import chat_turn
 msgs = [{"role": "user", "content": "Найди в базе знаний через инструмент search_knowledge материалы про протокол MCP и перечисли названия."}]
 try:
     res = asyncio.run(chat_turn(msgs, session_id="prod-diag", zone="private", max_iters=4))
-    print(json.dumps({"tool_calls": [c for c in calls if c], "text_len": len((res or {}).get("text", "")), "ok": any(calls)}))
+    diag.update(tool_calls=[c for c in calls if c], text_len=len((res or {}).get("text", "")), ok=any(calls))
 except Exception as e:
-    print(json.dumps({"error": type(e).__name__, "msg": str(e)[:160], "ok": False}))
+    diag.update(error=type(e).__name__, msg=str(e)[:200], ok=False, trace=traceback.format_exc()[-600:])
+print(json.dumps(diag, ensure_ascii=False))
 PYEOF
 )"
     if [ -z "$out" ]; then say_warn D17 tool-loop "нет ответа от контейнера $cn (LLM/MCP недоступны?)"; return; fi
@@ -326,7 +328,7 @@ PYEOF
     calls="$(printf '%s' "$out" | "$PY" -c 'import json,sys;d=json.load(sys.stdin);print(",".join(d.get("tool_calls",[])) or "-")' 2>/dev/null)"
     tl_="$(printf '%s' "$out" | "$PY" -c 'import json,sys;d=json.load(sys.stdin);print(d.get("text_len", d.get("error","?")))' 2>/dev/null)"
     if [ "$ok" = "True" ]; then say_pass D17 tool-loop "tool-loop сработал: инструмент($calls) вызван, ответ ~${tl_} симв."
-    else say_fail D17 tool-loop "инструмент НЕ вызван: $out"; fi
+    else say_fail D17 tool-loop "инструмент НЕ вызван"; printf '%s\n' "$out" | "$PY" -c 'import json,sys;d=json.load(sys.stdin);print("  WS_LLM_set=%s WS_MCP_set=%s"% (d.get("ws_llm_set"),d.get("ws_mcp_set")));print("  trace:",d.get("trace",d.get("msg",""))[-500:])' 2>/dev/null | sed "s/^/    /" || true; fi
 }
 
 setup_log
