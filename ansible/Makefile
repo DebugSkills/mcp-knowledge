@@ -87,7 +87,7 @@ update-airgap:
 	[ -f "$$PKG/manifest.json" ] || { echo "нет manifest.json в пакете: $$PKG"; exit 1; }; \
 	OLD_BRANCH="$$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["branch"])' "$$PKG/manifest.json")"; \
 	echo "~~~ пакет: $$PKG (branch=$$OLD_BRANCH)"; \
-	git -C "$(AIRGAP_WORK)/tree" init -q; \
+	mkdir -p "$(AIRGAP_WORK)/tree"; git -C "$(AIRGAP_WORK)/tree" init -q; \
 	git -C "$(AIRGAP_WORK)/tree" fetch -q "$$PKG/repo.git" "$$OLD_BRANCH"; \
 	git -C "$(AIRGAP_WORK)/tree" checkout -q FETCH_HEAD -- ansible; \
 	PB="$(AIRGAP_WORK)/tree/ansible/playbooks/update.yml"; \
