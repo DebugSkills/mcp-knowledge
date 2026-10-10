@@ -188,7 +188,10 @@ cmd_host() {
     else die "не удалось подключиться к $REMOTE через $JUMP (ssh rc=$rc)"; fi
     validate_artifacts
     node_ssh "mkdir -p $DEST" || die "не удалось создать $DEST на $REMOTE (права? путь?)"
-    local rsh="ssh -o BatchMode=yes $JUMP" rpath="${RSYNC_PATH:-rsync}"
+    # G1-фикс (code-2026-10-10-deploy-modes): -e НЕ должен содержать хост — rsync сам
+    # добавляет host из спецификации цели (`$JUMP:$DEST`); иначе на jump выполнялась
+    # бы команда-хост («<host>: command not found»). Хост цели задаёт `$JUMP`.
+    local rsh="ssh -o BatchMode=yes" rpath="${RSYNC_PATH:-rsync}"
 
     step 2 "передача rsync (resumable)"
     local attempt=1
