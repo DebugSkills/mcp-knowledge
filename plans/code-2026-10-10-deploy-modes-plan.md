@@ -11,8 +11,8 @@ created: 2026-10-10
 updated: 2026-10-10
 revision: "REV.1 (approved by User Gate 2026-10-10: вариант B + вход `airgap` + ОВ1–ОВ5 по рекомендациям); critic plan_only iter2 PASS 0.88 (0.79→0.88)"
 phases_total: 5
-phase_current: 4
-progress: "3/5 (60%)"
+phase_current: 5
+progress: "4/5 (80%)"
 source_analysis: "plans/_provenance/code-2026-10-10-deploy-modes/ (портфель v1.1/REV.2 + критика iter1 REVISE 0.79 / iter2 PASS 0.88)"
 tags: [phase-plan, code, airgap, deploy, makefile, usb, network]
 ---
@@ -56,7 +56,7 @@ tags: [phase-plan, code, airgap, deploy, makefile, usb, network]
 ## 📊 ПРОГРЕСС
 | Этап | Фазы | Готово | Прогресс % |
 |------|------|--------|-----------|
-| Механизм деплоя (3 режима) | Ф1–Ф5 | 3 / 5 | 60% |
+| Механизм деплоя (3 режима) | Ф1–Ф5 | 4 / 5 | 80% |
 
 ## Фаза 1 — Режимная матрица + диспетчер на источнике
 - 📥 портфель §2-B/§5-Ф1; Makefile:57-98 (deploy-семейство) + :154-217 (airgap-семейство).
