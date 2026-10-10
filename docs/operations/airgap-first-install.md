@@ -320,6 +320,21 @@ make airgap-update BUNDLE=/var/tmp/update-bundle/mcp-kb-update-<ISO>.tar.gz SKIP
 `CHECK=1` — `--check --diff`. Код-клон playbook обновляет сам (`git fetch` из пакета +
 `ff-only`); `INVENTORY_DIR` = где искать inventory, `AIRGAP_WORK` = рабочий каталог.
 
+### Единый вход: 3 режима (`make airgap`) — трасса code-2026-10-10-deploy-modes
+
+Единый диспетчер на источнике (lup) поверх движков выше; узел (aikb) — зеркальные цели.
+
+| MODE       | Состав        | pack + ship (lup)                                | узел aikb                      |
+|------------|---------------|--------------------------------------------------|--------------------------------|
+| `full-usb` | код + модели  | `airgap-bundle-pack` + ship `--usb`              | `bundle-unpack` → `deploy.yml` |
+| `full-net` | код + модели  | `airgap-bundle-pack` + ship `--host`/`--pipe-via` | `bundle-unpack` → `deploy.yml` |
+| `code-net` | ТОЛЬКО код    | `airgap-pack-subset` + ship `--files`            | `airgap-apply BUNDLE=…`        |
+
+- Источник: `make airgap MODE=… [STEP=pack|ship|all] [USB=…] [HOST=…|PIPE=…]` (`make airgap` без MODE — эта матрица).
+- Узел: `make airgap-first` (первичная установка, `CHECK=1` — план) · `make airgap-apply BUNDLE=…` (приёмка `verify-deploy` включена) · `make airgap-update` — устаревающий алиас.
+- **rsync через ВЛОЖЕННЫЙ jump (канон для `full-net`/`code-net`):** дефолт `--host <jump>` + `--rsync-path rsync` пишет на JUMP-хост. Правильно — `--rsync-path "ssh aikb rsync"` (напр. `ARGS='--host <jump> --rsync-path "ssh aikb rsync"'`); `--pipe-via` — гарантированный fallback (rc=3 = STOP без авто-pipe). На aikb rsync 3.2.7 присутствует.
+- Инвариант: едут ТОЛЬКО код и модели; корпус знаний и индексы Qdrant — НИКОГДА.
+
 ### Н9 — `DATA_ROOT` для `backup.sh` при запуске через ansible
 
 Симптом: `ERROR: Snapshot file not found: <клон>/data/qdrant/snapshots/…` в preflight-таске

@@ -41,7 +41,9 @@ class TestRunbookDoc:
         # Затем до 380: Шаг 8 — пост-апдейт проверка на узле (verify-deploy) +
         # маркер air-gap узла /etc/mcp-knowledge/airgap-node
         # (трасса code-2026-10-05-deploy-host-mechanism).
-        assert 80 <= n <= 380, f"ранбук подозрительной длины: {n} строк"
+        # Затем до 400: раздел «Единый вход: 3 режима (make airgap)»
+        # (трасса code-2026-10-10-deploy-modes, Ф4).
+        assert 80 <= n <= 400, f"ранбук подозрительной длины: {n} строк"
 
 
 class TestMakeTarget:
