@@ -156,3 +156,8 @@ mcp_kb_transfer__excludes:
 errors_guard_enabled: true        # kill-switch гварда: false = отключить
 errors_guard_cap_per_minute: 5    # cap событий на сигнатуру в минуту
 errors_guard_burst_abs: 50        # burst-порог: абсолютных событий за цикл
+
+# WS-слой верстака (arch-2026-10-10-ws-airgap-layers): локальная модель контура
+# litellm 'local' → ollama. НЕ секрет → не в vault. Оверрайд по хосту — host_vars/<host>.yml
+# (у узлов разные наборы моделей). См. ansible/templates/.env.j2 → WS_LOCAL_MODEL.
+ws_local_model: "qwen3:30b-a3b-instruct-2507-q4_K_M"
