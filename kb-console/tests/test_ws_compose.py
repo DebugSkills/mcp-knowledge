@@ -78,7 +78,13 @@ def test_aof_named_volume(doc: Any) -> None:
 
 @pytest.mark.parametrize("svc", ["ws-redis", "workspace"])
 def test_no_published_ports(doc: Any, svc: str) -> None:
-    assert "ports" not in doc["services"][svc], f"{svc}: публикация портов запрещена (I6)"
+    """I6: ws-redis — без портов; workspace — только loopback (127.0.0.1) для TLS-фасада (Ф2)."""
+    ports = doc["services"][svc].get("ports")
+    if svc == "workspace":
+        assert all(str(p).startswith("127.0.0.1:") for p in (ports or [])), (
+            f"workspace: публиковать только loopback: {ports!r}")
+    else:
+        assert not ports, f"{svc}: публикация портов запрещена (I6)"
 
 
 # ── workspace: env / depends_on / состав ────────────────────────────
@@ -111,8 +117,8 @@ def test_workspace_depends_on_ws_redis(doc: Any) -> None:
 
 
 def test_services_exactly_ws_redis_and_workspace(doc: Any) -> None:
-    """Ф3+ (litellm/queue/admission) — НЕ в этом файле; здесь только 5b."""
-    assert set(doc["services"]) == {"ws-redis", "workspace"}
+    """Ф3+ (litellm/queue/admission) — НЕ в этом файле; 5b + Ф2 TLS-фасад."""
+    assert set(doc["services"]) == {"ws-redis", "workspace", "ws-console-tls"}
 
 
 # ── Ф2 #6b-2: проводка attach_upload на странице «Чат» ──────────────

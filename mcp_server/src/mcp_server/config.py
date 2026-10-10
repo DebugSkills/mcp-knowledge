@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     # (паттерн MCP_API_KEY/CONSOLE_* выше). Значения НЕ логируются.
     LITELLM_MASTER_KEY: str = ""
     DEEPSEEK_API_KEY: str = ""
+    # WS-слой верстака (arch-2026-10-10-ws-airgap-layers): ключи MCP для workspace
+    # лежат в общем .env. Сервер их НЕ использует (workspace шлёт как Bearer) —
+    # поля нужны, чтобы pydantic не падал на extra_forbidden (паттерн выше).
+    WS_MCP_KEY: str = ""
+    WS_MCP_IMPORT_KEY: str = ""
 
     # Git audit (#21) + SSOT
     GIT_AUDIT: bool = True

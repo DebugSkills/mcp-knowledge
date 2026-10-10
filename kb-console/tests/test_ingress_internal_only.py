@@ -89,14 +89,16 @@ def test_litellm_gateway_has_no_published_ports() -> None:
 
 
 def test_workspace_services_internal_only() -> None:
-    """compose.workspace.yml: workspace и ws-redis — без published ports (I6)."""
+    """compose.workspace.yml: ws-redis — без портов; workspace — только loopback (Ф2 фасад)."""
     services = _get_services(_load_compose(COMPOSE_WORKSPACE))
-    for name in ("workspace", "ws-redis"):
-        svc = services.get(name)
-        assert isinstance(svc, dict), f"сервис {name} не найден в compose.workspace.yml"
-        assert svc.get("ports") in (None, []), (
-            f"{name}: порты публиковаться не должны (I6): ports={svc.get('ports')!r}"
-        )
+    svc = services.get("ws-redis")
+    assert isinstance(svc, dict), "ws-redis не найден в compose.workspace.yml"
+    assert svc.get("ports") in (None, []), f"ws-redis: порты запрещены (I6): {svc.get('ports')!r}"
+    ws = services.get("workspace")
+    assert isinstance(ws, dict), "workspace не найден в compose.workspace.yml"
+    for mapping in (ws.get("ports") or []):
+        ok, reason = mapping_is_loopback(mapping)
+        assert ok, f"workspace: {reason}"
 
 
 def test_main_compose_published_ports_loopback_only() -> None:
