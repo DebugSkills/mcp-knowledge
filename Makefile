@@ -596,14 +596,14 @@ WS_BUILD_FLAGS := --no-build
 endif
 
 .PHONY: ws-console-up ws-console-down ws-stack-up ws-stack-down stack-up
-ws-console-up: ## L4: поднять ws-консоль (чат; internal-only; AIRGAP=1 → без сборки)
-	docker compose $(WS_LAYER_COMPOSE) up -d $(WS_BUILD_FLAGS) workspace
+ws-console-up: ## L4: поднять ws-консоль (чат) + TLS-фасад ws-console-tls (:8445) [AIRGAP=1]
+	docker compose $(WS_LAYER_COMPOSE) up -d $(WS_BUILD_FLAGS) workspace ws-console-tls
 
-ws-console-down: ## L4: остановить ws-консоль
-	docker compose $(WS_LAYER_COMPOSE) stop workspace
+ws-console-down: ## L4: остановить ws-консоль + фасад
+	docker compose $(WS_LAYER_COMPOSE) stop workspace ws-console-tls
 
-ws-stack-up: gateway-up ws-up ## WS-слой целиком: шлюз(L2)+ws-redis(L3)+ws-консоль(L4) [AIRGAP=1]
-	docker compose $(WS_LAYER_COMPOSE) up -d $(WS_BUILD_FLAGS) workspace
+ws-stack-up: gateway-up ws-up ## WS-слой: шлюз(L2)+ws-redis(L3)+ws-консоль+фасад(L4) [AIRGAP=1]
+	docker compose $(WS_LAYER_COMPOSE) up -d $(WS_BUILD_FLAGS) workspace ws-console-tls
 
 ws-stack-down: ## WS-слой: остановить целиком
 	docker compose $(WS_LAYER_COMPOSE) down

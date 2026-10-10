@@ -1,0 +1,54 @@
+# workspace — TLS-фасад ВЕРСТАКА (arch-2026-10-10-ws-airgap-layers, Ф2).
+#
+# Отдельный Caddy (не трогаем kb-console-tls): свой сайт :8445 (8443 = kb-console,
+# 8444 = MCP-фасад). CA ОБЩИЙ — volume /data тот же, что у kb-console-tls →
+# участник ставит один корневой сертификат. /config отдельный (нет гонки autosave).
+#
+# Бэкенд: workspace на 127.0.0.1:8095 (loopback-публикация; в LAN порт не выходит —
+# наружу смотрит только этот фасад).
+{
+	admin off
+	auto_https disable_redirects      # :80 НЕ открываем (его держит kb-console-tls; в host-сети конфликт)
+	log {
+		output stdout
+		format json
+	}
+	servers {
+		protocols h1 h2
+	}
+}
+
+https://{$CONSOLE_LAN_IP}:{$WS_CONSOLE_PORT:8445} {
+	log {
+		output stdout
+		format json
+	}
+	tls internal
+	bind {$CONSOLE_LAN_IP}
+
+	@lan remote_ip {$CONSOLE_LAN_CIDR}
+
+	# liveness-эндпоинт наружу НЕ выходит (как у kb-console).
+	handle /healthz {
+		respond "denied" 403
+	}
+
+	handle @lan {
+		reverse_proxy 127.0.0.1:8095 {
+			header_up X-Forwarded-Proto https
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	handle {
+		respond "workspace: доступ только из локальной сети" 403
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}

@@ -54,6 +54,10 @@ services:
     image: kb-console:prod
     container_name: mcp-knowledge-workspace
     restart: unless-stopped
+    # Ф2 ws-airgap: loopback-публикация ТОЛЬКО для TLS-фасада (I6: в LAN порт
+    # не выходит; наружу смотрит ws-console-tls :8445).
+    ports:
+      - "127.0.0.1:8095:8085"
     environment:
       # MCP internal-only (I6): host-сеть mcp-server через host-gateway.
       - MCP_SERVER_URL=http://host.docker.internal:8000
@@ -71,6 +75,10 @@ services:
       - CONSOLE_USERS_FILE=/app/data/console/users.jsonl
       - CONSOLE_ADMIN_USER=${CONSOLE_ADMIN_USER:-}
       - CONSOLE_ADMIN_PASSWORD=${CONSOLE_ADMIN_PASSWORD:-}
+      # Гард (модель A, ws-airgap Ф2): required + БЕЗ CONSOLE_PASSWORD → при пустом
+      # сторе fail-fast (RuntimeError), legacy-admin невозможен; непустой стор →
+      # per-user auth (роли из users.jsonl; обычный пользователь = чат, не админка).
+      - CONSOLE_AUTH=required
       - CONSOLE_PORT=8085
       # 0.0.0.0 только ВНУТРИ bridge-контейнера без published ports (контур
       # internal-only); loopback внутри контейнера закрыл бы будущий
@@ -98,6 +106,44 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # ws-console-tls — TLS-фасад верстака (Ф2). Отдельный Caddy, общий CA (/data),
+  # свой сайт :8445. Бэкенд 127.0.0.1:8095 (loopback).
+  ws-console-tls:
+    image: caddy:2-alpine
+    container_name: mcp-knowledge-ws-tls
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      - CONSOLE_LAN_IP=${CONSOLE_LAN_IP:-}
+      - CONSOLE_LAN_CIDR=${CONSOLE_LAN_CIDR:-192.168.2.0/24}
+      - WS_CONSOLE_PORT=${WS_CONSOLE_PORT:-8445}
+    volumes:
+      - ./kb-console/caddy/Caddyfile.workspace:/etc/caddy/Caddyfile:ro
+      - ${DATA_ROOT:-./data}/caddy/data:/data          # общий локальный CA с kb-console-tls
+      - ${DATA_ROOT:-./data}/caddy/config-ws:/config   # отдельный autosave (нет гонки с L1)
+    command:
+      - sh
+      - -c
+      - 'test -n "$$CONSOLE_LAN_IP" || { echo "ws-console-tls: CONSOLE_LAN_IP не задан — фасад не поднимаю (fail-closed)"; exit 1; }; exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile'
+    depends_on:
+      workspace:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z -w 3 \"$$CONSOLE_LAN_IP\" 8445"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    mem_limit: 128m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
 
 volumes:
   ws-redis-data:

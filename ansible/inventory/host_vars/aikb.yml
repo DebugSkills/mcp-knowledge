@@ -50,7 +50,7 @@ mcp_kb_docker__bootstrap_reindex: false
 # lan_cidr → и ufw-правила (host-prepare), и CONSOLE_LAN_CIDR (allow-list фасада) одним значением.
 console_lan_ip: "192.168.10.253"
 mcp_kb_host_prepare__lan_cidr: ["192.168.10.0/24"]
-mcp_kb_host_prepare__lan_ports: ["8443", "8444"]   # дефолт group_vars; дублируем для самодостаточности (8444 = MCP-фасад, F10)
+mcp_kb_host_prepare__lan_ports: ["8443", "8444", "8445"]   # 8443=kb-console TLS, 8444=MCP-фасад (F10), 8445=workspace-верстак TLS (ws-airgap Ф2)
 # console_lan_ip обязан быть исключён из прокси (если прокси есть): берётся автоматически
 # в mcp_kb_host_prepare__no_proxy через docker_no_proxy | default(... ~ console_lan_ip).
 

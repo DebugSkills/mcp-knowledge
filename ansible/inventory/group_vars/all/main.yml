@@ -89,7 +89,7 @@ mcp_kb_host_prepare__no_proxy: "{{ docker_no_proxy | default('localhost,127.0.0.
 # прямой :8000 намеренно закрывается для LAN/интернета (F10: блок firewall в
 # playbooks/host-prepare.yml удаляет широкие правила :8000).
 mcp_kb_host_prepare__lan_cidr: ["192.168.2.0/24", "10.8.2.0/24"]
-mcp_kb_host_prepare__lan_ports: ["8443", "8444"]   # 8443 = kb-console (TLS), 8444 = MCP-фасад (TLS)
+mcp_kb_host_prepare__lan_ports: ["8443", "8444", "8445"]   # 8443=kb-console (TLS), 8444=MCP-фасад (TLS), 8445=workspace-верстак (TLS, ws-airgap Ф2)
 
 # F10 (трасса arch-2026-10-05-ai-workspace): прямой :8000 остаётся разрешённым ТОЛЬКО
 # локальным docker-подсетям (контейнеры ходят на хост-порт :8000; loopback разрешён
