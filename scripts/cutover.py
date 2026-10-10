@@ -481,18 +481,15 @@ def _download(url: str, dest: Path, timeout: int = 300) -> None:
 
 
 def _wait_health(base_url: str, timeout_s: int = 120) -> dict:
-    """Дождаться готовности сервера после deploy (иначе шаг 6 падал Connection refused)."""
-    import urllib.error  # noqa: F401  (симметрия обработки, см. except ниже)
-    import urllib.request
+    """Дождаться готовности сервера после deploy (иначе шаг 6 падал Connection refused).
 
+    Единый HTTP-seam — через `_http_json` (тестируемо monkeypatch'ем, без второго urllib-пути).
+    """
     deadline = time.time() + timeout_s
     last: object = "нет попыток"
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(
-                base_url.rstrip("/") + "/health", timeout=5
-            ) as resp:
-                data = json.loads(resp.read().decode() or "{}")
+            data = _http_json("GET", base_url.rstrip("/") + "/health", timeout=5)
             if data.get("status") in ("healthy", "ok", "degraded"):
                 return data
             last = data.get("status")
