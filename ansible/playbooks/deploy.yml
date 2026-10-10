@@ -126,6 +126,7 @@
       tags: [docker]
       block:
         - name: Копировать .env из шаблона
+          tags: [env, docker]
           ansible.builtin.template:
             src: "{{ playbook_dir | dirname }}/templates/.env.j2"
             dest: "{{ deploy_root }}/{{ repo_name }}/.env"

@@ -21,3 +21,8 @@ vault_telegram_chat_id: ""
 # ProxyHandler; пусто → прямой fallback — только для локальной отладки).
 # Формат: http://host:port (без кредов в URL; socks не поддерживается urllib).
 vault_telegram_proxy: ""
+
+# WS-слой верстака (arch-2026-10-10-ws-airgap-layers)
+vault_litellm_master_key: "<сгенерируйте: openssl rand -hex 32>"
+vault_ws_mcp_key: "<токен узла read+both: python -m mcp_server.cli token create --level read --zone both>"
+vault_ws_mcp_import_key: "<токен узла import+both>"
