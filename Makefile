@@ -596,7 +596,7 @@ WS_COMPOSE := compose.workspace.yml
 WS_COMPOSE_TEST := compose.workspace.test.yml
 WS_TEST_REDIS_URL := redis://127.0.0.1:6390/0
 
-.PHONY: ws-up ws-down ws-up-test ws-test ws-test-integration ws-budget-reconcile ws-quota-sweep ws-prio ws-redis-check quotas-set quotas-show modes-validate golden-run f47-run
+.PHONY: ws-up ws-down ws-up-test ws-test ws-test-integration ws-budget-reconcile ws-quota-sweep ws-prio ws-redis-check quotas-set quotas-show stack-config stack-config-set modes-validate golden-run f47-run
 ws-up: ## Ф3.1: поднять ws-redis (порт НЕ публикуется — I6, internal-only)
 	docker compose -f $(WS_COMPOSE) up -d ws-redis
 
@@ -664,6 +664,12 @@ quotas-set: ## Ф4.5c-1: правка quotas.yaml с хоста (dry-run по у
 
 quotas-show: ## Ф4.5c-1: показать participant-роли и бюджеты quotas.yaml: make quotas-show [ARGS="--json"]
 	.venv/bin/python scripts/quotas_set.py show $(ARGS)
+
+stack-config: ## Ф5: эффективный конфиг стека stack.settings.yaml (+источник каждого ключа): make stack-config [ARGS]
+	.venv/bin/python scripts/stack_config.py show $(ARGS)
+
+stack-config-set: ## Ф5: правка stack.settings.yaml (dry-run по умолчанию; --apply = бэкап .trash + атомарная запись + валидация): make stack-config-set ARGS="ws.local_model=... --apply"
+	.venv/bin/python scripts/stack_config.py set $(ARGS)
 
 modes-validate: ## Ф3.5: валидация режимов ai_workspace/modes/*.yaml
 	.venv/bin/python -m ai_workspace.tools.modes_validate

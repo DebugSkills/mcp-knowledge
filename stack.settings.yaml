@@ -1,0 +1,21 @@
+# Единая НЕсекретная точка конфигурации стека (Ф5) — trace: arch-2026-10-10-ws-airgap-layers
+#
+# Секреты здесь НЕ хранятся — только в ansible vault (vault_*).
+# Потребители: `make gateway-render` (LLM-шлюз) + ansible (.env.j2 через lookup в group_vars).
+# Доставка на air-gap узел — автоматически (airgap-bundle-pack = git clone --local всего репо).
+#
+# Конусы (R8): dev читает ЭТОТ файл; prod (aikb) перекрывает ws.local_ollama_base
+# через host_vars/aikb.yml (R8a) + env-инъекцию update.yml (R8b) — узел = host-ollama.
+version: 1
+
+ws:
+  # Модель «local»-контура litellm (полка ollama/${ws.local_model}).
+  local_model: qwen3:30b-a3b-instruct-2507-q4_K_M
+  # Адрес ollama для local-контура. dev — контейнер; prod перекрывается host_vars (R8a).
+  local_ollama_base: mcp-knowledge-ollama:11434
+
+gateway:
+  # K-параллелизм litellm (int ≥ 1, I13). По умолчанию НЕ задан → авто-детект
+  # gpu_k_detect.py → 1 (fail-safe). Явное число = осознанный override:
+  #   make stack-config-set ARGS="gateway.max_parallel=2 --apply"
+  # max_parallel: 2
