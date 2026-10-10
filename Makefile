@@ -543,14 +543,18 @@ gateway-render: ## Ф-B: рендер litellm*.config.yaml из .in (K: LITELLM_
 	[ -n "$$m" ] || m="$${WS_LOCAL_MODEL:-}"; \
 	[ -n "$$m" ] || m="$$(grep -m1 '^WS_LOCAL_MODEL=' .env 2>/dev/null | cut -d= -f2-)"; \
 	[ -n "$$m" ] || m="$(WS_LOCAL_MODEL_DEFAULT)"; \
-	echo "[gateway-render] K=$$k local=$$m -> litellm.config.yaml + litellm.local_only.config.yaml"; \
-	export LITELLM_MAX_PARALLEL="$$k" WS_LOCAL_MODEL="$$m"; \
+	o='$(WS_LOCAL_OLLAMA_BASE)'; \
+	[ -n "$$o" ] || o="$${WS_LOCAL_OLLAMA_BASE:-}"; \
+	[ -n "$$o" ] || o="$$(grep -m1 '^WS_LOCAL_OLLAMA_BASE=' .env 2>/dev/null | cut -d= -f2-)"; \
+	[ -n "$$o" ] || o="mcp-knowledge-ollama:11434"; \
+	echo "[gateway-render] K=$$k local=$$m @ $$o -> litellm.config.yaml + litellm.local_only.config.yaml"; \
+	export LITELLM_MAX_PARALLEL="$$k" WS_LOCAL_MODEL="$$m" WS_LOCAL_OLLAMA_BASE="$$o"; \
 	for t in litellm.config.yaml litellm.local_only.config.yaml; do \
 	  if command -v envsubst >/dev/null 2>&1; then \
-	    envsubst '$${LITELLM_MAX_PARALLEL} $${WS_LOCAL_MODEL}' < "$$t.in" > "$$t"; \
+	    envsubst '$${LITELLM_MAX_PARALLEL} $${WS_LOCAL_MODEL} $${WS_LOCAL_OLLAMA_BASE}' < "$$t.in" > "$$t"; \
 	  else \
 	    echo "[gateway-render] WARN: envsubst отсутствует (пакет gettext-base) — python-fallback (О-7)"; \
-	    python3 -c 'import os,sys; s=sys.stdin.read().replace("$${LITELLM_MAX_PARALLEL}", os.environ["LITELLM_MAX_PARALLEL"]).replace("$${WS_LOCAL_MODEL}", os.environ["WS_LOCAL_MODEL"]); sys.stdout.write(s)' < "$$t.in" > "$$t"; \
+	    python3 -c 'import os,sys; s=sys.stdin.read().replace("$${LITELLM_MAX_PARALLEL}", os.environ["LITELLM_MAX_PARALLEL"]).replace("$${WS_LOCAL_MODEL}", os.environ["WS_LOCAL_MODEL"]).replace("$${WS_LOCAL_OLLAMA_BASE}", os.environ["WS_LOCAL_OLLAMA_BASE"]); sys.stdout.write(s)' < "$$t.in" > "$$t"; \
 	  fi; \
 	done
 

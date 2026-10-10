@@ -19,7 +19,7 @@ model_list:
   - model_name: local
     litellm_params:
       model: ollama/${WS_LOCAL_MODEL}
-      api_base: http://mcp-knowledge-ollama:11434
+      api_base: http://${WS_LOCAL_OLLAMA_BASE}
       max_parallel_requests: ${LITELLM_MAX_PARALLEL}   # = K (int-литерал после рендера)
       timeout: 600
 
