@@ -2,10 +2,10 @@
 trace_id: code-2026-10-10-deploy-modes · дата: 2026-10-10
 
 ## Канон (диспетчер)
-make airgap MODE=code-net STEP=ship HOST=ch@46.17.105.195 RSYNC_PATH="ssh aikb rsync" DEST=/home/ch/update-bundle
+make airgap MODE=code-net STEP=ship HOST=<JUMP_HOST> RSYNC_PATH="ssh aikb rsync" DEST=/home/ch/update-bundle
 
 ## Найденный дефект (G1) и фикс — commit e92fffe
-- Симптом: `bash: line 1: 46.17.105.195: command not found` + `rsync code 12`.
+- Симптом: `bash: line 1: <JUMP_HOST>: command not found` + `rsync code 12`.
 - Корень: `airgap-bundle-ship.sh` cmd_host задавал `-e "ssh -o BatchMode=yes $JUMP"`, а rsync САМ
   добавляет host из цели (`$JUMP:$DEST`) → на jump запускалась команда-хост.
 - Фикс: `-e "ssh -o BatchMode=yes"` (хост задаёт спецификация цели).
