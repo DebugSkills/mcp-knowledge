@@ -92,3 +92,6 @@ docker_no_proxy: "localhost,127.0.0.1,::1"
 # ─── Секреты (НЕ здесь!) ───
 # vault_mcp_read_keys / vault_mcp_write_keys / vault_mcp_import_keys /
 # vault_mcp_console_key / vault_cron_write_key → inventory/group_vars/all/vault.yml (ansible-vault).
+
+# WS-слой верстака (arch-2026-10-10-ws-airgap-layers): поднимать вместе с обновлением.
+ws_layer_enabled: true

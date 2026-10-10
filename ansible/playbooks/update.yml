@@ -573,6 +573,20 @@
         and (up_result.stdout is search('Created|Recreated|Started|Built')
              or up_result.stderr is search('Created|Recreated|Started|Built'))
 
+    # ════════════════════ WS-слой верстака (arch-2026-10-10-ws-airgap-layers Ф3) ════════════════════
+    # После knowledge: шлюз(litellm)+ws-redis+ws-консоль+TLS-фасад. AIRGAP=1 → +compose.airgap.yml
+    # --no-build (I12: узел НЕ собирает). Включается per-host флагом ws_layer_enabled.
+    - name: "WS: поднять слой верстака (make ws-stack-up AIRGAP=1)"
+      tags: [up]
+      when: ws_layer_enabled | default(false)
+      ansible.builtin.command:
+        cmd: make ws-stack-up AIRGAP=1
+        chdir: "{{ clone_dir }}"
+      register: ws_up_result
+      changed_when: >-
+        ws_up_result.stdout is defined
+        and ws_up_result.stdout is search('Created|Recreated|Started')
+
     # ════════════════════ health ════════════════════
     - name: "Health: mcp-server /health (retries: health_retries)"
       tags: [health]
